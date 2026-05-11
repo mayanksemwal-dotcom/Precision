@@ -58,6 +58,7 @@ export interface AuditRecord {
   disputeHistory: DisputeHistory[];
   agentId: string;
   teamLeadId?: string;
+  isAccepted?: boolean;
 }
 
 export interface AppConfig {

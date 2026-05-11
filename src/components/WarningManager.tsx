@@ -6,61 +6,95 @@ import { Label } from './ui/label';
 import { RadioGroup, RadioGroupItem } from './ui/radio-group';
 import { Separator } from './ui/separator';
 import { toast } from 'sonner';
+import { auth, db, handleFirestoreError, OperationType } from '../lib/firebase';
+import { doc, setDoc, getDocs, collection } from 'firebase/firestore';
+import { WarningTicket, UserProfile, UserRole } from '../types';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
 
 interface WarningManagerProps {
-  agentName: string;
-  agentId: string;
+  agentName?: string;
+  agentId?: string;
   onClose: () => void;
+  allUsers?: UserProfile[]; // Optional list of users for selection
 }
 
-export default function WarningManager({ agentName, agentId, onClose }: WarningManagerProps) {
+export default function WarningManager({ agentName: initialName, agentId: initialId, onClose, allUsers = [] }: WarningManagerProps) {
   const [level, setLevel] = useState<'1st' | '2nd' | 'Final'>('1st');
   const [remarks, setRemarks] = useState('');
+  const [selectedAgentId, setSelectedAgentId] = useState(initialId || '');
 
-  // Mock history
-  const history = [
-    { level: '1st', date: '2026-03-12', remarks: 'Consistent quality below 90%' }
-  ];
+  const selectedAgent = allUsers.find(u => u.uid === selectedAgentId) || (initialId ? { name: initialName, uid: initialId } : null);
 
-  const handleSubmit = () => {
+  const handleSubmit = async () => {
+    if (!selectedAgentId) {
+      toast.error('Please select an agent');
+      return;
+    }
     if (!remarks) {
       toast.error('Remarks are required for issuing a warning');
       return;
     }
-    toast.success(`${level} Warning issued to ${agentName}`);
-    onClose();
+
+    try {
+      const ticket: WarningTicket = {
+        id: `wt-${Date.now()}`,
+        agentId: selectedAgentId,
+        qaId: auth.currentUser?.uid || 'unknown',
+        level,
+        remarks,
+        createdAt: new Date().toISOString()
+      };
+      
+      const docRef = doc(db, 'warnings', ticket.id);
+      await setDoc(docRef, ticket);
+      
+      toast.success(`${level} Warning issued to ${selectedAgent?.name || selectedAgentId}`);
+      onClose();
+    } catch (e) {
+      handleFirestoreError(e, OperationType.WRITE, 'warnings');
+    }
   };
 
   return (
     <div className="space-y-6">
-      <div className="bg-red-50 border border-red-100 p-4 rounded-lg flex gap-3">
-        <ShieldAlert className="text-red-600 shrink-0" size={20} />
-        <div>
-          <h4 className="text-sm font-bold text-red-900">Warning Ticket Issuance</h4>
-          <p className="text-xs text-red-700">This action will be logged and visible to Admin and Team Lead.</p>
+      <div className="bg-red-50 border border-red-100 p-4 rounded-lg flex flex-col gap-3">
+        <div className="flex gap-3">
+          <ShieldAlert className="text-red-600 shrink-0" size={20} />
+          <div>
+            <h4 className="text-sm font-bold text-red-900">Warning Ticket Issuance</h4>
+            <p className="text-xs text-red-700">This action will be logged and visible to Admin and Team Lead.</p>
+          </div>
         </div>
+        <a 
+          href="https://docs.google.com/document/d/1zAu2KCCUfOFBA8-nopnc1YRNycaDhCtRPfI7CIgFl7Y/edit?tab=t.ttcgryfeyu7#heading=h.ra63ci5w7hx3" 
+          target="_blank" 
+          rel="noopener noreferrer"
+          className="text-[10px] font-bold text-blue-600 hover:underline flex items-center gap-1 mt-1"
+        >
+          <History size={12} /> View Staircase Policy Reference
+        </a>
       </div>
 
       <div className="space-y-4">
         <div>
           <Label className="text-xs uppercase font-bold text-slate-500">Target Agent</Label>
-          <div className="p-3 bg-slate-50 rounded border border-slate-200 mt-1">
-             <p className="font-bold">{agentName}</p>
-             <p className="text-xs text-slate-500">ID: {agentId}</p>
-          </div>
-        </div>
-
-        <div>
-          <Label className="text-xs uppercase font-bold text-slate-500">Previous Warnings</Label>
-          <div className="space-y-2 mt-1">
-            {history.map((h, i) => (
-              <div key={i} className="flex items-center gap-2 text-sm p-2 bg-slate-50 rounded border border-slate-100">
-                <Badge className="bg-amber-100 text-amber-700 shrink-0">{h.level}</Badge>
-                <span className="text-slate-400 font-mono text-xs">{h.date}</span>
-                <span className="text-slate-600 truncate">{h.remarks}</span>
-              </div>
-            ))}
-          </div>
+          {!initialId ? (
+            <Select value={selectedAgentId} onValueChange={setSelectedAgentId}>
+              <SelectTrigger className="mt-1">
+                <SelectValue placeholder="Select an Agent..." />
+              </SelectTrigger>
+              <SelectContent>
+                {allUsers.filter(u => u.role === UserRole.AGENT).map(u => (
+                  <SelectItem key={u.uid} value={u.uid}>{u.name} ({u.email})</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          ) : (
+            <div className="p-3 bg-slate-50 rounded border border-slate-200 mt-1">
+               <p className="font-bold">{initialName}</p>
+               <p className="text-xs text-slate-500">ID: {initialId}</p>
+            </div>
+          )}
         </div>
 
         <Separator />

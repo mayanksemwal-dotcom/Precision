@@ -19,7 +19,7 @@ import {
   History
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { UserRole, UserProfile, SamplingTask, AuditRecord, QAAlignment, ProductionRecord } from './types';
+import { UserRole, UserProfile, SamplingTask, AuditRecord, QAAlignment, ProductionRecord, WarningTicket } from './types';
 import { INITIAL_ALIGNMENTS } from './lib/sample-data';
 import { auth, db, logout, handleFirestoreError, OperationType } from './lib/firebase';
 import { onAuthStateChanged } from 'firebase/auth';
@@ -48,6 +48,7 @@ import {
 import CompletedAuditsView from './views/CompletedAuditsView';
 import ErrorFeedbacksView from './views/ErrorFeedbacksView';
 import DisputesView from './views/DisputesView';
+import WarningsView from './views/WarningsView';
 
 export default function App() {
   const [user, setUser] = useState<UserProfile | null>(null);
@@ -59,6 +60,8 @@ export default function App() {
   const [auditLogs, setAuditLogs] = useState<AuditRecord[]>([]);
   const [alignments, setAlignments] = useState<QAAlignment[]>(INITIAL_ALIGNMENTS);
   const [productions, setProductions] = useState<ProductionRecord[]>([]);
+  const [warnings, setWarnings] = useState<WarningTicket[]>([]);
+  const [allUsers, setAllUsers] = useState<UserProfile[]>([]);
   const [editingAudit, setEditingAudit] = useState<AuditRecord | null>(null);
 
   // Firebase Auth Listener
@@ -94,6 +97,11 @@ export default function App() {
 
   useEffect(() => {
     if (!user) return;
+
+    // Listen to Users (for dropdowns)
+    const unsubscribeUsers = onSnapshot(collection(db, 'users'), (snapshot) => {
+      setAllUsers(snapshot.docs.map(doc => doc.data() as UserProfile));
+    });
 
     // Listen to Alignments
     const unsubscribeAlignments = onSnapshot(doc(db, 'config', 'alignments'), (docSnap) => {
@@ -139,11 +147,26 @@ export default function App() {
       handleFirestoreError(error, OperationType.LIST, 'production');
     });
 
+    // Listen to Warnings
+    let warningsQuery;
+    if (user.role === UserRole.ADMIN || user.role === UserRole.QA || user.role === UserRole.TEAM_LEAD) {
+      warningsQuery = collection(db, 'warnings');
+    } else {
+      warningsQuery = query(collection(db, 'warnings'), where('agentId', '==', user.uid));
+    }
+
+    const unsubscribeWarnings = onSnapshot(warningsQuery, (snapshot) => {
+      setWarnings(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as WarningTicket)));
+    }, (error) => {
+      handleFirestoreError(error, OperationType.LIST, 'warnings');
+    });
+
     return () => {
       unsubscribeAlignments();
       unsubscribeTasks();
       unsubscribeAudits();
       unsubscribeProductions();
+      unsubscribeWarnings();
     };
   }, [user]);
 
@@ -173,7 +196,7 @@ export default function App() {
     { id: 'error_feedbacks', label: 'Feedbacks', icon: MessageSquare, roles: [UserRole.ADMIN, UserRole.QA, UserRole.TEAM_LEAD] },
     { id: 'disputes', label: 'Disputes', icon: ShieldAlert, roles: [UserRole.ADMIN, UserRole.QA, UserRole.TEAM_LEAD] },
     { id: 'reports', label: 'Reports', icon: BarChart3, roles: [UserRole.ADMIN, UserRole.TEAM_LEAD, UserRole.QA] },
-    { id: 'warnings', label: 'Warnings', icon: ShieldAlert, roles: [UserRole.ADMIN, UserRole.QA] },
+    { id: 'warnings', label: 'Warnings', icon: ShieldAlert, roles: [UserRole.ADMIN, UserRole.QA, UserRole.TEAM_LEAD, UserRole.AGENT] },
     { id: 'config', label: 'Console', icon: Settings, roles: [UserRole.ADMIN, UserRole.TEAM_LEAD] },
   ];
 
@@ -334,6 +357,8 @@ export default function App() {
                     setActiveTab('sampling');
                   }}
                 />
+              ) : activeTab === 'warnings' ? (
+                <WarningsView warnings={warnings} user={user} allUsers={allUsers} />
               ) : activeTab === 'error_feedbacks' ? (
                 <ErrorFeedbacksView auditLogs={auditLogs} user={user} alignments={alignments} />
               ) : (

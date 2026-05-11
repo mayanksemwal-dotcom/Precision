@@ -507,10 +507,6 @@ export default function AdminView({
     );
   }
 
-  return (
-    <div className="flex items-center justify-center h-64 text-slate-400">
-      <p>Module {activeTab} coming soon...</p>
-    </div>
-  );
+  return null; // Handled at App level
 }
 

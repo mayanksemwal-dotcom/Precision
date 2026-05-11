@@ -18,14 +18,24 @@ interface DisputesViewProps {
 }
 
 export default function DisputesView({ auditLogs, user, onEditAudit }: DisputesViewProps) {
-  const [filter, setFilter] = useState<'All' | 'Pending' | 'Active'>('All');
+  const [filter, setFilter] = useState<'All' | 'Pending' | 'Active' | 'Resolved'>('All');
   const [selectedDispute, setSelectedDispute] = useState<AuditRecord | null>(null);
   const [actionComment, setActionComment] = useState('');
 
   const disputes = useMemo(() => {
     let filtered = auditLogs.filter(log => log.disputeStatus !== DisputeStatus.NONE);
-    if (filter === 'Pending') filtered = filtered.filter(l => l.disputeStatus === DisputeStatus.PENDING);
-    if (filter === 'Active') filtered = filtered.filter(l => l.disputeStatus === DisputeStatus.QA_REVIEWED);
+    
+    // Default "All" view should only show non-resolved if user wants "only active"
+    if (filter === 'All') {
+      filtered = filtered.filter(l => l.disputeStatus !== DisputeStatus.RESOLVED);
+    } else if (filter === 'Pending') {
+      filtered = filtered.filter(l => l.disputeStatus === DisputeStatus.PENDING);
+    } else if (filter === 'Active') {
+      filtered = filtered.filter(l => l.disputeStatus === DisputeStatus.QA_REVIEWED);
+    } else if (filter === 'Resolved') {
+      filtered = filtered.filter(l => l.disputeStatus === DisputeStatus.RESOLVED);
+    }
+    
     return filtered;
   }, [auditLogs, filter]);
 
@@ -57,7 +67,7 @@ export default function DisputesView({ auditLogs, user, onEditAudit }: DisputesV
       <h2 className="text-2xl font-bold">Pending Disputes</h2>
       
       <div className="flex gap-2">
-        {['All', 'Pending', 'Active'].map(f => (
+        {['All', 'Pending', 'Active', 'Resolved'].map(f => (
           <Button key={f} variant={filter === f ? 'default' : 'outline'} onClick={() => setFilter(f as any)}>
             {f} Disputes
           </Button>

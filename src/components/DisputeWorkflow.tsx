@@ -59,7 +59,9 @@ export default function DisputeWorkflow({ audit, currentUser, onUpdate }: Disput
           <MessageSquare size={18} className="text-blue-600" />
           Dispute Thread
         </h3>
-        {getStatusBadge(audit.disputeStatus)}
+        <div className="flex items-center gap-2">
+          {getStatusBadge(audit.disputeStatus)}
+        </div>
       </div>
 
       <ScrollArea className="flex-1 pr-4 mb-4 border rounded-lg p-4 bg-slate-50/50">
@@ -103,11 +105,11 @@ export default function DisputeWorkflow({ audit, currentUser, onUpdate }: Disput
         </div>
       </ScrollArea>
 
-      {(audit.disputeStatus !== DisputeStatus.RESOLVED) && (
+      {(audit.disputeStatus !== DisputeStatus.RESOLVED || currentUser.role === UserRole.AGENT) && (
         <div className="space-y-3">
           <textarea
             className="w-full h-24 p-3 rounded-lg border border-slate-200 focus:ring-2 focus:ring-blue-500 focus:outline-none text-sm resize-none"
-            placeholder={currentUser.role === UserRole.QA ? "Respond to agent's dispute..." : "Explain why you are disputing..."}
+            placeholder={currentUser.role === UserRole.QA ? "Respond to agent's dispute..." : (audit.disputeStatus === DisputeStatus.RESOLVED ? "Re-raise dispute with new details..." : "Explain why you are disputing...")}
             value={comment}
             onChange={(e) => setComment(e.target.value)}
           />
@@ -132,10 +134,10 @@ export default function DisputeWorkflow({ audit, currentUser, onUpdate }: Disput
               }}
             >
               <Send size={16} className="mr-2" /> 
-              {currentUser.role === UserRole.QA ? "Send to Agent" : "Send to QA"}
+              {currentUser.role === UserRole.AGENT && audit.disputeStatus === DisputeStatus.RESOLVED ? "Re-raise Dispute" : (currentUser.role === UserRole.QA ? "Send to Agent" : "Send to QA")}
             </Button>
 
-            {currentUser.role === UserRole.QA && (
+            {currentUser.role === UserRole.QA && audit.disputeStatus !== DisputeStatus.RESOLVED && (
               <Button 
                 variant="outline" 
                 className="flex-1 border-green-200 text-green-700 hover:bg-green-50"
@@ -148,7 +150,7 @@ export default function DisputeWorkflow({ audit, currentUser, onUpdate }: Disput
         </div>
       )}
 
-      {audit.disputeStatus === DisputeStatus.RESOLVED && (
+      {audit.disputeStatus === DisputeStatus.RESOLVED && currentUser.role !== UserRole.AGENT && (
         <div className="p-4 bg-green-50 border border-green-100 rounded-lg text-center text-green-700 text-sm flex items-center justify-center gap-2">
           <CheckCircle2 size={18} />
           <span>This dispute has been marked as <strong>Resolved</strong>.</span>

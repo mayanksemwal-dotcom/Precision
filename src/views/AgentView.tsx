@@ -82,9 +82,27 @@ export default function AgentView({ activeTab, audits, user }: AgentViewProps) {
     ? (audits.reduce((acc, curr) => acc + curr.quality, 0) / audits.length).toFixed(1)
     : '0.0';
 
-  const handleAccept = (id: string) => {
-    toast.success('Error Accepted.');
+  const handleAccept = async (id: string) => {
+    if (!window.confirm('Are you sure you want to accept this feedback? This action will remove it from your pending list.')) {
+      return;
+    }
+
+    try {
+      const docRef = doc(db, 'audits', id);
+      await updateDoc(docRef, {
+        isAccepted: true
+      });
+      toast.success('Error Accepted and cleared from view.');
+    } catch (e) {
+      handleFirestoreError(e, OperationType.UPDATE, `audits/${id}`);
+    }
   };
+
+  const pendingFeedback = audits.filter(a => 
+    a.status === 'Incorrect' && 
+    !a.isAccepted && 
+    a.disputeStatus !== DisputeStatus.RESOLVED
+  );
 
   if (activeTab === 'dashboard') {
     return (
@@ -231,7 +249,7 @@ export default function AgentView({ activeTab, audits, user }: AgentViewProps) {
         </AnimatePresence>
 
         <div className="grid gap-4">
-          {audits.map((f) => (
+          {pendingFeedback.map((f) => (
             <Card key={f.id} className={`shadow-sm border-l-4 overflow-hidden ${f.disputeStatus === DisputeStatus.PENDING ? 'border-l-amber-500 bg-amber-50/20' : 'border-l-red-500'}`}>
               <CardContent className="p-6">
                 <div className="flex flex-col md:flex-row justify-between gap-6">
@@ -293,7 +311,7 @@ export default function AgentView({ activeTab, audits, user }: AgentViewProps) {
             </Card>
           ))}
 
-          {audits.length === 0 && (
+          {pendingFeedback.length === 0 && (
             <div className="py-20 text-center space-y-4">
               <div className="w-16 h-16 bg-green-100 text-green-600 rounded-full flex items-center justify-center mx-auto">
                 <CheckCircle2 size={32} />
@@ -309,9 +327,5 @@ export default function AgentView({ activeTab, audits, user }: AgentViewProps) {
     );
   }
 
-  return (
-    <div className="flex items-center justify-center h-64 text-slate-400">
-      <p>Module {activeTab} coming soon...</p>
-    </div>
-  );
+  return null; // Handled at App level
 }
