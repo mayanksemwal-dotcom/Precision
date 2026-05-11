@@ -24,8 +24,9 @@ export default function LoginView() {
         message = 'Login popup was blocked. Please enable popups for this site.';
         setErrorDetails('Popup blocked. Check your browser settings.');
       } else if (error.code === 'auth/unauthorized-domain') {
-        message = 'This domain is not authorized. Contact your Admin.';
-        setErrorDetails(`Domain ${window.location.hostname} needs to be added to Firebase authorized domains.`);
+        const hostname = window.location.hostname;
+        message = 'This domain is not authorized in Firebase.';
+        setErrorDetails(`Add "${hostname}" to Authorized Domains in Firebase Console > Auth > Settings.`);
       } else if (error.code === 'auth/cancelled-popup-request') {
         message = 'Login request was cancelled.';
       } else {
