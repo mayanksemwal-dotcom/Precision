@@ -33,6 +33,7 @@ import AgentView from './views/AgentView';
 import LoginView from './views/LoginView';
 
 // UI Components
+import BergLogo from './components/BergLogo';
 import { Button } from './components/ui/button';
 import { Toaster } from './components/ui/sonner';
 import { 
@@ -216,12 +217,10 @@ export default function App() {
         <div className="p-8 pb-4 flex flex-col items-center">
           <div className="w-full flex items-center justify-between mb-8">
             <div className={`flex items-center gap-3 ${!sidebarOpen && 'justify-center w-full'}`}>
-              <div className="bg-white p-2.5 rounded-2xl flex items-center justify-center shadow-md border border-slate-200/50">
-                <img 
-                  src="/berg_logo.png" 
-                  alt="Berg Logo" 
-                  className={`${sidebarOpen ? 'h-8' : 'h-7'} object-contain`}
-                  referrerPolicy="no-referrer"
+              <div className="bg-white p-2.5 rounded-2xl flex items-center justify-center shadow-lg border border-slate-100">
+                <BergLogo 
+                  className={sidebarOpen ? 'h-8 w-24' : 'h-7 w-12'} 
+                  showSubtitle={false} 
                 />
               </div>
               {sidebarOpen && (
