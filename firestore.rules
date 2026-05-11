@@ -1,0 +1,101 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Default Deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helper Primitives
+    function isSignedIn() {
+      return request.auth != null;
+    }
+    
+    function isEmail(email) {
+      return request.auth.token.email == email;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && (
+        isEmail('mayank.semwal@bergtechnologies.co.in') ||
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
+         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'ADMIN')
+      );
+    }
+    
+    function isQA() {
+        return isSignedIn() && (
+            exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
+            get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'QA'
+        );
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // User Profiles
+    match /users/{userId} {
+      allow get: if isSignedIn() && (request.auth.uid == userId || isAdmin());
+      allow list: if isAdmin();
+      allow create: if isSignedIn() && request.auth.uid == userId && 
+                    incoming().role in ['AGENT', 'QA', 'TEAM_LEAD', 'ADMIN'] &&
+                    incoming().keys().hasAll(['uid', 'email', 'name', 'role']) &&
+                    incoming().keys().size() <= 6;
+      allow update: if isSignedIn() && (
+        isAdmin() || 
+        (request.auth.uid == userId && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'team']))
+      );
+    }
+
+    // Sampling Tasks
+    match /tasks {
+      allow list: if isSignedIn();
+      match /{taskId} {
+        allow read: if isSignedIn();
+        allow create, update, delete: if isAdmin() || isQA();
+      }
+    }
+
+    // Production Data
+    match /production {
+      allow list: if isSignedIn();
+      match /{prodId} {
+        allow read: if isSignedIn();
+        allow create, update: if isAdmin();
+      }
+    }
+
+    // Audit Records
+    match /audits/{auditId} {
+      allow read: if isSignedIn();
+      
+      allow create: if (isAdmin() || isQA()) && 
+                    isValidId(auditId) &&
+                    incoming().qaId == request.auth.uid &&
+                    incoming().quality is number &&
+                    incoming().quality >= 0 && incoming().quality <= 100;
+                    
+      allow update: if isSignedIn() && (
+        isAdmin() || 
+        (isQA() && incoming().diff(existing()).affectedKeys().hasOnly(['qaComment', 'quality', 'status', 'errorType', 'guideline', 'theme', 'disputeStatus', 'disputeHistory'])) ||
+        (existing().agentId == request.auth.uid && incoming().diff(existing()).affectedKeys().hasOnly(['disputeStatus', 'disputeHistory'])) ||
+        (existing().qvName == request.auth.token.name && incoming().diff(existing()).affectedKeys().hasOnly(['disputeStatus', 'disputeHistory']))
+      );
+    }
+
+    // App Config
+    match /config/{configId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+  }
+}

@@ -1,0 +1,92 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "User Profile",
+      "description": "User account information and roles",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "email": { "type": "string" },
+        "role": { "type": "string", "enum": ["ADMIN", "QA", "TEAM_LEAD", "AGENT"] },
+        "name": { "type": "string" },
+        "team": { "type": "string" }
+      },
+      "required": ["uid", "email", "role", "name"]
+    },
+    "SamplingTask": {
+      "title": "Sampling Task",
+      "description": "A single record to be audited",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "taskId": { "type": "string" },
+        "qvName": { "type": "string" },
+        "vertical": { "type": "string" },
+        "sellerId": { "type": "string" },
+        "categoryGroup": { "type": "string" },
+        "rows": { "type": "number" },
+        "rowsPassed": { "type": "number" },
+        "rowsFailed": { "type": "number" },
+        "attributesEdited": { "type": "number" },
+        "imageReshuffle": { "type": "boolean" },
+        "assignedQaId": { "type": "string" },
+        "status": { "type": "string", "enum": ["Pending", "Completed", "Skipped"] },
+        "sourceFileId": { "type": "string" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["id", "taskId", "qvName", "status"]
+    },
+    "AuditRecord": {
+      "title": "Audit Record",
+      "description": "The result of a QA audit",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "taskId": { "type": "string" },
+        "qvName": { "type": "string" },
+        "vertical": { "type": "string" },
+        "sellerId": { "type": "string" },
+        "categoryGroup": { "type": "string" },
+        "rows": { "type": "number" },
+        "rowsPassed": { "type": "number" },
+        "rowsFailed": { "type": "number" },
+        "quality": { "type": "number" },
+        "status": { "type": "string", "enum": ["Correct", "Incorrect"] },
+        "qaComment": { "type": "string" },
+        "errorType": { "type": "string" },
+        "guideline": { "type": "string" },
+        "theme": { "type": "string" },
+        "qaId": { "type": "string" },
+        "auditDate": { "type": "string" },
+        "disputeStatus": { "type": "string", "enum": ["None", "Pending", "QA Reviewed", "Resolved"] },
+        "agentId": { "type": "string" }
+      },
+      "required": ["id", "taskId", "qvName", "quality", "agentId", "qaId"]
+    }
+  },
+  "firestore": {
+    "users/{userId}": {
+      "schema": "UserProfile",
+      "description": "User profiles"
+    },
+    "tasks/{taskId}": {
+      "schema": "SamplingTask",
+      "description": "Raw sampling tasks"
+    },
+    "audits/{auditId}": {
+      "schema": "AuditRecord",
+      "description": "Audit results"
+    },
+    "config/main": {
+      "schema": {
+        "type": "object",
+        "properties": {
+          "errorTypes": { "type": "array", "items": { "type": "string" } },
+          "guidelines": { "type": "array", "items": { "type": "string" } },
+          "themes": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "description": "Application configuration"
+    }
+  }
+}

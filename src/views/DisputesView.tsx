@@ -1,0 +1,167 @@
+import React, { useMemo, useState } from 'react';
+import { ShieldAlert } from 'lucide-react';
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '../components/ui/card';
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../components/ui/table';
+import { AuditRecord, DisputeStatus, UserProfile, UserRole } from '../types';
+import { Badge } from '../components/ui/badge';
+import { Button } from '../components/ui/button';
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger, DialogFooter } from '../components/ui/dialog';
+import { Input } from '../components/ui/input';
+import { updateDoc, doc, arrayUnion, serverTimestamp } from 'firebase/firestore';
+import { db } from '../lib/firebase';
+import { toast } from 'sonner';
+
+interface DisputesViewProps {
+  auditLogs: AuditRecord[];
+  user: UserProfile;
+  onEditAudit?: (audit: AuditRecord) => void;
+}
+
+export default function DisputesView({ auditLogs, user, onEditAudit }: DisputesViewProps) {
+  const [filter, setFilter] = useState<'All' | 'Pending' | 'Active'>('All');
+  const [selectedDispute, setSelectedDispute] = useState<AuditRecord | null>(null);
+  const [actionComment, setActionComment] = useState('');
+
+  const disputes = useMemo(() => {
+    let filtered = auditLogs.filter(log => log.disputeStatus !== DisputeStatus.NONE);
+    if (filter === 'Pending') filtered = filtered.filter(l => l.disputeStatus === DisputeStatus.PENDING);
+    if (filter === 'Active') filtered = filtered.filter(l => l.disputeStatus === DisputeStatus.QA_REVIEWED);
+    return filtered;
+  }, [auditLogs, filter]);
+
+  const handleAction = async (action: 'Deny' | 'Partial' | 'Full' | 'BOD' | 'Comment') => {
+    if (!selectedDispute) return;
+
+    try {
+      const isResolution = action !== 'Comment';
+      await updateDoc(doc(db, 'audits', selectedDispute.id), {
+        disputeStatus: isResolution ? DisputeStatus.RESOLVED : (user.role === UserRole.AGENT ? DisputeStatus.PENDING : DisputeStatus.QA_REVIEWED),
+        disputeHistory: arrayUnion({
+          id: crypto.randomUUID(),
+          timestamp: new Date().toISOString(),
+          userRole: user.role,
+          userName: user.name,
+          comment: isResolution ? `Action: ${action}. Comment: ${actionComment}` : actionComment
+        })
+      });
+      toast.success(isResolution ? `Dispute ${action}ed successfully.` : 'Comment added.');
+      setSelectedDispute(null);
+      setActionComment('');
+    } catch (error) {
+      toast.error('Failed to update dispute');
+    }
+  };
+
+  return (
+    <div className="space-y-6">
+      <h2 className="text-2xl font-bold">Pending Disputes</h2>
+      
+      <div className="flex gap-2">
+        {['All', 'Pending', 'Active'].map(f => (
+          <Button key={f} variant={filter === f ? 'default' : 'outline'} onClick={() => setFilter(f as any)}>
+            {f} Disputes
+          </Button>
+        ))}
+      </div>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Disputed Audits</CardTitle>
+          <CardDescription>Review audits with active disputes ({disputes.length})</CardDescription>
+        </CardHeader>
+        <CardContent>
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Task ID</TableHead>
+                <TableHead>Agent</TableHead>
+                <TableHead>QA / TL</TableHead>
+                <TableHead>Status</TableHead>
+                <TableHead>Latest Comment</TableHead>
+                <TableHead>Action</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {disputes.map((audit) => (
+                <TableRow key={audit.id}>
+                  <TableCell className="font-mono font-bold text-blue-600">{audit.taskId}</TableCell>
+                  <TableCell>{audit.agentId}</TableCell>
+                  <TableCell>{audit.qvName}</TableCell>
+                  <TableCell>
+                    <Badge variant={audit.disputeStatus === DisputeStatus.PENDING ? 'outline' : 'secondary'}>
+                      {audit.disputeStatus}
+                    </Badge>
+                  </TableCell>
+                  <TableCell className="max-w-xs truncate">
+                    {audit.disputeHistory[audit.disputeHistory.length - 1]?.comment || 'No comment'}
+                  </TableCell>
+                  <TableCell>
+                    <Dialog>
+                      <DialogTrigger asChild>
+                        <Button variant="ghost" onClick={() => setSelectedDispute(audit)}>Review</Button>
+                      </DialogTrigger>
+                      <DialogContent className="max-w-2xl">
+                        <DialogHeader>
+                          <DialogTitle>Dispute Thread - {audit.taskId}</DialogTitle>
+                        </DialogHeader>
+                        
+                        <div className="space-y-4 max-h-[400px] overflow-y-auto p-2 border rounded bg-slate-50">
+                          {audit.disputeHistory.map((h) => (
+                            <div key={h.id} className={`p-3 rounded-lg border ${h.userRole === UserRole.AGENT ? 'bg-blue-50 border-blue-100 ml-4' : 'bg-white border-slate-200 mr-4'}`}>
+                              <div className="flex justify-between items-center mb-1">
+                                <span className="text-xs font-bold text-slate-900">{h.userName} ({h.userRole})</span>
+                                <span className="text-[10px] text-slate-500">
+                                  {h.timestamp ? new Date(h.timestamp).toLocaleString() : ''}
+                                </span>
+                              </div>
+                              <p className="text-sm text-slate-700">{h.comment}</p>
+                            </div>
+                          ))}
+                        </div>
+
+                        <div className="space-y-2 mt-4">
+                          <Input 
+                            value={actionComment} 
+                            onChange={(e) => setActionComment(e.target.value)} 
+                            placeholder="Provide your remarks here..." 
+                          />
+                          {(user.role === UserRole.ADMIN || user.role === UserRole.QA || user.role === UserRole.TEAM_LEAD) && (
+                            <div className="flex gap-2">
+                              {onEditAudit && (
+                                <Button 
+                                  variant="secondary" 
+                                  onClick={() => {
+                                    onEditAudit(audit);
+                                  }}
+                                  className="gap-2"
+                                >
+                                  <ShieldAlert size={16} /> Edit Scoring
+                                </Button>
+                              )}
+                              <Button variant="outline" onClick={() => handleAction('Comment')}>Post Comment</Button>
+                            </div>
+                          )}
+                        </div>
+
+                        <DialogFooter className="mt-4 flex flex-wrap gap-2 sm:justify-start">
+                          {(user.role === UserRole.ADMIN || user.role === UserRole.QA || user.role === UserRole.TEAM_LEAD) && (
+                            <>
+                              <Button variant="destructive" onClick={() => handleAction('Deny')}>Deny</Button>
+                              <Button variant="outline" onClick={() => handleAction('Partial')}>Partial Revert</Button>
+                              <Button variant="outline" onClick={() => handleAction('Full')}>Full Revert</Button>
+                              <Button variant="secondary" onClick={() => handleAction('BOD')}>BOD</Button>
+                            </>
+                          )}
+                        </DialogFooter>
+                      </DialogContent>
+                    </Dialog>
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
