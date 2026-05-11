@@ -37,7 +37,7 @@ export default function WarningsView({ warnings, user, allUsers }: WarningsViewP
     w.remarks.toLowerCase().includes(searchTerm.toLowerCase())
   );
 
-  const canIssueWarning = user.role === UserRole.ADMIN || user.role === UserRole.QA || user.role === UserRole.TEAM_LEAD;
+  const canIssueWarning = user.role === UserRole.ADMIN || user.role === UserRole.TEAM_LEAD;
 
   const getLevelColor = (level: string) => {
     switch (level) {
@@ -70,10 +70,10 @@ export default function WarningsView({ warnings, user, allUsers }: WarningsViewP
                   <Plus size={18} /> Issue Warning
                 </Button>
               </DialogTrigger>
-              <DialogContent className="sm:max-w-[500px]">
+              <DialogContent className="sm:max-w-[500px] bg-white shadow-2xl border border-slate-200">
                 <DialogHeader>
-                  <DialogTitle>Raise Disciplinary Action</DialogTitle>
-                  <DialogDescription>
+                  <DialogTitle className="text-xl font-bold">Raise Disciplinary Action</DialogTitle>
+                  <DialogDescription className="text-slate-500">
                     Select an agent and warning level based on the corporate policy.
                   </DialogDescription>
                 </DialogHeader>

@@ -376,6 +376,7 @@ export default function App() {
                       productions={productions}
                       auditLogs={auditLogs}
                       goToTab={setActiveTab}
+                      allUsers={allUsers}
                     />
                   )}
                   {(effectiveRole === UserRole.QA) && (

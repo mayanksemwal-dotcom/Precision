@@ -18,11 +18,12 @@ import { Badge } from '../components/ui/badge';
 import { toast } from 'sonner';
 import * as XLSX from 'xlsx';
 import ConfigurationManager from '../components/ConfigurationManager';
-import { SamplingTask, UserProfile, QAAlignment } from '../types';
+import { SamplingTask, UserProfile, QAAlignment, UserRole } from '../types';
 import { db, handleFirestoreError, OperationType } from '../lib/firebase';
-import { doc, writeBatch, collection, getDocs, deleteDoc, setDoc } from 'firebase/firestore';
+import { doc, writeBatch, collection, getDocs, deleteDoc, setDoc, updateDoc } from 'firebase/firestore';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../components/ui/table';
-import { Plus, Trash2 } from 'lucide-react';
+import { Plus, Trash2, ShieldCheck, UserCog } from 'lucide-react';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../components/ui/select';
 
 interface AdminViewProps {
   activeTab: string;
@@ -34,6 +35,7 @@ interface AdminViewProps {
   productions?: any[];
   auditLogs?: any[];
   goToTab?: (tab: string) => void;
+  allUsers?: UserProfile[];
 }
 
 export default function AdminView({ 
@@ -45,13 +47,31 @@ export default function AdminView({
   onAlignmentsUpdate,
   productions = [],
   auditLogs = [],
-  goToTab
+  goToTab,
+  allUsers = []
 }: AdminViewProps) {
   const [file, setFile] = useState<File | null>(null);
   const [coverage, setCoverage] = useState<string>('10');
   const [minSampleCount, setMinSampleCount] = useState<number>(1);
   const [processing, setProcessing] = useState(false);
   const [fileStatus, setFileStatus] = useState<'none' | 'supported' | 'unsupported'>('none');
+
+  // Role update handler
+  const handleRoleUpdate = async (targetUid: string, newRole: UserRole) => {
+    if (targetUid === user.uid) {
+      toast.error("You cannot change your own role.");
+      return;
+    }
+    
+    try {
+      await updateDoc(doc(db, 'users', targetUid), {
+        role: newRole
+      });
+      toast.success('User role updated successfully');
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `users/${targetUid}`);
+    }
+  };
 
   // Alignment editing state
   const [newAlign, setNewAlign] = useState({ qaEmail: '', agentName: '' });
@@ -421,6 +441,62 @@ export default function AdminView({
       <div className="space-y-12 animate-in fade-in slide-in-from-bottom-4 duration-300">
         <ConfigurationManager />
         
+        {/* User Management Section */}
+        <div className="space-y-6 pt-8 border-t border-slate-200">
+          <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+            <div>
+              <h3 className="text-xl font-bold text-[#0F172A] flex items-center gap-2">
+                <UserCog size={24} className="text-blue-600" />
+                User Access & Role Management
+              </h3>
+              <p className="text-sm text-slate-500">Promote or demote users to manage system access levels.</p>
+            </div>
+          </div>
+
+          <Card className="overflow-hidden border-slate-200 shadow-sm">
+            <Table>
+              <TableHeader className="bg-slate-50">
+                <TableRow>
+                  <TableHead className="font-bold text-xs uppercase tracking-wider">User Name</TableHead>
+                  <TableHead className="font-bold text-xs uppercase tracking-wider">Email Address</TableHead>
+                  <TableHead className="font-bold text-xs uppercase tracking-wider">Current Role</TableHead>
+                  <TableHead className="font-bold text-xs uppercase tracking-wider">Modify Role</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {allUsers.map((u) => (
+                  <TableRow key={u.uid} className="hover:bg-slate-50/50">
+                    <TableCell className="py-3 text-sm font-bold text-[#0F172A]">{u.name}</TableCell>
+                    <TableCell className="py-3 text-sm text-slate-500">{u.email}</TableCell>
+                    <TableCell className="py-3">
+                      <Badge variant={u.role === UserRole.ADMIN ? 'default' : u.role === UserRole.TEAM_LEAD ? 'secondary' : 'outline'}>
+                        {u.role}
+                      </Badge>
+                    </TableCell>
+                    <TableCell className="py-3">
+                      <Select 
+                        disabled={u.uid === user.uid}
+                        onValueChange={(val) => handleRoleUpdate(u.uid, val as UserRole)}
+                        defaultValue={u.role}
+                      >
+                        <SelectTrigger className="w-32 h-8 text-xs">
+                          <SelectValue placeholder="Change Role" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value={UserRole.AGENT}>Agent</SelectItem>
+                          <SelectItem value={UserRole.QA}>QA</SelectItem>
+                          <SelectItem value={UserRole.TEAM_LEAD}>Team Lead</SelectItem>
+                          <SelectItem value={UserRole.ADMIN}>Admin</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </Card>
+        </div>
+
         <div className="space-y-6 pt-8 border-t border-slate-200">
           <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
             <div>
