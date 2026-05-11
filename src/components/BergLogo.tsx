@@ -15,19 +15,19 @@ export default function BergLogo({ className = "h-8", showSubtitle = true }: Ber
         className="w-full h-full"
       >
         {/* B */}
-        <path fill-rule="evenodd" clip-rule="evenodd" d="M20 20H55C75 20 85 32 85 45C85 55 78 63 68 65C80 67 90 75 90 90C90 105 78 115 55 115H20V20ZM38 36V54H55C60 54 65 51 65 45C65 39 60 36 55 36H38ZM38 74V99H58C63 99 68 95 68 87C68 79 63 74 58 74H38Z" fill="#38BDF8" />
+        <path fill-rule="evenodd" clip-rule="evenodd" d="M20 20H55C72 20 82 30 82 42C82 50 76 58 68 62C78 65 85 75 85 88C85 102 75 110 55 110H20V20ZM38 35V52H55C58 52 62 50 62 42C62 35 58 35 55 35H38ZM38 68V95H58C62 95 65 92 65 85C65 78 62 68 58 68H38Z" fill="#38BDF8" />
         
         {/* E (Styled lines) */}
-        <path d="M110 20H180V40H110V20Z" fill="#3B82F6" />
-        <path d="M110 52H170V72H110V52Z" fill="#3B82F6" />
-        <path d="M110 84H180V104H110V84Z" fill="#3B82F6" />
+        <path d="M105 20H175V38H105V20Z" fill="#3B82F6" />
+        <path d="M105 56H165V74H105V56Z" fill="#3B82F6" />
+        <path d="M105 92H175V110H105V92Z" fill="#3B82F6" />
         
         {/* R */}
-        <path fill-rule="evenodd" clip-rule="evenodd" d="M210 20H250C275 20 285 35 285 50C285 65 275 80 250 80H228V110H210V20ZM228 35V65H250C258 65 265 60 265 50C265 40 258 35 250 35H228Z" fill="#38BDF8" />
-        <path d="M250 80L285 110H265L230 80H250Z" fill="#38BDF8" />
+        <path fill-rule="evenodd" clip-rule="evenodd" d="M200 20H240C260 20 270 32 270 45C270 58 260 70 240 70H218V110H200V20ZM218 35V55H240C245 55 250 52 250 45C250 38 245 35 240 35H218Z" fill="#38BDF8" />
+        <path d="M240 70L275 110H253L218 70H240Z" fill="#38BDF8" />
         
-        {/* G - Improved C curve into a G */}
-        <path fill-rule="evenodd" clip-rule="evenodd" d="M370 45V35C370 15 350 5 325 5C300 5 280 20 280 55V80C280 110 300 120 325 120C350 120 370 110 370 85V65H320V82H352V85C352 95 345 103 325 103C305 103 298 90 298 80V55C298 30 305 22 325 22C345 22 352 30 352 45V50H370V45Z" fill="#38BDF8" />
+        {/* G - Resized to match height and width better */}
+        <path fill-rule="evenodd" clip-rule="evenodd" d="M365 45V35C365 25 355 20 335 20C315 20 300 30 300 55V75C300 100 315 110 335 110C355 110 365 100 365 85V65H325V82H348V85C348 93 342 95 335 95C320 95 315 88 315 75V55C315 40 320 35 330 35C340 35 348 40 348 50V52H365V45Z" fill="#38BDF8" />
       </svg>
       {showSubtitle && (
         <div className="text-[10px] font-black tracking-[0.2em] text-[#0F172A] mt-1 whitespace-nowrap uppercase">
