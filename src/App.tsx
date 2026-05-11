@@ -211,22 +211,22 @@ export default function App() {
       {/* Sidebar */}
       <motion.aside 
         initial={false}
-        animate={{ width: sidebarOpen ? 260 : 80 }}
+        animate={{ width: sidebarOpen ? 280 : 80 }}
         className="bg-[#0F172A] border-r border-[#1E293B] flex flex-col z-30 text-[#CBD5E1]"
       >
-        <div className="p-8 pb-4 flex flex-col items-center">
-          <div className="w-full flex items-center justify-between mb-8">
+        <div className="p-6 pb-4 flex flex-col items-center">
+          <div className="w-full flex items-center justify-between mb-6">
             <div className={`flex items-center gap-3 ${!sidebarOpen && 'justify-center w-full'}`}>
-              <div className="bg-white p-2.5 rounded-2xl flex items-center justify-center shadow-lg border border-slate-100">
+              <div className="bg-white p-2 rounded-xl flex items-center justify-center shadow-lg border border-slate-100 flex-shrink-0">
                 <BergLogo 
-                  className={sidebarOpen ? 'h-8 w-24' : 'h-7 w-12'} 
+                  className={sidebarOpen ? 'h-7 w-20' : 'h-6 w-10'} 
                   showSubtitle={false} 
                 />
               </div>
               {sidebarOpen && (
-                <div className="flex flex-col ml-1">
-                  <span className="font-black text-xl leading-none tracking-tighter text-white">Precision360</span>
-                  <span className="text-[10px] font-bold text-sky-400 uppercase tracking-widest mt-1 opacity-90">Berg Technologies</span>
+                <div className="flex flex-col min-w-0 overflow-hidden">
+                  <span className="font-black text-lg leading-none tracking-tighter text-white truncate">Precision360</span>
+                  <span className="text-[9px] font-bold text-sky-400 uppercase tracking-widest mt-1 opacity-90 truncate">Berg Technologies</span>
                 </div>
               )}
             </div>

@@ -103,24 +103,24 @@ export default function LoginView() {
             Next-generation Quality Management System
           </CardDescription>
         </CardHeader>
-        <CardContent className="px-8 pb-8 space-y-4">
+        <CardContent className="px-8 pb-8">
           <Tabs defaultValue="login" className="w-full">
-            <TabsList className="grid w-full grid-cols-2 mb-6 h-11 bg-slate-100 p-1 rounded-lg">
-              <TabsTrigger value="login" className="rounded-md data-[state=active]:bg-white data-[state=active]:shadow-sm">Login</TabsTrigger>
-              <TabsTrigger value="signup" className="rounded-md data-[state=active]:bg-white data-[state=active]:shadow-sm">Sign up</TabsTrigger>
+            <TabsList className="grid w-full grid-cols-2 mb-8 h-11 bg-slate-100 p-1 rounded-lg">
+              <TabsTrigger value="login" className="rounded-md data-[state=active]:bg-white data-[state=active]:shadow-sm transition-all">Login</TabsTrigger>
+              <TabsTrigger value="signup" className="rounded-md data-[state=active]:bg-white data-[state=active]:shadow-sm transition-all">Sign up</TabsTrigger>
             </TabsList>
             
-            <TabsContent value="login" className="space-y-4">
+            <TabsContent value="login" className="space-y-4 outline-none">
               <form onSubmit={handleEmailLogin} className="space-y-4">
                 <div className="space-y-2">
-                  <Label htmlFor="email">Email Address</Label>
+                  <Label htmlFor="email" className="text-xs font-bold text-slate-500 uppercase tracking-wider">Email Address</Label>
                   <div className="relative">
-                    <Mail className="absolute left-3 top-3 text-slate-400" size={18} />
+                    <Mail className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={18} />
                     <Input 
                       id="email" 
                       type="email" 
                       placeholder="name@company.com" 
-                      className="pl-10 h-11"
+                      className="pl-10 h-12 bg-slate-50/50 border-slate-200 focus:bg-white transition-all w-full"
                       value={email}
                       onChange={(e) => setEmail(e.target.value)}
                       required 
@@ -128,14 +128,14 @@ export default function LoginView() {
                   </div>
                 </div>
                 <div className="space-y-2">
-                  <Label htmlFor="password">Password</Label>
+                  <Label htmlFor="password" colSpan={2} className="text-xs font-bold text-slate-500 uppercase tracking-wider">Password</Label>
                   <div className="relative">
-                    <Lock className="absolute left-3 top-3 text-slate-400" size={18} />
+                    <Lock className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={18} />
                     <Input 
                       id="password" 
                       type="password" 
                       placeholder="••••••••" 
-                      className="pl-10 h-11"
+                      className="pl-10 h-12 bg-slate-50/50 border-slate-200 focus:bg-white transition-all w-full"
                       value={password}
                       onChange={(e) => setPassword(e.target.value)}
                       required 
@@ -143,24 +143,25 @@ export default function LoginView() {
                   </div>
                 </div>
                 <Button 
+                  type="submit"
                   disabled={loading}
-                  className="w-full h-11 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded-lg shadow-md"
+                  className="w-full h-12 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded-lg shadow-lg shadow-blue-600/20 transition-all active:scale-[0.98]"
                 >
-                  {loading ? <div className="h-4 w-4 border-2 border-white/30 border-t-white rounded-full animate-spin"></div> : "Sign In"}
+                  {loading ? <div className="h-5 w-5 border-2 border-white/30 border-t-white rounded-full animate-spin"></div> : "Sign In to Dashboard"}
                 </Button>
               </form>
             </TabsContent>
 
-            <TabsContent value="signup" className="space-y-4">
+            <TabsContent value="signup" className="space-y-4 outline-none">
               <form onSubmit={handleEmailSignup} className="space-y-4">
                 <div className="space-y-2">
-                  <Label htmlFor="signup-name">Full Name</Label>
+                  <Label htmlFor="signup-name" className="text-xs font-bold text-slate-500 uppercase tracking-wider">Full Name</Label>
                   <div className="relative">
-                    <UserIcon className="absolute left-3 top-3 text-slate-400" size={18} />
+                    <UserIcon className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={18} />
                     <Input 
                       id="signup-name" 
                       placeholder="John Doe" 
-                      className="pl-10 h-11"
+                      className="pl-10 h-12 bg-slate-50/50 border-slate-200 focus:bg-white transition-all w-full"
                       value={name}
                       onChange={(e) => setName(e.target.value)}
                       required 
@@ -168,14 +169,14 @@ export default function LoginView() {
                   </div>
                 </div>
                 <div className="space-y-2">
-                  <Label htmlFor="signup-email">Email Address</Label>
+                  <Label htmlFor="signup-email" className="text-xs font-bold text-slate-500 uppercase tracking-wider">Email Address</Label>
                   <div className="relative">
-                    <Mail className="absolute left-3 top-3 text-slate-400" size={18} />
+                    <Mail className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={18} />
                     <Input 
                       id="signup-email" 
                       type="email" 
                       placeholder="name@company.com" 
-                      className="pl-10 h-11"
+                      className="pl-10 h-12 bg-slate-50/50 border-slate-200 focus:bg-white transition-all w-full"
                       value={email}
                       onChange={(e) => setEmail(e.target.value)}
                       required 
@@ -183,14 +184,14 @@ export default function LoginView() {
                   </div>
                 </div>
                 <div className="space-y-2">
-                  <Label htmlFor="signup-password">Create Password</Label>
+                  <Label htmlFor="signup-password" className="text-xs font-bold text-slate-500 uppercase tracking-wider">Create Password</Label>
                   <div className="relative">
-                    <Lock className="absolute left-3 top-3 text-slate-400" size={18} />
+                    <Lock className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={18} />
                     <Input 
                       id="signup-password" 
                       type="password" 
                       placeholder="Min. 6 characters" 
-                      className="pl-10 h-11"
+                      className="pl-10 h-12 bg-slate-50/50 border-slate-200 focus:bg-white transition-all w-full"
                       value={password}
                       onChange={(e) => setPassword(e.target.value)}
                       required 
@@ -198,21 +199,22 @@ export default function LoginView() {
                   </div>
                 </div>
                 <Button 
+                  type="submit"
                   disabled={loading}
-                  className="w-full h-11 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded-lg shadow-md"
+                  className="w-full h-12 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded-lg shadow-lg shadow-blue-600/20 transition-all active:scale-[0.98]"
                 >
-                  {loading ? <div className="h-4 w-4 border-2 border-white/30 border-t-white rounded-full animate-spin"></div> : "Create Account"}
+                  {loading ? <div className="h-5 w-5 border-2 border-white/30 border-t-white rounded-full animate-spin"></div> : "Create Your Account"}
                 </Button>
               </form>
             </TabsContent>
           </Tabs>
 
-          <div className="relative my-6">
+          <div className="relative my-8">
             <div className="absolute inset-0 flex items-center">
               <span className="w-full border-t border-slate-200"></span>
             </div>
             <div className="relative flex justify-center text-xs uppercase">
-              <span className="bg-white px-2 text-slate-400 font-bold">Or continue with</span>
+              <span className="bg-white px-4 text-slate-400 font-bold tracking-widest">Or continue with</span>
             </div>
           </div>
 
@@ -220,28 +222,31 @@ export default function LoginView() {
             onClick={handleGoogleLogin}
             disabled={loading}
             variant="outline"
-            className="w-full h-11 border-slate-200 hover:bg-slate-50 text-slate-700 font-bold rounded-lg flex items-center justify-center gap-3 transition-all active:scale-[0.98]"
+            className="w-full h-12 border-slate-200 hover:bg-slate-50 hover:border-slate-300 text-slate-700 font-bold rounded-lg flex items-center justify-center gap-3 transition-all active:scale-[0.98] bg-white shadow-sm"
           >
             {loading ? (
               <div className="h-4 w-4 border-2 border-slate-300 border-t-slate-600 rounded-full animate-spin"></div>
             ) : (
               <>
-                <LogIn size={18} />
+                <LogIn size={18} className="text-slate-500" />
                 Sign in with Google
               </>
             )}
           </Button>
 
           {errorDetails && (
-            <div className="p-3 bg-red-50 border border-red-100 rounded-lg flex items-start gap-2 text-red-600 text-[11px] font-medium animate-in fade-in slide-in-from-top-1">
-              <AlertCircle size={14} className="shrink-0 mt-0.5" />
-              <span>{errorDetails}</span>
+            <div className="mt-6 p-4 bg-red-50 border border-red-100 rounded-xl flex items-start gap-3 text-red-600 text-xs font-medium animate-in fade-in slide-in-from-top-1">
+              <AlertCircle size={16} className="shrink-0 mt-0.5" />
+              <div className="space-y-1">
+                <p className="font-bold underline">Configuration Error</p>
+                <p className="opacity-90 leading-relaxed">{errorDetails}</p>
+              </div>
             </div>
           )}
           
-          <div className="flex items-center justify-center gap-4 text-[10px] text-slate-400 font-bold uppercase tracking-widest pt-4">
+          <div className="flex items-center justify-center gap-4 text-[10px] text-slate-400 font-bold uppercase tracking-widest pt-8">
             <span className="h-px w-8 bg-slate-200"></span>
-            Enterprise Security
+            Enterprise Grade Security
             <span className="h-px w-8 bg-slate-200"></span>
           </div>
         </CardContent>
