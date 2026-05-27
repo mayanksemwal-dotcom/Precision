@@ -16,7 +16,8 @@ import {
   Menu,
   X,
   FileUp,
-  History
+  History,
+  Clock
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { UserRole, UserProfile, SamplingTask, AuditRecord, QAAlignment, ProductionRecord, WarningTicket } from './types';
@@ -50,6 +51,7 @@ import CompletedAuditsView from './views/CompletedAuditsView';
 import ErrorFeedbacksView from './views/ErrorFeedbacksView';
 import DisputesView from './views/DisputesView';
 import WarningsView from './views/WarningsView';
+import TMSView from './views/TMSView';
 
 export default function App() {
   const [user, setUser] = useState<UserProfile | null>(null);
@@ -192,6 +194,7 @@ export default function App() {
 
   const navItems = [
     { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard, roles: [UserRole.ADMIN, UserRole.QA, UserRole.TEAM_LEAD, UserRole.AGENT] },
+    { id: 'tms', label: 'Workforce TMS', icon: Clock, roles: [UserRole.ADMIN, UserRole.QA, UserRole.TEAM_LEAD, UserRole.AGENT] },
     { id: 'sampling', label: 'Audit Desk', icon: ClipboardCheck, roles: [UserRole.ADMIN, UserRole.QA] },
     { id: 'feedback', label: 'Feedback', icon: MessageSquare, roles: [UserRole.AGENT] },
     { id: 'error_feedbacks', label: 'Feedbacks', icon: MessageSquare, roles: [UserRole.ADMIN, UserRole.QA, UserRole.TEAM_LEAD] },
@@ -358,6 +361,8 @@ export default function App() {
                 />
               ) : activeTab === 'warnings' ? (
                 <WarningsView warnings={warnings} user={user} allUsers={allUsers} />
+              ) : activeTab === 'tms' ? (
+                <TMSView user={user} allUsers={allUsers} />
               ) : activeTab === 'error_feedbacks' ? (
                 <ErrorFeedbacksView auditLogs={auditLogs} user={user} alignments={alignments} />
               ) : (

@@ -97,5 +97,17 @@ service cloud.firestore {
       allow read: if isSignedIn();
       allow write: if isAdmin();
     }
+
+    // Warnings Rules
+    match /warnings/{warningId} {
+      allow read: if isSignedIn();
+      allow create, update: if isAdmin();
+    }
+
+    // TMS Shifts Rules
+    match /tmsShifts/{shiftId} {
+      allow read: if isSignedIn();
+      allow create, update: if isSignedIn() && (request.auth.uid == incoming().userId || isAdmin());
+    }
   }
 }
