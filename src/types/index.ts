@@ -11,6 +11,8 @@ export interface UserProfile {
   role: UserRole;
   team?: string;
   name: string;
+  teamLeadId?: string;
+  teamLeadName?: string;
 }
 
 export enum DisputeStatus {

@@ -73,6 +73,20 @@ export default function AdminView({
     }
   };
 
+  // Mapping TL to Agent/QA handler
+  const handleTeamLeadUpdate = async (targetUid: string, tlUid: string) => {
+    try {
+      const selectedTl = allUsers.find(u => u.uid === tlUid);
+      await updateDoc(doc(db, 'users', targetUid), {
+        teamLeadId: tlUid || null,
+        teamLeadName: selectedTl ? selectedTl.name : null
+      });
+      toast.success('Team Lead mapped successfully');
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `users/${targetUid}`);
+    }
+  };
+
   // Alignment editing state
   const [newAlign, setNewAlign] = useState({ qaEmail: '', agentName: '' });
 
@@ -437,6 +451,8 @@ export default function AdminView({
     );
   }
   if (activeTab === 'config') {
+    const teamLeadsList = allUsers.filter(u => u.role === UserRole.TEAM_LEAD);
+
     return (
       <div className="space-y-12 animate-in fade-in slide-in-from-bottom-4 duration-300">
         <ConfigurationManager />
@@ -453,7 +469,7 @@ export default function AdminView({
             </div>
           </div>
 
-          <Card className="overflow-hidden border-slate-200 shadow-sm">
+          <Card className="overflow-hidden border-slate-200 shadow-sm bg-white">
             <Table>
               <TableHeader className="bg-slate-50">
                 <TableRow>
@@ -461,6 +477,7 @@ export default function AdminView({
                   <TableHead className="font-bold text-xs uppercase tracking-wider">Email Address</TableHead>
                   <TableHead className="font-bold text-xs uppercase tracking-wider">Current Role</TableHead>
                   <TableHead className="font-bold text-xs uppercase tracking-wider">Modify Role</TableHead>
+                  <TableHead className="font-bold text-xs uppercase tracking-wider">Mapped Team Lead</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -489,6 +506,26 @@ export default function AdminView({
                           <SelectItem value={UserRole.ADMIN}>Admin</SelectItem>
                         </SelectContent>
                       </Select>
+                    </TableCell>
+                    <TableCell className="py-3">
+                      {u.role === UserRole.AGENT || u.role === UserRole.QA ? (
+                        <Select 
+                          onValueChange={(val) => handleTeamLeadUpdate(u.uid, val === 'none' ? '' : val)}
+                          defaultValue={u.teamLeadId || 'none'}
+                        >
+                          <SelectTrigger className="w-40 h-8 text-xs">
+                            <SelectValue placeholder="None Assigned" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="none">None Assigned</SelectItem>
+                            {teamLeadsList.map(tl => (
+                              <SelectItem key={tl.uid} value={tl.uid}>{tl.name}</SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      ) : (
+                        <span className="text-xs text-slate-400 italic">N/A</span>
+                      )}
                     </TableCell>
                   </TableRow>
                 ))}

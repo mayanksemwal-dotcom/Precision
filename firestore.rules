@@ -44,12 +44,12 @@ service cloud.firestore {
 
     // User Profiles
     match /users/{userId} {
-      allow get: if isSignedIn() && (request.auth.uid == userId || isAdmin());
-      allow list: if isAdmin();
+      allow get: if isSignedIn();
+      allow list: if isSignedIn();
       allow create: if isSignedIn() && request.auth.uid == userId && 
                     incoming().role in ['AGENT', 'QA', 'TEAM_LEAD', 'ADMIN'] &&
                     incoming().keys().hasAll(['uid', 'email', 'name', 'role']) &&
-                    incoming().keys().size() <= 6;
+                    incoming().keys().size() <= 8;
       allow update: if isSignedIn() && (
         isAdmin() || 
         (request.auth.uid == userId && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'team']))
@@ -107,7 +107,8 @@ service cloud.firestore {
     // TMS Shifts Rules
     match /tmsShifts/{shiftId} {
       allow read: if isSignedIn();
-      allow create, update: if isSignedIn() && (request.auth.uid == incoming().userId || isAdmin());
+      allow create: if isSignedIn() && (request.auth.uid == incoming().userId || isAdmin());
+      allow update: if isSignedIn() && (request.auth.uid == existing().userId || isAdmin());
     }
   }
 }

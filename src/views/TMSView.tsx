@@ -87,6 +87,10 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
   const [adminSearch, setAdminSearch] = useState('');
   const [selectedProcessInput, setSelectedProcessInput] = useState('');
   const [selectedBreakInput, setSelectedBreakInput] = useState(BREAK_OPTIONS[0]);
+
+  // Custom modal confirmations instead of window.confirm inside sandboxed iframe
+  const [showClockOutConfirm, setShowClockOutConfirm] = useState(false);
+  const [confirmDeleteProcessName, setConfirmDeleteProcessName] = useState<string | null>(null);
   
   // System timer ticker
   const [currentTime, setCurrentTime] = useState(new Date());
@@ -153,14 +157,16 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
     return () => unsubscribe();
   }, [user]);
 
-  // Fetch ALL Shifts for Admins to view workforce status
+  // Fetch ALL Shifts for Admins or Team Leads to view workforce status
   useEffect(() => {
-    if (user.role !== UserRole.ADMIN) return;
+    if (user.role !== UserRole.ADMIN && user.role !== UserRole.TEAM_LEAD) return;
     const qAllShifts = query(collection(db, 'tmsShifts'));
     const unsubscribe = onSnapshot(qAllShifts, (snapshot) => {
       const shifts = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as TMSShift));
       shifts.sort((a, b) => new Date(b.clockInTime).getTime() - new Date(a.clockInTime).getTime());
       setAllShifts(shifts);
+    }, (error) => {
+      handleFirestoreError(error, OperationType.LIST, 'tmsShifts');
     });
     return () => unsubscribe();
   }, [user]);
@@ -209,12 +215,33 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
     return `${hrs.toString().padStart(2, '0')}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
   };
 
-  // Helper: Format ISO timestamp to hh:mm AM/PM
+  // Helper: Format ISO timestamp to hh:mm AM/PM in IST
   const formatTimeStr = (isoStr: string) => {
     if (!isoStr) return 'N/A';
     try {
       const d = new Date(isoStr);
-      return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: true });
+      return d.toLocaleTimeString('en-US', { 
+        hour: '2-digit', 
+        minute: '2-digit', 
+        hour12: true,
+        timeZone: 'Asia/Kolkata' 
+      });
+    } catch {
+      return 'N/A';
+    }
+  };
+
+  // Helper: Format ISO timestamp to Date string in IST (DD/MM/YYYY)
+  const formatDateStr = (isoStr: string) => {
+    if (!isoStr) return 'N/A';
+    try {
+      const d = new Date(isoStr);
+      return d.toLocaleDateString('en-GB', {
+        day: '2-digit',
+        month: '2-digit',
+        year: 'numeric',
+        timeZone: 'Asia/Kolkata'
+      });
     } catch {
       return 'N/A';
     }
@@ -222,7 +249,8 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
 
   // Switch/Punch Shift Operations:
   const handleClockIn = async () => {
-    if (!selectedProcessInput) {
+    const targetProcess = selectedProcessInput || (processes.length > 0 ? processes[0] : '');
+    if (!targetProcess) {
       toast.error('Please select a starting process before Clocking In.');
       return;
     }
@@ -230,23 +258,24 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
     try {
       const nowISO = new Date().toISOString();
       const newShift: TMSShift = {
-        id: `shift-${user.uid}-${Date.now()}`,
-        userId: user.uid,
-        userName: user.name,
-        userEmail: user.email,
+        id: `shift-${user.uid || 'anon'}-${Date.now()}`,
+        userId: user.uid || '',
+        userName: user.name || 'Anonymous User',
+        userEmail: user.email || '',
         clockInTime: nowISO,
         status: 'ACTIVE',
         activities: [
           {
             type: 'productive',
-            name: selectedProcessInput,
+            name: targetProcess,
             startTime: nowISO
           }
         ]
       };
 
       await setDoc(doc(db, 'tmsShifts', newShift.id), newShift);
-      toast.success(`Clocked In successfully! Process: ${selectedProcessInput}`);
+      setSelectedProcessInput(targetProcess);
+      toast.success(`Clocked In successfully! Process: ${targetProcess}`);
     } catch (e) {
       handleFirestoreError(e, OperationType.WRITE, 'tmsShifts');
     }
@@ -367,13 +396,13 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
     }
   };
 
-  const handleClockOut = async () => {
+  const handleClockOut = () => {
     if (!currentShift) return;
+    setShowClockOutConfirm(true);
+  };
 
-    if (!window.confirm("Are you sure you want to Clock Out and finalise your shift logs?")) {
-      return;
-    }
-
+  const performClockOut = async () => {
+    if (!currentShift) return;
     try {
       const nowISO = new Date().toISOString();
       const updatedActivities = [...currentShift.activities];
@@ -460,11 +489,11 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
     }
   };
 
-  const handleDeleteProcess = async (procToDelete: string) => {
-    if (!window.confirm(`Are you sure you want to delete the process "${procToDelete}"?`)) {
-      return;
-    }
+  const handleDeleteProcess = (procToDelete: string) => {
+    setConfirmDeleteProcessName(procToDelete);
+  };
 
+  const performDeleteProcess = async (procToDelete: string) => {
     try {
       const updatedList = processes.filter(p => p !== procToDelete);
       await setDoc(doc(db, 'config', 'tmsProcesses'), { list: updatedList });
@@ -474,6 +503,299 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
       handleFirestoreError(e, OperationType.WRITE, 'config/tmsProcesses');
     }
   };
+
+  if (user.role === UserRole.TEAM_LEAD) {
+    const mappedUsers = allUsers.filter(u => u.teamLeadId === user.uid);
+    const activeShiftsList = allShifts.filter(sh => 
+      mappedUsers.some(mu => mu.uid === sh.userId) && (sh.status === 'ACTIVE' || sh.status === 'BREAK')
+    );
+    const currentActiveCount = activeShiftsList.length;
+
+    let totalActiveMs = 0;
+    let totalShiftMs = 0;
+    const mappedShifts = allShifts.filter(sh => mappedUsers.some(mu => mu.uid === sh.userId));
+    mappedShifts.forEach(sh => {
+      const stats = computeShiftStats(sh);
+      totalActiveMs += stats.activeMs;
+      totalShiftMs += stats.totalShiftMs;
+    });
+    const teamAvgUtilization = totalShiftMs > 0 
+      ? Number(((totalActiveMs / totalShiftMs) * 100).toFixed(1)) 
+      : 100;
+
+    const handleExportCSV = () => {
+      if (mappedUsers.length === 0) {
+        toast.error("No mapped agents to export");
+        return;
+      }
+
+      const headers = [
+        'Agent Name',
+        'Agent Email',
+        'Role',
+        'Current Shift Status',
+        'Active Process / Break',
+        'Today Clock In Time',
+        'Total Shift Time (Min)',
+        'Total Productive Time (Min)',
+        'Total Break Time (Min)',
+        'Overall Utilization (%)'
+      ];
+
+      const rows = mappedUsers.map(u => {
+        const userShifts = allShifts.filter(sh => sh.userId === u.uid);
+        const activeShift = userShifts.find(sh => sh.status === 'ACTIVE' || sh.status === 'BREAK');
+        
+        let currentStatus = 'Offline';
+        let currentProcess = 'None';
+        let clockInTime = 'N/A';
+        
+        if (activeShift) {
+          currentStatus = activeShift.status === 'BREAK' ? 'On Break' : 'Active Work';
+          const lastAct = activeShift.activities[activeShift.activities.length - 1];
+          currentProcess = lastAct ? lastAct.name : 'N/A';
+          clockInTime = new Date(activeShift.clockInTime).toLocaleString('en-US', { timeZone: 'Asia/Kolkata' });
+        }
+
+        let totalShiftMins = 0;
+        let totalProductiveMins = 0;
+        let totalBreakMins = 0;
+        let overallUtil = 100;
+
+        let totalShiftMsSum = 0;
+        let totalActiveMsSum = 0;
+
+        userShifts.forEach(sh => {
+          const stats = computeShiftStats(sh);
+          totalShiftMsSum += stats.totalShiftMs;
+          totalActiveMsSum += stats.activeMs;
+          totalShiftMins += stats.totalShiftMs / (60 * 1000);
+          totalProductiveMins += stats.activeMs / (60 * 1000);
+          totalBreakMins += stats.breakMs / (60 * 1000);
+        });
+
+        if (totalShiftMsSum > 0) {
+          overallUtil = Number(((totalActiveMsSum / totalShiftMsSum) * 100).toFixed(1));
+        }
+
+        return [
+          u.name,
+          u.email,
+          u.role,
+          currentStatus,
+          currentProcess,
+          clockInTime,
+          totalShiftMins.toFixed(1),
+          totalProductiveMins.toFixed(1),
+          totalBreakMins.toFixed(1),
+          overallUtil + '%'
+        ];
+      });
+
+      const csvContent = "\uFEFF" + [headers.join(','), ...rows.map(r => r.map(val => `"${String(val).replace(/"/g, '""')}"`).join(','))].join('\n');
+      
+      const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.setAttribute('href', url);
+      link.setAttribute('download', `TMS_Utilization_Report_TL_${user.name.split(' ').join('_')}.csv`);
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      
+      toast.success('Utilization Report exported successfully!');
+    };
+
+    return (
+      <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
+        {/* Upper header segment */}
+        <div className="flex flex-col md:flex-row md:items-center justify-between gap-6 bg-white p-6 rounded-2xl border border-slate-200 shadow-sm text-slate-800">
+          <div className="flex items-center gap-4">
+            <div className="w-12 h-12 rounded-xl bg-sky-600 flex items-center justify-center text-white shadow-lg shadow-sky-200">
+              <Clock size={24} />
+            </div>
+            <div>
+              <h2 className="text-2xl font-black text-slate-900 tracking-tight">Team Lead TMS Dashboard</h2>
+              <p className="text-sm font-medium text-slate-500">Supervise logged-in agents, productivity rates, and export utilization reports</p>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-3">
+            <Button
+              onClick={handleExportCSV}
+              className="bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold py-2.5 px-4 rounded-xl flex items-center gap-1.5 shadow-sm shadow-emerald-200 cursor-pointer"
+            >
+              <FileSpreadsheet size={16} /> Export Team Report (CSV)
+            </Button>
+
+            {/* Current system clock */}
+            <div className="flex items-center gap-3 bg-slate-50 border border-slate-200 px-4 py-2 rounded-xl text-left">
+              <Activity className="text-emerald-500 animate-pulse shrink-0" size={16} />
+              <div>
+                <p className="text-[8px] uppercase font-bold tracking-widest text-slate-400 leading-none">Live Server Time (IST)</p>
+                <p className="font-mono text-[11px] font-bold text-slate-800 leading-none mt-1">
+                  {currentTime.toLocaleString('en-US', { 
+                    timeZone: 'Asia/Kolkata',
+                    dateStyle: 'medium',
+                    timeStyle: 'medium'
+                  })}
+                </p>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Metric summary boxes */}
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+          <Card className="border border-slate-200 shadow-sm bg-white rounded-2xl">
+            <CardHeader className="pb-2">
+              <CardDescription className="text-xs uppercase font-extrabold tracking-wider text-slate-400">Total Assigned Team</CardDescription>
+              <CardTitle className="text-2xl font-black text-slate-900">{mappedUsers.length}</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <p className="text-xs text-slate-500 font-medium">Mapped Agents & QAs</p>
+            </CardContent>
+          </Card>
+
+          <Card className="border border-slate-200 shadow-sm bg-white rounded-2xl">
+            <CardHeader className="pb-2">
+              <CardDescription className="text-xs uppercase font-extrabold tracking-wider text-teal-500">Logged In Right Now</CardDescription>
+              <CardTitle className="text-2xl font-black text-teal-600">{currentActiveCount}</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <p className="text-xs text-slate-500 font-medium">{mappedUsers.length > 0 ? `${((currentActiveCount / mappedUsers.length) * 100).toFixed(0)}%` : '0%'} of total roster active</p>
+            </CardContent>
+          </Card>
+
+          <Card className="border border-slate-200 shadow-sm bg-white rounded-2xl">
+            <CardHeader className="pb-2">
+              <CardDescription className="text-xs uppercase font-extrabold tracking-wider text-sky-500">Average Team Utilization</CardDescription>
+              <CardTitle className="text-2xl font-black text-sky-600">{teamAvgUtilization}%</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <p className="text-xs text-slate-500 font-medium">Target productivity benchmark: 85%</p>
+            </CardContent>
+          </Card>
+        </div>
+
+        {/* Live workforce roster and session status table */}
+        <Card className="border border-slate-200 shadow-sm bg-white overflow-hidden rounded-2xl">
+          <CardHeader className="border-b border-slate-100 pb-4">
+            <CardTitle className="text-sm font-extrabold text-slate-900 uppercase tracking-widest flex items-center gap-2">
+              <User size={16} className="text-sky-500" />
+              Roster Session Audit & Real-time Tracking
+            </CardTitle>
+            <CardDescription className="text-xs">
+              Live-monitored metrics for resources under your supervision.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="p-0">
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs border-collapse">
+                <thead>
+                  <tr className="bg-slate-50 text-slate-500 border-b border-slate-200 font-bold uppercase tracking-widest text-[9px] select-none">
+                    <th className="p-4 pl-6">Profile</th>
+                    <th className="p-4">Role</th>
+                    <th className="p-4">Active Shift status</th>
+                    <th className="p-4">Current Process</th>
+                    <th className="p-4">Clocked Interval</th>
+                    <th className="p-4 text-center">Avg. Shift Utilization</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {mappedUsers.map((u) => {
+                    const userShifts = allShifts.filter(sh => sh.userId === u.uid);
+                    const activeShift = userShifts.find(sh => sh.status === 'ACTIVE' || sh.status === 'BREAK');
+                    
+                    let stats = activeShift ? computeShiftStats(activeShift) : null;
+                    
+                    // overall stats
+                    let totalShiftMsSum = 0;
+                    let totalActiveMsSum = 0;
+                    userShifts.forEach(sh => {
+                      const s = computeShiftStats(sh);
+                      totalShiftMsSum += s.totalShiftMs;
+                      totalActiveMsSum += s.activeMs;
+                    });
+                    const overallUtil = totalShiftMsSum > 0 
+                      ? Number(((totalActiveMsSum / totalShiftMsSum) * 100).toFixed(1)) 
+                      : null;
+
+                    return (
+                      <tr key={u.uid} className="hover:bg-slate-50/50 transition-colors">
+                        <td className="p-4 pl-6 font-bold text-slate-800">
+                          <div>{u.name}</div>
+                          <div className="text-[10px] font-mono text-slate-400 font-medium leading-none mt-1">{u.email}</div>
+                        </td>
+                        <td className="p-4">
+                          <Badge variant="outline" className="text-[10px] uppercase font-bold tracking-wider">{u.role}</Badge>
+                        </td>
+                        <td className="p-4">
+                          {activeShift ? (
+                            <Badge className={`text-[10px] font-black uppercase ${
+                              activeShift.status === 'BREAK' 
+                                ? 'bg-amber-100 text-amber-800 border-amber-200' 
+                                : 'bg-emerald-100 text-emerald-800 border-emerald-200'
+                            }`}>
+                              LIVE - {activeShift.status}
+                            </Badge>
+                          ) : (
+                            <Badge variant="secondary" className="text-[10px] bg-slate-100 text-slate-500 font-bold uppercase">
+                              Offline
+                            </Badge>
+                          )}
+                        </td>
+                        <td className="p-4 font-semibold text-slate-700">
+                          {activeShift ? (
+                            activeShift.activities[activeShift.activities.length - 1]?.name || 'N/A'
+                          ) : (
+                            <span className="text-slate-400">N/A</span>
+                          )}
+                        </td>
+                        <td className="p-4 font-medium text-slate-500">
+                          {activeShift ? (
+                            <div className="flex flex-col gap-0.5 text-[10px]">
+                              <span>Shift elapsed: {stats?.totalShiftStr}</span>
+                              <span className="text-teal-600 font-bold">Productive: {stats?.activeStr}</span>
+                            </div>
+                          ) : (
+                            <span className="text-slate-400">N/A</span>
+                          )}
+                        </td>
+                        <td className="p-4 text-center font-bold text-sm text-[#0F172A] font-mono">
+                          {overallUtil !== null ? (
+                            <div>
+                              <div>{overallUtil}%</div>
+                              <div className="text-[9px] text-slate-400 font-normal leading-none mt-1 uppercase tracking-wider">
+                                calculated over {userShifts.length} session(s)
+                              </div>
+                            </div>
+                          ) : (
+                            <span className="text-slate-400 font-normal text-xs">No entries</span>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                  {mappedUsers.length === 0 && (
+                    <tr>
+                      <td colSpan={6} className="p-16 text-center text-slate-400">
+                        <div className="flex flex-col items-center gap-3">
+                          <User size={36} className="text-slate-200" />
+                          <p className="font-bold uppercase tracking-widest text-[10px] text-slate-400">No agents mapped to you</p>
+                          <p className="text-xs text-slate-400 max-w-sm font-medium">Please ask your system administrator to assign Agents or Quality Analysts to your team under the Console tab.</p>
+                        </div>
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+    );
+  }
 
   // Filtering admin shift records
   const filteredAllShifts = allShifts.filter(s => 
@@ -501,9 +823,13 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
         <div className="flex items-center gap-4 bg-slate-50 border border-slate-200 px-5 py-2.5 rounded-xl">
           <Activity className="text-emerald-500 animate-pulse shrink-0" size={18} />
           <div className="text-right">
-            <p className="text-[9px] uppercase font-bold tracking-widest text-slate-400">Live Server Time (UTC)</p>
-            <p className="font-mono text-base font-bold text-slate-800 leading-none mt-1">
-              {currentTime.toUTCString().replace('GMT', 'UTC')}
+            <p className="text-[9px] uppercase font-bold tracking-widest text-slate-400">Live Server Time (IST)</p>
+            <p className="font-mono text-xs font-bold text-slate-800 leading-none mt-1">
+              {currentTime.toLocaleString('en-US', { 
+                timeZone: 'Asia/Kolkata',
+                dateStyle: 'medium',
+                timeStyle: 'medium'
+              })}
             </p>
           </div>
         </div>
@@ -807,7 +1133,7 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
                       <div className="space-y-1">
                         <div className="flex items-center gap-2">
                           <span className="font-extrabold text-slate-800">
-                            {new Date(sh.clockInTime).toLocaleDateString()}
+                            {formatDateStr(sh.clockInTime)}
                           </span>
                           <span className="text-slate-300">|</span>
                           <span className="text-slate-500 font-semibold">
@@ -980,6 +1306,55 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
               </Card>
             </div>
 
+          </div>
+        </div>
+      )}
+
+      {/* Custom clock-out confirmation overlay modal */}
+      {showClockOutConfirm && (
+        <div className="fixed inset-0 bg-slate-900/55 backdrop-blur-sm flex items-center justify-center z-[99999] p-4 animate-in fade-in duration-200">
+          <div className="bg-white rounded-2xl max-w-sm w-full p-6 shadow-xl border border-slate-200 space-y-4">
+            <div className="flex items-center gap-3 text-red-600">
+              <div className="w-10 h-10 rounded-full bg-red-50 flex items-center justify-center shrink-0">
+                <AlertCircle size={20} />
+              </div>
+              <div>
+                <h4 className="font-bold text-slate-900 text-sm">Clock Out Confirmation</h4>
+                <p className="text-slate-500 text-xs mt-1">Are you sure you want to Clock Out and finalise your shift logs?</p>
+              </div>
+            </div>
+            <div className="flex justify-end gap-2 text-xs font-bold pt-2 border-t">
+              <Button variant="ghost" onClick={() => setShowClockOutConfirm(false)}>Cancel</Button>
+              <Button className="bg-red-600 hover:bg-red-700 text-white font-bold" onClick={() => {
+                setShowClockOutConfirm(false);
+                performClockOut();
+              }}>Confirm Clock Out</Button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Custom process delete confirmation overlay modal */}
+      {confirmDeleteProcessName && (
+        <div className="fixed inset-0 bg-slate-900/55 backdrop-blur-sm flex items-center justify-center z-[99999] p-4 animate-in fade-in duration-200">
+          <div className="bg-white rounded-2xl max-w-sm w-full p-6 shadow-xl border border-slate-200 space-y-4">
+            <div className="flex items-center gap-3 text-amber-600">
+              <div className="w-10 h-10 rounded-full bg-amber-50 flex items-center justify-center shrink-0">
+                <AlertCircle size={20} />
+              </div>
+              <div>
+                <h4 className="font-bold text-slate-900 text-sm">Delete Process</h4>
+                <p className="text-slate-500 text-xs mt-1">Are you sure you want to delete the process <span className="font-semibold text-slate-900">"{confirmDeleteProcessName}"</span> from the configuration?</p>
+              </div>
+            </div>
+            <div className="flex justify-end gap-2 text-xs font-bold pt-2 border-t">
+              <Button variant="ghost" onClick={() => setConfirmDeleteProcessName(null)}>Cancel</Button>
+              <Button className="bg-amber-600 hover:bg-amber-700 text-white font-bold" onClick={() => {
+                const proc = confirmDeleteProcessName;
+                setConfirmDeleteProcessName(null);
+                performDeleteProcess(proc);
+              }}>Confirm Delete</Button>
+            </div>
           </div>
         </div>
       )}
