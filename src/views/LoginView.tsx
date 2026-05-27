@@ -2,13 +2,14 @@ import React, { useState } from 'react';
 import { Button } from '../components/ui/button';
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from '../components/ui/card';
 import { ShieldCheck, LogIn, AlertCircle, Mail, Lock, User as UserIcon } from 'lucide-react';
-import { loginWithGoogle, loginWithEmail, signupWithEmail } from '../lib/firebase';
+import { loginWithGoogle, loginWithEmail, signupWithEmail, db } from '../lib/firebase';
 import { Input } from '../components/ui/input';
 import { Label } from '../components/ui/label';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '../components/ui/tabs';
 import { toast } from 'sonner';
 import BergLogo from '../components/BergLogo';
 import { updateProfile } from 'firebase/auth';
+import { collection, query, where, getDocs } from 'firebase/firestore';
 
 export default function LoginView() {
   const [loading, setLoading] = useState(false);

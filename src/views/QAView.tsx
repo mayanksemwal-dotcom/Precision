@@ -43,6 +43,7 @@ import { doc, getDoc, setDoc, updateDoc, collection, query, where, onSnapshot, o
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogTrigger } from '../components/ui/dialog';
 import WarningManager from '../components/WarningManager';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../components/ui/table';
+import { submitToGoogleSheet } from '../lib/sheets';
 
 interface QAViewProps {
   activeTab: string;
@@ -645,9 +646,11 @@ export default function QAView({
     try {
       if (editingAudit) {
         await updateDoc(doc(db, 'audits', audit.id), audit as any);
+        submitToGoogleSheet('audit_submission', audit.id, user.email, user.name, audit);
       } else {
         await setDoc(doc(db, 'audits', audit.id), audit);
         await updateDoc(doc(db, 'tasks', currentTask.id), { status: 'Completed' });
+        submitToGoogleSheet('audit_submission', audit.id, user.email, user.name, audit);
       }
       setAuditOpen(false);
       onCancelEdit?.();
@@ -667,6 +670,7 @@ export default function QAView({
         quality: updated.quality,
         status: updated.status
       });
+      submitToGoogleSheet('dispute_resolution', updated.id, user.email, user.name, updated);
       toast.success('Dispute resolved and closed.');
     } catch (e) {
       handleFirestoreError(e, OperationType.UPDATE, `audits/${updated.id}`);

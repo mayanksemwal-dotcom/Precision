@@ -535,6 +535,8 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
         'Role',
         'Current Shift Status',
         'Active Process / Break',
+        'Process Name',
+        'Last Activity',
         'Today Clock In Time',
         'Total Shift Time (Min)',
         'Total Productive Time (Min)',
@@ -556,6 +558,12 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
           currentProcess = lastAct ? lastAct.name : 'N/A';
           clockInTime = new Date(activeShift.clockInTime).toLocaleString('en-US', { timeZone: 'Asia/Kolkata' });
         }
+
+        const lastShiftOfUser = userShifts.length > 0 ? userShifts[userShifts.length - 1] : null;
+        const productiveAct = lastShiftOfUser ? [...lastShiftOfUser.activities].reverse().find(act => act.type === 'productive') : null;
+        const processName = productiveAct ? productiveAct.name : 'N/A';
+        const lastActObj = lastShiftOfUser && lastShiftOfUser.activities.length > 0 ? lastShiftOfUser.activities[lastShiftOfUser.activities.length - 1] : null;
+        const lastActivity = lastActObj ? lastActObj.name : 'N/A';
 
         let totalShiftMins = 0;
         let totalProductiveMins = 0;
@@ -584,6 +592,8 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
           u.role,
           currentStatus,
           currentProcess,
+          processName,
+          lastActivity,
           clockInTime,
           totalShiftMins.toFixed(1),
           totalProductiveMins.toFixed(1),
@@ -804,6 +814,71 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
     s.activities.some(act => act.name.toLowerCase().includes(adminSearch.toLowerCase()))
   );
 
+  const handleExportAllShifts = () => {
+    if (allShifts.length === 0) {
+      toast.error("No shift logs at all to export");
+      return;
+    }
+
+    const headers = [
+      'Name',
+      'Email ID',
+      'Shift Status',
+      'Process Name',
+      'Last Activity',
+      'Clock In Time (IST)',
+      'Clock Out Time (IST)',
+      'Total Duration (Min)',
+      'Productive Duration (Min)',
+      'Break Duration (Min)',
+      'Utilization (%)'
+    ];
+
+    const rows = allShifts.map(sh => {
+      const stats = computeShiftStats(sh);
+      const clockIn = new Date(sh.clockInTime).toLocaleString('en-US', { timeZone: 'Asia/Kolkata' });
+      const clockOut = sh.clockOutTime 
+        ? new Date(sh.clockOutTime).toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }) 
+        : 'Ongoing';
+
+      const totalShiftMins = (stats.totalShiftMs / (60 * 1000)).toFixed(1);
+      const totalProductiveMins = (stats.activeMs / (60 * 1000)).toFixed(1);
+      const totalBreakMins = (stats.breakMs / (60 * 1000)).toFixed(1);
+
+      const productiveAct = [...sh.activities].reverse().find(act => act.type === 'productive');
+      const processName = productiveAct ? productiveAct.name : 'N/A';
+      const lastAct = sh.activities.length > 0 ? sh.activities[sh.activities.length - 1] : null;
+      const lastActivity = lastAct ? lastAct.name : 'N/A';
+
+      return [
+        sh.userName,
+        sh.userEmail,
+        sh.status,
+        processName,
+        lastActivity,
+        clockIn,
+        clockOut,
+        totalShiftMins,
+        totalProductiveMins,
+        totalBreakMins,
+        stats.utilization + '%'
+      ];
+    });
+
+    const csvContent = "\uFEFF" + [headers.join(','), ...rows.map(r => r.map(val => `"${String(val).replace(/"/g, '""')}"`).join(','))].join('\n');
+    
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.setAttribute('href', url);
+    link.setAttribute('download', `TMS_All_Shifts_Utilization_Report_Admin.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    
+    toast.success('Organization Utilization Report exported successfully!');
+  };
+
   return (
     <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
       
@@ -819,18 +894,29 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
           </div>
         </div>
 
-        {/* Current system clock */}
-        <div className="flex items-center gap-4 bg-slate-50 border border-slate-200 px-5 py-2.5 rounded-xl">
-          <Activity className="text-emerald-500 animate-pulse shrink-0" size={18} />
-          <div className="text-right">
-            <p className="text-[9px] uppercase font-bold tracking-widest text-slate-400">Live Server Time (IST)</p>
-            <p className="font-mono text-xs font-bold text-slate-800 leading-none mt-1">
-              {currentTime.toLocaleString('en-US', { 
-                timeZone: 'Asia/Kolkata',
-                dateStyle: 'medium',
-                timeStyle: 'medium'
-              })}
-            </p>
+        <div className="flex flex-wrap items-center gap-3">
+          {user.role === UserRole.ADMIN && (
+            <Button
+              onClick={handleExportAllShifts}
+              className="bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold py-2.5 px-4 rounded-xl flex items-center gap-1.5 shadow-sm shadow-emerald-200 cursor-pointer"
+            >
+              <FileSpreadsheet size={16} /> Export Organization Report (CSV)
+            </Button>
+          )}
+
+          {/* Current system clock */}
+          <div className="flex items-center gap-4 bg-slate-50 border border-slate-200 px-5 py-2.5 rounded-xl">
+            <Activity className="text-emerald-500 animate-pulse shrink-0" size={18} />
+            <div className="text-right">
+              <p className="text-[9px] uppercase font-bold tracking-widest text-slate-400">Live Server Time (IST)</p>
+              <p className="font-mono text-xs font-bold text-slate-800 leading-none mt-1">
+                {currentTime.toLocaleString('en-US', { 
+                  timeZone: 'Asia/Kolkata',
+                  dateStyle: 'medium',
+                  timeStyle: 'medium'
+                })}
+              </p>
+            </div>
           </div>
         </div>
       </div>

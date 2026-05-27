@@ -24,7 +24,11 @@ import { UserRole, UserProfile, SamplingTask, AuditRecord, QAAlignment, Producti
 import { INITIAL_ALIGNMENTS } from './lib/sample-data';
 import { auth, db, logout, handleFirestoreError, OperationType } from './lib/firebase';
 import { onAuthStateChanged } from 'firebase/auth';
-import { doc, getDoc, onSnapshot, collection, query, where, orderBy, setDoc } from 'firebase/firestore';
+import { doc, getDoc, getDocs, collection, query, where, orderBy, setDoc } from 'firebase/firestore';
+import { Database, RefreshCw } from 'lucide-react';
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from './components/ui/dialog';
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from './components/ui/table';
+import { fetchArchiveReports } from './lib/sheets';
 
 // Views
 import AdminView from './views/AdminView';
@@ -37,6 +41,7 @@ import LoginView from './views/LoginView';
 import BergLogo from './components/BergLogo';
 import { Button } from './components/ui/button';
 import { Toaster } from './components/ui/sonner';
+import { toast } from 'sonner';
 import { 
   DropdownMenu, 
   DropdownMenuContent, 
@@ -67,29 +72,100 @@ export default function App() {
   const [allUsers, setAllUsers] = useState<UserProfile[]>([]);
   const [editingAudit, setEditingAudit] = useState<AuditRecord | null>(null);
 
-  // Firebase Auth Listener
+  // Archive Reports sheets logic
+  const [archiveOpen, setArchiveOpen] = useState(false);
+  const [archiveRows, setArchiveRows] = useState<any[]>([]);
+  const [archiveLoading, setArchiveLoading] = useState(false);
+  const [archivePage, setArchivePage] = useState(1);
+
+  // Firebase Auth Listener with Custom Claims synchronization
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
       if (firebaseUser) {
         // Try to get existing profile
         const userDoc = await getDoc(doc(db, 'users', firebaseUser.uid));
+        let userProfile: UserProfile;
         if (userDoc.exists()) {
-          setUser(userDoc.data() as UserProfile);
+          userProfile = userDoc.data() as UserProfile;
         } else {
+          // Check if this email already exists under a different UID
+          if (firebaseUser.email) {
+            const q = query(collection(db, 'users'), where('email', '==', firebaseUser.email.toLowerCase().trim()));
+            const querySnapshot = await getDocs(q);
+            if (!querySnapshot.empty) {
+              toast.error(`The email ID "${firebaseUser.email}" is already registered. Please sign in with your original method.`);
+              await logout();
+              setUser(null);
+              setLoading(false);
+              return;
+            }
+          }
+
           // New user defaults to AGENT
-          const newProfile: UserProfile = {
+          const getCleanName = () => {
+            if (firebaseUser.displayName) return firebaseUser.displayName;
+            if (firebaseUser.email) {
+              const localPart = firebaseUser.email.split('@')[0];
+              if (localPart) {
+                return localPart
+                  .split(/[\._\-]/)
+                  .filter(Boolean)
+                  .map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+                  .join(' ');
+              }
+            }
+            return 'New User';
+          };
+
+          userProfile = {
             uid: firebaseUser.uid,
             email: firebaseUser.email || '',
-            name: firebaseUser.displayName || 'New User',
+            name: getCleanName(),
             role: UserRole.AGENT,
           };
           // Bootstrapped Admin check
           if (firebaseUser.email === 'mayank.semwal@bergtechnologies.co.in') {
-            newProfile.role = UserRole.ADMIN;
+            userProfile.role = UserRole.ADMIN;
           }
-          await setDoc(doc(db, 'users', firebaseUser.uid), newProfile);
-          setUser(newProfile);
+          await setDoc(doc(db, 'users', firebaseUser.uid), userProfile);
         }
+
+        setUser(userProfile);
+
+        // Sync Custom claims asynchronously in the background. We check current claims, and only hit the backend/force token refresh if they are out of sync.
+        (async () => {
+          try {
+            // Retrieve cached claims to avoid immediate network requests
+            const tokenResult = await firebaseUser.getIdTokenResult(false);
+            const expectedAdmin = userProfile.role === UserRole.ADMIN;
+            const expectedQA = userProfile.role === UserRole.QA;
+
+            const isCurrentAdmin = !!tokenResult.claims.isAdmin;
+            const isCurrentQA = !!tokenResult.claims.isQA;
+
+            if (isCurrentAdmin !== expectedAdmin || isCurrentQA !== expectedQA) {
+              console.log('Firebase user custom claims mismatch detected. Synchronizing claims...');
+              const idToken = await firebaseUser.getIdToken(true);
+              const claimResponse = await fetch('/api/set-claims', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Authorization': `Bearer ${idToken}`,
+                }
+              });
+              if (claimResponse.ok) {
+                const claimsResult = await claimResponse.json();
+                console.log('Successfully updated Firebase custom user claims via Express API backend:', claimsResult);
+                // Force refresh local token so firebase is aware of claims changes globally
+                await firebaseUser.getIdTokenResult(true);
+              }
+            } else {
+              console.log('Firebase user custom claims already in sync. Skipping sync operations.');
+            }
+          } catch (claimsErr) {
+            console.error('Failed to update Custom Firebase auth claims on login:', claimsErr);
+          }
+        })();
       } else {
         setUser(null);
       }
@@ -98,80 +174,99 @@ export default function App() {
     return () => unsubscribe();
   }, []);
 
-  useEffect(() => {
+  const [isRefreshing, setIsRefreshing] = useState(false);
+
+  const fetchAllData = async () => {
     if (!user) return;
+    setIsRefreshing(true);
+    try {
+      // Create all database query promises to execute in parallel
+      const usersPromise = getDocs(collection(db, 'users'));
+      const alignmentsPromise = getDoc(doc(db, 'config', 'alignments'));
+      
+      const tasksQuery = query(collection(db, 'tasks'), orderBy('createdAt', 'desc'));
+      const tasksPromise = getDocs(tasksQuery);
 
-    // Listen to Users (for dropdowns)
-    const unsubscribeUsers = onSnapshot(collection(db, 'users'), (snapshot) => {
-      setAllUsers(snapshot.docs.map(doc => doc.data() as UserProfile));
-    });
+      let auditsQuery;
+      if (user.role === UserRole.ADMIN || user.role === UserRole.QA || user.role === UserRole.TEAM_LEAD) {
+        auditsQuery = query(collection(db, 'audits'), orderBy('auditDate', 'desc'));
+      } else {
+        auditsQuery = query(collection(db, 'audits'), where('agentId', '==', user.uid), orderBy('auditDate', 'desc'));
+      }
+      const auditsPromise = getDocs(auditsQuery);
 
-    // Listen to Alignments
-    const unsubscribeAlignments = onSnapshot(doc(db, 'config', 'alignments'), (docSnap) => {
-      if (docSnap.exists()) {
-        setAlignments(docSnap.data().list || []);
+      const prodPromise = getDocs(collection(db, 'production'));
+
+      let warningsQuery;
+      if (user.role === UserRole.ADMIN || user.role === UserRole.QA || user.role === UserRole.TEAM_LEAD) {
+        warningsQuery = collection(db, 'warnings');
+      } else {
+        warningsQuery = query(collection(db, 'warnings'), where('agentId', '==', user.uid));
+      }
+      const warningsPromise = getDocs(warningsQuery);
+
+      // Execute all fetches in parallel to resolve waterfall latency issues
+      const [
+        usersSnap,
+        alignmentsDoc,
+        tasksSnap,
+        auditsSnap,
+        prodSnap,
+        warningsSnap
+      ] = await Promise.all([
+        usersPromise,
+        alignmentsPromise,
+        tasksPromise,
+        auditsPromise,
+        prodPromise,
+        warningsPromise
+      ]);
+
+      // Map and update state in one batch
+      setAllUsers(usersSnap.docs.map(doc => doc.data() as UserProfile));
+
+      if (alignmentsDoc.exists()) {
+        setAlignments(alignmentsDoc.data().list || []);
       } else if (user.role === UserRole.ADMIN) {
-        // Initialize with sample data if first time and user is admin
         setDoc(doc(db, 'config', 'alignments'), { list: INITIAL_ALIGNMENTS })
+          .then(() => setAlignments(INITIAL_ALIGNMENTS))
           .catch(e => handleFirestoreError(e, OperationType.WRITE, 'config/alignments'));
       }
-    }, (error) => {
-      handleFirestoreError(error, OperationType.GET, 'config/alignments');
-    });
 
-    // Listen to Tasks
-    const tasksQuery = query(collection(db, 'tasks'), orderBy('createdAt', 'desc'));
-    const unsubscribeTasks = onSnapshot(tasksQuery, (snapshot) => {
-      const taskData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as SamplingTask));
-      setTasks(taskData);
-    }, (error) => {
-      handleFirestoreError(error, OperationType.LIST, 'tasks');
-    });
+      setTasks(tasksSnap.docs.map(doc => ({ id: doc.id, ...(doc.data() as any) } as SamplingTask)));
+      setAuditLogs(auditsSnap.docs.map(doc => ({ id: doc.id, ...(doc.data() as any) } as AuditRecord)));
+      setProductions(prodSnap.docs.map(doc => ({ id: doc.id, ...(doc.data() as any) } as ProductionRecord)));
+      setWarnings(warningsSnap.docs.map(doc => ({ id: doc.id, ...(doc.data() as any) } as WarningTicket)));
 
-    // Listen to Audits
-    let auditsQuery;
-    if (user.role === UserRole.ADMIN || user.role === UserRole.QA) {
-      auditsQuery = query(collection(db, 'audits'), orderBy('auditDate', 'desc'));
-    } else {
-      auditsQuery = query(collection(db, 'audits'), where('agentId', '==', user.uid), orderBy('auditDate', 'desc'));
+      toast.success('All reports loaded/refreshed successfully');
+    } catch (error) {
+      console.error('Data loading error:', error);
+      handleFirestoreError(error, OperationType.LIST, 'all_data');
+    } finally {
+      setIsRefreshing(false);
     }
-    
-    const unsubscribeAudits = onSnapshot(auditsQuery, (snapshot) => {
-      const audits = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as AuditRecord));
-      setAuditLogs(audits);
-    }, (error) => {
-      handleFirestoreError(error, OperationType.LIST, 'audits');
-    });
+  };
 
-    // Listen to Productions
-    const unsubscribeProductions = onSnapshot(collection(db, 'production'), (snapshot) => {
-      setProductions(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as ProductionRecord)));
-    }, (error) => {
-      handleFirestoreError(error, OperationType.LIST, 'production');
-    });
-
-    // Listen to Warnings
-    let warningsQuery;
-    if (user.role === UserRole.ADMIN || user.role === UserRole.QA || user.role === UserRole.TEAM_LEAD) {
-      warningsQuery = collection(db, 'warnings');
-    } else {
-      warningsQuery = query(collection(db, 'warnings'), where('agentId', '==', user.uid));
+  useEffect(() => {
+    if (user) {
+      fetchAllData();
     }
+  }, [user, viewAsRole]);
 
-    const unsubscribeWarnings = onSnapshot(warningsQuery, (snapshot) => {
-      setWarnings(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as WarningTicket)));
-    }, (error) => {
-      handleFirestoreError(error, OperationType.LIST, 'warnings');
-    });
-
-    return () => {
-      unsubscribeAlignments();
-      unsubscribeTasks();
-      unsubscribeAudits();
-      unsubscribeProductions();
-      unsubscribeWarnings();
-    };
-  }, [user]);
+  const handleOpenArchive = async () => {
+    setArchiveOpen(true);
+    setArchiveLoading(true);
+    try {
+      const rows = await fetchArchiveReports();
+      setArchiveRows(rows);
+      setArchivePage(1);
+      toast.success(`Loaded ${rows.length} records from Google Sheets spreadsheet`);
+    } catch (err: any) {
+      toast.error('Failed to load archive sheet: ' + (err.message || String(err)));
+    } finally {
+      setArchiveLoading(false);
+    }
+  };
 
   const handleLogout = async () => {
     await logout();
@@ -206,6 +301,7 @@ export default function App() {
 
   const effectiveRole = viewAsRole || (user?.role || UserRole.AGENT);
   const filteredNav = navItems.filter(item => item.roles.includes(effectiveRole));
+  const effectiveUser = user ? { ...user, role: effectiveRole } : null;
 
   return (
     <div className="flex h-screen bg-[#F8FAFC] overflow-hidden text-slate-900 font-sans">
@@ -307,6 +403,29 @@ export default function App() {
             </div>
           </div>
           <div className="flex items-center gap-6">
+             <Button
+               variant="outline"
+               size="sm"
+               disabled={isRefreshing}
+               onClick={fetchAllData}
+               className="font-bold border-slate-200 hover:bg-slate-100 h-9 gap-2 shadow-sm text-slate-700 bg-white"
+             >
+               <RefreshCw size={14} className={isRefreshing ? "animate-spin" : ""} />
+               {isRefreshing ? "Refreshing..." : "Load Reports"}
+             </Button>
+
+             {(effectiveRole === UserRole.ADMIN || effectiveRole === UserRole.QA || effectiveRole === UserRole.TEAM_LEAD) && (
+               <Button
+                 variant="outline"
+                 size="sm"
+                 onClick={handleOpenArchive}
+                 className="font-black h-9 gap-2 border-blue-200 text-blue-700 hover:bg-blue-50 hover:text-blue-800 shadow-sm bg-white"
+               >
+                 <Database size={14} />
+                 Archive Reports
+               </Button>
+             )}
+
              {user.role === UserRole.ADMIN && (
                <div className="flex items-center gap-2 bg-slate-100 p-1 rounded-lg border border-slate-200">
                  <span className="text-[10px] font-bold text-slate-500 ml-2 uppercase">Preview as:</span>
@@ -347,24 +466,24 @@ export default function App() {
               className="max-w-7xl mx-auto h-full"
             >
               {activeTab === 'reports' ? (
-                <TeamLeadView activeTab={activeTab} tasks={tasks} auditLogs={auditLogs} productions={productions} user={user} alignments={alignments} goToTab={setActiveTab} />
+                <TeamLeadView activeTab={activeTab} tasks={tasks} auditLogs={auditLogs} productions={productions} user={effectiveUser!} alignments={alignments} goToTab={setActiveTab} allUsers={allUsers} />
               ) : activeTab === 'completed_audits' ? (
-                <CompletedAuditsView auditLogs={auditLogs} user={user} alignments={alignments} />
+                <CompletedAuditsView auditLogs={auditLogs} user={effectiveUser!} alignments={alignments} />
               ) : activeTab === 'disputes' ? (
                 <DisputesView 
                   auditLogs={auditLogs} 
-                  user={user} 
+                  user={effectiveUser!} 
                   onEditAudit={(audit) => {
                     setEditingAudit(audit);
                     setActiveTab('sampling');
                   }}
                 />
               ) : activeTab === 'warnings' ? (
-                <WarningsView warnings={warnings} user={user} allUsers={allUsers} />
+                <WarningsView warnings={warnings} user={effectiveUser!} allUsers={allUsers} />
               ) : activeTab === 'tms' ? (
-                <TMSView user={user} allUsers={allUsers} />
+                <TMSView user={effectiveUser!} allUsers={allUsers} />
               ) : activeTab === 'error_feedbacks' ? (
-                <ErrorFeedbacksView auditLogs={auditLogs} user={user} alignments={alignments} />
+                <ErrorFeedbacksView auditLogs={auditLogs} user={effectiveUser!} alignments={alignments} />
               ) : (
                 <>
                   {(effectiveRole === UserRole.ADMIN || (effectiveRole === UserRole.TEAM_LEAD && activeTab === 'config')) && (
@@ -372,7 +491,7 @@ export default function App() {
                       activeTab={activeTab} 
                       tasks={tasks} 
                       onTasksUpdate={() => {}} 
-                      user={user}
+                      user={effectiveUser!}
                       alignments={alignments}
                       onAlignmentsUpdate={async (newAligns) => {
                         await setDoc(doc(db, 'config', 'alignments'), { list: newAligns });
@@ -389,7 +508,7 @@ export default function App() {
                       tasks={tasks} 
                       onTasksUpdate={() => {}} 
                       onAuditUpdate={() => {}} 
-                      user={user}
+                      user={effectiveUser!}
                       alignments={alignments}
                       productions={productions}
                       auditLogs={auditLogs}
@@ -398,14 +517,100 @@ export default function App() {
                       onCancelEdit={() => setEditingAudit(null)}
                     />
                   )}
-                  {effectiveRole === UserRole.TEAM_LEAD && activeTab !== 'config' && <TeamLeadView activeTab={activeTab} tasks={tasks} auditLogs={auditLogs} productions={productions} user={user} alignments={alignments} goToTab={setActiveTab} />}
-                  {effectiveRole === UserRole.AGENT && <AgentView activeTab={activeTab} audits={auditLogs} user={user} />}
+                  {effectiveRole === UserRole.TEAM_LEAD && activeTab !== 'config' && <TeamLeadView activeTab={activeTab} tasks={tasks} auditLogs={auditLogs} productions={productions} user={effectiveUser!} alignments={alignments} goToTab={setActiveTab} allUsers={allUsers} />}
+                  {effectiveRole === UserRole.AGENT && <AgentView activeTab={activeTab} audits={auditLogs} user={effectiveUser!} />}
                 </>
               )}
             </motion.div>
           </AnimatePresence>
         </div>
       </main>
+
+      {/* Archive Reports Google Sheets Dialog Modal */}
+      <Dialog open={archiveOpen} onOpenChange={setArchiveOpen}>
+        <DialogContent className="max-w-5xl max-h-[85vh] overflow-hidden flex flex-col p-6 [id^='dialog-content-']">
+          <div className="border-b pb-4">
+            <h3 className="text-xl font-extrabold text-slate-900 tracking-tight flex items-center gap-2">
+              <Database size={22} className="text-blue-600" />
+              Google Sheets Archive Reports
+            </h3>
+            <p className="text-xs text-slate-500 mt-1">
+              Directly reading from Google Sheets without hitting Firestore (Standard Free JSON API fetching)
+            </p>
+          </div>
+
+          <div className="flex-1 overflow-auto my-4 min-h-[300px]">
+            {archiveLoading ? (
+              <div className="flex flex-col items-center justify-center h-full py-12 gap-3 min-h-[300px]">
+                <div className="animate-spin text-blue-600">
+                  <RefreshCw size={36} />
+                </div>
+                <span className="text-sm font-bold text-slate-500 animate-pulse">Requesting Google sheets archive rows...</span>
+              </div>
+            ) : archiveRows.length === 0 ? (
+              <div className="flex flex-col items-center justify-center h-full py-12 text-slate-400 min-h-[300px]">
+                <Database size={48} className="stroke-1 mb-2" />
+                <p className="text-sm">No archive rows returned or spreadsheet data is empty.</p>
+              </div>
+            ) : (
+              <div className="border border-slate-200 rounded-xl overflow-hidden shadow-sm">
+                <div className="max-h-[50vh] overflow-y-auto">
+                  <Table>
+                    <TableHeader className="bg-slate-50 sticky top-0 z-10 font-bold text-slate-600">
+                      <TableRow>
+                        {Object.keys(archiveRows[0] || {}).map((colName) => (
+                          <TableHead key={colName} className="text-xs font-black uppercase text-slate-700 py-3.5 px-4 h-auto">
+                            {colName}
+                          </TableHead>
+                        ))}
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {archiveRows.slice((archivePage - 1) * 10, archivePage * 10).map((row, rowIndex) => (
+                        <TableRow key={rowIndex} className="hover:bg-slate-50/50 transition-colors">
+                          {Object.values(row).map((val: any, colIndex) => (
+                            <TableCell key={colIndex} className="text-xs text-slate-600 font-medium py-3 px-4 max-w-[200px] truncate" title={val !== null && val !== undefined ? String(val) : ''}>
+                              {val !== null && val !== undefined ? String(val) : '-'}
+                            </TableCell>
+                          ))}
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {archiveRows.length > 0 && !archiveLoading && (
+            <div className="flex items-center justify-between border-t border-slate-100 pt-4">
+              <span className="text-xs font-bold text-slate-500">
+                Showing {Math.min(archiveRows.length, (archivePage - 1) * 10 + 1)}-{Math.min(archiveRows.length, archivePage * 10)} of {archiveRows.length} archive entries
+              </span>
+              <div className="flex items-center gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={archivePage === 1}
+                  onClick={() => setArchivePage(p => Math.max(1, p - 1))}
+                  className="h-8 font-bold text-xs"
+                >
+                  Previous Page
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={archivePage * 10 >= archiveRows.length}
+                  onClick={() => setArchivePage(p => p + 1)}
+                  className="h-8 font-bold text-xs"
+                >
+                  Next Page
+                </Button>
+              </div>
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

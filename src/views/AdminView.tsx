@@ -89,6 +89,18 @@ export default function AdminView({
 
   // Alignment editing state
   const [newAlign, setNewAlign] = useState({ qaEmail: '', agentName: '' });
+  const [userToDelete, setUserToDelete] = useState<UserProfile | null>(null);
+
+  const handleDeleteUserConfirmed = async () => {
+    if (!userToDelete) return;
+    try {
+      await deleteDoc(doc(db, 'users', userToDelete.uid));
+      toast.success(`User '${userToDelete.name}' deleted successfully.`);
+      setUserToDelete(null);
+    } catch (err) {
+      handleFirestoreError(err, OperationType.DELETE, `users/${userToDelete.uid}`);
+    }
+  };
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
@@ -478,6 +490,7 @@ export default function AdminView({
                   <TableHead className="font-bold text-xs uppercase tracking-wider">Current Role</TableHead>
                   <TableHead className="font-bold text-xs uppercase tracking-wider">Modify Role</TableHead>
                   <TableHead className="font-bold text-xs uppercase tracking-wider">Mapped Team Lead</TableHead>
+                  <TableHead className="font-bold text-xs uppercase tracking-wider text-right pr-6">Action</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -527,6 +540,20 @@ export default function AdminView({
                         <span className="text-xs text-slate-400 italic">N/A</span>
                       )}
                     </TableCell>
+                    <TableCell className="py-3 text-right pr-6">
+                      {u.uid !== user.uid ? (
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="h-8 w-8 text-slate-400 hover:text-red-600 hover:bg-red-50 transition-all rounded-full cursor-pointer"
+                          onClick={() => setUserToDelete(u)}
+                        >
+                          <Trash2 size={14} />
+                        </Button>
+                      ) : (
+                        <span className="text-[10px] text-slate-400 font-bold tracking-wider uppercase bg-slate-100 px-2 py-1 rounded">You</span>
+                      )}
+                    </TableCell>
                   </TableRow>
                 ))}
               </TableBody>
@@ -555,7 +582,7 @@ export default function AdminView({
                />
                <Button 
                  size="sm" 
-                 className="bg-[#0F172A] hover:bg-slate-900 gap-1 h-9 w-full md:w-auto"
+                 className="bg-[#0F172A] hover:bg-slate-900 gap-1 h-9 w-full md:w-auto text-white"
                  onClick={() => {
                    if (newAlign.qaEmail && newAlign.agentName) {
                      onAlignmentsUpdate([...alignments, newAlign]);
@@ -616,6 +643,44 @@ export default function AdminView({
             </div>
           </Card>
         </div>
+
+        {userToDelete && (
+          <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+            <Card className="max-w-md w-full bg-white border border-slate-200 shadow-2xl rounded-2xl overflow-hidden animate-in fade-in zoom-in-95 duration-200">
+              <CardHeader className="bg-red-50 text-red-900 pb-3 border-b border-red-100">
+                <CardTitle className="text-lg font-extrabold flex items-center gap-2">
+                  <AlertCircle className="text-red-600 animate-pulse" size={22} />
+                  Confirm User Deletion
+                </CardTitle>
+                <CardDescription className="text-red-700/80 font-medium"> This action is permanent and cannot be undone.</CardDescription>
+              </CardHeader>
+              <CardContent className="p-6 space-y-4">
+                <p className="text-sm text-slate-600 font-medium leading-relaxed">
+                  Are you absolutely sure you want to delete <span className="font-bold text-slate-800">{userToDelete.name}</span> (<span className="font-mono text-xs text-slate-500">{userToDelete.email}</span>) from the system?
+                </p>
+                <p className="text-xs text-amber-600 font-semibold bg-amber-50 border border-amber-100 p-3 rounded-xl flex gap-2">
+                  <AlertCircle className="shrink-0 mt-0.5" size={14} />
+                  All active shift tracking and assigned alignments or roles for this user inside the Firestore database will no longer refer to an active account.
+                </p>
+              </CardContent>
+              <div className="bg-slate-50 px-6 py-4 border-t border-slate-100 flex items-center justify-end gap-3">
+                <Button
+                  variant="outline"
+                  className="hover:bg-slate-100 text-xs font-bold border-slate-200 shadow-sm bg-white"
+                  onClick={() => setUserToDelete(null)}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  className="bg-red-600 hover:bg-red-700 text-white text-xs font-bold shadow-sm"
+                  onClick={() => handleDeleteUserConfirmed()}
+                >
+                  Delete Account
+                </Button>
+              </div>
+            </Card>
+          </div>
+        )}
       </div>
     );
   }

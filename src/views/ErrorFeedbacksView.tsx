@@ -16,6 +16,8 @@ interface ErrorFeedbacksViewProps {
 
 export default function ErrorFeedbacksView({ auditLogs, user, alignments = [] }: ErrorFeedbacksViewProps) {
   const [searchTerm, setSearchTerm] = useState('');
+  const [currentPage, setCurrentPage] = useState(1);
+  const itemsPerPage = 10;
 
   const getVisibleFeedbacks = () => {
     let logs = auditLogs.filter(a => a.status === 'Incorrect' || a.compErrorCount > 0 || a.mpqcErrorCount > 0);
@@ -40,6 +42,12 @@ export default function ErrorFeedbacksView({ auditLogs, user, alignments = [] }:
   };
 
   const filteredLogs = getVisibleFeedbacks();
+  const paginatedLogs = filteredLogs.slice((currentPage - 1) * itemsPerPage, currentPage * itemsPerPage);
+
+  const handleSearchChange = (val: string) => {
+    setSearchTerm(val);
+    setCurrentPage(1);
+  };
 
   const exportData = () => {
     if (filteredLogs.length === 0) {
@@ -92,7 +100,7 @@ export default function ErrorFeedbacksView({ auditLogs, user, alignments = [] }:
                 placeholder="Search by Task ID, Agent, Error..." 
                 className="pl-10 border-slate-200"
                 value={searchTerm}
-                onChange={(e) => setSearchTerm(e.target.value)}
+                onChange={(e) => handleSearchChange(e.target.value)}
               />
             </div>
             <div className="text-sm font-semibold text-slate-500 whitespace-nowrap px-4 py-2 bg-white border border-slate-200 rounded-lg shadow-sm">
@@ -117,7 +125,7 @@ export default function ErrorFeedbacksView({ auditLogs, user, alignments = [] }:
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {filteredLogs.map(log => (
+                {paginatedLogs.map(log => (
                   <TableRow key={log.id} className="hover:bg-slate-50/50 transition-colors">
                     <TableCell className="font-mono font-medium text-xs pl-6 text-blue-600">{log.taskId}</TableCell>
                     <TableCell className="font-semibold text-slate-700">{log.qvName}</TableCell>
@@ -145,6 +153,33 @@ export default function ErrorFeedbacksView({ auditLogs, user, alignments = [] }:
               </TableBody>
             </Table>
           </div>
+          {filteredLogs.length > 0 && (
+            <div className="flex items-center justify-between border-t border-slate-100 px-6 py-4 bg-slate-50/30">
+              <span className="text-xs font-bold text-slate-500">
+                Showing {Math.min(filteredLogs.length, (currentPage - 1) * itemsPerPage + 1)}-{Math.min(filteredLogs.length, currentPage * itemsPerPage)} of {filteredLogs.length} entries
+              </span>
+              <div className="flex justify-end gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={currentPage === 1}
+                  onClick={() => setCurrentPage(prev => Math.max(1, prev - 1))}
+                  className="font-bold text-xs h-8"
+                >
+                  Previous Page
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={currentPage * itemsPerPage >= filteredLogs.length}
+                  onClick={() => setCurrentPage(prev => prev + 1)}
+                  className="font-bold text-xs h-8"
+                >
+                  Next Page
+                </Button>
+              </div>
+            </div>
+          )}
         </CardContent>
       </Card>
     </div>

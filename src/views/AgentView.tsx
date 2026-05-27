@@ -34,6 +34,7 @@ import { analyzePrecision } from '../services/geminiService';
 import { Sparkles, BrainCircuit, Lightbulb } from 'lucide-react';
 import { db, handleFirestoreError, OperationType } from '../lib/firebase';
 import { doc, updateDoc } from 'firebase/firestore';
+import { submitToGoogleSheet } from '../lib/sheets';
 
 interface AgentViewProps {
   activeTab: string;
@@ -53,6 +54,7 @@ export default function AgentView({ activeTab, audits, user }: AgentViewProps) {
         disputeStatus: updated.disputeStatus,
         disputeHistory: updated.disputeHistory
       });
+      submitToGoogleSheet('dispute_submission', updated.id, user.email, user.name, updated);
       toast.success('Dispute updated successfully');
     } catch (e) {
       handleFirestoreError(e, OperationType.UPDATE, `audits/${updated.id}`);
@@ -291,10 +293,14 @@ export default function AgentView({ activeTab, audits, user }: AgentViewProps) {
                     
                     <div className="flex gap-2">
                       <Button variant="outline" size="sm" onClick={() => setActiveFeedbackId(activeFeedbackId === f.id ? null : f.id)}>
-                        {f.disputeStatus === DisputeStatus.NONE ? 'Dispute' : 'View Thread'}
+                        {f.disputeStatus === DisputeStatus.NONE 
+                          ? 'Dispute' 
+                          : f.disputeStatus === DisputeStatus.QA_REVIEWED
+                          ? 'Re-open Thread'
+                          : 'View Thread'}
                       </Button>
-                      <Button size="sm" className="bg-green-600 hover:bg-green-700" onClick={() => handleAccept(f.id)}>
-                        Accept
+                      <Button size="sm" className="bg-green-600 hover:bg-green-700 text-white font-bold" onClick={() => handleAccept(f.id)}>
+                        {f.disputeStatus === DisputeStatus.QA_REVIEWED ? 'Accept Feedback' : 'Accept'}
                       </Button>
                     </div>
                   </div>
@@ -310,7 +316,7 @@ export default function AgentView({ activeTab, audits, user }: AgentViewProps) {
                     >
                       <DisputeWorkflow 
                         audit={f} 
-                        currentUser={{ name: 'Agent User', role: UserRole.AGENT }} 
+                        currentUser={{ name: user.name, role: UserRole.AGENT }} 
                         onUpdate={handleUpdateAudit}
                       />
                     </motion.div>

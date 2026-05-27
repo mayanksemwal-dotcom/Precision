@@ -134,7 +134,11 @@ export default function DisputeWorkflow({ audit, currentUser, onUpdate }: Disput
               }}
             >
               <Send size={16} className="mr-2" /> 
-              {currentUser.role === UserRole.AGENT && audit.disputeStatus === DisputeStatus.RESOLVED ? "Re-raise Dispute" : (currentUser.role === UserRole.QA ? "Send to Agent" : "Send to QA")}
+              {currentUser.role === UserRole.AGENT && audit.disputeStatus === DisputeStatus.RESOLVED 
+                ? "Re-raise Dispute" 
+                : (currentUser.role === UserRole.AGENT && audit.disputeStatus === DisputeStatus.QA_REVIEWED)
+                ? "Re-open Dispute"
+                : (currentUser.role === UserRole.QA ? "Send to Agent" : "Send to QA")}
             </Button>
 
             {currentUser.role === UserRole.QA && audit.disputeStatus !== DisputeStatus.RESOLVED && (

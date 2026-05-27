@@ -28,7 +28,7 @@ import {
 } from 'recharts';
 import { toast } from 'sonner';
 import * as XLSX from 'xlsx';
-import { SamplingTask, AuditRecord, UserRole, UserProfile, QAAlignment, ProductionRecord } from '../types';
+import { SamplingTask, AuditRecord, UserRole, UserProfile, QAAlignment, ProductionRecord, DisputeStatus } from '../types';
 import { db, handleFirestoreError, OperationType } from '../lib/firebase';
 import { collection, getDocs, query, where } from 'firebase/firestore';
 
@@ -40,10 +40,56 @@ interface TeamLeadViewProps {
   alignments?: QAAlignment[];
   productions?: ProductionRecord[];
   goToTab?: (tab: string) => void;
+  allUsers?: UserProfile[];
 }
 
-export default function TeamLeadView({ activeTab, tasks = [], auditLogs = [], user, alignments = [], productions = [], goToTab }: TeamLeadViewProps) {
+export default function TeamLeadView({ activeTab, tasks = [], auditLogs = [], user, alignments = [], productions = [], goToTab, allUsers = [] }: TeamLeadViewProps) {
   const [searchTerm, setSearchTerm] = useState('');
+  const [currentPage, setCurrentPage] = useState(1);
+  const itemsPerPage = 10;
+
+  const handleSearchChange = (val: string) => {
+    setSearchTerm(val);
+    setCurrentPage(1);
+  };
+
+  // 1. Filter audit records to only those belonging to the logged in Team Lead's team
+  const myTeamAudits = React.useMemo(() => {
+    if (user?.role === UserRole.ADMIN) {
+      return auditLogs;
+    }
+    if (user?.role === UserRole.TEAM_LEAD) {
+      const mappedAgentIds = allUsers.filter(u => u.teamLeadId === user.uid).map(u => u.uid);
+      const mappedAgentNames = allUsers.filter(u => u.teamLeadId === user.uid).map(u => u.name.toLowerCase().trim());
+      return auditLogs.filter(log => 
+        (log.agentId && mappedAgentIds.includes(log.agentId)) || 
+        (log.qvName && mappedAgentNames.includes(log.qvName.toLowerCase().trim()))
+      );
+    }
+    return auditLogs;
+  }, [auditLogs, user, allUsers]);
+
+  // 2. Dynamically calculate metrics
+  const teamMtdQuality = React.useMemo(() => {
+    const auditsWithScores = myTeamAudits.filter(a => typeof a.quality === 'number');
+    if (auditsWithScores.length === 0) return 100;
+    const sum = auditsWithScores.reduce((acc, curr) => acc + curr.quality, 0);
+    return sum / auditsWithScores.length;
+  }, [myTeamAudits]);
+
+  const activeDisputesCount = React.useMemo(() => {
+    return myTeamAudits.filter(log => log.disputeStatus === DisputeStatus.PENDING || log.disputeStatus === DisputeStatus.QA_REVIEWED).length;
+  }, [myTeamAudits]);
+
+  const pendingFeedbackCount = React.useMemo(() => {
+    return myTeamAudits.filter(a => 
+      a.status === 'Incorrect' && 
+      !a.isAccepted && 
+      a.disputeStatus !== DisputeStatus.RESOLVED &&
+      a.disputeStatus !== DisputeStatus.PENDING &&
+      a.disputeStatus !== DisputeStatus.QA_REVIEWED
+    ).length;
+  }, [myTeamAudits]);
 
   // Calculate Reports Data
   const reportsData = React.useMemo(() => {
@@ -81,13 +127,18 @@ export default function TeamLeadView({ activeTab, tasks = [], auditLogs = [], us
       data.totalRowsAudited += audit.rows;
     });
 
-    // 3. Filter for QA role alignment
+    // 3. Filter for QA role alignment and Team Lead mapped agents
     let dataList = Object.values(agentMap);
     if (user?.role === UserRole.QA) {
       const myAlignedAgents = alignments
         .filter(a => a.qaEmail.toLowerCase() === user.email.toLowerCase())
         .map(a => a.agentName);
       dataList = dataList.filter(a => myAlignedAgents.includes(a.name));
+    } else if (user?.role === UserRole.TEAM_LEAD) {
+      const myAgents = allUsers
+        .filter(u => u.teamLeadId === user.uid)
+        .map(u => u.name.toLowerCase().trim());
+      dataList = dataList.filter(a => myAgents.includes(a.name.toLowerCase().trim()));
     }
 
     return dataList.map(agent => {
@@ -102,7 +153,7 @@ export default function TeamLeadView({ activeTab, tasks = [], auditLogs = [], us
       };
     }).filter(a => a.name.toLowerCase().includes(searchTerm.toLowerCase()))
     .sort((a, b) => b.coverage - a.coverage);
-  }, [tasks, auditLogs, searchTerm, user, alignments, productions]);
+  }, [tasks, auditLogs, searchTerm, user, alignments, productions, allUsers]);
 
   const exportQCReport = () => {
     toast.info('Generating report...');
@@ -139,7 +190,7 @@ export default function TeamLeadView({ activeTab, tasks = [], auditLogs = [], us
           <Card className="shadow-sm">
             <CardHeader className="pb-2">
               <CardDescription className="text-xs font-bold uppercase">Team MTD Quality</CardDescription>
-              <CardTitle className="text-2xl font-black">93.2%</CardTitle>
+              <CardTitle className="text-2xl font-black">{teamMtdQuality.toFixed(1)}%</CardTitle>
             </CardHeader>
             <CardContent>
               <div className="text-xs text-green-600 font-medium">+2.1% from prev. month</div>
@@ -159,7 +210,7 @@ export default function TeamLeadView({ activeTab, tasks = [], auditLogs = [], us
           <Card className="shadow-sm">
             <CardHeader className="pb-2">
               <CardDescription className="text-xs font-bold uppercase">Active Disputes</CardDescription>
-              <CardTitle className="text-2xl font-black">8</CardTitle>
+              <CardTitle className="text-2xl font-black">{activeDisputesCount}</CardTitle>
             </CardHeader>
             <CardContent>
               <div className="text-xs text-amber-600 font-medium">Needs review</div>
@@ -168,7 +219,7 @@ export default function TeamLeadView({ activeTab, tasks = [], auditLogs = [], us
           <Card className="shadow-sm">
             <CardHeader className="pb-2">
               <CardDescription className="text-xs font-bold uppercase">Pending Feedback</CardDescription>
-              <CardTitle className="text-2xl font-black">12</CardTitle>
+              <CardTitle className="text-2xl font-black">{pendingFeedbackCount}</CardTitle>
             </CardHeader>
             <CardContent>
               <div className="text-xs text-slate-500 font-medium">Awaiting agent response</div>
@@ -205,6 +256,8 @@ export default function TeamLeadView({ activeTab, tasks = [], auditLogs = [], us
   }
 
   if (activeTab === 'reports') {
+    const paginatedReports = reportsData.slice((currentPage - 1) * itemsPerPage, currentPage * itemsPerPage);
+
     return (
       <div className="space-y-6">
         <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
@@ -223,10 +276,10 @@ export default function TeamLeadView({ activeTab, tasks = [], auditLogs = [], us
                  <div className="relative flex-1 w-full">
                     <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={18} />
                     <Input 
-                      placeholder="Search by Agent name or Task ID..." 
+                      placeholder="Search by Agent name..." 
                       className="pl-10" 
                       value={searchTerm}
-                      onChange={(e) => setSearchTerm(e.target.value)}
+                      onChange={(e) => handleSearchChange(e.target.value)}
                     />
                  </div>
                  <div className="flex gap-2">
@@ -236,7 +289,7 @@ export default function TeamLeadView({ activeTab, tasks = [], auditLogs = [], us
                  </div>
               </div>
            </CardHeader>
-           <CardContent>
+           <CardContent className="space-y-4">
              <Table>
                <TableHeader>
                  <TableRow>
@@ -250,7 +303,7 @@ export default function TeamLeadView({ activeTab, tasks = [], auditLogs = [], us
                  </TableRow>
                </TableHeader>
                <TableBody>
-                 {reportsData.map((agent, i) => (
+                 {paginatedReports.map((agent, i) => (
                    <TableRow key={agent.name + i}>
                      <TableCell className="font-medium">{agent.name}</TableCell>
                      <TableCell className="font-semibold text-slate-600">{agent.production.toLocaleString()}</TableCell>
@@ -271,13 +324,41 @@ export default function TeamLeadView({ activeTab, tasks = [], auditLogs = [], us
                  ))}
                  {reportsData.length === 0 && (
                    <TableRow>
-                     <TableCell colSpan={6} className="h-32 text-center text-slate-400">
+                     <TableCell colSpan={7} className="h-32 text-center text-slate-400">
                        No report data available for the selected criteria.
                      </TableCell>
                    </TableRow>
                  )}
                </TableBody>
              </Table>
+
+             {reportsData.length > 0 && (
+               <div className="flex items-center justify-between border-t border-slate-100 pt-4">
+                 <span className="text-xs font-bold text-slate-500">
+                   Showing {Math.min(reportsData.length, (currentPage - 1) * itemsPerPage + 1)}-{Math.min(reportsData.length, currentPage * itemsPerPage)} of {reportsData.length} agents
+                 </span>
+                 <div className="flex items-center gap-2">
+                   <Button
+                     variant="outline"
+                     size="sm"
+                     disabled={currentPage === 1}
+                     onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
+                     className="h-8 font-bold text-xs"
+                   >
+                     Previous Page
+                   </Button>
+                   <Button
+                     variant="outline"
+                     size="sm"
+                     disabled={currentPage * itemsPerPage >= reportsData.length}
+                     onClick={() => setCurrentPage(p => p + 1)}
+                     className="h-8 font-bold text-xs"
+                   >
+                     Next Page
+                   </Button>
+                 </div>
+               </div>
+             )}
            </CardContent>
         </Card>
       </div>

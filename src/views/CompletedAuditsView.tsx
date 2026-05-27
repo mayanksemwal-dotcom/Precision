@@ -16,20 +16,16 @@ interface CompletedAuditsViewProps {
 
 export default function CompletedAuditsView({ auditLogs, user, alignments = [] }: CompletedAuditsViewProps) {
   const [searchTerm, setSearchTerm] = useState('');
+  const [currentPage, setCurrentPage] = useState(1);
+  const itemsPerPage = 10;
 
   // Filter based on role
   const getVisibleAudits = () => {
     let logs = [...auditLogs];
     
     if (user.role === UserRole.QA) {
-      // For QA role, limit to alignment + their own audits
-      // Wait, "Total Audits" on QA dashboard shows `auditLogs.filter(a => a.qaId === user.uid).length`
-      // So they probably just want their *own* audits, but it says "hyperlink this report view to total audits in the dashboards for each role", so we should show what they did.
       logs = logs.filter(a => a.qaId === user.uid);
-    } else if (user.role === UserRole.TEAM_LEAD) {
-      // TL sees all, or whatever is passed down 
     }
-    // Admin sees all.
     
     if (searchTerm) {
       const lower = searchTerm.toLowerCase();
@@ -44,6 +40,12 @@ export default function CompletedAuditsView({ auditLogs, user, alignments = [] }
   };
 
   const filteredLogs = getVisibleAudits();
+  const paginatedLogs = filteredLogs.slice((currentPage - 1) * itemsPerPage, currentPage * itemsPerPage);
+
+  const handleSearchChange = (val: string) => {
+    setSearchTerm(val);
+    setCurrentPage(1);
+  };
 
   const exportData = () => {
     if (filteredLogs.length === 0) {
@@ -108,7 +110,7 @@ export default function CompletedAuditsView({ auditLogs, user, alignments = [] }
                 placeholder="Search by Task ID or Agent Name..." 
                 className="pl-10 border-slate-200"
                 value={searchTerm}
-                onChange={(e) => setSearchTerm(e.target.value)}
+                onChange={(e) => handleSearchChange(e.target.value)}
               />
             </div>
             <div className="text-sm font-semibold text-slate-500 whitespace-nowrap px-4 py-2 bg-white border border-slate-200 rounded-lg shadow-sm">
@@ -133,7 +135,7 @@ export default function CompletedAuditsView({ auditLogs, user, alignments = [] }
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {filteredLogs.map(log => (
+                {paginatedLogs.map(log => (
                   <TableRow key={log.id} className="hover:bg-slate-50/50 transition-colors">
                     <TableCell className="font-mono font-medium text-xs pl-6">{log.taskId}</TableCell>
                     <TableCell className="font-semibold text-slate-700">{log.qvName}</TableCell>
@@ -163,6 +165,33 @@ export default function CompletedAuditsView({ auditLogs, user, alignments = [] }
               </TableBody>
             </Table>
           </div>
+          {filteredLogs.length > 0 && (
+            <div className="flex items-center justify-between border-t border-slate-100 px-6 py-4 bg-slate-50/30">
+              <span className="text-xs font-bold text-slate-500">
+                Showing {Math.min(filteredLogs.length, (currentPage - 1) * itemsPerPage + 1)}-{Math.min(filteredLogs.length, currentPage * itemsPerPage)} of {filteredLogs.length} entries
+              </span>
+              <div className="flex justify-end gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={currentPage === 1}
+                  onClick={() => setCurrentPage(prev => Math.max(1, prev - 1))}
+                  className="font-bold text-xs h-8"
+                >
+                  Previous Page
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={currentPage * itemsPerPage >= filteredLogs.length}
+                  onClick={() => setCurrentPage(prev => prev + 1)}
+                  className="font-bold text-xs h-8"
+                >
+                  Next Page
+                </Button>
+              </div>
+            </div>
+          )}
         </CardContent>
       </Card>
     </div>

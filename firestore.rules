@@ -29,6 +29,13 @@ service cloud.firestore {
             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'QA'
         );
     }
+    
+    function isTeamLead() {
+        return isSignedIn() && (
+            exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
+            get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'TEAM_LEAD'
+        );
+    }
 
     function isValidId(id) {
       return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
@@ -54,6 +61,7 @@ service cloud.firestore {
         isAdmin() || 
         (request.auth.uid == userId && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'team']))
       );
+      allow delete: if isSignedIn() && isAdmin();
     }
 
     // Sampling Tasks
@@ -101,7 +109,7 @@ service cloud.firestore {
     // Warnings Rules
     match /warnings/{warningId} {
       allow read: if isSignedIn();
-      allow create, update: if isAdmin();
+      allow create, update: if isAdmin() || isTeamLead();
     }
 
     // TMS Shifts Rules
