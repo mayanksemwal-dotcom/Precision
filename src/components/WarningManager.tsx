@@ -76,19 +76,24 @@ export default function WarningManager({ agentName: initialName, agentId: initia
       </div>
 
       <div className="space-y-4">
-        <div>
-          <Label className="text-xs uppercase font-bold text-slate-500">Target Agent</Label>
+        <div className="space-y-1">
+          <Label className="text-xs uppercase font-bold text-slate-500 tracking-wider">Target Agent</Label>
           {!initialId ? (
-            <Select value={selectedAgentId} onValueChange={setSelectedAgentId}>
-              <SelectTrigger className="mt-1">
-                <SelectValue placeholder="Select an Agent..." />
-              </SelectTrigger>
-              <SelectContent>
-                {allUsers.filter(u => u.role === UserRole.AGENT).map(u => (
-                  <SelectItem key={u.uid} value={u.uid}>{u.name} ({u.email})</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+            <div className="w-full relative z-40">
+              <Select value={selectedAgentId} onValueChange={setSelectedAgentId}>
+                <SelectTrigger className="mt-1 w-full h-11 bg-white border border-slate-200 text-slate-900 font-medium px-3 flex items-center justify-between rounded-lg shadow-sm focus:ring-2 focus:ring-red-500">
+                  <SelectValue placeholder="Select an Agent..." />
+                </SelectTrigger>
+                <SelectContent className="bg-white border border-slate-200 rounded-lg shadow-xl z-[9999] p-1 text-slate-900 max-h-60 overflow-y-auto w-full">
+                  {allUsers.filter(u => u.role === UserRole.AGENT).map(u => (
+                    <SelectItem key={u.uid} value={u.uid} className="hover:bg-slate-100 cursor-pointer p-2.5 rounded text-slate-900 flex items-center justify-start gap-2 focus:bg-slate-100 bg-white text-sm w-full">
+                      <span className="font-semibold text-slate-900">{u.name}</span>
+                      <span className="text-slate-400 font-mono text-xs">({u.email})</span>
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
           ) : (
             <div className="p-3 bg-slate-50 rounded border border-slate-200 mt-1">
                <p className="font-bold">{initialName}</p>

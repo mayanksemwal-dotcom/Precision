@@ -37,7 +37,7 @@ export default function WarningsView({ warnings, user, allUsers }: WarningsViewP
     w.remarks.toLowerCase().includes(searchTerm.toLowerCase())
   );
 
-  const canIssueWarning = user.role === UserRole.ADMIN || user.role === UserRole.TEAM_LEAD;
+  const canIssueWarning = user.role === UserRole.ADMIN || user.role === UserRole.QA;
 
   const getLevelColor = (level: string) => {
     switch (level) {

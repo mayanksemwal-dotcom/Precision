@@ -42,19 +42,30 @@ export default function DisputesView({ auditLogs, user, onEditAudit }: DisputesV
   const handleAction = async (action: 'Deny' | 'Partial' | 'Full' | 'BOD' | 'Comment') => {
     if (!selectedDispute) return;
 
+    if (!actionComment.trim()) {
+      toast.error('A comment is required for all dispute decisions and actions.');
+      return;
+    }
+
     try {
-      const isResolution = action !== 'Comment';
+      let newStatus: DisputeStatus;
+      if (action === 'Comment' || action === 'Deny') {
+        newStatus = DisputeStatus.QA_REVIEWED;
+      } else {
+        newStatus = DisputeStatus.RESOLVED;
+      }
+
       await updateDoc(doc(db, 'audits', selectedDispute.id), {
-        disputeStatus: isResolution ? DisputeStatus.RESOLVED : (user.role === UserRole.AGENT ? DisputeStatus.PENDING : DisputeStatus.QA_REVIEWED),
+        disputeStatus: newStatus,
         disputeHistory: arrayUnion({
           id: crypto.randomUUID(),
           timestamp: new Date().toISOString(),
           userRole: user.role,
           userName: user.name,
-          comment: isResolution ? `Action: ${action}. Comment: ${actionComment}` : actionComment
+          comment: action !== 'Comment' ? `Action: ${action}. Comment: ${actionComment}` : actionComment
         })
       });
-      toast.success(isResolution ? `Dispute ${action}ed successfully.` : 'Comment added.');
+      toast.success(action === 'Comment' ? 'Comment added.' : `Dispute ${action}ed successfully.`);
       setSelectedDispute(null);
       setActionComment('');
     } catch (error) {

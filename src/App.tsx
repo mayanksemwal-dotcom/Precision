@@ -272,8 +272,8 @@ export default function App() {
               <DropdownMenuGroup>
                 <DropdownMenuLabel>My Account</DropdownMenuLabel>
                 <DropdownMenuSeparator />
-                <DropdownMenuItem onClick={handleLogout} variant="destructive">
-                  <LogOut size={16} className="mr-2" />
+                <DropdownMenuItem onClick={handleLogout} variant="destructive" className="text-red-600 dark:text-red-400 font-bold focus:bg-red-50 focus:text-red-750 cursor-pointer flex items-center pr-4">
+                  <LogOut size={16} className="mr-2 text-red-600 dark:text-red-400 font-bold" />
                   Logout
                 </DropdownMenuItem>
               </DropdownMenuGroup>

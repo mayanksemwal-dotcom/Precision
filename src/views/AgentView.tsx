@@ -250,13 +250,22 @@ export default function AgentView({ activeTab, audits, user }: AgentViewProps) {
 
         <div className="grid gap-4">
           {pendingFeedback.map((f) => (
-            <Card key={f.id} className={`shadow-sm border-l-4 overflow-hidden ${f.disputeStatus === DisputeStatus.PENDING ? 'border-l-amber-500 bg-amber-50/20' : 'border-l-red-500'}`}>
+            <Card key={f.id} className={`shadow-sm border-l-4 overflow-hidden ${
+              f.disputeStatus === DisputeStatus.PENDING 
+                ? 'border-l-amber-500 bg-amber-50/20' 
+                : f.disputeStatus === DisputeStatus.QA_REVIEWED
+                ? 'border-l-rose-500 bg-rose-50/10'
+                : 'border-l-red-500'
+            }`}>
               <CardContent className="p-6">
                 <div className="flex flex-col md:flex-row justify-between gap-6">
                   <div className="flex-1 space-y-4">
-                    <div className="flex items-center gap-3">
+                    <div className="flex flex-wrap items-center gap-3">
                       <Badge variant="outline" className="font-mono">{f.taskId}</Badge>
                       <Badge variant="secondary" className="bg-red-100 text-red-700 hover:bg-red-100">{f.errorType}</Badge>
+                      {f.disputeStatus === DisputeStatus.QA_REVIEWED && (
+                        <Badge className="bg-rose-100 text-rose-800 border border-rose-200 font-bold">Dispute Denied by QA</Badge>
+                      )}
                       <span className="text-slate-400 text-sm">{f.auditDate}</span>
                     </div>
                     
