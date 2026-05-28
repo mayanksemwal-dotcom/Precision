@@ -61,6 +61,7 @@ export interface AuditRecord {
   agentId: string;
   teamLeadId?: string;
   isAccepted?: boolean;
+  isReopened?: boolean;
 }
 
 export interface AppConfig {

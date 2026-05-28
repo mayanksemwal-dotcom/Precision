@@ -32,10 +32,14 @@ export default function DisputeWorkflow({ audit, currentUser, onUpdate }: Disput
       comment: comment.trim()
     };
 
+    const isReopening = currentUser.role === UserRole.AGENT && 
+      (audit.disputeStatus === DisputeStatus.QA_REVIEWED || audit.disputeStatus === DisputeStatus.RESOLVED);
+
     const updatedAudit: AuditRecord = {
       ...audit,
       disputeStatus: newStatus,
-      disputeHistory: [...audit.disputeHistory, newHistoryEntry]
+      disputeHistory: [...audit.disputeHistory, newHistoryEntry],
+      isReopened: isReopening ? true : (currentUser.role === UserRole.QA ? false : (audit.isReopened || false))
     };
 
     onUpdate(updatedAudit);
@@ -60,6 +64,11 @@ export default function DisputeWorkflow({ audit, currentUser, onUpdate }: Disput
           Dispute Thread
         </h3>
         <div className="flex items-center gap-2">
+          {audit.isReopened && (
+            <Badge className="bg-orange-100 text-orange-850 hover:bg-orange-100 border border-orange-200 font-extrabold shadow-sm animate-pulse">
+              ↺ Re-opened
+            </Badge>
+          )}
           {getStatusBadge(audit.disputeStatus)}
         </div>
       </div>
@@ -82,7 +91,7 @@ export default function DisputeWorkflow({ audit, currentUser, onUpdate }: Disput
                 <div className="flex items-center gap-2 text-xs font-bold text-slate-500 justify-start">
                   {step.userRole === UserRole.QA ? '' : <span className="text-blue-600 uppercase">{step.userName}</span>}
                   <Clock size={10} />
-                  <span>{new Date(step.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                  <span>{new Date(step.timestamp).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })}</span>
                   {step.userRole === UserRole.QA ? <span className="text-blue-600 uppercase">{step.userName}</span> : ''}
                 </div>
                 <div className={`p-3 rounded-2xl shadow-sm text-sm ${

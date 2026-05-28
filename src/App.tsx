@@ -477,6 +477,7 @@ export default function App() {
                     setEditingAudit(audit);
                     setActiveTab('sampling');
                   }}
+                  onRefresh={fetchAllData}
                 />
               ) : activeTab === 'warnings' ? (
                 <WarningsView warnings={warnings} user={effectiveUser!} allUsers={allUsers} />
@@ -518,7 +519,14 @@ export default function App() {
                     />
                   )}
                   {effectiveRole === UserRole.TEAM_LEAD && activeTab !== 'config' && <TeamLeadView activeTab={activeTab} tasks={tasks} auditLogs={auditLogs} productions={productions} user={effectiveUser!} alignments={alignments} goToTab={setActiveTab} allUsers={allUsers} />}
-                  {effectiveRole === UserRole.AGENT && <AgentView activeTab={activeTab} audits={auditLogs} user={effectiveUser!} />}
+                  {effectiveRole === UserRole.AGENT && (
+                    <AgentView 
+                      activeTab={activeTab} 
+                      audits={auditLogs} 
+                      user={effectiveUser!} 
+                      onRefresh={fetchAllData} 
+                    />
+                  )}
                 </>
               )}
             </motion.div>

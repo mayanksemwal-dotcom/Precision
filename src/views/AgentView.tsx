@@ -40,9 +40,10 @@ interface AgentViewProps {
   activeTab: string;
   audits: AuditRecord[];
   user: UserProfile;
+  onRefresh?: () => void;
 }
 
-export default function AgentView({ activeTab, audits, user }: AgentViewProps) {
+export default function AgentView({ activeTab, audits, user, onRefresh }: AgentViewProps) {
   const [activeFeedbackId, setActiveFeedbackId] = useState<string | null>(null);
   const [analyzing, setAnalyzing] = useState(false);
   const [aiTips, setAiTips] = useState<string[]>([]);
@@ -52,10 +53,14 @@ export default function AgentView({ activeTab, audits, user }: AgentViewProps) {
       const docRef = doc(db, 'audits', updated.id);
       await updateDoc(docRef, {
         disputeStatus: updated.disputeStatus,
-        disputeHistory: updated.disputeHistory
+        disputeHistory: updated.disputeHistory,
+        isReopened: updated.isReopened || false
       });
       submitToGoogleSheet('dispute_submission', updated.id, user.email, user.name, updated);
       toast.success('Dispute updated successfully');
+      if (onRefresh) {
+        onRefresh();
+      }
     } catch (e) {
       handleFirestoreError(e, OperationType.UPDATE, `audits/${updated.id}`);
     }
@@ -95,6 +100,9 @@ export default function AgentView({ activeTab, audits, user }: AgentViewProps) {
         isAccepted: true
       });
       toast.success('Error Accepted and cleared from view.');
+      if (onRefresh) {
+        onRefresh();
+      }
     } catch (e) {
       handleFirestoreError(e, OperationType.UPDATE, `audits/${id}`);
     }
@@ -267,6 +275,11 @@ export default function AgentView({ activeTab, audits, user }: AgentViewProps) {
                       <Badge variant="secondary" className="bg-red-100 text-red-700 hover:bg-red-100">{f.errorType}</Badge>
                       {f.disputeStatus === DisputeStatus.QA_REVIEWED && (
                         <Badge className="bg-rose-100 text-rose-800 border border-rose-200 font-bold">Dispute Denied by QA</Badge>
+                      )}
+                      {f.isReopened && (
+                        <Badge className="bg-orange-100 text-orange-850 hover:bg-orange-100 border border-orange-200 font-extrabold gap-1 animate-pulse">
+                          ↺ Re-opened
+                        </Badge>
                       )}
                       <span className="text-slate-400 text-sm">{f.auditDate}</span>
                     </div>

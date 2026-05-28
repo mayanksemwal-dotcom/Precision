@@ -15,10 +15,11 @@ interface DisputesViewProps {
   auditLogs: AuditRecord[];
   user: UserProfile;
   onEditAudit?: (audit: AuditRecord) => void;
+  onRefresh?: () => void;
 }
 
-export default function DisputesView({ auditLogs, user, onEditAudit }: DisputesViewProps) {
-  const [filter, setFilter] = useState<'All' | 'Pending' | 'Active' | 'Resolved'>('All');
+export default function DisputesView({ auditLogs, user, onEditAudit, onRefresh }: DisputesViewProps) {
+  const [filter, setFilter] = useState<'All' | 'Pending' | 'Active' | 'Resolved'>('Pending');
   const [selectedDispute, setSelectedDispute] = useState<AuditRecord | null>(null);
   const [actionComment, setActionComment] = useState('');
 
@@ -57,6 +58,7 @@ export default function DisputesView({ auditLogs, user, onEditAudit }: DisputesV
 
       await updateDoc(doc(db, 'audits', selectedDispute.id), {
         disputeStatus: newStatus,
+        isReopened: false,
         disputeHistory: arrayUnion({
           id: crypto.randomUUID(),
           timestamp: new Date().toISOString(),
@@ -68,6 +70,9 @@ export default function DisputesView({ auditLogs, user, onEditAudit }: DisputesV
       toast.success(action === 'Comment' ? 'Comment added.' : `Dispute ${action}ed successfully.`);
       setSelectedDispute(null);
       setActionComment('');
+      if (onRefresh) {
+        onRefresh();
+      }
     } catch (error) {
       toast.error('Failed to update dispute');
     }
@@ -109,9 +114,16 @@ export default function DisputesView({ auditLogs, user, onEditAudit }: DisputesV
                   <TableCell>{audit.agentId}</TableCell>
                   <TableCell>{audit.qvName}</TableCell>
                   <TableCell>
-                    <Badge variant={audit.disputeStatus === DisputeStatus.PENDING ? 'outline' : 'secondary'}>
-                      {audit.disputeStatus}
-                    </Badge>
+                    <div className="flex flex-wrap gap-1 items-center">
+                      <Badge variant={audit.disputeStatus === DisputeStatus.PENDING ? 'outline' : 'secondary'}>
+                        {audit.disputeStatus}
+                      </Badge>
+                      {audit.isReopened && (
+                        <Badge className="bg-orange-100 text-orange-850 hover:bg-orange-100 border border-orange-200 font-extrabold shadow-sm animate-pulse text-[10px]">
+                          ↺ Re-opened
+                        </Badge>
+                      )}
+                    </div>
                   </TableCell>
                   <TableCell className="max-w-xs truncate">
                     {audit.disputeHistory[audit.disputeHistory.length - 1]?.comment || 'No comment'}
@@ -123,7 +135,16 @@ export default function DisputesView({ auditLogs, user, onEditAudit }: DisputesV
                       </DialogTrigger>
                       <DialogContent className="max-w-2xl">
                         <DialogHeader>
-                          <DialogTitle>Dispute Thread - {audit.taskId}</DialogTitle>
+                          <DialogTitle className="flex justify-between items-center pr-6">
+                            <span className="flex items-center gap-2">
+                              Dispute Thread - {audit.taskId}
+                              {audit.isReopened && (
+                                <Badge className="bg-orange-100 text-orange-850 hover:bg-orange-100 border border-orange-200 font-extrabold text-[10px]">
+                                  ↺ Re-opened
+                                </Badge>
+                              )}
+                            </span>
+                          </DialogTitle>
                         </DialogHeader>
                         
                         <div className="space-y-4 max-h-[400px] overflow-y-auto p-2 border rounded bg-slate-50">
