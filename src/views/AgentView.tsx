@@ -133,7 +133,7 @@ export default function AgentView({ activeTab, audits, user, onRefresh }: AgentV
           <Card className="shadow-sm">
             <CardHeader className="pb-2">
               <CardDescription className="text-xs font-bold uppercase text-slate-500">Target Accuracy</CardDescription>
-              <CardTitle className="text-4xl font-black text-slate-900">92%</CardTitle>
+              <CardTitle className="text-4xl font-black text-slate-900">98%</CardTitle>
             </CardHeader>
             <CardContent>
                <div className="w-full bg-slate-100 h-2 rounded-full mt-2">

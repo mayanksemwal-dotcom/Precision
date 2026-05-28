@@ -74,6 +74,11 @@ export default function QAView({
 }: QAViewProps) {
   const [selectedAgent, setSelectedAgent] = useState<string | null>(null);
   const [searchAgent, setSearchAgent] = useState('');
+  const [samplingPage, setSamplingPage] = useState(0);
+
+  useEffect(() => {
+    setSamplingPage(0);
+  }, [selectedAgent, searchAgent]);
   const [currentTask, setCurrentTask] = useState<SamplingTask | null>(null);
   const [auditStep, setAuditStep] = useState<1 | 2>(1);
   const [auditOpen, setAuditOpen] = useState(false);
@@ -747,7 +752,7 @@ export default function QAView({
               <CardTitle className="text-2xl">98.2%</CardTitle>
             </CardHeader>
             <CardContent>
-              <div className="text-xs text-green-600 font-medium">Above target (95%)</div>
+              <div className="text-xs text-green-600 font-medium">Above target (98%)</div>
             </CardContent>
           </Card>
           <Card className="bg-white border-l-4 border-l-amber-600">
@@ -845,9 +850,14 @@ export default function QAView({
       ? pendingTasks.filter(t => t.qvName === selectedAgent)
       : pendingTasks;
 
+    const PAGE_SIZE = 20;
+    const totalFilteredCases = filteredTasks.length;
+    const startIndex = samplingPage * PAGE_SIZE;
+    const paginatedTasks = filteredTasks.slice(startIndex, startIndex + PAGE_SIZE);
+
     // Grouping logic for the grid
     const groupedTasks: Record<number, SamplingTask[]> = {};
-    filteredTasks.forEach(t => {
+    paginatedTasks.forEach(t => {
       if (!groupedTasks[t.rows]) groupedTasks[t.rows] = [];
       groupedTasks[t.rows].push(t);
     });
@@ -963,6 +973,35 @@ export default function QAView({
               </div>
             )}
           </div>
+
+          {/* Pagination Controls */}
+          {filteredTasks.length > 0 && (
+            <div className="p-4 border-t border-slate-100 flex items-center justify-between bg-white text-xs select-none shadow-[0_-1px_3px_0_rgba(0,0,0,0.02)] shrink-0">
+              <div className="text-slate-500 font-bold">
+                Showing <span className="font-extrabold text-slate-800">{startIndex + 1}</span> to <span className="font-extrabold text-slate-800">{Math.min(startIndex + PAGE_SIZE, totalFilteredCases)}</span> of <span className="font-extrabold text-slate-800">{totalFilteredCases}</span> cases
+              </div>
+              <div className="flex gap-2">
+                <Button 
+                  variant="outline" 
+                  size="sm" 
+                  disabled={samplingPage === 0}
+                  onClick={() => setSamplingPage(p => p - 1)}
+                  className="text-xs font-black min-w-[90px] h-8 text-slate-700 bg-white hover:bg-slate-50"
+                >
+                  <ChevronLeft size={14} className="mr-1" /> Previous
+                </Button>
+                <Button 
+                  variant="outline" 
+                  size="sm" 
+                  disabled={startIndex + PAGE_SIZE >= totalFilteredCases}
+                  onClick={() => setSamplingPage(p => p + 1)}
+                  className="text-xs font-black min-w-[90px] h-8 text-slate-700 bg-white hover:bg-slate-50"
+                >
+                  Next <ChevronRight size={14} className="ml-1" />
+                </Button>
+              </div>
+            </div>
+          )}
         </div>
 
         {/* AUDIT FORM DIALOG */}

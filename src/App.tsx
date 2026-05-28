@@ -20,7 +20,7 @@ import {
   Clock
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { UserRole, UserProfile, SamplingTask, AuditRecord, QAAlignment, ProductionRecord, WarningTicket } from './types';
+import { UserRole, UserProfile, SamplingTask, AuditRecord, QAAlignment, ProductionRecord, WarningTicket, AgentKpiRecord } from './types';
 import { INITIAL_ALIGNMENTS } from './lib/sample-data';
 import { auth, db, logout, handleFirestoreError, OperationType } from './lib/firebase';
 import { onAuthStateChanged } from 'firebase/auth';
@@ -70,6 +70,7 @@ export default function App() {
   const [productions, setProductions] = useState<ProductionRecord[]>([]);
   const [warnings, setWarnings] = useState<WarningTicket[]>([]);
   const [allUsers, setAllUsers] = useState<UserProfile[]>([]);
+  const [agentKpis, setAgentKpis] = useState<AgentKpiRecord[]>([]);
   const [editingAudit, setEditingAudit] = useState<AuditRecord | null>(null);
 
   // Archive Reports sheets logic
@@ -205,6 +206,14 @@ export default function App() {
       }
       const warningsPromise = getDocs(warningsQuery);
 
+      let kpisQuery;
+      if (user.role === UserRole.ADMIN || user.role === UserRole.QA || user.role === UserRole.TEAM_LEAD) {
+        kpisQuery = collection(db, 'agent_kpis');
+      } else {
+        kpisQuery = query(collection(db, 'agent_kpis'), where('agentId', '==', user.uid));
+      }
+      const kpisPromise = getDocs(kpisQuery);
+
       // Execute all fetches in parallel to resolve waterfall latency issues
       const [
         usersSnap,
@@ -212,14 +221,16 @@ export default function App() {
         tasksSnap,
         auditsSnap,
         prodSnap,
-        warningsSnap
+        warningsSnap,
+        kpisSnap
       ] = await Promise.all([
         usersPromise,
         alignmentsPromise,
         tasksPromise,
         auditsPromise,
         prodPromise,
-        warningsPromise
+        warningsPromise,
+        kpisPromise
       ]);
 
       // Map and update state in one batch
@@ -237,6 +248,7 @@ export default function App() {
       setAuditLogs(auditsSnap.docs.map(doc => ({ id: doc.id, ...(doc.data() as any) } as AuditRecord)));
       setProductions(prodSnap.docs.map(doc => ({ id: doc.id, ...(doc.data() as any) } as ProductionRecord)));
       setWarnings(warningsSnap.docs.map(doc => ({ id: doc.id, ...(doc.data() as any) } as WarningTicket)));
+      setAgentKpis(kpisSnap.docs.map(doc => ({ id: doc.id, ...(doc.data() as any) } as AgentKpiRecord)));
 
       toast.success('All reports loaded/refreshed successfully');
     } catch (error) {
@@ -501,6 +513,8 @@ export default function App() {
                       auditLogs={auditLogs}
                       goToTab={setActiveTab}
                       allUsers={allUsers}
+                      agentKpis={agentKpis}
+                      onKpisUpdate={fetchAllData}
                     />
                   )}
                   {(effectiveRole === UserRole.QA) && (
@@ -518,13 +532,27 @@ export default function App() {
                       onCancelEdit={() => setEditingAudit(null)}
                     />
                   )}
-                  {effectiveRole === UserRole.TEAM_LEAD && activeTab !== 'config' && <TeamLeadView activeTab={activeTab} tasks={tasks} auditLogs={auditLogs} productions={productions} user={effectiveUser!} alignments={alignments} goToTab={setActiveTab} allUsers={allUsers} />}
+                  {effectiveRole === UserRole.TEAM_LEAD && activeTab !== 'config' && (
+                    <TeamLeadView 
+                      activeTab={activeTab} 
+                      tasks={tasks} 
+                      auditLogs={auditLogs} 
+                      productions={productions} 
+                      user={effectiveUser!} 
+                      alignments={alignments} 
+                      goToTab={setActiveTab} 
+                      allUsers={allUsers}
+                      agentKpis={agentKpis}
+                      onKpisUpdate={fetchAllData}
+                    />
+                  )}
                   {effectiveRole === UserRole.AGENT && (
                     <AgentView 
                       activeTab={activeTab} 
                       audits={auditLogs} 
                       user={effectiveUser!} 
                       onRefresh={fetchAllData} 
+                      agentKpis={agentKpis}
                     />
                   )}
                 </>

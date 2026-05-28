@@ -114,3 +114,17 @@ export interface ProductionRecord {
   totalTasks: number;
 }
 
+export interface AgentKpiRecord {
+  id: string;
+  agentId: string;
+  agentName: string;
+  date: string;
+  utilization: number;
+  attendance: number;
+  qaScore: number;
+  aptActual: number;
+  aptTarget: number;
+  timeline?: string;
+}
+
+

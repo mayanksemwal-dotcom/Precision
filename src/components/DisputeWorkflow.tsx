@@ -57,7 +57,7 @@ export default function DisputeWorkflow({ audit, currentUser, onUpdate }: Disput
   };
 
   return (
-    <div className="flex flex-col h-[500px]">
+    <div className="flex flex-col w-full">
       <div className="flex justify-between items-center mb-4 px-1">
         <h3 className="font-bold text-slate-900 flex items-center gap-2">
           <MessageSquare size={18} className="text-blue-600" />
@@ -73,7 +73,7 @@ export default function DisputeWorkflow({ audit, currentUser, onUpdate }: Disput
         </div>
       </div>
 
-      <ScrollArea className="flex-1 pr-4 mb-4 border rounded-lg p-4 bg-slate-50/50">
+      <ScrollArea className="max-h-[240px] overflow-y-auto pr-4 mb-4 border rounded-lg p-4 bg-slate-50/50">
         <div className="space-y-4">
           {audit.disputeHistory.map((step, i) => (
             <motion.div 
