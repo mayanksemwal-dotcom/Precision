@@ -4,7 +4,13 @@ export const MOCK_USER: UserProfile = {
   uid: 'admin-123',
   email: 'admin@precision360.com',
   name: 'Admin User',
+  fullName: 'Admin User',
   role: UserRole.ADMIN,
+  status: 'Active',
+  department: 'Operations',
+  Manager: 'System Root',
+  createdAt: new Date().toISOString(),
+  lastLoginAt: new Date().toISOString()
 };
 
 export const MOCK_CONFIG = {
@@ -33,5 +39,11 @@ export const MOCK_QA_USER: UserProfile = {
   uid: 'qa-1',
   email: 'akshit.sodhi@bergtechnologies.co.in',
   name: 'Akshit Sodhi',
+  fullName: 'Akshit Sodhi',
   role: UserRole.QA,
+  status: 'Active',
+  department: 'Operations',
+  Manager: 'Sandhya Pal',
+  createdAt: new Date().toISOString(),
+  lastLoginAt: new Date().toISOString()
 };

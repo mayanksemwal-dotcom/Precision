@@ -22,7 +22,8 @@ import {
   Calendar,
   Sparkles,
   BrainCircuit,
-  Lightbulb
+  Lightbulb,
+  RefreshCw
 } from 'lucide-react';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle, CardFooter } from '../components/ui/card';
 import { Button } from '../components/ui/button';
@@ -39,11 +40,11 @@ import { UserRole, AuditRecord, DisputeStatus, DisputeHistory, UserProfile, QAAl
 import DisputeWorkflow from '../components/DisputeWorkflow';
 import { analyzePrecision } from '../services/geminiService';
 import { db, handleFirestoreError, OperationType } from '../lib/firebase';
-import { doc, getDoc, setDoc, updateDoc, collection, query, where, onSnapshot, orderBy } from 'firebase/firestore';
+import { doc, getDoc, setDoc, updateDoc, collection, query, where, onSnapshot, orderBy, getDocs, limit } from 'firebase/firestore';
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogTrigger } from '../components/ui/dialog';
 import WarningManager from '../components/WarningManager';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../components/ui/table';
-import { submitToGoogleSheet } from '../lib/sheets';
+// No Sheets integrations
 
 interface QAViewProps {
   activeTab: string;
@@ -54,6 +55,7 @@ interface QAViewProps {
   alignments: QAAlignment[];
   productions?: any[];
   auditLogs?: any[];
+  allUsers?: UserProfile[];
   goToTab?: (tab: string) => void;
   editingAudit?: AuditRecord | null;
   onCancelEdit?: () => void;
@@ -69,6 +71,7 @@ export default function QAView({
   productions = [],
   auditLogs = [],
   goToTab,
+  allUsers = [],
   editingAudit,
   onCancelEdit
 }: QAViewProps) {
@@ -525,25 +528,85 @@ export default function QAView({
 
   const [disputes, setDisputes] = useState<AuditRecord[]>([]);
 
+  // Scalable queue storage
+  const [scalableTasks, setScalableTasks] = useState<SamplingTask[]>([]);
+  const [totalCount, setTotalCount] = useState(0);
+  const [currentPage, setCurrentPage] = useState(1);
+  const [isLoadingQueue, setIsLoadingQueue] = useState(false);
+  const PAGE_LIMIT = 25;
+
+  useEffect(() => {
+    const loadScalableQueue = async () => {
+      setIsLoadingQueue(true);
+      try {
+        // Fetch paginated pending tasks from Firestore Audit Queue (Pending Tasks)
+        // To reduce reads, improve performance and control Blaze plan costs, only readcurrentPage * PAGE_LIMIT docs
+        let countQuery = query(collection(db, 'tasks'), where('status', '==', 'Pending'));
+        if (selectedAgent) {
+          countQuery = query(countQuery, where('qvName', '==', selectedAgent));
+        }
+        const countSnap = await getDocs(countQuery);
+        setTotalCount(countSnap.docs.length);
+
+        let q = query(
+          collection(db, 'tasks'),
+          where('status', '==', 'Pending')
+        );
+        if (selectedAgent) {
+          q = query(q, where('qvName', '==', selectedAgent));
+        }
+
+        // Fetch only the needed items up to currentPage * PAGE_LIMIT to prevent index and heavy-read constraints
+        const qLimit = query(q, limit(currentPage * PAGE_LIMIT));
+        const snap = await getDocs(qLimit);
+        const allDocs = snap.docs.map(doc => ({ id: doc.id, ...(doc.data() as any) } as SamplingTask));
+        
+        // Slice the items local to this page
+        const startIndex = (currentPage - 1) * PAGE_LIMIT;
+        const paginatedTasks = allDocs.slice(startIndex, startIndex + PAGE_LIMIT);
+        setScalableTasks(paginatedTasks);
+      } catch (err) {
+        toast.error("Failed to load queue");
+        console.error("Scalable queue load error", err);
+      } finally {
+        setIsLoadingQueue(false);
+      }
+    };
+    loadScalableQueue();
+  }, [user.email, user.role, currentPage, selectedAgent]);
+
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [selectedAgent]);
+
   // Filter agents based on alignment
   const myAlignedAgents = alignments
     .filter(a => a.qaEmail.toLowerCase() === user.email.toLowerCase())
     .map(a => a.agentName);
 
-  const uniqueAgents = Array.from(new Set(tasks.map(t => t.qvName))).sort();
+  const isSheets = false;
+  const allTasksForStats = isSheets ? (scalableTasks || []) : (tasks || []);
+  
+  // For Admins, we show all AGENT roles as potential agents to filter by
+  const uniqueAgents = (user.role === UserRole.ADMIN)
+    ? Array.from(new Set(allUsers.filter(u => u.role === UserRole.AGENT).map(u => u.name))).sort()
+    : Array.from(new Set(allTasksForStats.map(t => String(t.qvName || '')))).filter(a => a !== '').sort();
+
   const filteredAgents = uniqueAgents.filter(a => 
-    a.toLowerCase().includes(searchAgent.toLowerCase())
+    String(a).toLowerCase().includes(searchAgent.toLowerCase())
   );
   
-  const displayedAgents = user.role === UserRole.QA 
-    ? filteredAgents.filter(a => myAlignedAgents.includes(a))
-    : filteredAgents;
+  const displayedAgents = (user.role === UserRole.ADMIN) 
+    ? filteredAgents
+    : user.role === UserRole.QA 
+      ? filteredAgents.filter(a => myAlignedAgents.includes(String(a)) || isSheets) // Trust Sheets more if enabled
+      : filteredAgents;
 
   useEffect(() => {
     if (!user) return;
-    const pending = auditLogs
+    const pending = (auditLogs || [])
       .filter(d => d.disputeStatus === DisputeStatus.PENDING)
-      .filter(d => myAlignedAgents.includes(d.qvName) || d.qaId === user.uid);
+      .filter(d => user.role === UserRole.ADMIN || myAlignedAgents.includes(String(d.qvName || '')) || d.qaId === user.uid);
     setDisputes(pending);
   }, [user, alignments, auditLogs]);
 
@@ -644,18 +707,16 @@ export default function QAView({
       auditDate: editingAudit ? editingAudit.auditDate : new Date().toISOString(),
       auditStartTime: editingAudit ? (editingAudit.auditStartTime || new Date().toISOString()) : (startTime ? new Date(startTime).toISOString() : new Date().toISOString()),
       disputeStatus: editingAudit ? editingAudit.disputeStatus : DisputeStatus.NONE,
-      disputeHistory: editingAudit ? editingAudit.disputeHistory : [],
+      disputeHistory: editingAudit ? (editingAudit.disputeHistory || []) : [],
       agentId: currentTask.qvName || ''
     };
 
     try {
       if (editingAudit) {
         await updateDoc(doc(db, 'audits', audit.id), audit as any);
-        submitToGoogleSheet('audit_submission', audit.id, user.email, user.name, audit);
       } else {
         await setDoc(doc(db, 'audits', audit.id), audit);
         await updateDoc(doc(db, 'tasks', currentTask.id), { status: 'Completed' });
-        submitToGoogleSheet('audit_submission', audit.id, user.email, user.name, audit);
       }
       setAuditOpen(false);
       onCancelEdit?.();
@@ -675,7 +736,6 @@ export default function QAView({
         quality: updated.quality,
         status: updated.status
       });
-      submitToGoogleSheet('dispute_resolution', updated.id, user.email, user.name, updated);
       toast.success('Dispute resolved and closed.');
     } catch (e) {
       handleFirestoreError(e, OperationType.UPDATE, `audits/${updated.id}`);
@@ -845,21 +905,17 @@ export default function QAView({
   }
 
   if (activeTab === 'sampling') {
-    const pendingTasks = tasks.filter(t => t.status === 'Pending');
-    const filteredTasks = selectedAgent 
-      ? pendingTasks.filter(t => t.qvName === selectedAgent)
-      : pendingTasks;
-
-    const PAGE_SIZE = 20;
-    const totalFilteredCases = filteredTasks.length;
-    const startIndex = samplingPage * PAGE_SIZE;
-    const paginatedTasks = filteredTasks.slice(startIndex, startIndex + PAGE_SIZE);
+    const isSheets = false;
+    const filteredTasks = scalableTasks;
 
     // Grouping logic for the grid
     const groupedTasks: Record<number, SamplingTask[]> = {};
-    paginatedTasks.forEach(t => {
-      if (!groupedTasks[t.rows]) groupedTasks[t.rows] = [];
-      groupedTasks[t.rows].push(t);
+    const tasksToGroup = Array.isArray(filteredTasks) ? filteredTasks : [];
+    tasksToGroup.forEach(t => {
+      if (!t) return;
+      const rowCount = Number(t.rows) || 1;
+      if (!groupedTasks[rowCount]) groupedTasks[rowCount] = [];
+      groupedTasks[rowCount].push(t);
     });
 
     return (
@@ -887,7 +943,7 @@ export default function QAView({
                 <ClipboardCheck size={18} className={!selectedAgent ? 'text-blue-400' : 'text-slate-400'} />
                 <span className="text-sm font-black">All Workload</span>
               </div>
-              <Badge variant="secondary" className={`${!selectedAgent ? 'bg-slate-800 text-white' : 'bg-slate-100 text-slate-600'} font-bold`}>{pendingTasks.length}</Badge>
+              <Badge variant="secondary" className={`${!selectedAgent ? 'bg-slate-800 text-white' : 'bg-slate-100 text-slate-600'} font-bold`}>{totalCount}</Badge>
             </button>
             <div className="h-px bg-slate-50 mx-4 my-2"></div>
             {displayedAgents.map(agent => (
@@ -917,7 +973,17 @@ export default function QAView({
              </div>
           </div>
 
-          <div className="flex-1 overflow-y-auto p-8 bg-[#F8FAFC]">
+          <div className="flex-1 overflow-y-auto p-8 bg-[#F8FAFC] relative">
+            {isLoadingQueue && (
+              <div className="absolute inset-0 z-10 bg-white/50 backdrop-blur-sm flex items-center justify-center">
+                <div className="flex flex-col items-center gap-3">
+                  <div className="animate-spin text-blue-600">
+                    <RefreshCw size={48} />
+                  </div>
+                  <p className="font-bold text-slate-500 animate-pulse">Synchronizing with Firestore Database...</p>
+                </div>
+              </div>
+            )}
             {Object.keys(groupedTasks).sort((a,b) => Number(b)-Number(a)).map(rowKey => (
               <div key={rowKey} className="mb-12">
                 <div className="flex items-center gap-4 mb-6">
@@ -974,18 +1040,17 @@ export default function QAView({
             )}
           </div>
 
-          {/* Pagination Controls */}
-          {filteredTasks.length > 0 && (
+          {(totalCount > 0) && (
             <div className="p-4 border-t border-slate-100 flex items-center justify-between bg-white text-xs select-none shadow-[0_-1px_3px_0_rgba(0,0,0,0.02)] shrink-0">
               <div className="text-slate-500 font-bold">
-                Showing <span className="font-extrabold text-slate-800">{startIndex + 1}</span> to <span className="font-extrabold text-slate-800">{Math.min(startIndex + PAGE_SIZE, totalFilteredCases)}</span> of <span className="font-extrabold text-slate-800">{totalFilteredCases}</span> cases
+                Showing <span className="font-extrabold text-slate-800">{(currentPage - 1) * PAGE_LIMIT + 1}</span> to <span className="font-extrabold text-slate-800">{Math.min(currentPage * PAGE_LIMIT, totalCount)}</span> of <span className="font-extrabold text-slate-800">{totalCount}</span> cases
               </div>
               <div className="flex gap-2">
                 <Button 
                   variant="outline" 
                   size="sm" 
-                  disabled={samplingPage === 0}
-                  onClick={() => setSamplingPage(p => p - 1)}
+                  disabled={currentPage === 1}
+                  onClick={() => setCurrentPage(p => p - 1)}
                   className="text-xs font-black min-w-[90px] h-8 text-slate-700 bg-white hover:bg-slate-50"
                 >
                   <ChevronLeft size={14} className="mr-1" /> Previous
@@ -993,8 +1058,8 @@ export default function QAView({
                 <Button 
                   variant="outline" 
                   size="sm" 
-                  disabled={startIndex + PAGE_SIZE >= totalFilteredCases}
-                  onClick={() => setSamplingPage(p => p + 1)}
+                  disabled={currentPage * PAGE_LIMIT >= totalCount}
+                  onClick={() => setCurrentPage(p => p + 1)}
                   className="text-xs font-black min-w-[90px] h-8 text-slate-700 bg-white hover:bg-slate-50"
                 >
                   Next <ChevronRight size={14} className="ml-1" />

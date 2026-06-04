@@ -2,5 +2,5 @@
   "name": "Precision360",
   "description": "Precision360: A professional Quality Management Traceability tool for sampling, audits, RCA, and performance monitoring.",
   "requestFramePermissions": [],
-  "majorCapabilities": []
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

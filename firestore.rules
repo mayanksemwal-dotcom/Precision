@@ -1,122 +1,248 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    // Default Deny
+    
+    // -------------------------------------------------------------------------
+    // 1. GLOBAL HELPERS & DEFAULT DENY
+    // -------------------------------------------------------------------------
+    
     match /{document=**} {
       allow read, write: if false;
     }
 
-    // Helper Primitives
-    function isSignedIn() {
-      return request.auth != null;
-    }
-    
-    function isEmail(email) {
-      return request.auth.token.email == email;
-    }
-
-    function isAdmin() {
+    function isSignedIn() { return request.auth != null; }
+    function isVerified() { 
       return isSignedIn() && (
-        isEmail('mayank.semwal@bergtechnologies.co.in') ||
-        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
-         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'ADMIN')
-      );
+        request.auth.token.email_verified == true || 
+        request.auth.token.email == 'mayank.semwal@bergtechnologies.co.in'
+      ); 
+    }
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+    function isValidId(id) { return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$'); }
+    
+    // Role-based Access Helpers
+    function getUserRole() {
+      return exists(/databases/$(database)/documents/users/$(request.auth.uid))
+             ? get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role
+             : 'AGENT';
     }
     
-    function isQA() {
-        return isSignedIn() && (
-            exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
-            get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'QA'
-        );
+    function isRole(role) { return isVerified() && getUserRole().upper() == role; }
+    function isAdmin() {
+      return isVerified() && getUserRole().upper() == 'ADMIN';
     }
+    function isManager() { return isRole('MANAGER') || isAdmin(); }
+    function isQA() { return isRole('QA') || isManager(); }
+    function isTL() { return isRole('TEAM_LEAD') || isManager(); }
+    function isAgent() { return isRole('AGENT') || isTL() || isQA(); }
     
-    function isTeamLead() {
-        return isSignedIn() && (
-            exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
-            get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'TEAM_LEAD'
-        );
+    // Ownership helpers
+    function isOwner(uid) { return isSignedIn() && request.auth.uid == uid; }
+
+    // -------------------------------------------------------------------------
+    // 2. VALIDATION HELPERS
+    // -------------------------------------------------------------------------
+
+    function isValidUserProfile(data) {
+      return data.keys().hasAll(['uid', 'email', 'role']) &&
+             data.uid is string &&
+             data.email is string &&
+             data.role in ['ADMIN', 'MANAGER', 'QA', 'TEAM_LEAD', 'AGENT'];
     }
 
-    function isValidId(id) {
-      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    function isValidAudit(data) {
+      return data.keys().hasAll(['id', 'taskId', 'qvName', 'quality', 'agentId', 'qaId']) &&
+             data.id is string &&
+             data.taskId is string &&
+             data.quality is number &&
+             data.agentId is string &&
+             data.qaId == request.auth.uid;
     }
 
-    function incoming() {
-      return request.resource.data;
+    function isValidWarning(data) {
+      return data.keys().hasAll(['id', 'agentId', 'level', 'status', 'createdAt']) &&
+             data.id is string &&
+             data.agentId is string &&
+             data.status in ['Pending', 'Accepted', 'Acknowledged', 'Disputed'] &&
+             data.createdAt is string; // or timestamp if using serverTime
     }
 
-    function existing() {
-      return resource.data;
+    function isValidPip(data) {
+      return data.keys().hasAll(['id', 'agentId', 'status', 'createdAt']) &&
+             data.id is string &&
+             data.agentId is string &&
+             data.status in ['Initiated', 'Under Review', 'Passed', 'Failed', 'Extended'] &&
+             data.createdAt is string;
     }
 
-    // User Profiles
+    // -------------------------------------------------------------------------
+    // 3. COLLECTION RULES
+    // -------------------------------------------------------------------------
+
     match /users/{userId} {
-      allow get: if isSignedIn();
-      allow list: if isSignedIn();
-      allow create: if isSignedIn() && request.auth.uid == userId && 
-                    incoming().role in ['AGENT', 'QA', 'TEAM_LEAD', 'ADMIN'] &&
-                    incoming().keys().hasAll(['uid', 'email', 'name', 'role']) &&
-                    incoming().keys().size() <= 8;
-      allow update: if isSignedIn() && (
-        isAdmin() || 
-        (request.auth.uid == userId && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'team']))
-      );
-      allow delete: if isSignedIn() && isAdmin();
+      allow read: if isVerified();
+      allow create: if isSignedIn() && isOwner(userId);
+      allow update: if isSignedIn() && (isOwner(userId) || isAdmin() || isManager());
+      allow delete: if isVerified() && isAdmin();
     }
 
-    // Sampling Tasks
-    match /tasks {
-      allow list: if isSignedIn();
-      match /{taskId} {
-        allow read: if isSignedIn();
-        allow create, update, delete: if isAdmin() || isQA();
-      }
+    match /tasks/{taskId} {
+      allow read: if isAgent();
+      allow create, update: if isQA();
+      allow delete: if isAdmin();
     }
 
-    // Production Data
-    match /production {
-      allow list: if isSignedIn();
-      match /{prodId} {
-        allow read: if isSignedIn();
-        allow create, update: if isAdmin();
-      }
-    }
-
-    // Audit Records
     match /audits/{auditId} {
-      allow read: if isSignedIn();
-      
-      allow create: if (isAdmin() || isQA()) && 
-                    isValidId(auditId) &&
-                    incoming().qaId == request.auth.uid &&
-                    incoming().quality is number &&
-                    incoming().quality >= 0 && incoming().quality <= 100;
-                    
-      allow update: if isSignedIn() && (
-        isAdmin() || 
-        (isQA() && incoming().diff(existing()).affectedKeys().hasOnly(['qaComment', 'quality', 'status', 'errorType', 'guideline', 'theme', 'disputeStatus', 'disputeHistory'])) ||
-        (existing().agentId == request.auth.uid && incoming().diff(existing()).affectedKeys().hasOnly(['disputeStatus', 'disputeHistory'])) ||
-        (existing().qvName == request.auth.token.name && incoming().diff(existing()).affectedKeys().hasOnly(['disputeStatus', 'disputeHistory']))
+      allow read: if isVerified() && (isAdmin() || isOwner(existing().agentId) || isOwner(existing().qaId) || isTL());
+      allow create: if isQA() && isValidAudit(incoming());
+      allow update: if isVerified() && (
+        (isQA() && incoming().diff(existing()).affectedKeys().hasOnly(['quality', 'status', 'qaComment', 'errorType', 'guideline', 'theme'])) ||
+        (isAgent() && isOwner(existing().agentId) && incoming().diff(existing()).affectedKeys().hasOnly(['disputeStatus', 'disputeHistory', 'isReopened'])) ||
+        (isQA() && incoming().diff(existing()).affectedKeys().hasOnly(['disputeStatus', 'disputeHistory']))
       );
+      allow delete: if isAdmin();
     }
 
-    // App Config
-    match /config/{configId} {
-      allow read: if isSignedIn();
+    match /dailyTargets/{targetId} {
+      allow read: if isVerified() && (isOwner(existing().agentId) || isTL());
+      allow write: if isTL() || isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    match /dailyPerformanceUploads/{performanceId} {
+      allow read: if isVerified() && (isOwner(existing().agentId) || isTL());
+      allow write: if isTL() || isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    match /dailyPerformance/{performanceId} {
+      allow read: if isVerified() && (isOwner(existing().agentId) || isTL());
+      allow write: if isTL() || isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    match /scorecards/{scorecardId} {
+      allow read: if isVerified();
+      allow write: if isTL() || isManager() || isAdmin();
+      allow delete: if isManager() || isAdmin();
+    }
+
+    match /leaderboards/{leaderboardId} {
+      allow read: if isVerified();
+      allow write: if isTL() || isManager() || isAdmin();
+      allow delete: if isManager() || isAdmin();
+    }
+
+    match /disciplinaryLogs/{logId} {
+      allow read: if isVerified() && (isOwner(existing().agentId) || isTL() || isQA() || isAdmin());
+      allow create: if isTL() && isValidWarning(incoming());
+      allow update: if isVerified() && (isAdmin() ||
+        (isOwner(existing().agentId) && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'acceptedAt', 'history'])) ||
+        (isTL() && incoming().diff(existing()).affectedKeys().hasOnly(['remarks', 'severity', 'level', 'status']))
+      );
+      allow delete: if isAdmin();
+    }
+
+    match /pips/{pipId} {
+      allow read: if isVerified() && (isOwner(existing().agentId) || isTL() || isAdmin());
+      allow create: if isTL() && isValidPip(incoming());
+      allow update: if isVerified() && (isAdmin() ||
+        (isOwner(existing().agentId) && incoming().diff(existing()).affectedKeys().hasOnly(['acknowledgedByAgent', 'acknowledgedAt', 'checkins', 'signedAndAcknowledged', 'signedAndAcknowledgedAt', 'signedAndAcknowledgedBy'])) ||
+        (isTL() && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'endDate', 'checkins', 'finalComments']))
+      );
+      allow delete: if isAdmin();
+    }
+
+    match /config/master {
+      allow read: if isVerified();
+      allow write, delete: if isAdmin();
+    }
+
+    match /config/tmsProcesses {
+      allow read: if isVerified();
+      allow write: if isAdmin() || isManager();
+      allow delete: if isAdmin();
+    }
+
+    match /config/alignments {
+      allow read: if isVerified();
+      allow write, delete: if isAdmin();
+    }
+
+    match /kpi_templates/{id} {
+      allow read: if isVerified();
+      allow write: if isAdmin() || isManager();
+      allow delete: if isAdmin();
+    }
+
+    match /kpi_uploads/{id} {
+      allow read: if isVerified();
+      allow create: if isManager() || isAdmin();
+      allow update: if isManager() || isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    match /kpi_exceptions/{id} {
+      allow read: if isVerified() && isAdmin();
+      allow create: if isVerified();
+      allow delete: if isAdmin();
+    }
+
+    match /importantLinks/{linkId} {
+      allow read: if isVerified();
+      allow create, update: if isQA() || isManager() || isAdmin() || isTL();
+      allow delete: if isAdmin() || isManager();
+    }
+
+    match /agent_kpis/{id} {
+      allow read: if isVerified() && (isOwner(existing().agentId) || isTL());
+      allow write: if isAdmin() || isTL();
+      allow delete: if isAdmin();
+    }
+
+    match /production/{id} {
+      allow read: if isVerified() && (isOwner(existing().agentId) || isTL());
+      allow write: if isAdmin() || isAgent();
+      allow delete: if isAdmin();
+    }
+
+    match /audit_logs/{logId} {
+      allow read: if isVerified() && isAdmin();
+      allow write: if isVerified();
+      allow delete: if isAdmin();
+    }
+    
+    match /uploadAuditLogs/{id} {
+      allow read: if isVerified() && (isAdmin() || isManager());
+      allow write: if isVerified();
+      allow delete: if isAdmin();
+    }
+
+    match /tmsShifts/{shiftId} {
+      allow read: if isVerified() && (isOwner(resource.data.userId) || isTL());
+      allow write: if isVerified() && (isOwner(incoming().userId) || isOwner(existing().userId) || isTL());
+      allow delete: if isAdmin();
+    }
+
+    match /adminAuditLogs/{id} {
+      allow read: if isVerified() && isAdmin();
+      allow create: if isVerified();
+      allow update, delete: if isAdmin();
+    }
+
+    match /admin_roles_config/{id} {
+      allow read: if isVerified();
       allow write: if isAdmin();
     }
 
-    // Warnings Rules
-    match /warnings/{warningId} {
-      allow read: if isSignedIn();
-      allow create, update: if isAdmin() || isTeamLead();
+    match /archived_records/{id} {
+      allow read: if isVerified() && (isAdmin() || isManager());
+      allow write, delete: if isAdmin();
     }
 
-    // TMS Shifts Rules
-    match /tmsShifts/{shiftId} {
-      allow read: if isSignedIn();
-      allow create: if isSignedIn() && (request.auth.uid == incoming().userId || isAdmin());
-      allow update: if isSignedIn() && (request.auth.uid == existing().userId || isAdmin());
+    match /admin_backups/{id} {
+      allow read, write: if isAdmin();
     }
   }
 }

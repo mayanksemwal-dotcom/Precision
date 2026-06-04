@@ -28,22 +28,22 @@ import {
 } from 'recharts';
 import { toast } from 'sonner';
 import { motion, AnimatePresence } from 'motion/react';
-import { UserRole, AuditRecord, DisputeStatus, DisputeHistory, UserProfile } from '../types';
+import { UserRole, AuditRecord, DisputeStatus, DisputeHistory, UserProfile, WarningTicket } from '../types';
 import DisputeWorkflow from '../components/DisputeWorkflow';
 import { analyzePrecision } from '../services/geminiService';
-import { Sparkles, BrainCircuit, Lightbulb } from 'lucide-react';
+import { Sparkles, BrainCircuit, Lightbulb, ShieldAlert } from 'lucide-react';
 import { db, handleFirestoreError, OperationType } from '../lib/firebase';
 import { doc, updateDoc } from 'firebase/firestore';
-import { submitToGoogleSheet } from '../lib/sheets';
 
 interface AgentViewProps {
   activeTab: string;
   audits: AuditRecord[];
   user: UserProfile;
+  warnings?: WarningTicket[];
   onRefresh?: () => void;
 }
 
-export default function AgentView({ activeTab, audits, user, onRefresh }: AgentViewProps) {
+export default function AgentView({ activeTab, audits, user, warnings = [], onRefresh }: AgentViewProps) {
   const [activeFeedbackId, setActiveFeedbackId] = useState<string | null>(null);
   const [analyzing, setAnalyzing] = useState(false);
   const [aiTips, setAiTips] = useState<string[]>([]);
@@ -56,7 +56,6 @@ export default function AgentView({ activeTab, audits, user, onRefresh }: AgentV
         disputeHistory: updated.disputeHistory,
         isReopened: updated.isReopened || false
       });
-      submitToGoogleSheet('dispute_submission', updated.id, user.email, user.name, updated);
       toast.success('Dispute updated successfully');
       if (onRefresh) {
         onRefresh();
@@ -115,8 +114,27 @@ export default function AgentView({ activeTab, audits, user, onRefresh }: AgentV
   );
 
   if (activeTab === 'dashboard') {
+    const pendingWarnings = warnings.filter(w => w.agentId === user.uid && w.status === 'Pending');
+
     return (
       <div className="space-y-6">
+        {pendingWarnings.length > 0 && (
+          <div className="bg-red-50 border border-red-200 text-red-900 px-5 py-4 rounded-xl flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 shadow-sm animate-pulse">
+            <div className="flex items-center gap-3">
+              <ShieldAlert className="text-red-650 shrink-0" size={24} />
+              <div>
+                <p className="font-extrabold text-sm">Action Required: Pending Disciplinary Feedback Ticket</p>
+                <p className="text-xs text-red-700 font-semibold mt-0.5">
+                  You have {pendingWarnings.length} feedback {pendingWarnings.length === 1 ? 'ticket' : 'tickets'} awaiting review and acknowledgment.
+                </p>
+              </div>
+            </div>
+            <div className="text-xs font-bold shrink-0 text-red-700 bg-red-100 border border-red-200 rounded px-2.5 py-1">
+              Please visit the Warnings tab to accept or acknowledge
+            </div>
+          </div>
+        )}
+
         <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
           <Card className="bg-gradient-to-br from-blue-600 to-blue-700 text-white border-none shadow-lg">
             <CardHeader className="pb-2">
@@ -142,15 +160,24 @@ export default function AgentView({ activeTab, audits, user, onRefresh }: AgentV
             </CardContent>
           </Card>
 
-          <Card className="shadow-sm border-l-4 border-l-amber-500">
+          <Card className={`shadow-sm border-l-4 ${warnings.filter(w => w.agentId === user.uid).length > 0 ? 'border-l-red-500 bg-red-50/10' : 'border-l-emerald-500'}`}>
              <CardHeader className="pb-2">
-              <CardDescription className="text-xs font-bold uppercase text-slate-500">Recent Warnings</CardDescription>
-              <CardTitle className="text-4xl font-black text-slate-900">0</CardTitle>
+              <CardDescription className="text-xs font-bold uppercase text-slate-500">Active Warnings</CardDescription>
+              <CardTitle className="text-4xl font-black text-slate-900">
+                {warnings.filter(w => w.agentId === user.uid).length}
+              </CardTitle>
             </CardHeader>
             <CardContent>
-              <div className="text-sm font-medium text-green-600">
-                Excellent disciplinary standing
-              </div>
+              {warnings.filter(w => w.agentId === user.uid).length > 0 ? (
+                <div className="text-xs font-semibold text-red-650 flex items-center gap-1">
+                  <ShieldAlert size={14} className="animate-bounce" />
+                  {warnings.filter(w => w.agentId === user.uid && w.status === 'Pending').length} pending acknowledgment!
+                </div>
+              ) : (
+                <div className="text-xs font-semibold text-emerald-600">
+                  Excellent standing (0 active warnings)
+                </div>
+              )}
             </CardContent>
           </Card>
         </div>

@@ -9,7 +9,8 @@ import {
   XCircle,
   AlertCircle,
   TrendingUp,
-  Download
+  Download,
+  ShieldAlert
 } from 'lucide-react';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '../components/ui/card';
 import { Button } from '../components/ui/button';
@@ -28,7 +29,7 @@ import {
 } from 'recharts';
 import { toast } from 'sonner';
 import * as XLSX from 'xlsx';
-import { SamplingTask, AuditRecord, UserRole, UserProfile, QAAlignment, ProductionRecord, DisputeStatus } from '../types';
+import { SamplingTask, AuditRecord, UserRole, UserProfile, QAAlignment, ProductionRecord, DisputeStatus, WarningTicket } from '../types';
 import { db, handleFirestoreError, OperationType } from '../lib/firebase';
 import { collection, getDocs, query, where } from 'firebase/firestore';
 
@@ -41,9 +42,20 @@ interface TeamLeadViewProps {
   productions?: ProductionRecord[];
   goToTab?: (tab: string) => void;
   allUsers?: UserProfile[];
+  warnings?: WarningTicket[];
 }
 
-export default function TeamLeadView({ activeTab, tasks = [], auditLogs = [], user, alignments = [], productions = [], goToTab, allUsers = [] }: TeamLeadViewProps) {
+export default function TeamLeadView({ 
+  activeTab, 
+  tasks = [], 
+  auditLogs = [], 
+  user, 
+  alignments = [], 
+  productions = [], 
+  goToTab, 
+  allUsers = [],
+  warnings = []
+}: TeamLeadViewProps) {
   const [searchTerm, setSearchTerm] = useState('');
   const [currentPage, setCurrentPage] = useState(1);
   const itemsPerPage = 10;
@@ -53,14 +65,37 @@ export default function TeamLeadView({ activeTab, tasks = [], auditLogs = [], us
     setCurrentPage(1);
   };
 
-  // 1. Filter audit records to only those belonging to the logged in Team Lead's team
+  // 1. Filter audit records to only those belonging to the logged in Team Lead or Manager's team
   const myTeamAudits = React.useMemo(() => {
     if (user?.role === UserRole.ADMIN) {
       return auditLogs;
     }
-    if (user?.role === UserRole.TEAM_LEAD) {
-      const mappedAgentIds = allUsers.filter(u => u.teamLeadId === user.uid).map(u => u.uid);
-      const mappedAgentNames = allUsers.filter(u => u.teamLeadId === user.uid).map(u => u.name.toLowerCase().trim());
+    if (user?.role === UserRole.TEAM_LEAD || user?.role === UserRole.MANAGER) {
+      const currentUserEmail = (user.email || '').toLowerCase().trim();
+      const isTL = user.role === UserRole.TEAM_LEAD;
+      const isMgr = user.role === UserRole.MANAGER;
+
+      const getMappedAgentsAndQAsForTL = (tlUid: string) => {
+        return allUsers.filter(u => u.teamLeadId === tlUid);
+      };
+
+      let mappedUsers: any[] = [];
+      if (isTL) {
+         mappedUsers = getMappedAgentsAndQAsForTL(user.uid);
+      } else if (isMgr) {
+         const mappedTLs = allUsers.filter(u => {
+           const isMappedRole = [UserRole.TEAM_LEAD, UserRole.OPS_TL, UserRole.QTL, UserRole.STL, UserRole.TRAINER_TL].includes(u.role as UserRole);
+           return isMappedRole && u.mappedManagerId === user.uid;
+         });
+         mappedUsers = [...mappedTLs];
+         mappedTLs.forEach(tl => {
+           mappedUsers.push(...getMappedAgentsAndQAsForTL(tl.uid));
+         });
+      }
+      
+      const mappedAgentIds = mappedUsers.map(u => u.uid);
+      const mappedAgentNames = mappedUsers.map(u => (u.name || '').toLowerCase().trim());
+      
       return auditLogs.filter(log => 
         (log.agentId && mappedAgentIds.includes(log.agentId)) || 
         (log.qvName && mappedAgentNames.includes(log.qvName.toLowerCase().trim()))
@@ -90,6 +125,37 @@ export default function TeamLeadView({ activeTab, tasks = [], auditLogs = [], us
       a.disputeStatus !== DisputeStatus.QA_REVIEWED
     ).length;
   }, [myTeamAudits]);
+
+  const teamWarnings = React.useMemo(() => {
+    const currentUserEmail = (user?.email || '').toLowerCase().trim();
+    const isTL = user?.role === UserRole.TEAM_LEAD;
+    const isMgr = user?.role === UserRole.MANAGER;
+
+    const getMappedAgentsAndQAsForTL = (tlUid: string) => {
+      return allUsers.filter(u => u.teamLeadId === tlUid);
+    };
+
+    let mappedUsers: any[] = [];
+    if (isTL && user) {
+       mappedUsers = getMappedAgentsAndQAsForTL(user.uid);
+    } else if (isMgr && user) {
+       const mappedTLs = allUsers.filter(u => {
+         const isMappedRole = [UserRole.TEAM_LEAD, UserRole.OPS_TL, UserRole.QTL, UserRole.STL, UserRole.TRAINER_TL].includes(u.role as UserRole);
+         return isMappedRole && u.mappedManagerId === user.uid;
+       });
+       mappedUsers = [...mappedTLs];
+       mappedTLs.forEach(tl => {
+         mappedUsers.push(...getMappedAgentsAndQAsForTL(tl.uid));
+       });
+    }
+
+    const myAgents = mappedUsers.map(u => u.uid);
+    return warnings.filter(w => myAgents.includes(w.agentId));
+  }, [warnings, allUsers, user]);
+
+  const pendingWarningsCount = React.useMemo(() => {
+    return teamWarnings.filter(w => w.status === 'Pending').length;
+  }, [teamWarnings]);
 
   // Calculate Reports Data
   const reportsData = React.useMemo(() => {
@@ -127,18 +193,38 @@ export default function TeamLeadView({ activeTab, tasks = [], auditLogs = [], us
       data.totalRowsAudited += audit.rows;
     });
 
-    // 3. Filter for QA role alignment and Team Lead mapped agents
+    // 3. Filter for QA role alignment and Team Lead/Manager mapped agents
     let dataList = Object.values(agentMap);
     if (user?.role === UserRole.QA) {
       const myAlignedAgents = alignments
-        .filter(a => a.qaEmail.toLowerCase() === user.email.toLowerCase())
+        .filter(a => (a.qaEmail || '').toLowerCase() === (user.email || '').toLowerCase())
         .map(a => a.agentName);
       dataList = dataList.filter(a => myAlignedAgents.includes(a.name));
-    } else if (user?.role === UserRole.TEAM_LEAD) {
-      const myAgents = allUsers
-        .filter(u => u.teamLeadId === user.uid)
-        .map(u => u.name.toLowerCase().trim());
-      dataList = dataList.filter(a => myAgents.includes(a.name.toLowerCase().trim()));
+    } else if (user?.role === UserRole.TEAM_LEAD || user?.role === UserRole.MANAGER) {
+      const currentUserEmail = (user.email || '').toLowerCase().trim();
+      const isTL = user.role === UserRole.TEAM_LEAD;
+      const isMgr = user.role === UserRole.MANAGER;
+
+      const getMappedAgentsAndQAsForTL = (tlUid: string) => {
+        return allUsers.filter(u => u.teamLeadId === tlUid);
+      };
+
+      let mappedUsers: any[] = [];
+      if (isTL) {
+         mappedUsers = getMappedAgentsAndQAsForTL(user.uid);
+      } else if (isMgr) {
+         const mappedTLs = allUsers.filter(u => {
+           const isMappedRole = [UserRole.TEAM_LEAD, UserRole.OPS_TL, UserRole.QTL, UserRole.STL, UserRole.TRAINER_TL].includes(u.role as UserRole);
+           return isMappedRole && u.mappedManagerId === user.uid;
+         });
+         mappedUsers = [...mappedTLs];
+         mappedTLs.forEach(tl => {
+           mappedUsers.push(...getMappedAgentsAndQAsForTL(tl.uid));
+         });
+      }
+
+      const myAgents = mappedUsers.map(u => (u.name || '').toLowerCase().trim());
+      dataList = dataList.filter(a => myAgents.includes((a.name || '').toLowerCase().trim()));
     }
 
     return dataList.map(agent => {
@@ -151,7 +237,7 @@ export default function TeamLeadView({ activeTab, tasks = [], auditLogs = [], us
         coverage,
         score
       };
-    }).filter(a => a.name.toLowerCase().includes(searchTerm.toLowerCase()))
+    }).filter(a => (a.name || '').toLowerCase().includes((searchTerm || '').toLowerCase()))
     .sort((a, b) => b.coverage - a.coverage);
   }, [tasks, auditLogs, searchTerm, user, alignments, productions, allUsers]);
 
@@ -186,7 +272,7 @@ export default function TeamLeadView({ activeTab, tasks = [], auditLogs = [], us
     // ... existing dashboard code ...
     return (
       <div className="space-y-6">
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+        <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
           <Card className="shadow-sm">
             <CardHeader className="pb-2">
               <CardDescription className="text-xs font-bold uppercase">Team MTD Quality</CardDescription>
@@ -225,7 +311,28 @@ export default function TeamLeadView({ activeTab, tasks = [], auditLogs = [], us
               <div className="text-xs text-slate-500 font-medium">Awaiting agent response</div>
             </CardContent>
           </Card>
+          <Card className={`shadow-sm border-l-4 ${pendingWarningsCount > 0 ? 'border-l-red-500 bg-red-50/10' : 'border-l-indigo-500 bg-white'}`}>
+            <CardHeader className="pb-2">
+              <CardDescription className="text-xs font-bold uppercase">Team Warnings</CardDescription>
+              <CardTitle className="text-2xl font-black">{teamWarnings.length}</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className={`text-xs font-medium ${pendingWarningsCount > 0 ? 'text-red-650' : 'text-indigo-600'}`}>
+                {pendingWarningsCount} Pending Action
+              </div>
+            </CardContent>
+          </Card>
         </div>
+
+        {pendingWarningsCount > 0 && (
+          <div className="bg-red-50 border-2 border-red-200 text-red-950 p-4 rounded-xl flex items-start gap-3 shadow-sm animate-in fade-in slide-in-from-top-4 duration-300">
+            <ShieldAlert className="text-red-650 shrink-0 mt-0.5" size={20} />
+            <div className="text-xs">
+              <span className="font-extrabold text-sm block mb-1">⚠️ Urgent: Pending Disciplinary Actions on Team</span>
+              There are currently <strong className="underline text-red-700">{pendingWarningsCount} pending disciplinary warnings</strong> awaiting acknowledgment from agents in your team. Please coordinate with them to ensure warnings are acknowledged or reviewed immediately.
+            </div>
+          </div>
+        )}
 
         <Card className="shadow-sm overflow-hidden">
           <CardHeader className="border-b bg-slate-50/50">

@@ -2,7 +2,6 @@ import React, { useState } from 'react';
 import { ShieldAlert, AlertTriangle, Info, History, ChevronDown, Check, Search } from 'lucide-react';
 import { Button } from './ui/button';
 import { Label } from './ui/label';
-import { RadioGroup, RadioGroupItem } from './ui/radio-group';
 import { Separator } from './ui/separator';
 import { toast } from 'sonner';
 import { auth, db, handleFirestoreError, OperationType } from '../lib/firebase';
@@ -17,11 +16,12 @@ interface WarningManagerProps {
 }
 
 export default function WarningManager({ agentName: initialName, agentId: initialId, onClose, allUsers = [] }: WarningManagerProps) {
-  const [level, setLevel] = useState<'1st' | '2nd' | 'Final'>('1st');
+  const [level, setLevel] = useState<'1st' | '2nd' | 'Final' | string>('1st');
   const [remarks, setRemarks] = useState('');
   const [selectedAgentId, setSelectedAgentId] = useState(initialId || '');
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const [dropdownSearch, setDropdownSearch] = useState('');
+  const [severity, setSeverity] = useState<'Mild' | 'Moderate' | 'Severe' | 'Critical'>('Mild');
 
   const selectedAgent = allUsers.find(u => u.uid === selectedAgentId) || (initialId ? { name: initialName, uid: initialId } : null);
 
@@ -36,22 +36,54 @@ export default function WarningManager({ agentName: initialName, agentId: initia
     }
 
     try {
+      const fullAgent = allUsers.find(u => u.uid === selectedAgentId);
+      const email = fullAgent?.email || '';
+      const name = fullAgent?.name || initialName || selectedAgentId;
+      const employeeId = `EMP-2026-${selectedAgentId.substring(0, 4).toUpperCase()}`;
+
       const ticket: WarningTicket = {
         id: `wt-${Date.now()}`,
         agentId: selectedAgentId,
+        agentName: name,
+        agentEmail: email,
+        employeeId: employeeId,
         qaId: auth.currentUser?.uid || 'unknown',
         level,
         remarks,
-        createdAt: new Date().toISOString()
+        severity,
+        status: 'Pending',
+        createdAt: new Date().toISOString(),
+        history: [
+          {
+            action: `Warning raised by QA/Supervisor`,
+            timestamp: new Date().toISOString()
+          }
+        ]
       };
       
-      const docRef = doc(db, 'warnings', ticket.id);
+      console.log("Submitting ticket:", ticket);
+      console.log("Current user:", auth.currentUser?.uid, auth.currentUser?.email);
+      
+      const docRef = doc(db, 'disciplinaryLogs', ticket.id);
       await setDoc(docRef, ticket);
       
-      toast.success(`${level} Warning issued to ${selectedAgent?.name || selectedAgentId}`);
+      toast.success(`${level} Warning issued to ${name}`);
       onClose();
     } catch (e) {
-      handleFirestoreError(e, OperationType.WRITE, 'warnings');
+      console.error("Warning ticket submission failed:", e);
+      // Detailed error logging
+      if (e instanceof Error) {
+        console.error("Error name:", e.name);
+        console.error("Error message:", e.message);
+      }
+      
+      const errMsg = e instanceof Error ? e.message : String(e);
+      toast.error(`Failed to issue warning: ${errMsg}`);
+      try {
+        handleFirestoreError(e, OperationType.WRITE, 'disciplinaryLogs');
+      } catch (err) {
+        // Prevent unhandled promise rejection/crashes in the UI click context
+      }
     }
   };
 
@@ -153,20 +185,85 @@ export default function WarningManager({ agentName: initialName, agentId: initia
 
         <div className="space-y-3">
           <Label className="text-xs uppercase font-bold text-slate-500 tracking-wider">Select Warning Level</Label>
-          <RadioGroup value={level} onValueChange={(v: any) => setLevel(v)} className="grid grid-cols-3 gap-4">
-            <div className="flex items-center space-x-2 bg-slate-50 p-2.5 rounded-lg border border-slate-150 hover:bg-slate-100 transition-colors cursor-pointer">
-              <RadioGroupItem value="1st" id="r1" className="cursor-pointer" />
-              <Label htmlFor="r1" className="cursor-pointer font-bold select-none w-full text-xs">1st Warning</Label>
-            </div>
-            <div className="flex items-center space-x-2 bg-slate-50 p-2.5 rounded-lg border border-slate-150 hover:bg-slate-100 transition-colors cursor-pointer">
-              <RadioGroupItem value="2nd" id="r2" className="cursor-pointer" />
-              <Label htmlFor="r2" className="cursor-pointer font-bold select-none w-full text-xs">2nd Warning</Label>
-            </div>
-            <div className="flex items-center space-x-2 bg-slate-50 p-2.5 rounded-lg border border-slate-150 hover:bg-slate-100 transition-colors cursor-pointer">
-              <RadioGroupItem value="Final" id="r3" className="cursor-pointer" />
-              <Label htmlFor="r3" className="cursor-pointer font-bold select-none w-full text-xs">Final Notice</Label>
-            </div>
-          </RadioGroup>
+          <div className="grid grid-cols-3 gap-4">
+            <button
+              type="button"
+              onClick={() => setLevel('1st')}
+              className={`flex items-center space-x-2 p-2.5 rounded-lg border transition-all text-left cursor-pointer ${
+                level === '1st'
+                  ? 'bg-red-50 border-red-500 text-red-950 font-bold ring-2 ring-red-200'
+                  : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'
+              }`}
+            >
+              <div className={`size-4 rounded-full border flex items-center justify-center shrink-0 ${
+                level === '1st' ? 'border-red-600 bg-red-600' : 'border-slate-300'
+              }`}>
+                {level === '1st' && <div className="size-1.5 rounded-full bg-white" />}
+              </div>
+              <span className="font-bold select-none w-full text-xs">1st Warning</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setLevel('2nd')}
+              className={`flex items-center space-x-2 p-2.5 rounded-lg border transition-all text-left cursor-pointer ${
+                level === '2nd'
+                  ? 'bg-red-50 border-red-500 text-red-950 font-bold ring-2 ring-red-200'
+                  : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'
+              }`}
+            >
+              <div className={`size-4 rounded-full border flex items-center justify-center shrink-0 ${
+                level === '2nd' ? 'border-red-600 bg-red-600' : 'border-slate-300'
+              }`}>
+                {level === '2nd' && <div className="size-1.5 rounded-full bg-white" />}
+              </div>
+              <span className="font-bold select-none w-full text-xs">2nd Warning</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setLevel('Final')}
+              className={`flex items-center space-x-2 p-2.5 rounded-lg border transition-all text-left cursor-pointer ${
+                level === 'Final'
+                  ? 'bg-red-50 border-red-500 text-red-950 font-bold ring-2 ring-red-200'
+                  : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'
+              }`}
+            >
+              <div className={`size-4 rounded-full border flex items-center justify-center shrink-0 ${
+                level === 'Final' ? 'border-red-600 bg-red-600' : 'border-slate-300'
+              }`}>
+                {level === 'Final' && <div className="size-1.5 rounded-full bg-white" />}
+              </div>
+              <span className="font-bold select-none w-full text-xs">Final Notice</span>
+            </button>
+          </div>
+        </div>
+
+        <div className="space-y-3">
+          <Label className="text-xs uppercase font-bold text-slate-500 tracking-wider">Select Severity Level</Label>
+          <div className="grid grid-cols-4 gap-2">
+            {(['Mild', 'Moderate', 'Severe', 'Critical'] as const).map((sev) => {
+              const active = severity === sev;
+              const activeColors = 
+                sev === 'Mild' ? 'bg-blue-50 border-blue-500 text-blue-950 ring-2 ring-blue-100' :
+                sev === 'Moderate' ? 'bg-amber-50 border-amber-500 text-amber-950 ring-2 ring-amber-100' :
+                sev === 'Severe' ? 'bg-orange-50 border-orange-500 text-orange-950 ring-2 ring-orange-100' :
+                'bg-red-50 border-red-500 text-red-950 ring-2 ring-red-100';
+
+              return (
+                <button
+                  key={sev}
+                  type="button"
+                  onClick={() => setSeverity(sev)}
+                  className={`p-2 rounded-lg border text-center font-bold text-xs transition-all cursor-pointer ${
+                    active ? activeColors : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'
+                  }`}
+                >
+                  {sev}
+                </button>
+              );
+            })}
+          </div>
         </div>
 
         <div className="space-y-2">

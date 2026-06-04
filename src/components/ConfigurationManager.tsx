@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Plus, X, Save, ShieldCheck } from 'lucide-react';
+import { Plus, X, Save, ShieldCheck, TrendingUp, CloudLightning, Database } from 'lucide-react';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle, CardFooter } from './ui/card';
 import { Button } from './ui/button';
 import { Input } from './ui/input';
@@ -11,7 +11,6 @@ import { AppConfig } from '../types';
 import { MOCK_CONFIG } from '../lib/sample-data';
 import { doc, getDoc, setDoc } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from '../lib/firebase';
-
 export default function ConfigurationManager() {
   const [config, setConfig] = useState<AppConfig>({
     errorTypes: [...MOCK_CONFIG.errorTypes],
@@ -19,7 +18,13 @@ export default function ConfigurationManager() {
     themes: [...MOCK_CONFIG.themes],
     skipLimit: MOCK_CONFIG.skipLimit,
     minSamplingCount: 1,
-    systemOverrideRights: true
+    systemOverrideRights: true,
+    kpiTargets: {
+      utilization: 90,
+      attendance: 95,
+      qaScore: 98,
+      apt: 100
+    }
   });
   const [isLoading, setIsLoading] = useState(true);
 
@@ -41,14 +46,38 @@ export default function ConfigurationManager() {
   }, []);
 
   const addItem = (type: 'errorTypes' | 'guidelines' | 'themes') => {
-    const value = prompt(`Enter new ${type.replace('Types', '')}`);
-    if (value) {
-      if (config[type].includes(value)) {
-         toast.error(`${value} already exists`);
-         return;
+    const label = type === 'errorTypes' ? 'Error Type(s)' : type === 'guidelines' ? 'Guideline(s)' : 'Theme(s)';
+    const input = prompt(`Enter new ${label} (separate multiple values with commas for bulk upload):`);
+    if (input) {
+      const valuesToAdd = input
+        .split(',')
+        .map(v => v.trim())
+        .filter(v => v !== '');
+
+      if (valuesToAdd.length === 0) {
+        return;
       }
-      setConfig({ ...config, [type]: [...config[type], value] });
-      toast.success(`Added ${value}`);
+
+      const existingSet = new Set(config[type]);
+      const added: string[] = [];
+      const skipped: string[] = [];
+
+      valuesToAdd.forEach(val => {
+        if (existingSet.has(val)) {
+          skipped.push(val);
+        } else {
+          existingSet.add(val);
+          added.push(val);
+        }
+      });
+
+      if (added.length > 0) {
+        setConfig({ ...config, [type]: Array.from(existingSet) });
+        toast.success(`Successfully added: ${added.join(', ')}`);
+      }
+      if (skipped.length > 0) {
+        toast.error(`Already exists: ${skipped.join(', ')}`);
+      }
     }
   };
 
@@ -148,58 +177,9 @@ export default function ConfigurationManager() {
             </Button>
           </CardContent>
         </Card>
+
       </div>
 
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <ShieldCheck className="text-blue-600" size={20} />
-            Advanced Console Settings
-          </CardTitle>
-          <CardDescription>Configure core system behavior and sampling logic</CardDescription>
-        </CardHeader>
-        <CardContent className="grid grid-cols-1 md:grid-cols-2 gap-8">
-          <div className="space-y-6">
-            <div className="space-y-2">
-              <Label>QA Skip Limit</Label>
-              <Input 
-                type="number" 
-                value={config.skipLimit} 
-                onChange={(e) => setConfig({...config, skipLimit: parseInt(e.target.value) || 0})}
-              />
-              <p className="text-xs text-slate-500">Maximum number of cases a QA can skip before being forced to audit.</p>
-            </div>
-            
-            <div className="space-y-2">
-              <Label>Minimum Sampling Count</Label>
-              <Input 
-                type="number" 
-                value={config.minSamplingCount} 
-                onChange={(e) => setConfig({...config, minSamplingCount: parseInt(e.target.value) || 0})}
-              />
-              <p className="text-xs text-slate-500">Ensures at least this many cases are sampled per QV regardless of coverage %.</p>
-            </div>
-          </div>
-
-          <div className="space-y-6">
-            <div className="flex items-center justify-between p-4 bg-slate-50 rounded-lg border">
-              <div className="space-y-0.5">
-                <Label>System-Wide Override Rights</Label>
-                <p className="text-xs text-slate-500">Allow Admins to modify scores and update logs post-submission.</p>
-              </div>
-              <Switch 
-                checked={config.systemOverrideRights} 
-                onCheckedChange={(v) => setConfig({...config, systemOverrideRights: v})} 
-              />
-            </div>
-
-            <div className="flex flex-col gap-2">
-              <Button variant="outline" className="justify-start">Configure Coverage Rules</Button>
-              <Button variant="outline" className="justify-start">Manage QA Assignments</Button>
-            </div>
-          </div>
-        </CardContent>
-      </Card>
     </div>
   );
 }

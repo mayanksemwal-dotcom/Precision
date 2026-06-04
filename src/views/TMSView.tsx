@@ -16,7 +16,9 @@ import {
   Activity,
   Award
 } from 'lucide-react';
+import ProcessSelector from '../components/ProcessSelector';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle, CardFooter } from '../components/ui/card';
+
 import { Button } from '../components/ui/button';
 import { Badge } from '../components/ui/badge';
 import { Input } from '../components/ui/input';
@@ -35,10 +37,14 @@ import {
   addDoc, 
   updateDoc, 
   deleteDoc,
-  serverTimestamp 
+  serverTimestamp,
+  getDocs,
+  limit
 } from 'firebase/firestore';
 import { UserProfile, UserRole } from '../types';
 import { motion, AnimatePresence } from 'motion/react';
+import * as XLSX from 'xlsx';
+// No Sheets imports
 
 interface TMSViewProps {
   user: UserProfile;
@@ -76,7 +82,30 @@ const BREAK_OPTIONS = [
 export default function TMSView({ user, allUsers }: TMSViewProps) {
   // Configured processes in the app
   const [processes, setProcesses] = useState<string[]>([]);
+  const [recentProcesses, setRecentProcesses] = useState<string[]>(
+    JSON.parse(localStorage.getItem('tms_recent_processes') || '[]')
+  );
+  const [favoriteProcesses, setFavoriteProcesses] = useState<string[]>(
+    JSON.parse(localStorage.getItem('tms_favorite_processes') || '[]')
+  );
+  
   const [newProcessName, setNewProcessName] = useState('');
+  const [tmsSearch, setTmsSearch] = useState('');
+  const toggleFavorite = (process: string) => {
+    const newFavorites = favoriteProcesses.includes(process)
+      ? favoriteProcesses.filter(p => p !== process)
+      : [...favoriteProcesses, process];
+    setFavoriteProcesses(newFavorites);
+    localStorage.setItem('tms_favorite_processes', JSON.stringify(newFavorites));
+  };
+  
+  const updateRecent = (process: string) => {
+    const newRecent = [process, ...recentProcesses.filter(p => p !== process)].slice(0, 5);
+    setRecentProcesses(newRecent);
+    localStorage.setItem('tms_recent_processes', JSON.stringify(newRecent));
+  };
+
+  const [processing, setProcessing] = useState(false);
   
   // Real-time user's shift state
   const [currentShift, setCurrentShift] = useState<TMSShift | null>(null);
@@ -91,6 +120,22 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
   // Custom modal confirmations instead of window.confirm inside sandboxed iframe
   const [showClockOutConfirm, setShowClockOutConfirm] = useState(false);
   const [confirmDeleteProcessName, setConfirmDeleteProcessName] = useState<string | null>(null);
+
+  // Date Range and Format selection states for reports
+  const [showExportModal, setShowExportModal] = useState(false);
+  const [exportType, setExportType] = useState<'team' | 'organization' | null>(null);
+  const [selectedRangePreset, setSelectedRangePreset] = useState<string>('last30');
+  const [startDateStr, setStartDateStr] = useState<string>('');
+  const [endDateStr, setEndDateStr] = useState<string>('');
+  const [exportFormat, setExportFormat] = useState<'csv' | 'excel'>('excel');
+  const [reportType, setReportType] = useState<'summary' | 'chronological' | 'both'>('both');
+
+  // Fallback to summary if CSV format is selected since CSV is single sheet
+  useEffect(() => {
+    if (exportFormat === 'csv' && reportType === 'both') {
+      setReportType('summary');
+    }
+  }, [exportFormat, reportType]);
   
   // System timer ticker
   const [currentTime, setCurrentTime] = useState(new Date());
@@ -106,19 +151,32 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
 
   // Fetch Processes Config in Real-time
   useEffect(() => {
+    if (!user) return;
     const docRef = doc(db, 'config', 'tmsProcesses');
     const unsubscribe = onSnapshot(docRef, (snap) => {
       if (snap.exists()) {
         setProcesses(snap.data().list || []);
       } else {
-        // Initialize default processes for the team if not exist
-        setDoc(docRef, { list: DEFAULT_PROCESSES })
-          .then(() => setProcesses(DEFAULT_PROCESSES))
-          .catch(e => handleFirestoreError(e, OperationType.WRITE, 'config/tmsProcesses'));
+        // Initialize default processes for the team if not exist and user has privileges
+        const isUserPrivileged = user.role === UserRole.ADMIN || user.role === UserRole.MANAGER;
+        if (isUserPrivileged) {
+          setDoc(docRef, { list: DEFAULT_PROCESSES })
+            .then(() => setProcesses(DEFAULT_PROCESSES))
+            .catch(e => {
+              console.warn('Failed to auto-seed tmsProcesses, using local defaults', e);
+              setProcesses(DEFAULT_PROCESSES);
+            });
+        } else {
+          setProcesses(DEFAULT_PROCESSES);
+        }
       }
+    }, (err) => {
+      console.warn('Failed to subscribe to tmsProcesses, using local defaults', err);
+      // Fallback only if we don't have any processes loaded yet
+      setProcesses(prev => prev.length > 0 ? prev : DEFAULT_PROCESSES);
     });
     return () => unsubscribe();
-  }, []);
+  }, [user]);
 
   // Fetch User's Personal Shifts & Current Active Shift
   useEffect(() => {
@@ -157,19 +215,70 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
     return () => unsubscribe();
   }, [user]);
 
-  // Fetch ALL Shifts for Admins or Team Leads to view workforce status
-  useEffect(() => {
-    if (user.role !== UserRole.ADMIN && user.role !== UserRole.TEAM_LEAD) return;
-    const qAllShifts = query(collection(db, 'tmsShifts'));
-    const unsubscribe = onSnapshot(qAllShifts, (snapshot) => {
-      const shifts = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as TMSShift));
-      shifts.sort((a, b) => new Date(b.clockInTime).getTime() - new Date(a.clockInTime).getTime());
+  const getDateRange = (preset: string, customStart?: string, customEnd?: string) => {
+    const now = new Date();
+    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0);
+    const endOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
+
+    let start = new Date(startOfToday);
+    let end = new Date(endOfToday);
+
+    switch (preset) {
+      case 'today':
+        break;
+      case 'yesterday':
+        start.setDate(start.getDate() - 1);
+        end.setDate(end.getDate() - 1);
+        break;
+      case 'last7':
+        start.setDate(start.getDate() - 6);
+        break;
+      case 'last30':
+        start.setDate(start.getDate() - 29);
+        break;
+      case 'currentMonth':
+        start = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0);
+        end = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59, 999);
+        break;
+      case 'previousMonth':
+        start = new Date(now.getFullYear(), now.getMonth() - 1, 1, 0, 0, 0);
+        end = new Date(now.getFullYear(), now.getMonth(), 0, 23, 59, 59, 999);
+        break;
+      case 'custom':
+        if (customStart) start = new Date(customStart + 'T00:00:00');
+        if (customEnd) end = new Date(customEnd + 'T23:59:59');
+        break;
+    }
+    return { start, end };
+  };
+
+  // Fetch ALL Shifts for Admins, Managers or Team Leads to view workforce status
+  const fetchAllShifts = async () => {
+    const isManagerRole = user.role === UserRole.MANAGER;
+    const isTLRole = [UserRole.TEAM_LEAD, UserRole.OPS_TL, UserRole.QTL, UserRole.STL, UserRole.TRAINER_TL].includes(user.role as UserRole);
+
+    if (user.role !== UserRole.ADMIN && !isManagerRole && !isTLRole) return;
+    try {
+      const qAllShifts = query(collection(db, 'tmsShifts'), orderBy('clockInTime', 'desc'), limit(500));
+      const snap = await getDocs(qAllShifts);
+      const shifts = snap.docs.map(doc => ({ id: doc.id, ...doc.data() } as TMSShift));
       setAllShifts(shifts);
-    }, (error) => {
+    } catch (error) {
       handleFirestoreError(error, OperationType.LIST, 'tmsShifts');
-    });
-    return () => unsubscribe();
+    }
+  };
+
+  useEffect(() => {
+    fetchAllShifts();
   }, [user]);
+
+  const saveShiftState = async (updatedShift: TMSShift) => {
+    await setDoc(doc(db, 'tmsShifts', updatedShift.id), updatedShift);
+  };
+
+  const saveProcessesList = async (updatedList: string[]) => {
+    await setDoc(doc(db, 'config', 'tmsProcesses'), { list: updatedList }, { merge: true });
+  };
 
   // Handle ticking timers for currently active shift
   useEffect(() => {
@@ -273,7 +382,7 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
         ]
       };
 
-      await setDoc(doc(db, 'tmsShifts', newShift.id), newShift);
+      await saveShiftState(newShift);
       setSelectedProcessInput(targetProcess);
       toast.success(`Clocked In successfully! Process: ${targetProcess}`);
     } catch (e) {
@@ -311,12 +420,14 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
         startTime: nowISO
       });
 
-      await updateDoc(doc(db, 'tmsShifts', currentShift.id), {
+      await saveShiftState({
+        ...currentShift,
         activities: updatedActivities,
         status: 'ACTIVE'
       });
 
       setSelectedProcessInput(targetProcess);
+      updateRecent(targetProcess);
       toast.success(`Process switched to: ${targetProcess}`);
     } catch (e) {
       handleFirestoreError(e, OperationType.WRITE, 'tmsShifts');
@@ -346,7 +457,8 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
         startTime: nowISO
       });
 
-      await updateDoc(doc(db, 'tmsShifts', currentShift.id), {
+      await saveShiftState({
+        ...currentShift,
         activities: updatedActivities,
         status: 'BREAK'
       });
@@ -384,12 +496,14 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
         startTime: nowISO
       });
 
-      await updateDoc(doc(db, 'tmsShifts', currentShift.id), {
+      await saveShiftState({
+        ...currentShift,
         activities: updatedActivities,
         status: 'ACTIVE'
       });
 
       setSelectedProcessInput(resumeProcess);
+      updateRecent(resumeProcess);
       toast.success(`Resumed work on process: ${resumeProcess}`);
     } catch (e) {
       handleFirestoreError(e, OperationType.WRITE, 'tmsShifts');
@@ -412,7 +526,8 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
         updatedActivities[updatedActivities.length - 1].endTime = nowISO;
       }
 
-      await updateDoc(doc(db, 'tmsShifts', currentShift.id), {
+      await saveShiftState({
+        ...currentShift,
         activities: updatedActivities,
         clockOutTime: nowISO,
         status: 'COMPLETED'
@@ -478,14 +593,35 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
       return;
     }
 
+    setProcessing(true);
     try {
       const updatedList = [...processes, newProcessName.trim()];
-      await setDoc(doc(db, 'config', 'tmsProcesses'), { list: updatedList });
-      setProcesses(updatedList);
+      await saveProcessesList(updatedList);
+      
+      // Audit log process creation
+      const logId = `log-process-${Date.now()}`;
+      await setDoc(doc(db, 'uploadAuditLogs', logId), {
+        id: logId,
+        targetId: 'tmsProcesses',
+        entityType: 'process',
+        fieldName: 'list',
+        oldValue: JSON.stringify(processes),
+        newValue: JSON.stringify(updatedList),
+        updatedBy: user.uid,
+        updatedByName: user.name,
+        updatedAt: new Date().toISOString(),
+        action: 'create_process',
+        details: `Process "${newProcessName.trim()}" created.`
+      });
+      console.log(`[PROCESS CREATION] Process "${newProcessName.trim()}" successfully created by User ${user.name} (${user.email}) at ${new Date().toISOString()}`);
+
       setNewProcessName('');
       toast.success('New process added to console.');
     } catch (e) {
+      console.error(`[PROCESS CREATION FAILURE] Error code: `, e);
       handleFirestoreError(e, OperationType.WRITE, 'config/tmsProcesses');
+    } finally {
+      setProcessing(false);
     }
   };
 
@@ -496,16 +632,71 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
   const performDeleteProcess = async (procToDelete: string) => {
     try {
       const updatedList = processes.filter(p => p !== procToDelete);
-      await setDoc(doc(db, 'config', 'tmsProcesses'), { list: updatedList });
+      await saveProcessesList(updatedList);
       setProcesses(updatedList);
+
+      // Audit log process deletion
+      const logId = `log-process-${Date.now()}`;
+      await setDoc(doc(db, 'uploadAuditLogs', logId), {
+        id: logId,
+        targetId: 'tmsProcesses',
+        entityType: 'process',
+        fieldName: 'list',
+        oldValue: JSON.stringify(processes),
+        newValue: JSON.stringify(updatedList),
+        updatedBy: user.uid,
+        updatedByName: user.name,
+        updatedAt: new Date().toISOString(),
+        action: 'delete_process',
+        details: `Process "${procToDelete}" deleted.`
+      });
+      console.log(`[PROCESS DELETION] Process "${procToDelete}" successfully deleted by User ${user.name} (${user.email}) at ${new Date().toISOString()}`);
+
       toast.success('Process deleted successfully.');
     } catch (e) {
+      console.error(`[PROCESS DELETION FAILURE] Error code: `, e);
       handleFirestoreError(e, OperationType.WRITE, 'config/tmsProcesses');
     }
   };
 
-  if (user.role === UserRole.TEAM_LEAD) {
-    const mappedUsers = allUsers.filter(u => u.teamLeadId === user.uid);
+  const isManagerRole = user.role === UserRole.MANAGER;
+  const isTLRole = [UserRole.TEAM_LEAD, UserRole.OPS_TL, UserRole.QTL, UserRole.STL, UserRole.TRAINER_TL].includes(user.role as UserRole);
+
+  if (isTLRole || isManagerRole) {
+
+    const getMappedAgentsAndQAsForTL = (tlUid: string) => {
+      return allUsers.filter(u => {
+        const isAgentOrQA = u.role === UserRole.AGENT || u.role === UserRole.QA;
+        return isAgentOrQA && u.teamLeadId === tlUid;
+      });
+    };
+
+    let mappedUsers: any[] = [];
+    
+    if (isTLRole) {
+      mappedUsers = getMappedAgentsAndQAsForTL(user.uid);
+    } else if (isManagerRole) {
+      const mappedTLs = allUsers.filter(u => {
+        const isMappedRole = [UserRole.TEAM_LEAD, UserRole.OPS_TL, UserRole.QTL, UserRole.STL, UserRole.TRAINER_TL].includes(u.role as UserRole);
+        return isMappedRole && u.mappedManagerId === user.uid;
+      });
+      mappedUsers = [...mappedTLs];
+      mappedTLs.forEach(tl => {
+        const agentsAndQAs = getMappedAgentsAndQAsForTL(tl.uid);
+        mappedUsers.push(...agentsAndQAs);
+      });
+      
+      const uniqueMUs = new Map();
+      mappedUsers.forEach(u => uniqueMUs.set(u.uid, u));
+      mappedUsers = Array.from(uniqueMUs.values());
+    }
+
+    console.log('--- TMS Dashboard Mapping Debug ---');
+    console.log('Current User Role:', user.role);
+    console.log('Mapped Users Found:', mappedUsers.map(u => ({ email: u.email, role: u.role })));
+    console.log('Query Results Count:', mappedUsers.length);
+    console.log('-----------------------------------');
+
     const activeShiftsList = allShifts.filter(sh => 
       mappedUsers.some(mu => mu.uid === sh.userId) && (sh.status === 'ACTIVE' || sh.status === 'BREAK')
     );
@@ -524,56 +715,93 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
       : 100;
 
     const handleExportCSV = () => {
+      setExportType('team');
+      setSelectedRangePreset('last30');
+      setStartDateStr('');
+      setEndDateStr('');
+      setExportFormat('excel');
+      setReportType('both');
+      setShowExportModal(true);
+    };
+
+    const executeTeamExport = (
+      start: Date, 
+      end: Date, 
+      format: 'csv' | 'excel', 
+      fetchedShifts: TMSShift[],
+      selectedReportType: 'summary' | 'chronological' | 'both' = 'both'
+    ) => {
       if (mappedUsers.length === 0) {
         toast.error("No mapped agents to export");
         return;
       }
 
-      const headers = [
+      const isTodayOnly = start.toDateString() === end.toDateString() && start.toDateString() === new Date().toDateString();
+      const includeSummary = selectedReportType === 'summary' || selectedReportType === 'both';
+      const includeChrono = selectedReportType === 'chronological' || selectedReportType === 'both';
+
+      const summaryHeaders = [
         'Agent Name',
         'Agent Email',
         'Role',
-        'Current Shift Status',
-        'Active Process / Break',
-        'Process Name',
-        'Last Activity',
-        'Today Clock In Time',
+        isTodayOnly ? 'Live Status' : 'Period Status',
+        'Process/Break',
+        'Shift Count in Period',
+        'Period Start (First Clock In)',
+        'Period End (Last Clock Out)',
         'Total Shift Time (Min)',
         'Total Productive Time (Min)',
         'Total Break Time (Min)',
-        'Overall Utilization (%)'
+        'Range Utilization (%)'
       ];
 
-      const rows = mappedUsers.map(u => {
-        const userShifts = allShifts.filter(sh => sh.userId === u.uid);
+      // Filter fetchedShifts strictly by range and user mapping
+      const teamUserIds = mappedUsers.map(u => u.uid);
+      const teamRangeShifts = fetchedShifts.filter(sh => {
+        const clockInDate = new Date(sh.clockInTime);
+        const isInRange = clockInDate >= start && clockInDate <= end;
+        return isInRange && teamUserIds.includes(sh.userId);
+      });
+
+      const summaryRows = includeSummary ? mappedUsers.map(u => {
+        const userShifts = fetchedShifts.filter(sh => sh.userId === u.uid);
         const activeShift = userShifts.find(sh => sh.status === 'ACTIVE' || sh.status === 'BREAK');
         
+        const rangeShifts = userShifts.filter(sh => {
+          const clockInDate = new Date(sh.clockInTime);
+          return clockInDate >= start && clockInDate <= end;
+        });
+
         let currentStatus = 'Offline';
         let currentProcess = 'None';
-        let clockInTime = 'N/A';
         
         if (activeShift) {
           currentStatus = activeShift.status === 'BREAK' ? 'On Break' : 'Active Work';
           const lastAct = activeShift.activities[activeShift.activities.length - 1];
           currentProcess = lastAct ? lastAct.name : 'N/A';
-          clockInTime = new Date(activeShift.clockInTime).toLocaleString('en-US', { timeZone: 'Asia/Kolkata' });
+        } else if (rangeShifts.length > 0) {
+          currentStatus = 'Completed';
+          const lastS = rangeShifts[rangeShifts.length - 1];
+          const lastAct = lastS.activities[lastS.activities.length - 1];
+          currentProcess = lastAct ? lastAct.name : 'N/A';
         }
 
-        const lastShiftOfUser = userShifts.length > 0 ? userShifts[userShifts.length - 1] : null;
-        const productiveAct = lastShiftOfUser ? [...lastShiftOfUser.activities].reverse().find(act => act.type === 'productive') : null;
-        const processName = productiveAct ? productiveAct.name : 'N/A';
-        const lastActObj = lastShiftOfUser && lastShiftOfUser.activities.length > 0 ? lastShiftOfUser.activities[lastShiftOfUser.activities.length - 1] : null;
-        const lastActivity = lastActObj ? lastActObj.name : 'N/A';
+        const sortedRangeShifts = [...rangeShifts].sort((a, b) => new Date(a.clockInTime).getTime() - new Date(b.clockInTime).getTime());
+        const firstShift = sortedRangeShifts[0];
+        const lastShift = sortedRangeShifts[sortedRangeShifts.length - 1];
+
+        const clockInTime = firstShift ? new Date(firstShift.clockInTime).toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }) : 'N/A';
+        const clockOutTime = lastShift ? (lastShift.clockOutTime ? new Date(lastShift.clockOutTime).toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }) : 'Ongoing') : 'N/A';
 
         let totalShiftMins = 0;
         let totalProductiveMins = 0;
         let totalBreakMins = 0;
-        let overallUtil = 100;
+        let overallUtil = 0;
 
         let totalShiftMsSum = 0;
         let totalActiveMsSum = 0;
 
-        userShifts.forEach(sh => {
+        rangeShifts.forEach(sh => {
           const stats = computeShiftStats(sh);
           totalShiftMsSum += stats.totalShiftMs;
           totalActiveMsSum += stats.activeMs;
@@ -592,29 +820,198 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
           u.role,
           currentStatus,
           currentProcess,
-          processName,
-          lastActivity,
+          rangeShifts.length,
           clockInTime,
+          clockOutTime,
           totalShiftMins.toFixed(1),
           totalProductiveMins.toFixed(1),
           totalBreakMins.toFixed(1),
-          overallUtil + '%'
+          rangeShifts.length > 0 ? (overallUtil + '%') : '0%'
         ];
-      });
+      }) : [];
 
-      const csvContent = "\uFEFF" + [headers.join(','), ...rows.map(r => r.map(val => `"${String(val).replace(/"/g, '""')}"`).join(','))].join('\n');
-      
-      const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.setAttribute('href', url);
-      link.setAttribute('download', `TMS_Utilization_Report_TL_${user.name.split(' ').join('_')}.csv`);
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
+      const chronoHeaders = [
+        'Agent Name',
+        'Agent Email',
+        'Date (IST)',
+        'Action Sequence',
+        'Duration Type',
+        'Specific Activity / Break Type',
+        'Start Time (IST)',
+        'End Time (IST)',
+        'Duration (Mins)'
+      ];
+
+      const buildChronoRows = (shifts: TMSShift[]) => {
+        const chronoRows: any[] = [];
+        const sortedShifts = [...shifts].sort((a, b) => new Date(a.clockInTime).getTime() - new Date(b.clockInTime).getTime());
+
+        sortedShifts.forEach(sh => {
+          const dateStr = new Date(sh.clockInTime).toLocaleDateString('en-US', { timeZone: 'Asia/Kolkata' });
+          
+          sh.activities.forEach((act, idx) => {
+            const startTimeIST = new Date(act.startTime).toLocaleString('en-US', { timeZone: 'Asia/Kolkata' });
+            const endTimeIST = act.endTime 
+              ? new Date(act.endTime).toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }) 
+              : 'Ongoing';
+            
+            let durationMin = 0;
+            if (act.endTime) {
+              durationMin = (new Date(act.endTime).getTime() - new Date(act.startTime).getTime()) / (1000 * 60);
+            } else {
+              durationMin = (new Date().getTime() - new Date(act.startTime).getTime()) / (1000 * 60);
+              if (durationMin < 0) durationMin = 0;
+            }
+
+            chronoRows.push([
+              sh.userName || 'N/A',
+              sh.userEmail || 'N/A',
+              dateStr,
+              idx + 1,
+              act.type === 'productive' ? 'Productive Work' : 'Break',
+              act.name || 'N/A',
+              startTimeIST,
+              endTimeIST,
+              durationMin.toFixed(1)
+            ]);
+          });
+        });
+        return chronoRows;
+      };
+
+      const chronoRows = includeChrono ? buildChronoRows(teamRangeShifts) : [];
+
+      console.log(`[REPORT EXPORT] Team Lead report exported by ${user.name} (${user.email}). Date range: ${start.toISOString()} to ${end.toISOString()} in format: ${format}, reportType: ${selectedReportType}`);
+
+      if (format === 'excel') {
+        const workbook = XLSX.utils.book_new();
+
+        if (selectedReportType === 'both') {
+          const wsMain = XLSX.utils.aoa_to_sheet([summaryHeaders, ...summaryRows]);
+          wsMain['!cols'] = summaryHeaders.map(() => ({ wch: 18 }));
+          XLSX.utils.book_append_sheet(workbook, wsMain, "Team Utilization");
+
+          const wsChrono = XLSX.utils.aoa_to_sheet([chronoHeaders, ...chronoRows]);
+          wsChrono['!cols'] = chronoHeaders.map(() => ({ wch: 18 }));
+          XLSX.utils.book_append_sheet(workbook, wsChrono, "Chronological Activity Logs");
+        } else if (selectedReportType === 'summary') {
+          const wsMain = XLSX.utils.aoa_to_sheet([summaryHeaders, ...summaryRows]);
+          wsMain['!cols'] = summaryHeaders.map(() => ({ wch: 18 }));
+          XLSX.utils.book_append_sheet(workbook, wsMain, "Team Utilization");
+        } else if (selectedReportType === 'chronological') {
+          const wsChrono = XLSX.utils.aoa_to_sheet([chronoHeaders, ...chronoRows]);
+          wsChrono['!cols'] = chronoHeaders.map(() => ({ wch: 18 }));
+          XLSX.utils.book_append_sheet(workbook, wsChrono, "Chronological Activity Logs");
+        }
+
+        const excelBuffer = XLSX.write(workbook, { bookType: 'xlsx', type: 'array' });
+        const blob = new Blob([excelBuffer], { type: 'application/octet-stream' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.setAttribute('href', url);
+
+        let filenameSuffix = "Team_Report";
+        if (selectedReportType === 'both') filenameSuffix = "Team_Summary_and_Chronological_Report";
+        else if (selectedReportType === 'summary') filenameSuffix = "Team_Summary_Report";
+        else if (selectedReportType === 'chronological') filenameSuffix = "Team_Chronological_Activity_Logs";
+
+        link.setAttribute('download', `TMS_Team_${filenameSuffix}_${user.name.split(' ').join('_')}.xlsx`);
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+      } else {
+        if (selectedReportType === 'summary') {
+          const csvContent = "\uFEFF" + [summaryHeaders.join(','), ...summaryRows.map(r => r.map(val => `"${String(val).replace(/"/g, '""')}"`).join(','))].join('\n');
+          const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+          const url = URL.createObjectURL(blob);
+          const link = document.createElement('a');
+          link.setAttribute('href', url);
+          link.setAttribute('download', `TMS_Team_Summary_Report_${user.name.split(' ').join('_')}.csv`);
+          document.body.appendChild(link);
+          link.click();
+          document.body.removeChild(link);
+        } else {
+          const csvContent = "\uFEFF" + [chronoHeaders.join(','), ...chronoRows.map(r => r.map(val => `"${String(val).replace(/"/g, '""')}"`).join(','))].join('\n');
+          const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+          const url = URL.createObjectURL(blob);
+          const link = document.createElement('a');
+          link.setAttribute('href', url);
+          link.setAttribute('download', `TMS_Team_Chronological_Activity_Logs_${user.name.split(' ').join('_')}.csv`);
+          document.body.appendChild(link);
+          link.click();
+          document.body.removeChild(link);
+        }
+      }
       
       toast.success('Utilization Report exported successfully!');
     };
+
+    const handleGenerateExport = async () => {
+      if (selectedRangePreset === 'custom' && (!startDateStr || !endDateStr)) {
+        toast.error('Please select both start and end dates for custom range.');
+        return;
+      }
+      const { start, end } = getDateRange(selectedRangePreset, startDateStr, endDateStr);
+      if (start > end) {
+        toast.error('Start date cannot be after end date.');
+        return;
+      }
+
+      toast.info('Fetching comprehensive shift data for requested range...');
+      try {
+        // Fetch data directly from Firestore for the export to bypass local state limits
+        const qRange = query(
+          collection(db, 'tmsShifts'),
+          where('clockInTime', '>=', start.toISOString()),
+          where('clockInTime', '<=', end.toISOString())
+        );
+        const snap = await getDocs(qRange);
+        const rangeShifts = snap.docs.map(d => ({ id: d.id, ...d.data() } as TMSShift));
+
+        setShowExportModal(false);
+        if (exportType === 'team') {
+          executeTeamExport(start, end, exportFormat, rangeShifts, reportType);
+        } else {
+          executeOrganizationExport(start, end, exportFormat, rangeShifts, reportType);
+        }
+      } catch (err) {
+        console.error('Export fetch failed:', err);
+        toast.error('Failed to fetch data for export. Please try a smaller range.');
+      }
+    };
+
+    const performAdminClockOut = async (shiftId: string, userName: string) => {
+      if (!confirm(`Are you sure you want to force clock-out ${userName}?`)) return;
+      try {
+        const shiftRef = doc(db, 'tmsShifts', shiftId);
+        const shiftSnap = await getDoc(shiftRef);
+        if (!shiftSnap.exists()) {
+          toast.error('Shift not found');
+          return;
+        }
+        const shift = shiftSnap.data() as TMSShift;
+        const nowISO = new Date().toISOString();
+        const updatedActivities = [...shift.activities];
+        if (updatedActivities.length > 0) {
+          updatedActivities[updatedActivities.length - 1].endTime = nowISO;
+        }
+        await updateDoc(shiftRef, {
+          activities: updatedActivities,
+          clockOutTime: nowISO,
+          status: 'COMPLETED'
+        });
+        toast.success(`Successfully forced clock-out for ${userName}.`);
+        await fetchAllShifts();
+      } catch (e) {
+        handleFirestoreError(e, OperationType.WRITE, 'tmsShifts');
+      }
+    };
+
+    const finalMappedUsers = mappedUsers.filter((u) => {
+      const search = (tmsSearch || '').toLowerCase();
+      if (!search) return true;
+      return (u.name || '').toLowerCase().includes(search) || (u.email || '').toLowerCase().includes(search);
+    });
 
     return (
       <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
@@ -625,7 +1022,7 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
               <Clock size={24} />
             </div>
             <div>
-              <h2 className="text-2xl font-black text-slate-900 tracking-tight">Team Lead TMS Dashboard</h2>
+              <h2 className="text-2xl font-black text-slate-900 tracking-tight">{isManagerRole ? 'Manager Dashboard' : 'Team Lead TMS Dashboard'}</h2>
               <p className="text-sm font-medium text-slate-500">Supervise logged-in agents, productivity rates, and export utilization reports</p>
             </div>
           </div>
@@ -635,7 +1032,7 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
               onClick={handleExportCSV}
               className="bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold py-2.5 px-4 rounded-xl flex items-center gap-1.5 shadow-sm shadow-emerald-200 cursor-pointer"
             >
-              <FileSpreadsheet size={16} /> Export Team Report (CSV)
+              <FileSpreadsheet size={16} /> Export Team Report
             </Button>
 
             {/* Current system clock */}
@@ -690,19 +1087,30 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
 
         {/* Live workforce roster and session status table */}
         <Card className="border border-slate-200 shadow-sm bg-white overflow-hidden rounded-2xl">
-          <CardHeader className="border-b border-slate-100 pb-4">
-            <CardTitle className="text-sm font-extrabold text-slate-900 uppercase tracking-widest flex items-center gap-2">
-              <User size={16} className="text-sky-500" />
-              Roster Session Audit & Real-time Tracking
-            </CardTitle>
-            <CardDescription className="text-xs">
-              Live-monitored metrics for resources under your supervision.
-            </CardDescription>
+          <CardHeader className="border-b border-slate-100 pb-4 flex flex-col md:flex-row md:items-center justify-between gap-4">
+            <div>
+              <CardTitle className="text-sm font-extrabold text-slate-900 uppercase tracking-widest flex items-center gap-2">
+                <User size={16} className="text-sky-500" />
+                Roster Session Audit & Real-time Tracking
+              </CardTitle>
+              <CardDescription className="text-xs">
+                Live-monitored metrics for resources under your supervision.
+              </CardDescription>
+            </div>
+            <div className="relative w-full md:w-64">
+              <Search className="absolute left-3 top-2.5 h-4 w-4 text-slate-400" />
+              <Input
+                placeholder="Search resources..."
+                value={tmsSearch}
+                onChange={(e) => setTmsSearch(e.target.value)}
+                className="pl-9 h-9 text-xs focus-visible:ring-1 focus-visible:ring-sky-500 rounded-xl"
+              />
+            </div>
           </CardHeader>
           <CardContent className="p-0">
-            <div className="overflow-x-auto">
+            <div className="overflow-x-auto max-h-[500px]">
               <table className="w-full text-left text-xs border-collapse">
-                <thead>
+                <thead className="sticky top-0 z-10 bg-slate-50 shadow-sm shadow-slate-200/50">
                   <tr className="bg-slate-50 text-slate-500 border-b border-slate-200 font-bold uppercase tracking-widest text-[9px] select-none">
                     <th className="p-4 pl-6">Profile</th>
                     <th className="p-4">Role</th>
@@ -713,7 +1121,7 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
-                  {mappedUsers.map((u) => {
+                  {finalMappedUsers.map((u) => {
                     const userShifts = allShifts.filter(sh => sh.userId === u.uid);
                     const activeShift = userShifts.find(sh => sh.status === 'ACTIVE' || sh.status === 'BREAK');
                     
@@ -740,15 +1148,27 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
                         <td className="p-4">
                           <Badge variant="outline" className="text-[10px] uppercase font-bold tracking-wider">{u.role}</Badge>
                         </td>
-                        <td className="p-4">
+                        <td className="p-4 flex items-center gap-2">
                           {activeShift ? (
-                            <Badge className={`text-[10px] font-black uppercase ${
-                              activeShift.status === 'BREAK' 
-                                ? 'bg-amber-100 text-amber-800 border-amber-200' 
-                                : 'bg-emerald-100 text-emerald-800 border-emerald-200'
-                            }`}>
-                              LIVE - {activeShift.status}
-                            </Badge>
+                            <>
+                              <Badge className={`text-[10px] font-black uppercase ${
+                                activeShift.status === 'BREAK' 
+                                  ? 'bg-amber-100 text-amber-800 border-amber-200' 
+                                  : 'bg-emerald-100 text-emerald-800 border-emerald-200'
+                              }`}>
+                                LIVE - {activeShift.status}
+                              </Badge>
+                              {(isManagerRole || user.role === UserRole.ADMIN) && (
+                                <Button 
+                                  size="sm" 
+                                  variant="ghost" 
+                                  className="text-[9px] text-red-500 hover:text-red-700 hover:bg-red-50" 
+                                  onClick={() => performAdminClockOut(activeShift.id, activeShift.userName)}
+                                >
+                                  Force Out
+                                </Button>
+                              )}
+                            </>
                           ) : (
                             <Badge variant="secondary" className="text-[10px] bg-slate-100 text-slate-500 font-bold uppercase">
                               Offline
@@ -787,13 +1207,17 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
                       </tr>
                     );
                   })}
-                  {mappedUsers.length === 0 && (
+                  {finalMappedUsers.length === 0 && (
                     <tr>
                       <td colSpan={6} className="p-16 text-center text-slate-400">
                         <div className="flex flex-col items-center gap-3">
                           <User size={36} className="text-slate-200" />
-                          <p className="font-bold uppercase tracking-widest text-[10px] text-slate-400">No agents mapped to you</p>
-                          <p className="text-xs text-slate-400 max-w-sm font-medium">Please ask your system administrator to assign Agents or Quality Analysts to your team under the Console tab.</p>
+                          <p className="font-bold uppercase tracking-widest text-[10px] text-slate-400">
+                            {mappedUsers.length === 0 ? "No agents mapped to you" : "No resources match your search"}
+                          </p>
+                          {mappedUsers.length === 0 && (
+                             <p className="text-xs text-slate-400 max-w-sm font-medium">Please ask your system administrator to assign Agents or Quality Analysts to your team under the Console tab.</p>
+                          )}
                         </div>
                       </td>
                     </tr>
@@ -803,24 +1227,178 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
             </div>
           </CardContent>
         </Card>
+
+        {/* Dynamic Date Range & Format Select Modal for Team Leads / Managers */}
+        {showExportModal && exportType === 'team' && (
+          <div className="fixed inset-0 bg-slate-900/55 backdrop-blur-sm flex items-center justify-center z-[99999] p-4 animate-in fade-in duration-200 text-slate-800">
+            <div className="bg-white rounded-2xl max-w-sm w-full p-6 shadow-xl border border-slate-200 space-y-4">
+              <div className="flex items-center gap-3 border-b pb-3">
+                <div className="w-10 h-10 rounded-xl bg-sky-50 flex items-center justify-center text-sky-600 shrink-0">
+                  <FileSpreadsheet size={20} />
+                </div>
+                <div className="text-left">
+                  <h4 className="font-extrabold text-slate-900 text-sm uppercase tracking-wide">
+                    Export Team Report
+                  </h4>
+                  <p className="text-slate-500 text-[10px] font-bold leading-none mt-1">Specify date range and filter criteria</p>
+                </div>
+              </div>
+
+              <div className="space-y-4 text-xs font-bold text-slate-700">
+                {/* Date Range Preset */}
+                <div className="space-y-1.5 text-left">
+                  <Label className="text-[10px] font-black text-slate-500 uppercase tracking-widest leading-none">Date Range Preset</Label>
+                  <select
+                    value={selectedRangePreset}
+                    onChange={(e) => {
+                      setSelectedRangePreset(e.target.value);
+                      if (e.target.value !== 'custom') {
+                        setStartDateStr('');
+                        setEndDateStr('');
+                      }
+                    }}
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 text-xs text-slate-800 font-bold focus:outline-none focus:ring-2 focus:ring-sky-500 cursor-pointer"
+                  >
+                    <option value="today">Today</option>
+                    <option value="yesterday">Yesterday</option>
+                    <option value="last7">Last 7 Days</option>
+                    <option value="last30">Last 30 Days (Default)</option>
+                    <option value="currentMonth">Current Month</option>
+                    <option value="previousMonth">Previous Month</option>
+                    <option value="custom">Custom Date Range...</option>
+                  </select>
+                </div>
+
+                {/* Custom Date Inputs */}
+                {selectedRangePreset === 'custom' && (
+                  <div className="grid grid-cols-2 gap-3 pt-1 animate-in slide-in-from-top-2 duration-200">
+                    <div className="space-y-1.5 text-left">
+                      <Label className="text-[9px] font-black text-slate-400 uppercase tracking-widest leading-none">Start Date</Label>
+                      <Input
+                        type="date"
+                        value={startDateStr}
+                        onChange={(e) => setStartDateStr(e.target.value)}
+                        className="border-slate-200 rounded-xl text-xs font-bold p-2.5 w-full bg-slate-50"
+                      />
+                    </div>
+                    <div className="space-y-1.5 text-left">
+                      <Label className="text-[9px] font-black text-slate-400 uppercase tracking-widest leading-none">End Date</Label>
+                      <Input
+                        type="date"
+                        value={endDateStr}
+                        onChange={(e) => setEndDateStr(e.target.value)}
+                        className="border-slate-200 rounded-xl text-xs font-bold p-2.5 w-full bg-slate-50"
+                      />
+                    </div>
+                  </div>
+                )}
+
+                {/* File Format Selection */}
+                <div className="space-y-2 text-left">
+                  <Label className="text-[10px] font-black text-slate-500 uppercase tracking-widest leading-none">File Format</Label>
+                  <div className="grid grid-cols-2 gap-3">
+                    <button
+                      type="button"
+                      onClick={() => setExportFormat('excel')}
+                      className={`p-3 rounded-xl border font-bold text-[11px] flex items-center justify-center gap-1.5 cursor-pointer transition-all ${
+                        exportFormat === 'excel'
+                          ? 'border-emerald-500 bg-emerald-50/50 text-emerald-850'
+                          : 'border-slate-200 hover:bg-slate-50 text-slate-600'
+                      }`}
+                    >
+                      <span className="w-2 h-2 rounded-full bg-emerald-500" />
+                      Excel (.xlsx)
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setExportFormat('csv')}
+                      className={`p-3 rounded-xl border font-bold text-[11px] flex items-center justify-center gap-1.5 cursor-pointer transition-all ${
+                        exportFormat === 'csv'
+                          ? 'border-sky-500 bg-sky-50/50 text-sky-850'
+                          : 'border-slate-200 hover:bg-slate-50 text-slate-600'
+                      }`}
+                    >
+                      <span className="w-2 h-2 rounded-full bg-sky-500" />
+                      CSV (.csv)
+                    </button>
+                  </div>
+                </div>
+
+                {/* Report Type Selection */}
+                <div className="space-y-2 text-left">
+                  <Label className="text-[10px] font-black text-slate-500 uppercase tracking-widest leading-none">Report Type</Label>
+                  <select
+                    value={reportType}
+                    onChange={(e) => setReportType(e.target.value as any)}
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 text-xs text-slate-800 font-bold focus:outline-none focus:ring-2 focus:ring-sky-500 cursor-pointer"
+                  >
+                    <option value="summary">Utilization Summary Report</option>
+                    <option value="chronological">Detailed Chronological Activity Log (Breaks & Switches)</option>
+                    {exportFormat === 'excel' && (
+                      <option value="both">Both Reports (Separate Sheets)</option>
+                    )}
+                  </select>
+                </div>
+              </div>
+
+              <div className="flex justify-end gap-2 text-xs font-bold pt-3 border-t">
+                <Button variant="ghost" onClick={() => setShowExportModal(false)} className="rounded-xl">Cancel</Button>
+                <Button
+                  className="bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded-xl flex items-center gap-1.5 cursor-pointer"
+                  onClick={handleGenerateExport}
+                >
+                  Generate & Export
+                </Button>
+              </div>
+            </div>
+          </div>
+        )}
+
       </div>
     );
   }
 
   // Filtering admin shift records
-  const filteredAllShifts = allShifts.filter(s => 
-    s.userName.toLowerCase().includes(adminSearch.toLowerCase()) ||
-    s.userEmail.toLowerCase().includes(adminSearch.toLowerCase()) ||
-    s.activities.some(act => act.name.toLowerCase().includes(adminSearch.toLowerCase()))
-  );
+  const filteredAllShifts = allShifts.filter(s => {
+    const search = (adminSearch || '').toLowerCase();
+    return (s.userName || '').toLowerCase().includes(search) ||
+           (s.userEmail || '').toLowerCase().includes(search) ||
+           (s.activities || []).some(act => (act.name || '').toLowerCase().includes(search));
+  });
 
   const handleExportAllShifts = () => {
-    if (allShifts.length === 0) {
-      toast.error("No shift logs at all to export");
+    setExportType('organization');
+    setSelectedRangePreset('last30');
+    setStartDateStr('');
+    setEndDateStr('');
+    setExportFormat('excel');
+    setReportType('both');
+    setShowExportModal(true);
+  };
+
+  const executeOrganizationExport = (
+    start: Date, 
+    end: Date, 
+    format: 'csv' | 'excel', 
+    fetchedShifts: TMSShift[] = allShifts,
+    selectedReportType: 'summary' | 'chronological' | 'both' = 'both'
+  ) => {
+    // Filter fetchedShifts strictly by date range
+    const startISO = start.toISOString();
+    const endISO = end.toISOString();
+    const rangeShifts = fetchedShifts.filter(sh => {
+      return sh.clockInTime >= startISO && sh.clockInTime <= endISO;
+    });
+
+    if (rangeShifts.length === 0) {
+      toast.error("No shift logs found in the selected date range");
       return;
     }
 
-    const headers = [
+    const includeSummary = selectedReportType === 'summary' || selectedReportType === 'both';
+    const includeChrono = selectedReportType === 'chronological' || selectedReportType === 'both';
+
+    const summaryHeaders = [
       'Name',
       'Email ID',
       'Shift Status',
@@ -834,7 +1412,7 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
       'Utilization (%)'
     ];
 
-    const rows = allShifts.map(sh => {
+    const summaryRows = includeSummary ? rangeShifts.map(sh => {
       const stats = computeShiftStats(sh);
       const clockIn = new Date(sh.clockInTime).toLocaleString('en-US', { timeZone: 'Asia/Kolkata' });
       const clockOut = sh.clockOutTime 
@@ -863,20 +1441,152 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
         totalBreakMins,
         stats.utilization + '%'
       ];
-    });
+    }) : [];
 
-    const csvContent = "\uFEFF" + [headers.join(','), ...rows.map(r => r.map(val => `"${String(val).replace(/"/g, '""')}"`).join(','))].join('\n');
+    const chronoHeaders = [
+      'Agent Name',
+      'Agent Email',
+      'Date (IST)',
+      'Action Sequence',
+      'Duration Type',
+      'Specific Activity / Break Type',
+      'Start Time (IST)',
+      'End Time (IST)',
+      'Duration (Mins)'
+    ];
+
+    const buildChronoRowsForOrg = (shifts: TMSShift[]) => {
+      const chronoRows: any[] = [];
+      const sortedShifts = [...shifts].sort((a, b) => new Date(a.clockInTime).getTime() - new Date(b.clockInTime).getTime());
+
+      sortedShifts.forEach(sh => {
+        const dateStr = new Date(sh.clockInTime).toLocaleDateString('en-US', { timeZone: 'Asia/Kolkata' });
+        
+        sh.activities.forEach((act, idx) => {
+          const startTimeIST = new Date(act.startTime).toLocaleString('en-US', { timeZone: 'Asia/Kolkata' });
+          const endTimeIST = act.endTime 
+            ? new Date(act.endTime).toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }) 
+            : 'Ongoing';
+          
+          let durationMin = 0;
+          if (act.endTime) {
+            durationMin = (new Date(act.endTime).getTime() - new Date(act.startTime).getTime()) / (1000 * 60);
+          } else {
+            durationMin = (new Date().getTime() - new Date(act.startTime).getTime()) / (1000 * 60);
+            if (durationMin < 0) durationMin = 0;
+          }
+
+          chronoRows.push([
+            sh.userName || 'N/A',
+            sh.userEmail || 'N/A',
+            dateStr,
+            idx + 1,
+            act.type === 'productive' ? 'Productive Work' : 'Break',
+            act.name || 'N/A',
+            startTimeIST,
+            endTimeIST,
+            durationMin.toFixed(1)
+          ]);
+        });
+      });
+      return chronoRows;
+    };
+
+    const chronoRows = includeChrono ? buildChronoRowsForOrg(rangeShifts) : [];
+
+    console.log(`[REPORT EXPORT] Admin/Manager organization report exported by ${user.name} (${user.email}). Date range: ${start.toISOString()} to ${end.toISOString()} in format: ${format}, reportType: ${selectedReportType}`);
+
+    if (format === 'excel') {
+      const workbook = XLSX.utils.book_new();
+
+      if (selectedReportType === 'both') {
+        const wsMain = XLSX.utils.aoa_to_sheet([summaryHeaders, ...summaryRows]);
+        wsMain['!cols'] = summaryHeaders.map(() => ({ wch: 18 }));
+        XLSX.utils.book_append_sheet(workbook, wsMain, "Organization Utilization");
+
+        const wsChrono = XLSX.utils.aoa_to_sheet([chronoHeaders, ...chronoRows]);
+        wsChrono['!cols'] = chronoHeaders.map(() => ({ wch: 18 }));
+        XLSX.utils.book_append_sheet(workbook, wsChrono, "Chronological Activity Logs");
+      } else if (selectedReportType === 'summary') {
+        const wsMain = XLSX.utils.aoa_to_sheet([summaryHeaders, ...summaryRows]);
+        wsMain['!cols'] = summaryHeaders.map(() => ({ wch: 18 }));
+        XLSX.utils.book_append_sheet(workbook, wsMain, "Organization Utilization");
+      } else if (selectedReportType === 'chronological') {
+        const wsChrono = XLSX.utils.aoa_to_sheet([chronoHeaders, ...chronoRows]);
+        wsChrono['!cols'] = chronoHeaders.map(() => ({ wch: 18 }));
+        XLSX.utils.book_append_sheet(workbook, wsChrono, "Chronological Activity Logs");
+      }
+
+      const excelBuffer = XLSX.write(workbook, { bookType: 'xlsx', type: 'array' });
+      const blob = new Blob([excelBuffer], { type: 'application/octet-stream' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.setAttribute('href', url);
+
+      let filenameSuffix = "Org_Report";
+      if (selectedReportType === 'both') filenameSuffix = "Summary_and_Chronological_Report";
+      else if (selectedReportType === 'summary') filenameSuffix = "Summary_Report";
+      else if (selectedReportType === 'chronological') filenameSuffix = "Chronological_Activity_Logs";
+
+      link.setAttribute('download', `TMS_Org_${filenameSuffix}.xlsx`);
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    } else {
+      if (selectedReportType === 'summary') {
+        const csvContent = "\uFEFF" + [summaryHeaders.join(','), ...summaryRows.map(r => r.map(val => `"${String(val).replace(/"/g, '""')}"`).join(','))].join('\n');
+        const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.setAttribute('href', url);
+        link.setAttribute('download', `TMS_Org_Summary_Report.csv`);
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+      } else {
+        const csvContent = "\uFEFF" + [chronoHeaders.join(','), ...chronoRows.map(r => r.map(val => `"${String(val).replace(/"/g, '""')}"`).join(','))].join('\n');
+        const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.setAttribute('href', url);
+        link.setAttribute('download', `TMS_Org_Chronological_Activity_Logs.csv`);
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+      }
+    }
     
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.setAttribute('href', url);
-    link.setAttribute('download', `TMS_All_Shifts_Utilization_Report_Admin.csv`);
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    
-    toast.success('Organization Utilization Report exported successfully!');
+    toast.success('Organization Report exported successfully!');
+  };
+
+  const handleAdminGenerateExport = async () => {
+    if (selectedRangePreset === 'custom' && (!startDateStr || !endDateStr)) {
+      toast.error('Please select both start and end dates for custom range.');
+      return;
+    }
+    const { start, end } = getDateRange(selectedRangePreset, startDateStr, endDateStr);
+    if (start > end) {
+      toast.error('Start date cannot be after end date.');
+      return;
+    }
+
+    toast.info('Fetching comprehensive shift data for requested range...');
+    try {
+      // Query data directly from Firestore to ensure exactness and reliability
+      const qRange = query(
+        collection(db, 'tmsShifts'),
+        where('clockInTime', '>=', start.toISOString()),
+        where('clockInTime', '<=', end.toISOString())
+      );
+      const snap = await getDocs(qRange);
+      const rangeShifts = snap.docs.map(d => ({ id: d.id, ...d.data() } as TMSShift));
+
+      setShowExportModal(false);
+      executeOrganizationExport(start, end, exportFormat, rangeShifts, reportType);
+    } catch (err) {
+      console.error('Export fetch failed:', err);
+      toast.error('Failed to fetch data for export. Please try a smaller range.');
+    }
   };
 
   return (
@@ -895,12 +1605,12 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
         </div>
 
         <div className="flex flex-wrap items-center gap-3">
-          {user.role === UserRole.ADMIN && (
+          {((user.role as any) === UserRole.ADMIN || (user.role as any) === UserRole.MANAGER) && (
             <Button
               onClick={handleExportAllShifts}
               className="bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold py-2.5 px-4 rounded-xl flex items-center gap-1.5 shadow-sm shadow-emerald-200 cursor-pointer"
             >
-              <FileSpreadsheet size={16} /> Export Organization Report (CSV)
+              <FileSpreadsheet size={16} /> Export Organization Report
             </Button>
           )}
 
@@ -925,7 +1635,7 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
         
         {/* Punch Control / Agent Panel */}
         <div className="lg:col-span-5 space-y-6">
-          <Card className="border-none shadow-md shadow-slate-200">
+          <Card className="border-none shadow-md shadow-slate-200 overflow-visible">
             <CardHeader className="bg-slate-900 text-white rounded-t-2xl pb-6">
               <div className="flex items-center justify-between">
                 <div>
@@ -973,16 +1683,14 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
                 <div className="space-y-4">
                   <div className="space-y-1.5">
                     <Label className="text-xs font-bold text-slate-500 uppercase tracking-wider">Select Start Process</Label>
-                    <select
-                      className="w-full h-11 bg-white border border-slate-200 rounded-lg px-3 text-sm text-slate-900 font-bold focus:ring-2 focus:ring-sky-500 focus:outline-none"
-                      value={selectedProcessInput}
-                      onChange={(e) => setSelectedProcessInput(e.target.value)}
-                    >
-                      <option value="">-- Choose Process --</option>
-                      {processes.map(proc => (
-                        <option key={proc} value={proc}>{proc}</option>
-                      ))}
-                    </select>
+                    <ProcessSelector
+                      allProcesses={processes}
+                      currentProcess={selectedProcessInput}
+                      onSelectProcess={setSelectedProcessInput}
+                      recentProcesses={recentProcesses}
+                      favoriteProcesses={favoriteProcesses}
+                      onToggleFavorite={toggleFavorite}
+                    />
                   </div>
                   <Button 
                     className="w-full h-12 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-sm rounded-xl flex items-center justify-center gap-2 shadow-sm shadow-emerald-200 cursor-pointer"
@@ -1003,16 +1711,14 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
                   </div>
                   <div className="space-y-1.5">
                     <Label className="text-xs font-bold text-slate-500 uppercase tracking-wider">Resume Process</Label>
-                    <select
-                      className="w-full h-11 bg-white border border-slate-200 rounded-lg px-3 text-xs text-slate-800 font-bold focus:ring-2 focus:ring-sky-500 focus:outline-none"
-                      value={selectedProcessInput}
-                      onChange={(e) => setSelectedProcessInput(e.target.value)}
-                    >
-                      <option value="">-- Choose target process --</option>
-                      {processes.map(proc => (
-                        <option key={proc} value={proc}>{proc}</option>
-                      ))}
-                    </select>
+                    <ProcessSelector
+                      allProcesses={processes}
+                      currentProcess={selectedProcessInput}
+                      onSelectProcess={setSelectedProcessInput}
+                      recentProcesses={recentProcesses}
+                      favoriteProcesses={favoriteProcesses}
+                      onToggleFavorite={toggleFavorite}
+                    />
                   </div>
                   <div className="grid grid-cols-2 gap-3">
                     <Button 
@@ -1040,17 +1746,16 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
 
                   {/* Switch process inline dropdown */}
                   <div className="space-y-1.5 border-t border-slate-100 pt-4">
-                    <Label className="text-xs font-bold text-slate-500 uppercase tracking-wider">Switch Current Process</Label>
+                    <Label className="text-xs font-bold text-slate-500 uppercase tracking-wider">Switch To:</Label>
                     <div className="flex gap-2">
-                      <select
-                        className="flex-1 h-10 bg-white border border-slate-200 rounded-lg px-3 text-xs text-slate-800 font-bold focus:ring-2 focus:ring-sky-500 focus:outline-none"
-                        value={selectedProcessInput}
-                        onChange={(e) => handleSwitchProcess(e.target.value)}
-                      >
-                        {processes.map(proc => (
-                          <option key={proc} value={proc}>{proc}</option>
-                        ))}
-                      </select>
+                    <ProcessSelector
+                      allProcesses={processes}
+                      currentProcess={""}
+                      onSelectProcess={handleSwitchProcess}
+                      recentProcesses={recentProcesses}
+                      favoriteProcesses={favoriteProcesses}
+                      onToggleFavorite={toggleFavorite}
+                    />
                     </div>
                   </div>
 
@@ -1249,13 +1954,13 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
 
       </div>
 
-      {/* ADMIN PANEL - PROCESSES & LIVE TRACKER (Only layout for admins) */}
-      {user.role === UserRole.ADMIN && (
+      {/* ADMIN PANEL - PROCESSES & LIVE TRACKER */}
+      {(((user.role as any) === UserRole.ADMIN || (user.role as any) === UserRole.MANAGER)) && (
         <div className="border-t border-slate-200 pt-8 space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
           <div className="flex items-center gap-3 bg-red-50/50 p-4 border border-red-100 rounded-xl">
             <LockIcon className="text-red-500 shrink-0" size={18} />
             <div>
-              <h3 className="text-sm font-black text-red-950 uppercase tracking-wide">Admin control: Clock Master Consolidation</h3>
+              <h3 className="text-sm font-black text-red-950 uppercase tracking-wide">Workforce Control: Clock Master Consolidation</h3>
               <p className="text-[11px] font-bold text-red-800 leading-none mt-1">Supervise organization-wide utilization, live activity maps, and process configurations</p>
             </div>
           </div>
@@ -1440,6 +2145,132 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
                 setConfirmDeleteProcessName(null);
                 performDeleteProcess(proc);
               }}>Confirm Delete</Button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Dynamic Date Range & Format Select Modal for Admins & Managers */}
+      {showExportModal && exportType === 'organization' && (
+        <div className="fixed inset-0 bg-slate-900/55 backdrop-blur-sm flex items-center justify-center z-[99999] p-4 animate-in fade-in duration-200 text-slate-800">
+          <div className="bg-white rounded-2xl max-w-sm w-full p-6 shadow-xl border border-slate-200 space-y-4">
+            <div className="flex items-center gap-3 border-b pb-3">
+              <div className="w-10 h-10 rounded-xl bg-sky-50 flex items-center justify-center text-sky-600 shrink-0">
+                <FileSpreadsheet size={20} />
+              </div>
+              <div className="text-left">
+                <h4 className="font-extrabold text-slate-900 text-sm uppercase tracking-wide">
+                  Export Organization Report
+                </h4>
+                <p className="text-slate-500 text-[10px] font-bold leading-none mt-1">Specify date range and filter criteria</p>
+              </div>
+            </div>
+
+            <div className="space-y-4 text-xs font-bold text-slate-700">
+              {/* Date Range Preset */}
+              <div className="space-y-1.5 text-left">
+                <Label className="text-[10px] font-black text-slate-500 uppercase tracking-widest leading-none">Date Range Preset</Label>
+                <select
+                  value={selectedRangePreset}
+                  onChange={(e) => {
+                    setSelectedRangePreset(e.target.value);
+                    if (e.target.value !== 'custom') {
+                      setStartDateStr('');
+                      setEndDateStr('');
+                    }
+                  }}
+                  className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 text-xs text-slate-800 font-bold focus:outline-none focus:ring-2 focus:ring-sky-500 cursor-pointer"
+                >
+                  <option value="today">Today</option>
+                  <option value="yesterday">Yesterday</option>
+                  <option value="last7">Last 7 Days</option>
+                  <option value="last30">Last 30 Days (Default)</option>
+                  <option value="currentMonth">Current Month</option>
+                  <option value="previousMonth">Previous Month</option>
+                  <option value="custom">Custom Date Range...</option>
+                </select>
+              </div>
+
+              {/* Custom Date Inputs */}
+              {selectedRangePreset === 'custom' && (
+                <div className="grid grid-cols-2 gap-3 pt-1 animate-in slide-in-from-top-2 duration-200">
+                  <div className="space-y-1.5 text-left">
+                    <Label className="text-[9px] font-black text-slate-400 uppercase tracking-widest leading-none">Start Date</Label>
+                    <Input
+                      type="date"
+                      value={startDateStr}
+                      onChange={(e) => setStartDateStr(e.target.value)}
+                      className="border-slate-200 rounded-xl text-xs font-bold p-2.5 w-full bg-slate-50"
+                    />
+                  </div>
+                  <div className="space-y-1.5 text-left">
+                    <Label className="text-[9px] font-black text-slate-400 uppercase tracking-widest leading-none">End Date</Label>
+                    <Input
+                      type="date"
+                      value={endDateStr}
+                      onChange={(e) => setEndDateStr(e.target.value)}
+                      className="border-slate-200 rounded-xl text-xs font-bold p-2.5 w-full bg-slate-50"
+                    />
+                  </div>
+                </div>
+              )}
+
+              {/* File Format Selection */}
+              <div className="space-y-2 text-left">
+                <Label className="text-[10px] font-black text-slate-500 uppercase tracking-widest leading-none">File Format</Label>
+                <div className="grid grid-cols-2 gap-3">
+                  <button
+                    type="button"
+                    onClick={() => setExportFormat('excel')}
+                    className={`p-3 rounded-xl border font-bold text-[11px] flex items-center justify-center gap-1.5 cursor-pointer transition-all ${
+                      exportFormat === 'excel'
+                        ? 'border-emerald-500 bg-emerald-50/50 text-emerald-850'
+                        : 'border-slate-200 hover:bg-slate-50 text-slate-600'
+                    }`}
+                  >
+                    <span className="w-2 h-2 rounded-full bg-emerald-500" />
+                    Excel (.xlsx)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setExportFormat('csv')}
+                    className={`p-3 rounded-xl border font-bold text-[11px] flex items-center justify-center gap-1.5 cursor-pointer transition-all ${
+                      exportFormat === 'csv'
+                        ? 'border-sky-500 bg-sky-50/50 text-sky-850'
+                        : 'border-slate-200 hover:bg-slate-50 text-slate-600'
+                    }`}
+                  >
+                    <span className="w-2 h-2 rounded-full bg-sky-500" />
+                    CSV (.csv)
+                  </button>
+                </div>
+              </div>
+
+              {/* Report Type Selection */}
+              <div className="space-y-2 text-left">
+                <Label className="text-[10px] font-black text-slate-500 uppercase tracking-widest leading-none">Report Type</Label>
+                <select
+                  value={reportType}
+                  onChange={(e) => setReportType(e.target.value as any)}
+                  className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 text-xs text-slate-800 font-bold focus:outline-none focus:ring-2 focus:ring-sky-500 cursor-pointer"
+                >
+                  <option value="summary">Utilization Summary Report</option>
+                  <option value="chronological">Detailed Chronological Activity Log (Breaks & Switches)</option>
+                  {exportFormat === 'excel' && (
+                    <option value="both">Both Reports (Separate Sheets)</option>
+                  )}
+                </select>
+              </div>
+            </div>
+
+            <div className="flex justify-end gap-2 text-xs font-bold pt-3 border-t">
+              <Button variant="ghost" onClick={() => setShowExportModal(false)} className="rounded-xl">Cancel</Button>
+              <Button
+                className="bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded-xl flex items-center gap-1.5 cursor-pointer"
+                onClick={handleAdminGenerateExport}
+              >
+                Generate & Export
+              </Button>
             </div>
           </div>
         </div>

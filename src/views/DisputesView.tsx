@@ -126,13 +126,19 @@ export default function DisputesView({ auditLogs, user, onEditAudit, onRefresh }
                     </div>
                   </TableCell>
                   <TableCell className="max-w-xs truncate">
-                    {audit.disputeHistory[audit.disputeHistory.length - 1]?.comment || 'No comment'}
+                    {audit.disputeHistory && audit.disputeHistory.length > 0
+                      ? audit.disputeHistory[audit.disputeHistory.length - 1]?.comment || 'No comment'
+                      : 'No comment'}
                   </TableCell>
                   <TableCell>
                     <Dialog>
-                      <DialogTrigger asChild>
-                        <Button variant="ghost" onClick={() => setSelectedDispute(audit)}>Review</Button>
-                      </DialogTrigger>
+                      <DialogTrigger 
+                        render={
+                          <Button variant="ghost" onClick={() => setSelectedDispute(audit)}>
+                            Review
+                          </Button>
+                        }
+                      />
                       <DialogContent className="max-w-2xl">
                         <DialogHeader>
                           <DialogTitle className="flex justify-between items-center pr-6">
@@ -148,7 +154,7 @@ export default function DisputesView({ auditLogs, user, onEditAudit, onRefresh }
                         </DialogHeader>
                         
                         <div className="space-y-4 max-h-[400px] overflow-y-auto p-2 border rounded bg-slate-50">
-                          {audit.disputeHistory.map((h) => (
+                          {(audit.disputeHistory || []).map((h) => (
                             <div key={h.id} className={`p-3 rounded-lg border ${h.userRole === UserRole.AGENT ? 'bg-blue-50 border-blue-100 ml-4' : 'bg-white border-slate-200 mr-4'}`}>
                               <div className="flex justify-between items-center mb-1">
                                 <span className="text-xs font-bold text-slate-900">{h.userName} ({h.userRole})</span>
@@ -167,7 +173,7 @@ export default function DisputesView({ auditLogs, user, onEditAudit, onRefresh }
                             onChange={(e) => setActionComment(e.target.value)} 
                             placeholder="Provide your remarks here..." 
                           />
-                          {(user.role === UserRole.ADMIN || user.role === UserRole.QA || user.role === UserRole.TEAM_LEAD) && (
+                          {(user.role === UserRole.ADMIN || user.role === UserRole.MANAGER || user.role === UserRole.QA || user.role === UserRole.TEAM_LEAD) && (
                             <div className="flex gap-2">
                               {onEditAudit && (
                                 <Button 
@@ -186,7 +192,7 @@ export default function DisputesView({ auditLogs, user, onEditAudit, onRefresh }
                         </div>
 
                         <DialogFooter className="mt-4 flex flex-wrap gap-2 sm:justify-start">
-                          {(user.role === UserRole.ADMIN || user.role === UserRole.QA || user.role === UserRole.TEAM_LEAD) && (
+                          {(user.role === UserRole.ADMIN || user.role === UserRole.MANAGER || user.role === UserRole.QA || user.role === UserRole.TEAM_LEAD) && (
                             <>
                               <Button variant="destructive" onClick={() => handleAction('Deny')}>Deny</Button>
                               <Button variant="outline" onClick={() => handleAction('Partial')}>Partial Revert</Button>

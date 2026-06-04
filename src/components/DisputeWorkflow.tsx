@@ -38,7 +38,7 @@ export default function DisputeWorkflow({ audit, currentUser, onUpdate }: Disput
     const updatedAudit: AuditRecord = {
       ...audit,
       disputeStatus: newStatus,
-      disputeHistory: [...audit.disputeHistory, newHistoryEntry],
+      disputeHistory: [...(audit.disputeHistory || []), newHistoryEntry],
       isReopened: isReopening ? true : (currentUser.role === UserRole.QA ? false : (audit.isReopened || false))
     };
 
@@ -75,7 +75,7 @@ export default function DisputeWorkflow({ audit, currentUser, onUpdate }: Disput
 
       <ScrollArea className="max-h-[240px] overflow-y-auto pr-4 mb-4 border rounded-lg p-4 bg-slate-50/50">
         <div className="space-y-4">
-          {audit.disputeHistory.map((step, i) => (
+          {(audit.disputeHistory || []).map((step, i) => (
             <motion.div 
               key={step.id}
               initial={{ opacity: 0, x: step.userRole === UserRole.AGENT ? -10 : 10 }}
@@ -105,7 +105,7 @@ export default function DisputeWorkflow({ audit, currentUser, onUpdate }: Disput
             </motion.div>
           ))}
 
-          {audit.disputeHistory.length === 0 && (
+          {(!audit.disputeHistory || audit.disputeHistory.length === 0) && (
             <div className="h-64 flex flex-col items-center justify-center text-slate-400 gap-2">
               <MessageSquare size={32} strokeWidth={1} />
               <p className="text-sm">No activity in this dispute thread yet.</p>

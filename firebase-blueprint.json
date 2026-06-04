@@ -7,9 +7,14 @@
       "properties": {
         "uid": { "type": "string" },
         "email": { "type": "string" },
-        "role": { "type": "string", "enum": ["ADMIN", "QA", "TEAM_LEAD", "AGENT"] },
+        "role": { "type": "string", "enum": ["ADMIN", "MANAGER", "QA", "TEAM_LEAD", "AGENT"] },
         "name": { "type": "string" },
-        "team": { "type": "string" }
+        "team": { "type": "string" },
+        "teamLeadId": { "type": "string" },
+        "teamLeadName": { "type": "string" },
+        "mappedManagerId": { "type": "string" },
+        "mappedManagerName": { "type": "string" },
+        "lastLogin": { "type": "string" }
       },
       "required": ["uid", "email", "role", "name"]
     },
@@ -24,6 +29,7 @@
         "vertical": { "type": "string" },
         "sellerId": { "type": "string" },
         "categoryGroup": { "type": "string" },
+        "auditUrl": { "type": "string" },
         "rows": { "type": "number" },
         "rowsPassed": { "type": "number" },
         "rowsFailed": { "type": "number" },
@@ -47,11 +53,8 @@
         "vertical": { "type": "string" },
         "sellerId": { "type": "string" },
         "categoryGroup": { "type": "string" },
-        "rows": { "type": "number" },
-        "rowsPassed": { "type": "number" },
-        "rowsFailed": { "type": "number" },
         "quality": { "type": "number" },
-        "status": { "type": "string", "enum": ["Correct", "Incorrect"] },
+        "status": { "type": "string", "enum": ["Correct", "Incorrect", "Tech Issue"] },
         "qaComment": { "type": "string" },
         "errorType": { "type": "string" },
         "guideline": { "type": "string" },
@@ -59,9 +62,152 @@
         "qaId": { "type": "string" },
         "auditDate": { "type": "string" },
         "disputeStatus": { "type": "string", "enum": ["None", "Pending", "QA Reviewed", "Resolved"] },
-        "agentId": { "type": "string" }
+        "agentId": { "type": "string" },
+        "isReopened": { "type": "boolean" },
+        "disputeHistory": { "type": "array" }
       },
       "required": ["id", "taskId", "qvName", "quality", "agentId", "qaId"]
+    },
+    "DailyTarget": {
+      "title": "Daily Target",
+      "description": "Daily KPI targets assigned to an agent",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "date": { "type": "string" },
+        "agentId": { "type": "string" },
+        "agentName": { "type": "string" },
+        "process": { "type": "string" },
+        "productivityTarget": { "type": "number" },
+        "aptTarget": { "type": "number" },
+        "qualityTarget": { "type": "number" },
+        "attendanceTarget": { "type": "number" },
+        "updatedBy": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["id", "date", "agentId", "productivityTarget", "aptTarget", "qualityTarget", "attendanceTarget"]
+    },
+    "DailyPerformance": {
+      "title": "Daily Performance",
+      "description": "Calculated actual daily achievements",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "date": { "type": "string" },
+        "agentId": { "type": "string" },
+        "agentName": { "type": "string" },
+        "process": { "type": "string" },
+        "productivityTarget": { "type": "number" },
+        "aptTarget": { "type": "number" },
+        "qualityTarget": { "type": "number" },
+        "attendanceTarget": { "type": "number" },
+        "actualProductivity": { "type": "number" },
+        "actualApt": { "type": "string" },
+        "actualAptValue": { "type": "number" },
+        "actualQuality": { "type": "number" },
+        "actualAttendance": { "type": "number" },
+        "bonus": { "type": "number" },
+        "penalty": { "type": "number" },
+        "remarks": { "type": "string" },
+        "productivityScore": { "type": "number" },
+        "aptScore": { "type": "number" },
+        "attendanceScore": { "type": "number" },
+        "qualityScore": { "type": "number" },
+        "finalScore": { "type": "number" },
+        "rating": { "type": "string" },
+        "isOverridden": { "type": "boolean" },
+        "isLocked": { "type": "boolean" },
+        "updatedBy": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["id", "date", "agentId", "finalScore", "rating"]
+    },
+    "ScorecardRecord": {
+      "title": "Scorecard Record",
+      "description": "Monthly performance summary",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "agentId": { "type": "string" },
+        "agentName": { "type": "string" },
+        "yearMonth": { "type": "string" },
+        "averageScore": { "type": "number" },
+        "overallRating": { "type": "string" },
+        "promotionReadiness": { "type": "number" },
+        "pipRecommendation": { "type": "boolean" },
+        "alertStatus": { "type": "string", "enum": ["None", "Top Performer", "Bottom Performer", "Critical Attention"] },
+        "justification": { "type": "string" },
+        "selfScorecardComments": { "type": "string" },
+        "reviewerComments": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["id", "agentId", "yearMonth", "averageScore", "promotionReadiness"]
+    },
+    "WarningTicket": {
+      "title": "Warning Ticket",
+      "description": "Disciplinary warning record",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "agentId": { "type": "string" },
+        "agentName": { "type": "string" },
+        "agentEmail": { "type": "string" },
+        "employeeId": { "type": "string" },
+        "qaId": { "type": "string" },
+        "level": { "type": "string" },
+        "remarks": { "type": "string" },
+        "severity": { "type": "string", "enum": ["Mild", "Moderate", "Severe", "Critical"] },
+        "status": { "type": "string", "enum": ["Pending", "Accepted", "Acknowledged", "Disputed"] },
+        "createdAt": { "type": "string" },
+        "acceptedAt": { "type": "string" },
+        "history": { "type": "array" }
+      },
+      "required": ["id", "agentId", "level", "status", "createdAt"]
+    },
+    "PipRecord": {
+      "title": "PIP Record",
+      "description": "Performance Improvement Plan record",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "agentId": { "type": "string" },
+        "agentName": { "type": "string" },
+        "agentEmail": { "type": "string" },
+        "initiatorId": { "type": "string" },
+        "initiatorName": { "type": "string" },
+        "title": { "type": "string" },
+        "description": { "type": "string" },
+        "startDate": { "type": "string" },
+        "endDate": { "type": "string" },
+        "durationDays": { "type": "number" },
+        "qualityTarget": { "type": "number" },
+        "attendanceTarget": { "type": "number" },
+        "productivityTarget": { "type": "number" },
+        "status": { "type": "string", "enum": ["Initiated", "Under Review", "Passed", "Failed", "Extended"] },
+        "coachingSupportPlan": { "type": "string" },
+        "finalComments": { "type": "string" },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" },
+        "checkins": { "type": "array" },
+        "acknowledgedByAgent": { "type": "boolean" },
+        "acknowledgedAt": { "type": "string" }
+      },
+      "required": ["id", "agentId", "status", "createdAt"]
+    },
+    "ImportantLink": {
+      "title": "Important Link",
+      "description": "An important resource link",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "url": { "type": "string" },
+        "category": { "type": "string" },
+        "description": { "type": "string" },
+        "createdBy": { "type": "string" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["id", "name", "url", "category", "createdBy", "createdAt"]
     }
   },
   "firestore": {
@@ -71,22 +217,67 @@
     },
     "tasks/{taskId}": {
       "schema": "SamplingTask",
-      "description": "Raw sampling tasks"
+      "description": "Sampling tasks"
     },
     "audits/{auditId}": {
       "schema": "AuditRecord",
-      "description": "Audit results"
+      "description": "Audit records and disputes"
     },
-    "config/main": {
+    "dailyTargets/{targetId}": {
+      "schema": "DailyTarget",
+      "description": "Daily KPI targets"
+    },
+    "dailyPerformance/{performanceId}": {
+      "schema": "DailyPerformance",
+      "description": "Daily performance achievements"
+    },
+    "scorecards/{scorecardId}": {
+      "schema": "ScorecardRecord",
+      "description": "Monthly scorecards"
+    },
+    "disciplinaryLogs/{logId}": {
+      "schema": "WarningTicket",
+      "description": "Disciplinary warnings"
+    },
+    "pips/{pipId}": {
+      "schema": "PipRecord",
+      "description": "Performance Improvement Plans"
+    },
+    "importantLinks/{linkId}": {
+      "schema": "ImportantLink",
+      "description": "Important app links"
+    },
+    "config/master": {
       "schema": {
         "type": "object",
         "properties": {
           "errorTypes": { "type": "array", "items": { "type": "string" } },
           "guidelines": { "type": "array", "items": { "type": "string" } },
-          "themes": { "type": "array", "items": { "type": "string" } }
+          "themes": { "type": "array", "items": { "type": "string" } },
+          "skipLimit": { "type": "number" },
+          "minSamplingCount": { "type": "number" },
+          "systemOverrideRights": { "type": "boolean" },
+          "kpiTargets": {
+            "type": "object",
+            "properties": {
+              "utilization": { "type": "number" },
+              "attendance": { "type": "number" },
+              "qaScore": { "type": "number" },
+              "apt": { "type": "number" }
+            }
+          }
         }
       },
-      "description": "Application configuration"
+      "description": "Global app configuration"
+    },
+    "config/tmsProcesses": {
+      "schema": {
+        "type": "object",
+        "properties": {
+          "list": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "description": "Workforce TMS processes"
     }
   }
 }

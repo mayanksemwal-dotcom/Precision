@@ -17,24 +17,25 @@ import {
   X,
   FileUp,
   History,
-  Clock
+  Clock,
+  Award,
+  Link2
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { UserRole, UserProfile, SamplingTask, AuditRecord, QAAlignment, ProductionRecord, WarningTicket, AgentKpiRecord } from './types';
 import { INITIAL_ALIGNMENTS } from './lib/sample-data';
-import { auth, db, logout, handleFirestoreError, OperationType } from './lib/firebase';
+import { auth, db, logout } from './lib/firebase';
+import { isFirestoreBlocked, handleFirestoreError } from './lib/safeFirestore';
+import { OperationType } from './lib/firebase';
 import { onAuthStateChanged } from 'firebase/auth';
-import { doc, getDoc, getDocs, collection, query, where, orderBy, setDoc } from 'firebase/firestore';
-import { Database, RefreshCw } from 'lucide-react';
+import { doc, getDoc, getDocs, collection, query, where, orderBy, setDoc, updateDoc, deleteDoc, limit, onSnapshot } from 'firebase/firestore';
+import { Database, RefreshCw, Activity } from 'lucide-react';
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from './components/ui/dialog';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from './components/ui/table';
-import { fetchArchiveReports } from './lib/sheets';
+// Removed fetchArchiveReports import
 
 // Views
 import AdminView from './views/AdminView';
-import QAView from './views/QAView';
-import TeamLeadView from './views/TeamLeadView';
-import AgentView from './views/AgentView';
 import LoginView from './views/LoginView';
 
 // UI Components
@@ -52,16 +53,17 @@ import {
   DropdownMenuGroup 
 } from './components/ui/dropdown-menu';
 
-import CompletedAuditsView from './views/CompletedAuditsView';
-import ErrorFeedbacksView from './views/ErrorFeedbacksView';
-import DisputesView from './views/DisputesView';
 import WarningsView from './views/WarningsView';
 import TMSView from './views/TMSView';
+import ScorecardView from './views/ScorecardView';
+import PipView from './views/PipView';
+import ManageHistoricalRecordsView from './views/ManageHistoricalRecordsView';
+import ResourceHubView from './views/ResourceHubView';
 
 export default function App() {
   const [user, setUser] = useState<UserProfile | null>(null);
   const [loading, setLoading] = useState(true);
-  const [activeTab, setActiveTab] = useState('dashboard');
+  const [activeTab, setActiveTab] = useState('tms');
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [viewAsRole, setViewAsRole] = useState<UserRole | null>(null);
   const [tasks, setTasks] = useState<SamplingTask[]>([]);
@@ -73,36 +75,15 @@ export default function App() {
   const [agentKpis, setAgentKpis] = useState<AgentKpiRecord[]>([]);
   const [editingAudit, setEditingAudit] = useState<AuditRecord | null>(null);
 
-  // Archive Reports sheets logic
-  const [archiveOpen, setArchiveOpen] = useState(false);
-  const [archiveRows, setArchiveRows] = useState<any[]>([]);
-  const [archiveLoading, setArchiveLoading] = useState(false);
-  const [archivePage, setArchivePage] = useState(1);
+  // Removed Archive Reports states
 
   // Firebase Auth Listener with Custom Claims synchronization
   useEffect(() => {
+    console.log('Setting up Firebase Auth listener...');
     const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
+      console.log('onAuthStateChanged fired. User:', firebaseUser ? firebaseUser.email : 'null');
       if (firebaseUser) {
-        // Try to get existing profile
-        const userDoc = await getDoc(doc(db, 'users', firebaseUser.uid));
-        let userProfile: UserProfile;
-        if (userDoc.exists()) {
-          userProfile = userDoc.data() as UserProfile;
-        } else {
-          // Check if this email already exists under a different UID
-          if (firebaseUser.email) {
-            const q = query(collection(db, 'users'), where('email', '==', firebaseUser.email.toLowerCase().trim()));
-            const querySnapshot = await getDocs(q);
-            if (!querySnapshot.empty) {
-              toast.error(`The email ID "${firebaseUser.email}" is already registered. Please sign in with your original method.`);
-              await logout();
-              setUser(null);
-              setLoading(false);
-              return;
-            }
-          }
-
-          // New user defaults to AGENT
+        try {
           const getCleanName = () => {
             if (firebaseUser.displayName) return firebaseUser.displayName;
             if (firebaseUser.email) {
@@ -118,56 +99,144 @@ export default function App() {
             return 'New User';
           };
 
-          userProfile = {
-            uid: firebaseUser.uid,
-            email: firebaseUser.email || '',
-            name: getCleanName(),
-            role: UserRole.AGENT,
-          };
-          // Bootstrapped Admin check
-          if (firebaseUser.email === 'mayank.semwal@bergtechnologies.co.in') {
-            userProfile.role = UserRole.ADMIN;
-          }
-          await setDoc(doc(db, 'users', firebaseUser.uid), userProfile);
-        }
-
-        setUser(userProfile);
-
-        // Sync Custom claims asynchronously in the background. We check current claims, and only hit the backend/force token refresh if they are out of sync.
-        (async () => {
+          const now = new Date();
+          let userProfile: UserProfile;
           try {
-            // Retrieve cached claims to avoid immediate network requests
-            const tokenResult = await firebaseUser.getIdTokenResult(false);
-            const expectedAdmin = userProfile.role === UserRole.ADMIN;
-            const expectedQA = userProfile.role === UserRole.QA;
+            // Try to get existing profile from Firestore
+            const userDocRef = doc(db, 'users', firebaseUser.uid);
+            const userDoc = await getDoc(userDocRef);
+            
+            if (userDoc.exists()) {
+              console.log('User document found, syncing profile.');
+              const currentData = userDoc.data() as any;
+              
+              userProfile = {
+                ...currentData,
+                uid: firebaseUser.uid,
+                email: (firebaseUser.email || '').toLowerCase().trim(),
+                name: currentData.name || currentData.fullName || getCleanName(),
+                fullName: currentData.fullName || currentData.name || getCleanName(),
+                role: currentData.role || UserRole.AGENT,
+                status: currentData.status || 'Active',
+                department: currentData.department || 'Operations',
+                Manager: currentData.Manager || '',
+                createdAt: currentData.createdAt || now.toISOString(),
+                lastLoginAt: now.toISOString(), // Update last login
+              };
 
-            const isCurrentAdmin = !!tokenResult.claims.isAdmin;
-            const isCurrentQA = !!tokenResult.claims.isQA;
-
-            if (isCurrentAdmin !== expectedAdmin || isCurrentQA !== expectedQA) {
-              console.log('Firebase user custom claims mismatch detected. Synchronizing claims...');
-              const idToken = await firebaseUser.getIdToken(true);
-              const claimResponse = await fetch('/api/set-claims', {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json',
-                  'Authorization': `Bearer ${idToken}`,
-                }
-              });
-              if (claimResponse.ok) {
-                const claimsResult = await claimResponse.json();
-                console.log('Successfully updated Firebase custom user claims via Express API backend:', claimsResult);
-                // Force refresh local token so firebase is aware of claims changes globally
-                await firebaseUser.getIdTokenResult(true);
-              }
+              await setDoc(userDocRef, userProfile, { merge: true });
             } else {
-              console.log('Firebase user custom claims already in sync. Skipping sync operations.');
+              console.log('New user detected or profile missing, checking pre-provisioning...');
+              const usersRef = collection(db, 'users');
+              const checkQuery = query(usersRef, where('email', '==', (firebaseUser.email || '').toLowerCase().trim()));
+              const querySnap = await getDocs(checkQuery);
+              
+              if (!querySnap.empty) {
+                const matchedDoc = querySnap.docs[0];
+                const matchedData = matchedDoc.data() as any;
+                console.log('Pre-provisioned user found. Linking to Auth uid...', matchedDoc.id);
+                
+                userProfile = {
+                  ...matchedData,
+                  uid: firebaseUser.uid,
+                  email: (firebaseUser.email || '').toLowerCase().trim(),
+                  name: matchedData.name || matchedData.fullName || getCleanName(),
+                  fullName: matchedData.fullName || matchedData.name || getCleanName(),
+                  role: matchedData.role || UserRole.AGENT,
+                  status: matchedData.status || 'Active',
+                  department: matchedData.department || 'Operations',
+                  Manager: matchedData.Manager || '',
+                  createdAt: matchedData.createdAt || now.toISOString(),
+                  lastLoginAt: now.toISOString(),
+                };
+                
+                await setDoc(userDocRef, userProfile);
+                if (matchedDoc.id !== firebaseUser.uid) {
+                  await deleteDoc(doc(db, 'users', matchedDoc.id));
+                }
+              } else {
+                console.log('No pre-provisioned profile, creating clean profile...');
+                const isEmail = firebaseUser.providerData.some(p => p.providerId === 'password');
+                userProfile = {
+                  uid: firebaseUser.uid,
+                  email: (firebaseUser.email || '').toLowerCase().trim(),
+                  name: getCleanName(),
+                  fullName: getCleanName(),
+                  role: UserRole.AGENT,
+                  status: 'Active',
+                  department: 'Operations',
+                  Manager: '',
+                  createdAt: now.toISOString(),
+                  lastLoginAt: now.toISOString(),
+                  authProvider: isEmail ? 'email' : 'google',
+                };
+                await setDoc(userDocRef, userProfile);
+              }
+              console.log('Bootstrapped user profile saved to Firestore.');
             }
-          } catch (claimsErr) {
-            console.error('Failed to update Custom Firebase auth claims on login:', claimsErr);
+          } catch (dbErr) {
+            console.warn('Unable to reach Firestore database, generating safe fallback user profile:', dbErr);
+            userProfile = {
+              uid: firebaseUser.uid,
+              email: (firebaseUser.email || '').toLowerCase().trim(),
+              name: getCleanName(),
+              fullName: getCleanName(),
+              role: (firebaseUser.email?.toLowerCase().trim() === 'mayank.semwal@bergtechnologies.co.in') ? UserRole.ADMIN : UserRole.AGENT,
+              status: 'Active',
+              department: 'Operations',
+              Manager: '',
+              createdAt: now.toISOString(),
+              lastLoginAt: now.toISOString(),
+            } as UserProfile;
           }
-        })();
+
+          setUser(userProfile);
+          console.log('User profile set in state.');
+
+          // Sync Custom claims asynchronously in the background. We check current claims, and only hit the backend/force token refresh if they are out of sync.
+          (async () => {
+            try {
+              // Retrieve cached claims to avoid immediate network requests
+              const tokenResult = await firebaseUser.getIdTokenResult(false);
+              const expectedAdmin = userProfile.role === UserRole.ADMIN;
+              const expectedQA = userProfile.role === UserRole.QA;
+
+              const isCurrentAdmin = !!tokenResult.claims.isAdmin;
+              const isCurrentQA = !!tokenResult.claims.isQA;
+
+              if (isCurrentAdmin !== expectedAdmin || isCurrentQA !== expectedQA) {
+                console.log('Firebase user custom claims mismatch detected. Synchronizing claims...');
+                const idToken = await firebaseUser.getIdToken(true);
+                const claimResponse = await fetch('/api/set-claims', {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${idToken}`,
+                  }
+                });
+                const cType = claimResponse.headers.get('content-type');
+                if (claimResponse.ok && cType && cType.includes('application/json')) {
+                  const claimsResult = await claimResponse.json();
+                  console.log('Successfully updated Firebase custom user claims via Express API backend:', claimsResult);
+                  // Force refresh local token so firebase is aware of claims changes globally
+                  await firebaseUser.getIdTokenResult(true);
+                } else {
+                  const bodySample = await claimResponse.text();
+                  console.warn('Express API backend claims sync failed. Status:', claimResponse.status, 'Content-Type:', cType, 'Body Sample:', bodySample.substring(0, 200));
+                  console.log('Skipping claims response check. Express API backend is offline or running in standard client-only static SPA mode.');
+                }
+              } else {
+                console.log('Firebase user custom claims already in sync. Skipping sync operations.');
+              }
+            } catch (claimsErr) {
+              console.error('Failed to update Custom Firebase auth claims on login:', claimsErr);
+            }
+          })();
+        } catch (authErr) {
+            console.error('Error handling firebase user:', authErr);
+        }
       } else {
+        console.log('User logged out.');
         setUser(null);
       }
       setLoading(false);
@@ -180,75 +249,44 @@ export default function App() {
   const fetchAllData = async () => {
     if (!user) return;
     setIsRefreshing(true);
+
     try {
-      // Create all database query promises to execute in parallel
-      const usersPromise = getDocs(collection(db, 'users'));
-      const alignmentsPromise = getDoc(doc(db, 'config', 'alignments'));
-      
-      const tasksQuery = query(collection(db, 'tasks'), orderBy('createdAt', 'desc'));
-      const tasksPromise = getDocs(tasksQuery);
+      // Helper for safer fetching
+      const safeFetch = async <T,>(promise: Promise<T>, fallback: T, name: string): Promise<T> => {
+        try {
+          return await promise;
+        } catch (err) {
+          handleFirestoreError(err, OperationType.LIST, name);
+          return fallback;
+        }
+      };
 
-      let auditsQuery;
+      // Create database query promises
+      let warningsQuery: any;
       if (user.role === UserRole.ADMIN || user.role === UserRole.QA || user.role === UserRole.TEAM_LEAD) {
-        auditsQuery = query(collection(db, 'audits'), orderBy('auditDate', 'desc'));
+        warningsQuery = query(collection(db, 'disciplinaryLogs'), orderBy('createdAt', 'desc'), limit(25));
       } else {
-        auditsQuery = query(collection(db, 'audits'), where('agentId', '==', user.uid), orderBy('auditDate', 'desc'));
-      }
-      const auditsPromise = getDocs(auditsQuery);
-
-      const prodPromise = getDocs(collection(db, 'production'));
-
-      let warningsQuery;
-      if (user.role === UserRole.ADMIN || user.role === UserRole.QA || user.role === UserRole.TEAM_LEAD) {
-        warningsQuery = collection(db, 'warnings');
-      } else {
-        warningsQuery = query(collection(db, 'warnings'), where('agentId', '==', user.uid));
+        warningsQuery = query(collection(db, 'disciplinaryLogs'), where('agentId', '==', user.uid), orderBy('createdAt', 'desc'), limit(25));
       }
       const warningsPromise = getDocs(warningsQuery);
 
-      let kpisQuery;
-      if (user.role === UserRole.ADMIN || user.role === UserRole.QA || user.role === UserRole.TEAM_LEAD) {
-        kpisQuery = collection(db, 'agent_kpis');
-      } else {
-        kpisQuery = query(collection(db, 'agent_kpis'), where('agentId', '==', user.uid));
-      }
-      const kpisPromise = getDocs(kpisQuery);
-
-      // Execute all fetches in parallel to resolve waterfall latency issues
+      // Execute fetches in parallel
       const [
-        usersSnap,
-        alignmentsDoc,
-        tasksSnap,
-        auditsSnap,
-        prodSnap,
-        warningsSnap,
-        kpisSnap
+        warningsSnap
       ] = await Promise.all([
-        usersPromise,
-        alignmentsPromise,
-        tasksPromise,
-        auditsPromise,
-        prodPromise,
-        warningsPromise,
-        kpisPromise
+        safeFetch(warningsPromise, null, 'warnings')
       ]);
 
-      // Map and update state in one batch
-      setAllUsers(usersSnap.docs.map(doc => doc.data() as UserProfile));
+      setAlignments(INITIAL_ALIGNMENTS);
 
-      if (alignmentsDoc.exists()) {
-        setAlignments(alignmentsDoc.data().list || []);
-      } else if (user.role === UserRole.ADMIN) {
-        setDoc(doc(db, 'config', 'alignments'), { list: INITIAL_ALIGNMENTS })
-          .then(() => setAlignments(INITIAL_ALIGNMENTS))
-          .catch(e => handleFirestoreError(e, OperationType.WRITE, 'config/alignments'));
+      if (warningsSnap) {
+        setWarnings(warningsSnap.docs.map(doc => ({ id: doc.id, ...(doc.data() as any) } as WarningTicket)));
       }
 
-      setTasks(tasksSnap.docs.map(doc => ({ id: doc.id, ...(doc.data() as any) } as SamplingTask)));
-      setAuditLogs(auditsSnap.docs.map(doc => ({ id: doc.id, ...(doc.data() as any) } as AuditRecord)));
-      setProductions(prodSnap.docs.map(doc => ({ id: doc.id, ...(doc.data() as any) } as ProductionRecord)));
-      setWarnings(warningsSnap.docs.map(doc => ({ id: doc.id, ...(doc.data() as any) } as WarningTicket)));
-      setAgentKpis(kpisSnap.docs.map(doc => ({ id: doc.id, ...(doc.data() as any) } as AgentKpiRecord)));
+      setProductions([]);
+      setAgentKpis([]);
+      setAuditLogs([]);
+      setTasks([]);
 
       toast.success('All reports loaded/refreshed successfully');
     } catch (error) {
@@ -265,25 +303,26 @@ export default function App() {
     }
   }, [user, viewAsRole]);
 
-  const handleOpenArchive = async () => {
-    setArchiveOpen(true);
-    setArchiveLoading(true);
-    try {
-      const rows = await fetchArchiveReports();
-      setArchiveRows(rows);
-      setArchivePage(1);
-      toast.success(`Loaded ${rows.length} records from Google Sheets spreadsheet`);
-    } catch (err: any) {
-      toast.error('Failed to load archive sheet: ' + (err.message || String(err)));
-    } finally {
-      setArchiveLoading(false);
-    }
-  };
-
   const handleLogout = async () => {
     await logout();
     setUser(null);
   };
+
+  // Real-time Users Listener for Admin Console
+  useEffect(() => {
+    if (!user) return;
+    console.log('Setting up real-time users list listener...');
+    const usersQuery = collection(db, 'users');
+    const unsubscribe = onSnapshot(usersQuery, (snapshot) => {
+      const usersList = snapshot.docs.map(doc => doc.data() as UserProfile);
+      setAllUsers(usersList);
+      console.log(`Real-time users sync: ${usersList.length} profiles loaded.`);
+    }, (err) => {
+      console.error('Users listener error:', err);
+      handleFirestoreError(err, OperationType.LIST, 'users_realtime');
+    });
+    return () => unsubscribe();
+  }, [user]);
 
   if (loading) {
     return (
@@ -300,15 +339,13 @@ export default function App() {
   }
 
   const navItems = [
-    { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard, roles: [UserRole.ADMIN, UserRole.QA, UserRole.TEAM_LEAD, UserRole.AGENT] },
-    { id: 'tms', label: 'Workforce TMS', icon: Clock, roles: [UserRole.ADMIN, UserRole.QA, UserRole.TEAM_LEAD, UserRole.AGENT] },
-    { id: 'sampling', label: 'Audit Desk', icon: ClipboardCheck, roles: [UserRole.ADMIN, UserRole.QA] },
-    { id: 'feedback', label: 'Feedback', icon: MessageSquare, roles: [UserRole.AGENT] },
-    { id: 'error_feedbacks', label: 'Feedbacks', icon: MessageSquare, roles: [UserRole.ADMIN, UserRole.QA, UserRole.TEAM_LEAD] },
-    { id: 'disputes', label: 'Disputes', icon: ShieldAlert, roles: [UserRole.ADMIN, UserRole.QA, UserRole.TEAM_LEAD] },
-    { id: 'reports', label: 'Reports', icon: BarChart3, roles: [UserRole.ADMIN, UserRole.TEAM_LEAD, UserRole.QA] },
-    { id: 'warnings', label: 'Warnings', icon: ShieldAlert, roles: [UserRole.ADMIN, UserRole.QA, UserRole.TEAM_LEAD, UserRole.AGENT] },
-    { id: 'config', label: 'Console', icon: Settings, roles: [UserRole.ADMIN, UserRole.TEAM_LEAD] },
+    { id: 'tms', label: 'Workforce TMS', icon: Clock, roles: [UserRole.ADMIN, UserRole.MANAGER, UserRole.QA, UserRole.TEAM_LEAD, UserRole.AGENT] },
+    { id: 'kpis_scorecard', label: 'KPI Scorecard', icon: Award, roles: [UserRole.ADMIN, UserRole.MANAGER, UserRole.QA, UserRole.TEAM_LEAD, UserRole.AGENT] },
+    { id: 'warnings', label: 'Warnings', icon: ShieldAlert, roles: [UserRole.ADMIN, UserRole.MANAGER, UserRole.QA, UserRole.TEAM_LEAD, UserRole.AGENT] },
+    { id: 'pips', label: 'PIP Management', icon: Activity, roles: [UserRole.ADMIN, UserRole.MANAGER, UserRole.QA, UserRole.TEAM_LEAD, UserRole.AGENT] },
+    { id: 'historical', label: 'Historical Records', icon: History, roles: [UserRole.ADMIN] },
+    { id: 'resources', label: 'Important Quality Links', icon: Link2, roles: [UserRole.ADMIN, UserRole.MANAGER, UserRole.QA, UserRole.TEAM_LEAD, UserRole.AGENT] },
+    { id: 'config', label: 'Console', icon: Settings, roles: [UserRole.ADMIN, UserRole.MANAGER, UserRole.TEAM_LEAD] },
   ];
 
   const effectiveRole = viewAsRole || (user?.role || UserRole.AGENT);
@@ -415,33 +452,10 @@ export default function App() {
             </div>
           </div>
           <div className="flex items-center gap-6">
-             <Button
-               variant="outline"
-               size="sm"
-               disabled={isRefreshing}
-               onClick={fetchAllData}
-               className="font-bold border-slate-200 hover:bg-slate-100 h-9 gap-2 shadow-sm text-slate-700 bg-white"
-             >
-               <RefreshCw size={14} className={isRefreshing ? "animate-spin" : ""} />
-               {isRefreshing ? "Refreshing..." : "Load Reports"}
-             </Button>
-
-             {(effectiveRole === UserRole.ADMIN || effectiveRole === UserRole.QA || effectiveRole === UserRole.TEAM_LEAD) && (
-               <Button
-                 variant="outline"
-                 size="sm"
-                 onClick={handleOpenArchive}
-                 className="font-black h-9 gap-2 border-blue-200 text-blue-700 hover:bg-blue-50 hover:text-blue-800 shadow-sm bg-white"
-               >
-                 <Database size={14} />
-                 Archive Reports
-               </Button>
-             )}
-
              {user.role === UserRole.ADMIN && (
                <div className="flex items-center gap-2 bg-slate-100 p-1 rounded-lg border border-slate-200">
                  <span className="text-[10px] font-bold text-slate-500 ml-2 uppercase">Preview as:</span>
-                 {[UserRole.ADMIN, UserRole.TEAM_LEAD, UserRole.QA, UserRole.AGENT].map(r => (
+                 {[UserRole.ADMIN, UserRole.MANAGER, UserRole.TEAM_LEAD, UserRole.QA, UserRole.AGENT].map(r => (
                    <button
                      key={r}
                      onClick={() => setViewAsRole(r as UserRole)}
@@ -477,176 +491,44 @@ export default function App() {
               transition={{ duration: 0.2 }}
               className="max-w-7xl mx-auto h-full"
             >
-              {activeTab === 'reports' ? (
-                <TeamLeadView activeTab={activeTab} tasks={tasks} auditLogs={auditLogs} productions={productions} user={effectiveUser!} alignments={alignments} goToTab={setActiveTab} allUsers={allUsers} />
-              ) : activeTab === 'completed_audits' ? (
-                <CompletedAuditsView auditLogs={auditLogs} user={effectiveUser!} alignments={alignments} />
-              ) : activeTab === 'disputes' ? (
-                <DisputesView 
-                  auditLogs={auditLogs} 
-                  user={effectiveUser!} 
-                  onEditAudit={(audit) => {
-                    setEditingAudit(audit);
-                    setActiveTab('sampling');
-                  }}
-                  onRefresh={fetchAllData}
-                />
+              {activeTab === 'tms' ? (
+                <TMSView user={effectiveUser!} allUsers={allUsers} />
+              ) : activeTab === 'kpis_scorecard' ? (
+                <ScorecardView user={effectiveUser!} allUsers={allUsers} onRefreshAllData={fetchAllData} />
               ) : activeTab === 'warnings' ? (
                 <WarningsView warnings={warnings} user={effectiveUser!} allUsers={allUsers} />
-              ) : activeTab === 'tms' ? (
-                <TMSView user={effectiveUser!} allUsers={allUsers} />
-              ) : activeTab === 'error_feedbacks' ? (
-                <ErrorFeedbacksView auditLogs={auditLogs} user={effectiveUser!} alignments={alignments} />
+              ) : activeTab === 'pips' ? (
+                <PipView user={effectiveUser!} allUsers={allUsers} />
+              ) : activeTab === 'historical' ? (
+                <ManageHistoricalRecordsView user={effectiveUser!} />
+              ) : activeTab === 'resources' ? (
+                <ResourceHubView user={effectiveUser!} />
+              ) : activeTab === 'config' ? (
+                <AdminView 
+                  activeTab={activeTab} 
+                  tasks={[]} 
+                  onTasksUpdate={() => {}} 
+                  user={effectiveUser!}
+                  alignments={[]}
+                  onAlignmentsUpdate={async () => {}}
+                  productions={[]}
+                  auditLogs={[]}
+                  goToTab={setActiveTab}
+                  allUsers={allUsers}
+                  warnings={warnings}
+                  onRefresh={fetchAllData}
+                />
               ) : (
-                <>
-                  {(effectiveRole === UserRole.ADMIN || (effectiveRole === UserRole.TEAM_LEAD && activeTab === 'config')) && (
-                    <AdminView 
-                      activeTab={activeTab} 
-                      tasks={tasks} 
-                      onTasksUpdate={() => {}} 
-                      user={effectiveUser!}
-                      alignments={alignments}
-                      onAlignmentsUpdate={async (newAligns) => {
-                        await setDoc(doc(db, 'config', 'alignments'), { list: newAligns });
-                      }}
-                      productions={productions}
-                      auditLogs={auditLogs}
-                      goToTab={setActiveTab}
-                      allUsers={allUsers}
-                      agentKpis={agentKpis}
-                      onKpisUpdate={fetchAllData}
-                    />
-                  )}
-                  {(effectiveRole === UserRole.QA) && (
-                    <QAView 
-                      activeTab={activeTab} 
-                      tasks={tasks} 
-                      onTasksUpdate={() => {}} 
-                      onAuditUpdate={() => {}} 
-                      user={effectiveUser!}
-                      alignments={alignments}
-                      productions={productions}
-                      auditLogs={auditLogs}
-                      goToTab={setActiveTab}
-                      editingAudit={editingAudit}
-                      onCancelEdit={() => setEditingAudit(null)}
-                    />
-                  )}
-                  {effectiveRole === UserRole.TEAM_LEAD && activeTab !== 'config' && (
-                    <TeamLeadView 
-                      activeTab={activeTab} 
-                      tasks={tasks} 
-                      auditLogs={auditLogs} 
-                      productions={productions} 
-                      user={effectiveUser!} 
-                      alignments={alignments} 
-                      goToTab={setActiveTab} 
-                      allUsers={allUsers}
-                      agentKpis={agentKpis}
-                      onKpisUpdate={fetchAllData}
-                    />
-                  )}
-                  {effectiveRole === UserRole.AGENT && (
-                    <AgentView 
-                      activeTab={activeTab} 
-                      audits={auditLogs} 
-                      user={effectiveUser!} 
-                      onRefresh={fetchAllData} 
-                      agentKpis={agentKpis}
-                    />
-                  )}
-                </>
+                <div className="py-12 text-center text-slate-500 font-bold text-sm">
+                  Module Not Registered
+                </div>
               )}
             </motion.div>
           </AnimatePresence>
         </div>
       </main>
 
-      {/* Archive Reports Google Sheets Dialog Modal */}
-      <Dialog open={archiveOpen} onOpenChange={setArchiveOpen}>
-        <DialogContent className="max-w-5xl max-h-[85vh] overflow-hidden flex flex-col p-6 [id^='dialog-content-']">
-          <div className="border-b pb-4">
-            <h3 className="text-xl font-extrabold text-slate-900 tracking-tight flex items-center gap-2">
-              <Database size={22} className="text-blue-600" />
-              Google Sheets Archive Reports
-            </h3>
-            <p className="text-xs text-slate-500 mt-1">
-              Directly reading from Google Sheets without hitting Firestore (Standard Free JSON API fetching)
-            </p>
-          </div>
 
-          <div className="flex-1 overflow-auto my-4 min-h-[300px]">
-            {archiveLoading ? (
-              <div className="flex flex-col items-center justify-center h-full py-12 gap-3 min-h-[300px]">
-                <div className="animate-spin text-blue-600">
-                  <RefreshCw size={36} />
-                </div>
-                <span className="text-sm font-bold text-slate-500 animate-pulse">Requesting Google sheets archive rows...</span>
-              </div>
-            ) : archiveRows.length === 0 ? (
-              <div className="flex flex-col items-center justify-center h-full py-12 text-slate-400 min-h-[300px]">
-                <Database size={48} className="stroke-1 mb-2" />
-                <p className="text-sm">No archive rows returned or spreadsheet data is empty.</p>
-              </div>
-            ) : (
-              <div className="border border-slate-200 rounded-xl overflow-hidden shadow-sm">
-                <div className="max-h-[50vh] overflow-y-auto">
-                  <Table>
-                    <TableHeader className="bg-slate-50 sticky top-0 z-10 font-bold text-slate-600">
-                      <TableRow>
-                        {Object.keys(archiveRows[0] || {}).map((colName) => (
-                          <TableHead key={colName} className="text-xs font-black uppercase text-slate-700 py-3.5 px-4 h-auto">
-                            {colName}
-                          </TableHead>
-                        ))}
-                      </TableRow>
-                    </TableHeader>
-                    <TableBody>
-                      {archiveRows.slice((archivePage - 1) * 10, archivePage * 10).map((row, rowIndex) => (
-                        <TableRow key={rowIndex} className="hover:bg-slate-50/50 transition-colors">
-                          {Object.values(row).map((val: any, colIndex) => (
-                            <TableCell key={colIndex} className="text-xs text-slate-600 font-medium py-3 px-4 max-w-[200px] truncate" title={val !== null && val !== undefined ? String(val) : ''}>
-                              {val !== null && val !== undefined ? String(val) : '-'}
-                            </TableCell>
-                          ))}
-                        </TableRow>
-                      ))}
-                    </TableBody>
-                  </Table>
-                </div>
-              </div>
-            )}
-          </div>
-
-          {archiveRows.length > 0 && !archiveLoading && (
-            <div className="flex items-center justify-between border-t border-slate-100 pt-4">
-              <span className="text-xs font-bold text-slate-500">
-                Showing {Math.min(archiveRows.length, (archivePage - 1) * 10 + 1)}-{Math.min(archiveRows.length, archivePage * 10)} of {archiveRows.length} archive entries
-              </span>
-              <div className="flex items-center gap-2">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  disabled={archivePage === 1}
-                  onClick={() => setArchivePage(p => Math.max(1, p - 1))}
-                  className="h-8 font-bold text-xs"
-                >
-                  Previous Page
-                </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  disabled={archivePage * 10 >= archiveRows.length}
-                  onClick={() => setArchivePage(p => p + 1)}
-                  className="h-8 font-bold text-xs"
-                >
-                  Next Page
-                </Button>
-              </div>
-            </div>
-          )}
-        </DialogContent>
-      </Dialog>
     </div>
   );
 }
