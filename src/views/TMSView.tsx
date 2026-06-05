@@ -14,7 +14,9 @@ import {
   AlertCircle,
   FileSpreadsheet,
   Activity,
-  Award
+  Award,
+  ChevronLeft,
+  ChevronRight
 } from 'lucide-react';
 import ProcessSelector from '../components/ProcessSelector';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle, CardFooter } from '../components/ui/card';
@@ -114,12 +116,66 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
   // Admin view variables
   const [allShifts, setAllShifts] = useState<TMSShift[]>([]);
   const [adminSearch, setAdminSearch] = useState('');
+  const [currentPage, setCurrentPage] = useState(1);
   const [selectedProcessInput, setSelectedProcessInput] = useState('');
   const [selectedBreakInput, setSelectedBreakInput] = useState(BREAK_OPTIONS[0]);
 
   // Custom modal confirmations instead of window.confirm inside sandboxed iframe
   const [showClockOutConfirm, setShowClockOutConfirm] = useState(false);
   const [confirmDeleteProcessName, setConfirmDeleteProcessName] = useState<string | null>(null);
+
+  // Force Logout States
+  const [forceOutShiftId, setForceOutShiftId] = useState<string | null>(null);
+  const [forceOutTargetName, setForceOutTargetName] = useState<string>('');
+  const [forceOutTargetUid, setForceOutTargetUid] = useState<string>('');
+  const [forceOutReason, setForceOutReason] = useState<string>('Left without logging out');
+  const [forceOutCustomReason, setForceOutCustomReason] = useState<string>('');
+
+  // Hierarchy validation helper
+  const canUserForceLogoutTarget = (actor: UserProfile, targetUid: string) => {
+    if (actor.uid === targetUid) return false;
+    
+    const target = allUsers.find(u => u.uid === targetUid);
+    if (!target) return false;
+
+    if (actor.role === UserRole.ADMIN) return true;
+
+    if (actor.role === UserRole.MANAGER) {
+      // Manager can force logout Team Leads, SMEs, QAs, Trainers, and Agents reporting under them.
+      const eligibleRoles = [
+        UserRole.TEAM_LEAD, 
+        'TEAM_LEAD',
+        'OPS_TL', 
+        'QTL', 
+        'STL', 
+        'TRAINER_TL', 
+        UserRole.SME, 
+        UserRole.QA, 
+        UserRole.TRAINER, 
+        UserRole.AGENT
+      ];
+      if (!eligibleRoles.includes(target.role as any)) return false;
+
+      // reporting under them means directly mapped manager or indirectly mapped via team lead
+      const isDirectReport = target.mappedManagerId === actor.uid;
+      const isIndirectReport = allUsers.some(tl => {
+        const isTL = [UserRole.TEAM_LEAD, 'TEAM_LEAD', 'OPS_TL', 'QTL', 'STL', 'TRAINER_TL'].includes(tl.role as any);
+        return isTL && tl.mappedManagerId === actor.uid && target.teamLeadId === tl.uid;
+      });
+      return isDirectReport || isIndirectReport;
+    }
+
+    const isTL = [UserRole.TEAM_LEAD, 'TEAM_LEAD', 'OPS_TL', 'QTL', 'STL', 'TRAINER_TL'].includes(actor.role as any);
+    if (isTL) {
+      // Team Lead can force logout SMEs, QAs, Trainers, and Agents mapped under them.
+      const eligibleRoles = [UserRole.SME, UserRole.QA, UserRole.TRAINER, UserRole.AGENT];
+      if (!eligibleRoles.includes(target.role as any)) return false;
+
+      return target.teamLeadId === actor.uid;
+    }
+
+    return false;
+  };
 
   // Date Range and Format selection states for reports
   const [showExportModal, setShowExportModal] = useState(false);
@@ -265,6 +321,96 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
       setAllShifts(shifts);
     } catch (error) {
       handleFirestoreError(error, OperationType.LIST, 'tmsShifts');
+    }
+  };
+
+  const startForceLogoutFlow = (shiftId: string, targetUid: string, targetName: string) => {
+    setForceOutShiftId(shiftId);
+    setForceOutTargetUid(targetUid);
+    setForceOutTargetName(targetName);
+    setForceOutReason('Left without logging out');
+    setForceOutCustomReason('');
+  };
+
+  const performAdminClockOut = async () => {
+    if (!forceOutShiftId) return;
+    try {
+      const shiftRef = doc(db, 'tmsShifts', forceOutShiftId);
+      const shiftSnap = await getDoc(shiftRef);
+      if (!shiftSnap.exists()) {
+        toast.error('Shift not found');
+        return;
+      }
+      const shift = shiftSnap.data() as TMSShift;
+      const nowISO = new Date().toISOString();
+      const updatedActivities = [...shift.activities];
+      const lastActivity = updatedActivities.length > 0 
+        ? updatedActivities[updatedActivities.length - 1].name 
+        : 'Unknown Process';
+        
+      if (updatedActivities.length > 0) {
+        updatedActivities[updatedActivities.length - 1].endTime = nowISO;
+      }
+
+      // Apply selected / custom reason
+      const finalReason = forceOutReason === 'other' 
+        ? (forceOutCustomReason.trim() || 'Forced logout by supervisor')
+        : forceOutReason;
+
+      // Update shift to COMPLETED
+      await updateDoc(shiftRef, {
+        activities: updatedActivities,
+        clockOutTime: nowISO,
+        status: 'COMPLETED'
+      });
+
+      // 1. Audit log process creation/alteration
+      const logId = `tms-forcelogout-${Date.now()}`;
+      await setDoc(doc(db, 'uploadAuditLogs', logId), {
+        id: logId,
+        targetId: forceOutTargetUid,
+        entityType: 'user_shift',
+        fieldName: 'status',
+        oldValue: 'ACTIVE/BREAK',
+        newValue: 'COMPLETED_FORCED',
+        updatedBy: user.uid,
+        updatedByName: user.name,
+        updatedAt: nowISO,
+        action: 'force_logout',
+        details: `Force Logout executed. User Forced Out: ${forceOutTargetName} (${shift.userEmail}). Forced By: ${user.name} (${user.email}). Reason: ${finalReason}. Current Activity at logout: ${lastActivity}.`
+      });
+
+      // 2. Also add to adminAuditLogs to be fully aligned with general compliance dashboard
+      const adminLogId = `wt-audit-${Date.now()}`;
+      await setDoc(doc(db, 'adminAuditLogs', adminLogId), {
+        timestamp: nowISO,
+        action: 'Force Logout',
+        performedBy: `${user.name} (${user.email})`,
+        affectedUser: `${forceOutTargetName} (${shift.userEmail})`,
+        previousValue: 'ACTIVE/BREAK',
+        newValue: 'COMPLETED_FORCED',
+        remarks: `Supervisor executed force logout. Reason: ${finalReason}`,
+        details: {
+          shiftId: forceOutShiftId,
+          targetUid: forceOutTargetUid,
+          reason: finalReason,
+          currentActivityAtLogout: lastActivity
+        }
+      });
+
+      toast.success(`Successfully forced clock-out for ${forceOutTargetName}.`);
+      
+      // Clean up modal states
+      setForceOutShiftId(null);
+      setForceOutTargetUid('');
+      setForceOutTargetName('');
+      setForceOutReason('Left without logging out');
+      setForceOutCustomReason('');
+
+      await fetchAllShifts();
+    } catch (e) {
+      console.error('[TMS FORCE LOGOUT ERROR]', e);
+      handleFirestoreError(e, OperationType.WRITE, 'tmsShifts');
     }
   };
 
@@ -659,10 +805,11 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
     }
   };
 
+  const isAdminRole = user.role === UserRole.ADMIN;
   const isManagerRole = user.role === UserRole.MANAGER;
   const isTLRole = [UserRole.TEAM_LEAD, UserRole.OPS_TL, UserRole.QTL, UserRole.STL, UserRole.TRAINER_TL].includes(user.role as UserRole);
 
-  if (isTLRole || isManagerRole) {
+  if (isTLRole || isManagerRole || isAdminRole) {
 
     const getMappedAgentsAndQAsForTL = (tlUid: string) => {
       return allUsers.filter(u => {
@@ -673,7 +820,9 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
 
     let mappedUsers: any[] = [];
     
-    if (isTLRole) {
+    if (isAdminRole) {
+      mappedUsers = allUsers.filter(u => u.uid !== user.uid);
+    } else if (isTLRole) {
       mappedUsers = getMappedAgentsAndQAsForTL(user.uid);
     } else if (isManagerRole) {
       const mappedTLs = allUsers.filter(u => {
@@ -980,33 +1129,6 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
       }
     };
 
-    const performAdminClockOut = async (shiftId: string, userName: string) => {
-      if (!confirm(`Are you sure you want to force clock-out ${userName}?`)) return;
-      try {
-        const shiftRef = doc(db, 'tmsShifts', shiftId);
-        const shiftSnap = await getDoc(shiftRef);
-        if (!shiftSnap.exists()) {
-          toast.error('Shift not found');
-          return;
-        }
-        const shift = shiftSnap.data() as TMSShift;
-        const nowISO = new Date().toISOString();
-        const updatedActivities = [...shift.activities];
-        if (updatedActivities.length > 0) {
-          updatedActivities[updatedActivities.length - 1].endTime = nowISO;
-        }
-        await updateDoc(shiftRef, {
-          activities: updatedActivities,
-          clockOutTime: nowISO,
-          status: 'COMPLETED'
-        });
-        toast.success(`Successfully forced clock-out for ${userName}.`);
-        await fetchAllShifts();
-      } catch (e) {
-        handleFirestoreError(e, OperationType.WRITE, 'tmsShifts');
-      }
-    };
-
     const finalMappedUsers = mappedUsers.filter((u) => {
       const search = (tmsSearch || '').toLowerCase();
       if (!search) return true;
@@ -1158,12 +1280,12 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
                               }`}>
                                 LIVE - {activeShift.status}
                               </Badge>
-                              {(isManagerRole || user.role === UserRole.ADMIN) && (
+                              {canUserForceLogoutTarget(user, u.uid) && (
                                 <Button 
                                   size="sm" 
                                   variant="ghost" 
-                                  className="text-[9px] text-red-500 hover:text-red-700 hover:bg-red-50" 
-                                  onClick={() => performAdminClockOut(activeShift.id, activeShift.userName)}
+                                  className="text-[9px] text-red-500 hover:text-red-700 hover:bg-red-50 border border-transparent hover:border-red-200 rounded-lg shrink-0 h-6 px-1.5 ml-1 font-bold" 
+                                  onClick={() => startForceLogoutFlow(activeShift.id, u.uid, u.name)}
                                 >
                                   Force Out
                                 </Button>
@@ -1365,6 +1487,13 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
            (s.userEmail || '').toLowerCase().includes(search) ||
            (s.activities || []).some(act => (act.name || '').toLowerCase().includes(search));
   });
+
+  const itemsPerPage = 30;
+  const totalPages = Math.ceil(filteredAllShifts.length / itemsPerPage) || 1;
+  const paginatedShifts = filteredAllShifts.slice(
+    (currentPage - 1) * itemsPerPage,
+    currentPage * itemsPerPage
+  );
 
   const handleExportAllShifts = () => {
     setExportType('organization');
@@ -2027,12 +2156,15 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
                         placeholder="Search users..." 
                         className="pl-8 h-8 rounded-lg text-[11px] bg-slate-50/50"
                         value={adminSearch}
-                        onChange={(e) => setAdminSearch(e.target.value)}
+                        onChange={(e) => {
+                          setAdminSearch(e.target.value);
+                          setCurrentPage(1);
+                        }}
                       />
                     </div>
                   </div>
                 </CardHeader>
-                <CardContent className="p-0 max-h-96 overflow-y-auto">
+                <CardContent className="p-0 max-h-[500px] overflow-y-auto">
                   <div className="overflow-x-auto">
                     <table className="w-full text-left text-xs border-collapse">
                       <thead>
@@ -2041,10 +2173,11 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
                           <th className="p-4">Process / Status</th>
                           <th className="p-4">Clocked Interval</th>
                           <th className="p-4 text-center">Calculated Utilization</th>
+                          <th className="p-4 text-center">Action</th>
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-100">
-                        {filteredAllShifts.map((sh) => {
+                        {paginatedShifts.map((sh) => {
                           const stats = computeShiftStats(sh);
                           const currentActiveActivity = sh.activities[sh.activities.length - 1];
 
@@ -2080,12 +2213,26 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
                                   Productive: {stats.activeStr} / {stats.totalShiftStr}
                                 </div>
                               </td>
+                              <td className="p-4 text-center">
+                                {(sh.status === 'ACTIVE' || sh.status === 'BREAK') && canUserForceLogoutTarget(user, sh.userId) ? (
+                                  <Button 
+                                    size="sm" 
+                                    variant="ghost" 
+                                    className="text-[10px] text-red-500 hover:text-red-700 hover:bg-red-50 border border-transparent hover:border-red-200 rounded-lg font-bold" 
+                                    onClick={() => startForceLogoutFlow(sh.id, sh.userId, sh.userName)}
+                                  >
+                                    Force Out
+                                  </Button>
+                                ) : (
+                                  <span className="text-slate-400 font-normal text-xs">-</span>
+                                )}
+                              </td>
                             </tr>
                           );
                         })}
                         {filteredAllShifts.length === 0 && (
                           <tr>
-                            <td colSpan={4} className="p-10 text-center opacity-40 font-bold uppercase tracking-widest text-[10px] text-slate-400">
+                            <td colSpan={5} className="p-10 text-center opacity-40 font-bold uppercase tracking-widest text-[10px] text-slate-400">
                               No team records or matching logs found
                             </td>
                           </tr>
@@ -2094,6 +2241,34 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
                     </table>
                   </div>
                 </CardContent>
+                <CardFooter className="py-3 px-6 border-t border-slate-100 flex flex-col sm:flex-row items-center justify-between text-xs text-slate-500 bg-slate-50/50 rounded-b-xl gap-3">
+                  <div>
+                    Showing <span className="font-extrabold text-slate-850">{filteredAllShifts.length === 0 ? 0 : (currentPage - 1) * itemsPerPage + 1}-{Math.min(filteredAllShifts.length, currentPage * itemsPerPage)}</span> of <span className="font-extrabold text-slate-850">{filteredAllShifts.length}</span> resources
+                  </div>
+                  <div className="flex items-center gap-1">
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-8 text-[11px] text-slate-705 font-bold bg-white hover:bg-slate-100 border-slate-200 rounded-lg shrink-0 cursor-pointer"
+                      onClick={() => setCurrentPage(prev => Math.max(1, prev - 1))}
+                      disabled={currentPage === 1}
+                    >
+                      <ChevronLeft size={14} className="mr-1" /> Prev
+                    </Button>
+                    <span className="font-bold text-slate-700 mx-2 text-[11px] select-none">
+                      Page {currentPage} of {totalPages}
+                    </span>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-8 text-[11px] text-slate-705 font-bold bg-white hover:bg-slate-100 border-slate-200 rounded-lg shrink-0 cursor-pointer"
+                      onClick={() => setCurrentPage(prev => Math.min(totalPages, prev + 1))}
+                      disabled={currentPage === totalPages}
+                    >
+                      Next <ChevronRight size={14} className="ml-1" />
+                    </Button>
+                  </div>
+                </CardFooter>
               </Card>
             </div>
 
@@ -2120,6 +2295,92 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
                 setShowClockOutConfirm(false);
                 performClockOut();
               }}>Confirm Clock Out</Button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Custom user force logout overlay modal with reason select and logging */}
+      {forceOutShiftId && (
+        <div className="fixed inset-0 bg-slate-900/55 backdrop-blur-sm flex items-center justify-center z-[99999] p-4 animate-in fade-in duration-200 text-slate-800">
+          <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-xl border border-slate-200 space-y-4">
+            <div className="flex items-center gap-3 text-red-650 border-b pb-3">
+              <div className="w-10 h-10 rounded-full bg-red-50 flex items-center justify-center shrink-0">
+                <AlertCircle size={20} />
+              </div>
+              <div className="text-left">
+                <h4 className="font-extrabold text-slate-900 text-md uppercase tracking-wide">Force Logout Action</h4>
+                <p className="text-slate-500 text-[10px] font-bold leading-none mt-1">Authorized compliance override execution</p>
+              </div>
+            </div>
+
+            <div className="space-y-4 text-xs font-bold text-slate-700">
+              <div className="p-3.5 bg-red-50/50 border border-red-100 rounded-xl space-y-2 text-left">
+                <p className="text-red-950 font-black uppercase tracking-wider text-[10px]">Target Resource Details</p>
+                <div className="grid grid-cols-2 gap-2 text-slate-650 font-semibold">
+                  <div>
+                    <span className="text-slate-400 block text-[9px] uppercase font-black">Name</span>
+                    <span className="text-slate-950 font-extrabold">{forceOutTargetName}</span>
+                  </div>
+                  <div>
+                    <span className="text-slate-400 block text-[9px] uppercase font-black">Current Status</span>
+                    <span className="bg-amber-100 text-amber-900 border border-amber-250 px-1.5 rounded text-[10px] uppercase font-black">
+                      {allShifts.find(s => s.id === forceOutShiftId)?.status || 'ACTIVE'}
+                    </span>
+                  </div>
+                  <div className="col-span-2">
+                    <span className="text-slate-400 block text-[9px] uppercase font-black">Active Process at logout</span>
+                    <span className="text-slate-950 font-black underline">
+                      {(() => {
+                        const s = allShifts.find(x => x.id === forceOutShiftId);
+                        if (s && s.activities && s.activities.length > 0) {
+                          return s.activities[s.activities.length - 1].name;
+                        }
+                        return 'Unknown Process';
+                      })()}
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Preset Reason Select */}
+              <div className="space-y-1.5 text-left">
+                <Label className="text-[10px] font-black text-slate-500 uppercase tracking-widest leading-none">Select Standard Reason</Label>
+                <select
+                  value={forceOutReason}
+                  onChange={(e) => setForceOutReason(e.target.value)}
+                  className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 text-xs text-slate-800 font-bold focus:outline-none focus:ring-2 focus:ring-red-500 cursor-pointer"
+                >
+                  <option value="Left without logging out">Left without logging out (End of Shift)</option>
+                  <option value="Long inactivity / Away from desk">Unscheduled inactivity / Away from desk</option>
+                  <option value="System glitch / Hanging session">Technical glitch / Hanging timer session</option>
+                  <option value="Disciplinary violation">Disciplinary violation / Policy breach</option>
+                  <option value="other">Other (Write custom response below...)</option>
+                </select>
+              </div>
+
+              {/* Custom Input */}
+              {forceOutReason === 'other' && (
+                <div className="space-y-1.5 text-left animate-in slide-in-from-top-2 duration-200">
+                  <Label className="text-[10px] font-black text-slate-500 uppercase tracking-widest leading-none">Custom Override Remarks</Label>
+                  <textarea
+                    placeholder="Provide explicit reasons for this security clock-out..."
+                    value={forceOutCustomReason}
+                    onChange={(e) => setForceOutCustomReason(e.target.value)}
+                    className="w-full h-20 p-3 rounded-xl border border-slate-200 focus:ring-1 focus:ring-red-500 focus:outline-none text-xs text-slate-900 bg-white shadow-inner font-semibold"
+                  />
+                </div>
+              )}
+            </div>
+
+            <div className="flex justify-end gap-2 text-xs font-bold pt-3 border-t">
+              <Button variant="ghost" onClick={() => setForceOutShiftId(null)} className="rounded-xl">Cancel</Button>
+              <Button 
+                className="bg-red-600 hover:bg-red-700 text-white font-bold rounded-xl flex items-center gap-1.5"
+                onClick={performAdminClockOut}
+              >
+                Finalize Force Out
+              </Button>
             </div>
           </div>
         </div>

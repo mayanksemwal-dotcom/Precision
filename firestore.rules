@@ -236,6 +236,26 @@ service cloud.firestore {
       allow write: if isAdmin();
     }
 
+    match /roles/{roleId} {
+      allow read: if isVerified();
+      allow write, delete: if isAdmin();
+    }
+
+    match /role_permissions/{permissionId} {
+      allow read: if isVerified();
+      allow write, delete: if isAdmin();
+    }
+
+    match /permission_templates/{id} {
+      allow read: if isVerified();
+      allow write, delete: if isAdmin();
+    }
+
+    match /module_master/{moduleId} {
+      allow read: if isVerified();
+      allow write, delete: if isAdmin();
+    }
+
     match /archived_records/{id} {
       allow read: if isVerified() && (isAdmin() || isManager());
       allow write, delete: if isAdmin();

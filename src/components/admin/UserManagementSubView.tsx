@@ -70,7 +70,9 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
     department: 'Operations',
     process: '',
     dateJoined: '',
-    notes: ''
+    notes: '',
+    teamLeadName: '',
+    mappedManagerName: ''
   });
 
   const [newForm, setNewForm] = useState({
@@ -82,6 +84,8 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
     process: '',
     dateJoined: new Date().toISOString().slice(0, 10),
     notes: '',
+    teamLeadName: '',
+    mappedManagerName: '',
     password: 'Password360@'
   });
 
@@ -236,16 +240,49 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
       'User Role': u.role || 'N/A',
       'Department Name': u.department || 'Operations',
       'Enterprise Process': u.process || 'N/A',
+      'Team Lead': u.teamLeadName || 'N/A',
+      'Manager Name': u.mappedManagerName || u.Manager || 'N/A',
       'Joined Date': u.dateJoined || 'N/A',
       'Account State': (u.status?.toLowerCase() === 'active' || u.isActive === true) ? 'Active' : 'Inactive',
+      'Last Login': u.lastLoginAt ? new Date(u.lastLoginAt).toLocaleString() : (u.lastLogin ? new Date(u.lastLogin).toLocaleString() : 'Never'),
       'Employee Notes': u.notes || ''
     }));
 
     const ws = XLSX.utils.json_to_sheet(format);
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'Roster Directory');
-    XLSX.writeFile(wb, 'Precision360_Profiles.xlsx');
+    XLSX.writeFile(wb, 'Precision365_Profiles.xlsx');
     toast.success('Roster Sheet compiled and downloaded.');
+  };
+
+  const handleExportCSV = () => {
+    const headers = ['Employee ID', 'Employee Name', 'Email ID', 'User Role', 'Department Name', 'Enterprise Process', 'Team Lead', 'Manager Name', 'Joined Date', 'Account State', 'Last Login', 'Employee Notes'];
+    const rows = filteredUsers.map(u => [
+      u.employeeId || 'N/A',
+      u.fullName || u.name || 'N/A',
+      u.email || 'N/A',
+      u.role || 'N/A',
+      u.department || 'Operations',
+      u.process || 'N/A',
+      u.teamLeadName || 'N/A',
+      u.mappedManagerName || u.Manager || 'N/A',
+      u.dateJoined || 'N/A',
+      (u.status?.toLowerCase() === 'active' || u.isActive === true) ? 'Active' : 'Inactive',
+      u.lastLoginAt ? new Date(u.lastLoginAt).toLocaleString() : (u.lastLogin ? new Date(u.lastLogin).toLocaleString() : 'Never'),
+      (u.notes || '').replace(/"/g, '""').replace(/\r?\n|\r/g, ' ')
+    ]);
+
+    const csvContent = "data:text/csv;charset=utf-8,\uFEFF" 
+      + [headers.join(','), ...rows.map(e => e.map(val => `"${val}"`).join(','))].join('\n');
+    
+    const encodedUri = encodeURI(csvContent);
+    const link = document.createElement("a");
+    link.setAttribute("href", encodedUri);
+    link.setAttribute("download", "Precision365_Profiles.csv");
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    toast.success('Roster CSV compiled and downloaded.');
   };
 
   // Add User Submission
@@ -292,6 +329,8 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
         process: newForm.process,
         dateJoined: newForm.dateJoined,
         notes: newForm.notes,
+        teamLeadName: newForm.teamLeadName,
+        mappedManagerName: newForm.mappedManagerName,
         status: 'Active',
         isActive: true,
         createdAt: new Date().toISOString()
@@ -311,6 +350,8 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
         process: '',
         dateJoined: new Date().toISOString().slice(0, 10),
         notes: '',
+        teamLeadName: '',
+        mappedManagerName: '',
         password: 'Password360@'
       });
       onRefresh();
@@ -329,7 +370,9 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
       department: user.department || 'Operations',
       process: user.process || '',
       dateJoined: user.dateJoined || '',
-      notes: user.notes || ''
+      notes: user.notes || '',
+      teamLeadName: user.teamLeadName || '',
+      mappedManagerName: user.mappedManagerName || user.Manager || ''
     });
     setIsEditUserOpen(true);
   };
@@ -353,6 +396,8 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
         process: editForm.process,
         dateJoined: editForm.dateJoined,
         notes: editForm.notes,
+        teamLeadName: editForm.teamLeadName,
+        mappedManagerName: editForm.mappedManagerName,
         lastModifiedAt: new Date().toISOString()
       };
 
@@ -439,6 +484,32 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
     }
   };
 
+  // Compute dynamic workforce statistics
+  const stats = useMemo(() => {
+    const total = allUsers.length;
+    const active = allUsers.filter(u => u.status?.toLowerCase() === 'active' || u.isActive === true).length;
+    const inactive = total - active;
+    
+    const counts: Record<string, number> = {
+      ADMIN: 0,
+      MANAGER: 0,
+      ASSISTANT_MANAGER: 0,
+      TEAM_LEAD: 0,
+      SME: 0,
+      TRAINER: 0,
+      QA: 0,
+      AGENT: 0
+    };
+
+    allUsers.forEach(u => {
+      if (counts[u.role] !== undefined) {
+        counts[u.role]++;
+      }
+    });
+
+    return { total, active, inactive, ...counts };
+  }, [allUsers]);
+
   // Render variables
   const containerClass = adminTheme === 'dark' ? 'space-y-6 text-slate-100' : 'space-y-6 text-slate-800';
   const filterBg = adminTheme === 'dark' ? 'bg-slate-805 gap-4 p-4 rounded-xl border border-slate-700/60' : 'bg-slate-100/50 gap-4 p-4 rounded-xl border border-slate-200/60';
@@ -449,6 +520,84 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
 
   return (
     <div className={containerClass}>
+      
+      {/* Workforce Analytics Summary Grid */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-5 gap-4">
+        {/* Total Workforce */}
+        <div className={`p-4 rounded-2xl border transition-all ${
+          adminTheme === 'dark' ? 'bg-slate-900/60 border-slate-800/80 shadow-md' : 'bg-white border-slate-200 shadow-sm'
+        }`}>
+          <span className="text-[10px] font-black uppercase text-slate-400 tracking-wider">Total Force</span>
+          <div className="flex items-baseline gap-2 mt-1">
+            <span className="text-2xl font-black text-indigo-500">{stats.total}</span>
+            <span className="text-[10px] text-slate-400 font-bold">employees</span>
+          </div>
+          <div className="text-[10px] text-slate-400 mt-1 flex gap-2">
+            <span className="text-emerald-500">● {stats.active} Active</span>
+            <span className="text-rose-500">● {stats.inactive} Inactive</span>
+          </div>
+        </div>
+
+        {/* Support Staff Roles */}
+        <div className={`p-4 rounded-2xl border transition-all ${
+          adminTheme === 'dark' ? 'bg-slate-900/60 border-slate-800/80 shadow-md' : 'bg-white border-slate-200 shadow-sm'
+        }`}>
+          <span className="text-[10px] font-black uppercase text-slate-400 tracking-wider">Admins / Managers</span>
+          <div className="flex items-baseline gap-2 mt-1">
+            <span className="text-2xl font-black text-indigo-400">{stats.ADMIN + stats.MANAGER + stats.ASSISTANT_MANAGER}</span>
+            <span className="text-[10px] text-slate-400 font-bold">profiles</span>
+          </div>
+          <div className="text-[10px] text-slate-400 mt-1 flex flex-wrap gap-1">
+            <span>{stats.ADMIN} Adm •</span>
+            <span>{stats.MANAGER} Mgr •</span>
+            <span>{stats.ASSISTANT_MANAGER} AM</span>
+          </div>
+        </div>
+
+        {/* Team Leads Core count */}
+        <div className={`p-4 rounded-2xl border transition-all ${
+          adminTheme === 'dark' ? 'bg-slate-900/60 border-slate-800/80 shadow-md' : 'bg-white border-slate-200 shadow-sm'
+        }`}>
+          <span className="text-[10px] font-black uppercase text-slate-400 tracking-wider">Team Leads (TL)</span>
+          <div className="flex items-baseline gap-1 mt-1">
+            <span className="text-2xl font-black text-amber-500">{stats.TEAM_LEAD}</span>
+            <span className="text-[10px] text-slate-400 font-bold">leaders</span>
+          </div>
+          <div className="text-[10px] text-slate-400 mt-1">
+            Direct team supervisor matrices.
+          </div>
+        </div>
+
+        {/* Quality and Training Support */}
+        <div className={`p-4 rounded-2xl border transition-all ${
+          adminTheme === 'dark' ? 'bg-slate-900/60 border-slate-800/80 shadow-md' : 'bg-white border-slate-200 shadow-sm'
+        }`}>
+          <span className="text-[10px] font-black uppercase text-slate-400 tracking-wider">SME / trainers / QA</span>
+          <div className="flex items-baseline gap-1 mt-1">
+            <span className="text-2xl font-black text-emerald-500">{stats.SME + stats.TRAINER + stats.QA}</span>
+            <span className="text-[10px] text-slate-400 font-bold">specialists</span>
+          </div>
+          <div className="text-[10px] text-slate-400 mt-1 flex flex-wrap gap-1">
+            <span>{stats.SME} SME •</span>
+            <span>{stats.TRAINER} Trn •</span>
+            <span>{stats.QA} QA</span>
+          </div>
+        </div>
+
+        {/* Frontline Agents */}
+        <div className={`p-4 rounded-2xl border transition-all col-span-2 sm:col-span-1 ${
+          adminTheme === 'dark' ? 'bg-slate-900/60 border-slate-800/80 shadow-md' : 'bg-white border-slate-200 shadow-sm'
+        }`}>
+          <span className="text-[10px] font-black uppercase text-slate-400 tracking-wider">Frontline Agents</span>
+          <div className="flex items-baseline gap-1 mt-1">
+            <span className="text-2xl font-black text-sky-500">{stats.AGENT}</span>
+            <span className="text-[10px] text-slate-400 font-bold">agents</span>
+          </div>
+          <div className="text-[10px] text-slate-400 mt-1">
+            Frontline production directory.
+          </div>
+        </div>
+      </div>
       
       {/* Search and Filters Segment */}
       <div className="flex flex-col gap-4">
@@ -473,7 +622,10 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
               <Upload size={14} /> Paste CSV Group
             </button>
             <button onClick={handleExportExcel} className="px-3 py-2 text-xs font-bold rounded-lg cursor-pointer bg-amber-600 hover:bg-amber-700 text-white flex items-center gap-1.5">
-              <FileDown size={14} /> Export Directory
+              <FileDown size={14} /> Excel Export
+            </button>
+            <button onClick={handleExportCSV} className="px-3 py-2 text-xs font-bold rounded-lg cursor-pointer bg-sky-600 hover:bg-sky-700 text-white flex items-center gap-1.5">
+              <FileDown size={14} /> CSV Export
             </button>
           </div>
         </div>
@@ -572,9 +724,12 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
                 <th className="p-4 font-bold">Role</th>
                 <th className="p-4 font-bold">Division</th>
                 <th className="p-4 font-bold">Process</th>
+                <th className="p-4 font-bold">Team Lead</th>
+                <th className="p-4 font-bold">Manager</th>
                 <th className="p-4 font-bold cursor-pointer text-center" onClick={() => handleSort('dateJoined')}>
                   <span className="flex items-center gap-1 justify-center">Join Date <ArrowUpDown size={11} /></span>
                 </th>
+                <th className="p-4 text-center">Last Login</th>
                 <th className="p-4 text-center">Active Status</th>
                 <th className="p-4 text-center">Files / Notes</th>
                 <th className="p-4 text-right pr-6">Manage</th>
@@ -607,7 +762,12 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
                       </td>
                       <td className="p-4 font-medium opacity-85">{user.department || 'Operations'}</td>
                       <td className="p-4 font-mono font-bold opacity-85">{user.process || 'Commonpool'}</td>
+                      <td className="p-4 font-medium text-slate-500 dark:text-slate-400">{user.teamLeadName || 'N/A'}</td>
+                      <td className="p-4 font-medium text-slate-500 dark:text-slate-400">{user.mappedManagerName || user.Manager || 'N/A'}</td>
                       <td className="p-4 text-center opacity-75">{user.dateJoined || 'N/A'}</td>
+                      <td className="p-4 text-center text-slate-400 dark:text-slate-500 font-medium">
+                        {user.lastLoginAt ? new Date(user.lastLoginAt).toLocaleDateString() : (user.lastLogin ? new Date(user.lastLogin).toLocaleDateString() : 'Never')}
+                      </td>
                       
                       {/* Active Status Toggle */}
                       <td className="p-4 text-center">
@@ -794,6 +954,26 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
               </div>
 
               <div>
+                <label className="block text-[10px] font-bold text-slate-400 mb-0.5">Team Lead Name</label>
+                <input 
+                  value={newForm.teamLeadName} 
+                  onChange={e => setNewForm({...newForm, teamLeadName: e.target.value})} 
+                  placeholder="e.g. Mayank Rawat" 
+                  className={adminTheme === 'dark' ? 'w-full bg-slate-900 p-2 border border-slate-705 rounded-lg' : 'w-full bg-white border border-slate-200 p-2 rounded-lg'}
+                />
+              </div>
+
+              <div>
+                <label className="block text-[10px] font-bold text-slate-400 mb-0.5">Manager Name</label>
+                <input 
+                  value={newForm.mappedManagerName} 
+                  onChange={e => setNewForm({...newForm, mappedManagerName: e.target.value})} 
+                  placeholder="e.g. Mayank Semwal" 
+                  className={adminTheme === 'dark' ? 'w-full bg-slate-900 p-2 border border-slate-705 rounded-lg' : 'w-full bg-white border border-slate-200 p-2 rounded-lg'}
+                />
+              </div>
+
+              <div>
                 <label className="block text-[10px] font-bold text-slate-400 mb-0.5">Joining Date</label>
                 <input 
                   type="date"
@@ -896,6 +1076,26 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
                   value={editForm.process} 
                   onChange={e => setEditForm({...editForm, process: e.target.value})} 
                   placeholder="e.g. Mobile Verticals" 
+                  className={adminTheme === 'dark' ? 'w-full bg-slate-900 p-2 border border-slate-700 rounded-lg' : 'w-full bg-white border border-slate-200 p-2 rounded-lg'}
+                />
+              </div>
+
+              <div>
+                <label className="block text-[10px] font-bold text-slate-400 mb-0.5">Team Lead Name</label>
+                <input 
+                  value={editForm.teamLeadName} 
+                  onChange={e => setEditForm({...editForm, teamLeadName: e.target.value})} 
+                  placeholder="e.g. Mayank Rawat" 
+                  className={adminTheme === 'dark' ? 'w-full bg-slate-900 p-2 border border-slate-700 rounded-lg' : 'w-full bg-white border border-slate-200 p-2 rounded-lg'}
+                />
+              </div>
+
+              <div>
+                <label className="block text-[10px] font-bold text-slate-400 mb-0.5">Manager Name</label>
+                <input 
+                  value={editForm.mappedManagerName} 
+                  onChange={e => setEditForm({...editForm, mappedManagerName: e.target.value})} 
+                  placeholder="e.g. Mayank Semwal" 
                   className={adminTheme === 'dark' ? 'w-full bg-slate-900 p-2 border border-slate-700 rounded-lg' : 'w-full bg-white border border-slate-200 p-2 rounded-lg'}
                 />
               </div>

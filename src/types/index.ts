@@ -1,6 +1,7 @@
 export enum UserRole {
   ADMIN = 'ADMIN',
   MANAGER = 'MANAGER',
+  ASSISTANT_MANAGER = 'ASSISTANT_MANAGER',
   STL = 'STL',
   OPS_TL = 'OPS_TL',
   SME = 'SME',

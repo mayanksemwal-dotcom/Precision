@@ -208,9 +208,78 @@
         "createdAt": { "type": "string" }
       },
       "required": ["id", "name", "url", "category", "createdBy", "createdAt"]
+    },
+    "Role": {
+      "title": "Role",
+      "description": "User Role definition",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "description": { "type": "string" },
+        "templateName": { "type": "string" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["id", "name"]
+    },
+    "ModuleMaster": {
+      "title": "Module Master",
+      "description": "Master list of registered modules",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "description": { "type": "string" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["id", "name"]
+    },
+    "RolePermission": {
+      "title": "Role Permission",
+      "description": "Permission mapping for a role and module",
+      "type": "object",
+      "properties": {
+        "role_name": { "type": "string" },
+        "module_name": { "type": "string" },
+        "can_view": { "type": "boolean" },
+        "can_create": { "type": "boolean" },
+        "can_edit": { "type": "boolean" },
+        "can_delete": { "type": "boolean" },
+        "can_export": { "type": "boolean" },
+        "can_approve": { "type": "boolean" }
+      },
+      "required": ["role_name", "module_name", "can_view"]
+    },
+    "PermissionTemplate": {
+      "title": "Permission Template",
+      "description": "Standardized permission templates for roles",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "permissions": { "type": "object" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["id", "name"]
     }
   },
   "firestore": {
+    "roles/{roleId}": {
+      "schema": "Role",
+      "description": "Organizational roles"
+    },
+    "permission_templates/{id}": {
+      "schema": "PermissionTemplate",
+      "description": "Baselined permission templates"
+    },
+    "module_master/{moduleId}": {
+      "schema": "ModuleMaster",
+      "description": "Registered modules"
+    },
+    "role_permissions/{permissionId}": {
+      "schema": "RolePermission",
+      "description": "Role-based module permissions map"
+    },
     "users/{userId}": {
       "schema": "UserProfile",
       "description": "User profiles"
