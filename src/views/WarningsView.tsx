@@ -28,7 +28,7 @@ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, Di
 import WarningManager from '../components/WarningManager';
 import { db, handleFirestoreError, OperationType } from '../lib/firebase';
 import { softDeleteRecord } from '../lib/adminUtils';
-import { doc, setDoc, updateDoc } from 'firebase/firestore';
+import { doc, setDoc, updateDoc, addDoc, collection } from 'firebase/firestore';
 import { toast } from 'sonner';
 
 interface WarningsViewProps {
@@ -77,12 +77,37 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
   const isAdmin = user.role === UserRole.ADMIN;
 
   const handleDelete = async (ticket: WarningTicket) => {
-    if(confirm('Are you sure you want to permanently delete this warning?')) {
+    if (confirm('Are you sure you want to soft-delete/cancel this warning ticket? It will be archived and logged.')) {
         try {
-            const { deleteDoc, doc } = await import('firebase/firestore');
-            await deleteDoc(doc(db, 'disciplinaryLogs', ticket.id));
-            toast.success('Record deleted successfully.');
-            if(onRefresh) onRefresh();
+            const docRef = doc(db, 'disciplinaryLogs', ticket.id);
+            const nowISO = new Date().toISOString();
+            const performerName = `${user.fullName || user.name || user.email}`;
+
+            await updateDoc(docRef, {
+                isDeleted: true,
+                status: 'Deleted',
+                deletedAt: nowISO,
+                deletedBy: user.email
+            });
+
+            // Log tool audit event
+            await addDoc(collection(db, 'adminAuditLogs'), {
+              timestamp: nowISO,
+              action: 'Warning Closed',
+              performedBy: `${performerName} (${user.email})`,
+              affectedUser: `${ticket.agentName} (${ticket.agentEmail})`,
+              previousValue: ticket.status || 'Pending',
+              newValue: 'Deleted / Cancelled',
+              remarks: `Soft deleted warning ticket ${ticket.id}`,
+              details: {
+                ticketId: ticket.id,
+                level: ticket.level,
+                reason: ticket.remarks
+              }
+            });
+
+            toast.success('Warning ticket successfully soft-deleted.');
+            if (onRefresh) onRefresh();
         } catch (err: any) {
              console.error('Deletion failure:', err);
              toast.error(`Deletion failed: ${err.message || 'Permission denied'}`);
@@ -122,15 +147,16 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
   // Action handers: Accept Warning
   const handleAccept = async (ticket: WarningTicket) => {
     try {
+      const nowISO = new Date().toISOString();
       const updatedTicket: WarningTicket = {
         ...ticket,
         status: 'Accepted',
-        acceptedAt: new Date().toISOString(),
+        acceptedAt: nowISO,
         history: [
           ...(ticket.history || []),
           {
             action: `Warning Accepted by Agent`,
-            timestamp: new Date().toISOString(),
+            timestamp: nowISO,
             userName: user.name,
             userRole: user.role
           }
@@ -139,6 +165,22 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
 
       const docRef = doc(db, 'disciplinaryLogs', ticket.id);
       await setDoc(docRef, updatedTicket, { merge: true });
+
+      // Log to audit logs
+      await addDoc(collection(db, 'adminAuditLogs'), {
+        timestamp: nowISO,
+        action: 'Warning Modified',
+        performedBy: `${user.fullName || user.name || user.email} (${user.email})`,
+        affectedUser: `${ticket.agentName} (${ticket.agentEmail})`,
+        previousValue: ticket.status || 'Pending',
+        newValue: 'Accepted',
+        remarks: 'Warning acknowledged and accepted by employee',
+        details: {
+          ticketId: ticket.id,
+          level: ticket.level,
+        }
+      });
+
       toast.success(`Success! Warning has been successfully accepted and logged.`);
       if (onRefresh) onRefresh();
     } catch (e: any) {

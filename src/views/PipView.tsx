@@ -46,7 +46,7 @@ const Textarea = React.forwardRef<HTMLTextAreaElement, TextareaProps>(
 Textarea.displayName = "Textarea";
 
 import { db, handleFirestoreError, OperationType } from '../lib/firebase';
-import { doc, setDoc, updateDoc, collection, onSnapshot, query, where, orderBy, getDocs, serverTimestamp } from 'firebase/firestore';
+import { doc, setDoc, updateDoc, collection, addDoc, onSnapshot, query, where, orderBy, getDocs, serverTimestamp } from 'firebase/firestore';
 import { toast } from 'sonner';
 
 interface PipViewProps {
@@ -60,6 +60,7 @@ export default function PipView({ user, allUsers = [] }: PipViewProps) {
   const [searchTerm, setSearchTerm] = useState('');
   const [statusFilter, setStatusFilter] = useState<string>('All');
   const [selectedPip, setSelectedPip] = useState<PipRecord | null>(null);
+  const [sendEmailNotification, setSendEmailNotification] = useState(true);
 
   const getTodayYmd = () => new Date().toISOString().slice(0, 10);
   const getThirtyDaysAheadYmd = () => {
@@ -198,6 +199,100 @@ export default function PipView({ user, allUsers = [] }: PipViewProps) {
 
       await setDoc(doc(db, 'pips', pipId), pipRecord);
       
+      const nowISO = new Date().toISOString();
+      const performerName = `${user.fullName || user.name || user.email}`;
+
+      // 1. Audit Log: PIP Initiated
+      await addDoc(collection(db, 'adminAuditLogs'), {
+        timestamp: nowISO,
+        action: 'PIP Initiated',
+        performedBy: `${performerName} (${user.email})`,
+        affectedUser: `${targetAgent.name} (${targetAgent.email})`,
+        previousValue: 'None',
+        newValue: 'Initiated',
+        remarks: `Initiated PIP plan: "${newPipForm.title}". Observation Period: ${newPipForm.startDate} to ${newPipForm.endDate}. Targets: QA Score: ${newPipForm.qualityTarget}%, Attendance: ${newPipForm.attendanceTarget}%, Cases: ${newPipForm.productivityTarget}`,
+        details: {
+          pipId,
+          startDate: newPipForm.startDate,
+          endDate: newPipForm.endDate,
+          targets: {
+            quality: newPipForm.qualityTarget,
+            attendance: newPipForm.attendanceTarget,
+            productivity: newPipForm.productivityTarget
+          }
+        }
+      });
+
+      // 2. Automated Trigger Email Simulation
+      if (sendEmailNotification) {
+        const reportingLineCC = [];
+        if (targetAgent.teamLeadId) {
+          const tlObj = allUsers.find(u => u.uid === targetAgent.teamLeadId);
+          reportingLineCC.push(tlObj ? tlObj.email : `${targetAgent.teamLeadId}@bergtechnologies.co.in`);
+        }
+        if (targetAgent.mappedManagerId) {
+          const mgrObj = allUsers.find(u => u.uid === targetAgent.mappedManagerId);
+          reportingLineCC.push(mgrObj ? mgrObj.email : `${targetAgent.mappedManagerId}@bergtechnologies.co.in`);
+        }
+        reportingLineCC.push('hr@bergtechnologies.co.in');
+
+        const emailSubject = `[URGENT] Performance Improvement Plan Initiated - ${targetAgent.name}`;
+        const emailBody = `
+Dear ${targetAgent.name},
+
+Please be advised that a Performance Improvement Plan (PIP) has been initiated for you by your Team Lead/Manager, ${performerName}, on ${new Date().toLocaleDateString()}.
+
+PROSPECTS & PLAN DETAILS:
+- Title: ${newPipForm.title}
+- Gaps Identified: ${newPipForm.description}
+- Coaching & Support Schedule: ${newPipForm.coachingSupportPlan}
+- Observation Period: ${newPipForm.startDate} to ${newPipForm.endDate} (${calculatedDurationDays} Calendar Days)
+
+OBSERVATION KEY PERFORMANCE STANDARDS:
+- Target QA Quality Score: ${newPipForm.qualityTarget}%
+- Target Attendance standard: ${newPipForm.attendanceTarget}%
+- Target Productivity cases: ${newPipForm.productivityTarget} cases
+
+Please review and officially acknowledge this plan in your Coaching & Excellence Bureau portal.
+
+Sincerely,
+System Automatons
+Berg Technologies Corp HS Division
+(CC: HR Executive Desk, Operational Managers, and Direct Team Leads)
+        `.trim();
+
+        // Audit Log: Email Sent
+        await addDoc(collection(db, 'adminAuditLogs'), {
+          timestamp: nowISO,
+          action: 'Email Sent',
+          performedBy: `${performerName} (${user.email})`,
+          affectedUser: `${targetAgent.name} (${targetAgent.email})`,
+          previousValue: 'N/A',
+          newValue: `Recipient: ${targetAgent.email}`,
+          remarks: `Automated PIP initiation notification email sent. Status: Dispatch simulated successfully.`,
+          details: {
+            to: targetAgent.email,
+            cc: reportingLineCC,
+            subject: emailSubject,
+            body: emailBody
+          }
+        });
+
+        toast.success(`Automated notification email dispatched to ${targetAgent.email} and reporting leads!`);
+      } else {
+        // Audit Log: Email Skipped
+        await addDoc(collection(db, 'adminAuditLogs'), {
+          timestamp: nowISO,
+          action: 'Email Skipped',
+          performedBy: `${performerName} (${user.email})`,
+          affectedUser: `${targetAgent.name} (${targetAgent.email})`,
+          previousValue: 'N/A',
+          newValue: 'Skipped',
+          remarks: `User opted out of sending automated PIP notification email`
+        });
+        toast.info("Automated email notification suppressed by initiator.");
+      }
+
       toast.success(`Successfully pre-provisioned PIP plan for ${targetAgent.name}`);
       setIsNewPipOpen(false);
       
@@ -251,10 +346,26 @@ export default function PipView({ user, allUsers = [] }: PipViewProps) {
         }
       ];
 
+      const nowISO = new Date().toISOString();
       await updateDoc(doc(db, 'pips', selectedPip.id), {
         checkins: updatedCheckins,
         status: 'Under Review', // Automatically transition status on first check-in
-        updatedAt: new Date().toISOString()
+        updatedAt: nowISO
+      });
+
+      // Audit log: Milestone update
+      await addDoc(collection(db, 'adminAuditLogs'), {
+        timestamp: nowISO,
+        action: 'PIP Updated',
+        performedBy: `${user.fullName || user.name || user.email} (${user.email})`,
+        affectedUser: `${selectedPip.agentName} (${selectedPip.agentEmail})`,
+        previousValue: selectedPip.status,
+        newValue: 'Under Review',
+        remarks: `Recorded milestone check-in review: "${checkinForm.metricsAssessment.trim()}". Action items: "${checkinForm.actionItems.trim() || 'Keep monitoring current metrics'}"`,
+        details: {
+          pipId: selectedPip.id,
+          type: 'Milestone Check-in'
+        }
       });
 
       // Update state local for continuous detail view
@@ -351,10 +462,11 @@ export default function PipView({ user, allUsers = [] }: PipViewProps) {
     });
 
     try {
+      const nowISO = new Date().toISOString();
       const payload: any = {
         status: newStatus,
         finalComments: comments.trim(),
-        updatedAt: new Date().toISOString()
+        updatedAt: nowISO
       };
 
       // If extended, add 15 more days to end date
@@ -365,6 +477,23 @@ export default function PipView({ user, allUsers = [] }: PipViewProps) {
       }
 
       await updateDoc(doc(db, 'pips', selectedPip.id), payload);
+
+      // Audit log: PIP Status update
+      await addDoc(collection(db, 'adminAuditLogs'), {
+        timestamp: nowISO,
+        action: newStatus === 'Extended' ? 'PIP Updated' : 'PIP Closed',
+        performedBy: `${user.fullName || user.name || user.email} (${user.email})`,
+        affectedUser: `${selectedPip.agentName} (${selectedPip.agentEmail})`,
+        previousValue: selectedPip.status,
+        newValue: newStatus,
+        remarks: `PIP plan officially resolved as [${newStatus}]. Comments: "${comments.trim()}"`,
+        details: {
+          pipId: selectedPip.id,
+          finalStatus: newStatus,
+          comments: comments.trim(),
+          extendedEndDate: payload.endDate || null
+        }
+      });
       
       setSelectedPip(prev => prev ? { ...prev, ...payload } : null);
       toast.success(`PIP plan has been officially compiled and marked: ${newStatus}`);
@@ -557,6 +686,20 @@ export default function PipView({ user, allUsers = [] }: PipViewProps) {
                       onChange={(e) => setNewPipForm({ ...newPipForm, coachingSupportPlan: e.target.value })}
                       className="text-xs min-h-[70px] border-slate-200"
                     />
+                  </div>
+
+                  {/* Send Email Notification Checkbox */}
+                  <div className="flex items-center gap-2 pt-3 pb-2 bg-indigo-50/40 border border-indigo-150 rounded-xl px-4 mt-2">
+                    <input
+                      type="checkbox"
+                      id="sendEmailNotificationPip"
+                      checked={sendEmailNotification}
+                      onChange={(e) => setSendEmailNotification(e.target.checked)}
+                      className="h-4 w-4 rounded border-indigo-300 text-indigo-650 focus:ring-indigo-500 cursor-pointer"
+                    />
+                    <Label htmlFor="sendEmailNotificationPip" className="text-xs font-black text-indigo-950 cursor-pointer select-none">
+                      Send Email Notification to Employee & Reporting Hierarchy
+                    </Label>
                   </div>
                 </div>
 
