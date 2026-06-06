@@ -30,6 +30,8 @@ import { db, handleFirestoreError, OperationType } from '../lib/firebase';
 import { softDeleteRecord } from '../lib/adminUtils';
 import { doc, setDoc, updateDoc, addDoc, collection } from 'firebase/firestore';
 import { toast } from 'sonner';
+import { usePermission } from '../components/PermissionContext';
+import { canActOn } from '../lib/hierarchy';
 
 interface WarningsViewProps {
   warnings: WarningTicket[];
@@ -39,26 +41,24 @@ interface WarningsViewProps {
 }
 
 export default function WarningsView({ warnings = [], user, allUsers = [], onRefresh }: WarningsViewProps) {
+  const { canCreate, canEdit, canDelete } = usePermission();
   const [searchTerm, setSearchTerm] = useState('');
   const [isWarningOpen, setIsWarningOpen] = useState(false);
   const [statusFilter, setStatusFilter] = useState<string>('All');
 
-  // Filter based on roles, and exclude soft-deleted
+  // Filter based on hierarchy, and exclude soft-deleted
   const filteredWarnings = warnings.filter(w => {
-    if (w.isDeleted) return false; // Exclude from standard view
-    // Role level filtering
-    if (user.role === UserRole.AGENT) {
-      if (w.agentId !== user.uid) return false;
-    } else if (user.role === UserRole.QA) {
-      if (w.agentId !== user.uid) return false;
-    } else if (user.role === UserRole.TEAM_LEAD) {
-      const mapping = allUsers.find(u => u.uid === w.agentId);
-      if (mapping?.teamLeadId !== user.uid && w.agentId !== user.uid) return false;
-    } else if (user.role === UserRole.MANAGER) {
-      const mapping = allUsers.find(u => u.uid === w.agentId);
-      if (mapping?.mappedManagerId !== user.uid && w.agentId !== user.uid) return false;
-    }
-    // Admin sees all
+    if (w.isDeleted) return false; 
+    
+    // Visibility check: 
+    // 1. Is it my own warning?
+    const isMine = w.agentId === user.uid;
+    
+    // 2. Is it someone I supervise?
+    const targetUser = allUsers.find(u => u.uid === w.agentId);
+    const isSubordinate = targetUser ? canActOn(user, targetUser, allUsers) : false;
+
+    if (!isMine && !isSubordinate) return false;
 
     // Search filter
     const matchesSearch = 
@@ -73,8 +73,9 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
     return matchesSearch && matchesStatus;
   });
 
-  const canIssueWarning = user.role === UserRole.ADMIN || user.role === UserRole.MANAGER || user.role === UserRole.TEAM_LEAD;
-  const isAdmin = user.role === UserRole.ADMIN;
+  const canIssueWarning = canCreate('Warnings');
+  const canModifyWarning = canEdit('Warnings');
+  const canDeleteWarning = canDelete('Warnings');
 
   const handleDelete = async (ticket: WarningTicket) => {
     if (confirm('Are you sure you want to soft-delete/cancel this warning ticket? It will be archived and logged.')) {
@@ -231,7 +232,7 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
           <div className="px-4 py-2 bg-slate-50/50 rounded-lg border border-slate-100 flex items-center gap-3">
             <div className="text-right border-r border-slate-200 pr-3">
               <p className="text-[10px] font-extrabold text-slate-400 uppercase tracking-widest">
-                {user.role === UserRole.AGENT ? 'My Pending' : 'Pending'}
+                {canCreate('Warnings') ? 'Pending' : 'My Pending'}
               </p>
               <p className="text-lg font-black text-red-600 leading-none">
                 {filteredWarnings.filter(w => w.status === 'Pending').length}
@@ -244,7 +245,7 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
           <div className="px-4 py-2 bg-slate-50/50 rounded-lg border border-slate-100 flex items-center gap-3">
             <div className="text-right">
               <p className="text-[10px] font-extrabold text-slate-400 uppercase tracking-widest">
-                {user.role === UserRole.AGENT ? 'My Total Warnings' : 'Total Active'}
+                {canCreate('Warnings') ? 'Total Active' : 'My Total Warnings'}
               </p>
               <p className="text-lg font-black text-slate-900 leading-none">{filteredWarnings.length}</p>
             </div>
@@ -364,6 +365,11 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
                     const isSelfTarget = ticket.agentId === user.uid;
                     const isPending = ticket.status === 'Pending';
 
+                    const targetUser = allUsers.find(u => u.uid === ticket.agentId);
+                    const agentDisplayName = targetUser?.fullName || targetUser?.name || ticket.agentName || 'Corporate Agent';
+                    const agentDisplayEmail = targetUser?.email || ticket.agentEmail || 'agent@workforce.co';
+                    const agentDisplayEmpId = targetUser?.uid ? `EMP-2026-${targetUser.uid.substring(0, 4).toUpperCase()}` : (ticket.employeeId || 'EMP-360');
+
                     return (
                       <TableRow key={ticket.id} className="hover:bg-slate-50/50 border-slate-100 group transition-colors">
                         <TableCell className="pl-6">
@@ -376,11 +382,21 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
                         </TableCell>
                         <TableCell>
                           <div className="flex flex-col gap-0.5 py-1">
-                            <span className="font-black text-xs text-slate-900">{ticket.agentName || 'Corporate Agent'}</span>
-                            <span className="text-[10px] text-slate-500 font-mono font-medium">{ticket.agentEmail || 'agent@workforce.co'}</span>
+                            <span className="font-black text-xs text-slate-900">{agentDisplayName}</span>
+                            <span className="text-[10px] text-slate-500 font-mono font-medium">{agentDisplayEmail}</span>
                             <span className="text-[9px] text-blue-650 font-bold bg-blue-50/80 px-1.5 py-0.5 rounded border border-blue-105 inline-block w-fit font-mono mt-1">
-                              {ticket.employeeId || 'EMP-360'}
+                              {agentDisplayEmpId}
                             </span>
+                            {targetUser && (
+                              <div className="mt-1.5 space-y-0.5">
+                                <p className="text-[9px] font-bold text-slate-400 uppercase tracking-tighter">
+                                  Process: <span className="text-slate-600">{targetUser.department || targetUser.team || 'N/A'}</span>
+                                </p>
+                                <p className="text-[9px] font-bold text-slate-400 uppercase tracking-tighter">
+                                  TL: <span className="text-slate-600">{targetUser.teamLeadName || 'Unmapped'}</span>
+                                </p>
+                              </div>
+                            )}
                           </div>
                         </TableCell>
                         <TableCell>
@@ -426,8 +442,7 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
                                 Accepted <CheckCircle size={12} />
                               </Button>
                             )}
-                            {isAdmin && (
-                              <>
+                            {canModifyWarning && (
                                 <Button 
                                   size="sm" 
                                   variant="ghost" 
@@ -448,6 +463,8 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
                                 >
                                   <Edit2 size={16} />
                                 </Button>
+                            )}
+                            {canDeleteWarning && (
                                 <Button 
                                   size="sm" 
                                   variant="ghost" 
@@ -456,7 +473,6 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
                                 >
                                   <Trash2 size={16} />
                                 </Button>
-                              </>
                             )}
                           </div>
                       </TableCell>

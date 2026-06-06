@@ -1,28 +1,29 @@
 export enum UserRole {
   ADMIN = 'ADMIN',
-  MANAGER = 'MANAGER',
-  ASSISTANT_MANAGER = 'ASSISTANT_MANAGER',
+  MANAGER = 'Manager',
   STL = 'STL',
-  OPS_TL = 'OPS_TL',
+  OPS_TL = 'Ops_TL',
   SME = 'SME',
   QTL = 'QTL',
   QA = 'QA',
-  TEAM_LEAD = 'TEAM_LEAD',
-  TRAINER = 'TRAINER',
-  TRAINER_TL = 'TRAINER_TL',
+  TEAM_LEAD = 'Team_Lead',
+  TRAINER = 'Trainer',
+  TRAINER_TL = 'Trainer_TL',
   MIS = 'MIS',
-  AGENT = 'AGENT',
+  AGENT = 'Agent',
 }
 
 export interface UserProfile {
   uid: string;
   email: string;
-  role: UserRole;
+  role: string | UserRole;
   name: string; // Legacy field for internal use/fallback
   fullName: string;
+  employeeName?: string; // Master field
+  employeeId?: string; // Master field
   status: 'Active' | 'Inactive' | string;
   department: string;
-  Manager: string;
+  Manager?: string; // Legacy field
   createdAt: any;
   lastLogin?: any;
   lastLoginAt?: any;
@@ -31,11 +32,16 @@ export interface UserProfile {
   team?: string;
   teamLeadId?: string;
   teamLeadName?: string;
-  mappedManagerId?: string;
-  mappedManagerName?: string;
+  managerId?: string; // Master field
+  managerName?: string; // Master field
+  mappedManagerId?: string; // Legacy/Auth field
+  mappedManagerName?: string; // Legacy/Auth field
   mappedTL?: string;
   mappedQA?: string;
   mappedManager?: string;
+  process?: string;
+  dateJoined?: string;
+  lastUpdated?: string;
 }
 
 export enum DisputeStatus {
@@ -129,9 +135,10 @@ export interface QAAlignment {
 export interface WarningTicket {
   id: string;
   agentId: string;
-  agentName: string;
-  agentEmail: string;
-  employeeId: string;
+  agentName?: string; // Optional for legacy/caching
+  agentEmail?: string; // Optional for legacy/caching
+  employeeId?: string; // Optional for legacy/caching
+  process?: string; // Master field
   qaId: string;
   level: '1st' | '2nd' | 'Final' | string; // Warning Type
   remarks: string;
@@ -242,8 +249,10 @@ export interface KpiAuditLog {
 export interface PipRecord {
   id: string;
   agentId: string;
-  agentName: string;
-  agentEmail: string;
+  agentName?: string;
+  agentEmail?: string;
+  employeeId?: string;
+  process?: string;
   initiatorId: string;
   initiatorName: string;
   title: string;

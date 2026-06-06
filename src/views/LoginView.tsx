@@ -56,7 +56,9 @@ export default function LoginView() {
     console.error('Auth Error:', error);
     let message = 'Authentication failed.';
     
-    if (error.code === 'auth/popup-blocked') {
+    if (error.message && error.message.includes('DEACTIVATED_ACCOUNT')) {
+      message = 'Your account has been deactivated. Please contact your administrator.';
+    } else if (error.code === 'auth/popup-blocked') {
       message = 'Login popup was blocked. Please enable popups.';
       setErrorDetails('Enable popups in your browser.');
     } else if (error.code === 'auth/unauthorized-domain') {

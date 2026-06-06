@@ -85,6 +85,10 @@ export async function syncUserProfile(user: User, authProvider: 'google' | 'emai
       });
       console.log(`Created new profile for: ${user.email}`);
     } else {
+      const data = userDoc.data();
+      if (data.status === 'Inactive' || data.isActive === false) {
+        throw new Error('DEACTIVATED_ACCOUNT: Your account has been deactivated. Please contact your administrator.');
+      }
       await updateDoc(userRef, {
         lastLogin: new Date().toISOString()
       });

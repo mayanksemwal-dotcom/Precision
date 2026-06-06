@@ -1,5 +1,6 @@
 import React, { useMemo, useState } from 'react';
-import { ShieldAlert } from 'lucide-react';
+import { ShieldAlert, AlertTriangle, MessageCircle } from 'lucide-react';
+import { usePermission } from '../components/PermissionContext';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '../components/ui/card';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../components/ui/table';
 import { AuditRecord, DisputeStatus, UserProfile, UserRole } from '../types';
@@ -22,6 +23,9 @@ export default function DisputesView({ auditLogs, user, onEditAudit, onRefresh }
   const [filter, setFilter] = useState<'All' | 'Pending' | 'Active' | 'Resolved'>('Pending');
   const [selectedDispute, setSelectedDispute] = useState<AuditRecord | null>(null);
   const [actionComment, setActionComment] = useState('');
+  const { canEdit: canReviewDispute } = usePermission();
+  const canEditScoring = canReviewDispute('KPI Scorecard'); // Approximation for quality management
+  const isManagement = canReviewDispute('KPI Scorecard'); // Proxy for review actions
 
   const disputes = useMemo(() => {
     let filtered = auditLogs.filter(log => log.disputeStatus !== DisputeStatus.NONE);
@@ -173,7 +177,7 @@ export default function DisputesView({ auditLogs, user, onEditAudit, onRefresh }
                             onChange={(e) => setActionComment(e.target.value)} 
                             placeholder="Provide your remarks here..." 
                           />
-                          {(user.role === UserRole.ADMIN || user.role === UserRole.MANAGER || user.role === UserRole.QA || user.role === UserRole.TEAM_LEAD) && (
+                          {canEditScoring && (
                             <div className="flex gap-2">
                               {onEditAudit && (
                                 <Button 
@@ -192,7 +196,7 @@ export default function DisputesView({ auditLogs, user, onEditAudit, onRefresh }
                         </div>
 
                         <DialogFooter className="mt-4 flex flex-wrap gap-2 sm:justify-start">
-                          {(user.role === UserRole.ADMIN || user.role === UserRole.MANAGER || user.role === UserRole.QA || user.role === UserRole.TEAM_LEAD) && (
+                          {isManagement && (
                             <>
                               <Button variant="destructive" onClick={() => handleAction('Deny')}>Deny</Button>
                               <Button variant="outline" onClick={() => handleAction('Partial')}>Partial Revert</Button>

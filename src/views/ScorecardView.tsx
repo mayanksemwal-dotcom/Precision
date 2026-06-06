@@ -40,6 +40,8 @@ import { Badge } from '../components/ui/badge';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../components/ui/table';
 import { toast } from 'sonner';
 import * as XLSX from 'xlsx';
+import { usePermission } from '../components/PermissionContext';
+import { canActOn } from '../lib/hierarchy';
 import { db, handleFirestoreError, OperationType } from '../lib/firebase';
 import { cn, convertExcelDate, convertExcelPeriod } from '../lib/utils';
 import { 
@@ -57,7 +59,7 @@ import {
 } from 'firebase/firestore';
 import { 
   UserProfile, 
-  UserRole 
+  UserRole
 } from '../types';
 import { 
   ensureDefaultTemplatesExist,
@@ -131,6 +133,8 @@ function getRatingColor(score: number): string {
   return "bg-rose-50 text-rose-700 border-rose-100";
 }
 
+import { UserPicker } from '../components/UserPicker';
+
 interface ScorecardViewProps {
   user: UserProfile;
   allUsers: UserProfile[];
@@ -138,6 +142,13 @@ interface ScorecardViewProps {
 }
 
 export default function ScorecardView({ user, allUsers = [], onRefreshAllData }: ScorecardViewProps) {
+  const { canView, canCreate, canEdit, canDelete } = usePermission();
+
+  const canManageKPIs = canEdit('KPI Scorecard');
+  const canUploadKPIs = canCreate('KPI Scorecard');
+  const canDeleteKPIs = canDelete('KPI Scorecard');
+  const canViewReports = canView('KPI Scorecard');
+
   // Navigation Tabs
   const [activeTab, setActiveTab] = useState<'dashboard' | 'leaderboard' | 'uploads_desk' | 'templates_desk'>('dashboard');
 
@@ -150,8 +161,6 @@ export default function ScorecardView({ user, allUsers = [], onRefreshAllData }:
   const [selectedLeaderboardTL, setSelectedLeaderboardTL] = useState<string>('All');
   const [selectedLeaderboardMgr, setSelectedLeaderboardMgr] = useState<string>('All');
   const [selectedDashboardProcess, setSelectedDashboardProcess] = useState<string>('All');
-  const [employeeSearch, setEmployeeSearch] = useState<string>('');
-  const [isEmployeeDropdownOpen, setIsEmployeeDropdownOpen] = useState<boolean>(false);
   const [isPeriodDropdownOpen, setIsPeriodDropdownOpen] = useState<boolean>(false);
   const [isWorkDateDropdownOpen, setIsWorkDateDropdownOpen] = useState<boolean>(false);
 
@@ -189,9 +198,9 @@ export default function ScorecardView({ user, allUsers = [], onRefreshAllData }:
   // Comment History Modal State
   const [activeKpiComment, setActiveKpiComment] = useState<{ kpiName: string, email: string, period: string } | null>(null);
 
-  // Check roles constraints
-  const canManageKPIs = user.role === UserRole.ADMIN || user.role === UserRole.MANAGER;
-  const isQAorAgent = user.role === UserRole.QA || user.role === UserRole.AGENT;
+  // Removed hardcoded checks
+  const canRecalculate = canManageKPIs;
+  const isQAorAgent = !canManageKPIs; // Approximation for UI toggle if needed
 
   // On mount, initialize default templates and fetch metrics
   useEffect(() => {
@@ -207,14 +216,9 @@ export default function ScorecardView({ user, allUsers = [], onRefreshAllData }:
   // Sync default email filter based on logged-in user
   useEffect(() => {
     if (allUsers.length > 0 && !selectedEmail) {
-      if (isQAorAgent) {
-        setSelectedEmail(user.email.toLowerCase().trim());
-      } else {
-        // Management defaults to the first user found or self
-        setSelectedEmail(user.email.toLowerCase().trim());
-      }
+      setSelectedEmail(user.email.toLowerCase().trim());
     }
-  }, [allUsers, selectedEmail, isQAorAgent, user]);
+  }, [allUsers, selectedEmail, user]);
 
   // Synchronize dynamic leaderboard default selection with user's role if supported
   useEffect(() => {
@@ -538,23 +542,6 @@ export default function ScorecardView({ user, allUsers = [], onRefreshAllData }:
     });
     return Array.from(list).sort((a,b) => b.localeCompare(a));
   }, [allScorecards]);
-
-  // List of unique emails that have uploaded data or exist in system
-  const scorecardEmailsList = useMemo(() => {
-    const list = new Map<string, string>();
-    allUsers.forEach(u => {
-      list.set(u.email.toLowerCase().trim(), u.name);
-    });
-    // Supplement with scorecards emails if not in users list
-    allScorecards.forEach(sc => {
-      const email = sc.employeeEmail.toLowerCase().trim();
-      if (!list.has(email)) {
-        list.set(email, sc.employeeName || email);
-      }
-    });
-
-    return Array.from(list.entries()).map(([email, name]) => ({ email, name }));
-  }, [allUsers, allScorecards]);
 
   // Filter leaderboard rankings based on selections
   const leaderboardRankings = useMemo(() => {
@@ -1389,72 +1376,19 @@ export default function ScorecardView({ user, allUsers = [], onRefreshAllData }:
               </div>
             )}
             
-            {/* Employee Email Search for Scorecards dashboard */}
             <div className="space-y-1.5 relative mt-4">
-              <label className="text-[10px] font-extrabold text-slate-500 uppercase tracking-wider">Employee Match</label>
+              <label className="text-[10px] font-extrabold text-slate-500 uppercase tracking-wider pl-1">Employee Match</label>
               {isQAorAgent ? (
                 <div className="w-full text-xs font-bold h-10 rounded-lg border border-slate-200 bg-slate-50/50 px-3 flex items-center text-slate-600">
                   {user.name} ({user.email})
                 </div>
               ) : (
-                <div className="relative">
-                  <div 
-                    className="w-full text-xs font-bold h-10 rounded-lg border border-slate-200 bg-slate-50/50 px-3 cursor-pointer outline-none flex items-center justify-between"
-                    onClick={() => {
-                      setIsEmployeeDropdownOpen(!isEmployeeDropdownOpen);
-                      setEmployeeSearch('');
-                    }}
-                  >
-                    <span className="truncate">
-                      {selectedEmail 
-                        ? (scorecardEmailsList.find(e => e.email === selectedEmail)?.name || selectedEmail) 
-                        : "Select an employee..."
-                      }
-                    </span>
-                    <ChevronDown size={14} className={cn("text-slate-400 transition-transform duration-200", isEmployeeDropdownOpen && "rotate-180")} />
-                  </div>
-                  
-                  {isEmployeeDropdownOpen && (
-                    <>
-                      <div className="fixed inset-0 z-40" onClick={() => setIsEmployeeDropdownOpen(false)} />
-                      <div className="absolute top-full left-0 right-0 mt-1 z-50 bg-white border border-slate-200 shadow-xl rounded-lg max-h-60 flex flex-col animate-in fade-in zoom-in-95 duration-150">
-                      <div className="p-2 border-b border-slate-100 shrink-0">
-                        <Input
-                           placeholder="Search by name or email..."
-                           value={employeeSearch}
-                           onChange={(e) => setEmployeeSearch(e.target.value)}
-                           className="h-8 text-xs focus-visible:ring-1 focus-visible:ring-indigo-500 rounded-md"
-                           autoFocus
-                           onClick={(e) => e.stopPropagation()}
-                        />
-                      </div>
-                      <div className="overflow-y-auto w-full p-1 space-y-0.5">
-                        {scorecardEmailsList.filter(item => 
-                          (item.name || '').toLowerCase().includes(employeeSearch.toLowerCase()) || 
-                          (item.email || '').toLowerCase().includes(employeeSearch.toLowerCase())
-                        ).slice(0, 50).map(item => (
-                          <div
-                            key={item.email}
-                            className={`px-3 py-2 text-xs rounded-md cursor-pointer hover:bg-indigo-50 transition-colors ${selectedEmail === item.email ? "bg-indigo-50 text-indigo-700 font-bold" : "text-slate-700 font-medium"}`}
-                            onClick={() => {
-                              setSelectedEmail(item.email);
-                              setIsEmployeeDropdownOpen(false);
-                            }}
-                          >
-                            <span className="block truncate">{item.name} <span className="opacity-70 font-normal">({item.email})</span></span>
-                          </div>
-                        ))}
-                        {scorecardEmailsList.filter(item => 
-                          (item.name || '').toLowerCase().includes(employeeSearch.toLowerCase()) || 
-                          (item.email || '').toLowerCase().includes(employeeSearch.toLowerCase())
-                        ).length === 0 && (
-                           <div className="px-3 py-4 text-xs text-center text-slate-400 font-medium">No employees found.</div>
-                        )}
-                      </div>
-                    </div>
-                  </>
-                )}
-                </div>
+                <UserPicker 
+                  onSelect={(u) => setSelectedEmail(u.email)}
+                  selectedUserId={allUsers.find(u => u.email === selectedEmail)?.uid}
+                  placeholder="Select or search employee..."
+                  className="mt-1"
+                />
               )}
             </div>
           </div>
@@ -1536,7 +1470,7 @@ export default function ScorecardView({ user, allUsers = [], onRefreshAllData }:
               </Button>
             )}
 
-            {user.role === UserRole.ADMIN && (
+            {canEdit('Console') && (
               <>
                 <Button 
                   variant={activeTab === 'templates_desk' ? 'default' : 'ghost'}
@@ -1882,16 +1816,13 @@ export default function ScorecardView({ user, allUsers = [], onRefreshAllData }:
                   </select>
 
                   {/* Role Selector */}
-                  {selectedLeaderboardType === 'role' && user.role !== UserRole.AGENT && (
+                  {selectedLeaderboardType === 'role' && canManageKPIs && (
                     <select 
                       value={selectedLeaderboardRole}
                       onChange={(e) => setSelectedLeaderboardRole(e.target.value)}
                       className="h-9 text-xs font-bold rounded-lg border border-slate-200 bg-white px-2.5 outline-none focus:ring-1 focus:ring-indigo-500 cursor-pointer"
                     >
-                      {SUPPORTED_ROLES.filter(r => {
-                        if (user.role === UserRole.QA) return r === 'QV' || r === 'QA';
-                        return true;
-                      }).map(r => (
+                      {SUPPORTED_ROLES.map(r => (
                         <option key={r} value={r}>{r} Leaderboard</option>
                       ))}
                     </select>
@@ -2478,7 +2409,7 @@ export default function ScorecardView({ user, allUsers = [], onRefreshAllData }:
           )}
 
           {/* TAB 4: Dynamic KPI Templates configure */}
-          {activeTab === 'templates_desk' && user.role === UserRole.ADMIN && (
+          {activeTab === 'templates_desk' && canEdit('Console') && (
             <Card className="border border-slate-150 shadow-sm rounded-2xl overflow-hidden bg-white">
               <CardHeader className="bg-slate-50/60 border-b border-slate-100 p-6 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
                 <div>

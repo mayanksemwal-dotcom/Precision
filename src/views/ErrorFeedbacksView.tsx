@@ -4,6 +4,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '.
 import { Input } from '../components/ui/input';
 import { Search, Calendar, MessageSquare, Download } from 'lucide-react';
 import { AuditRecord, UserProfile, UserRole, QAAlignment } from '../types';
+import { usePermission } from '../components/PermissionContext';
 import * as XLSX from 'xlsx';
 import { toast } from 'sonner';
 import { Button } from '../components/ui/button';
@@ -15,6 +16,8 @@ interface ErrorFeedbacksViewProps {
 }
 
 export default function ErrorFeedbacksView({ auditLogs, user, alignments = [] }: ErrorFeedbacksViewProps) {
+  const { canEdit } = usePermission();
+  const canManageReports = canEdit('KPI Scorecard');
   const [searchTerm, setSearchTerm] = useState('');
   const [currentPage, setCurrentPage] = useState(1);
   const itemsPerPage = 10;
@@ -22,10 +25,8 @@ export default function ErrorFeedbacksView({ auditLogs, user, alignments = [] }:
   const getVisibleFeedbacks = () => {
     let logs = auditLogs.filter(a => a.status === 'Incorrect' || a.compErrorCount > 0 || a.mpqcErrorCount > 0);
     
-    if (user.role === UserRole.QA) {
-      logs = logs.filter(a => a.qaId === user.uid);
-    } else if (user.role === UserRole.AGENT) {
-      logs = logs.filter(a => a.agentId === user.name || a.qvName === user.name);
+    if (!canManageReports) {
+      logs = logs.filter(a => a.qaId === user.uid || a.agentId === user.uid || a.qvName === user.name);
     }
     
     if (searchTerm) {

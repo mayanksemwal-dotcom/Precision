@@ -5,6 +5,7 @@ import { Button } from '../components/ui/button';
 import { Input } from '../components/ui/input';
 import { Card, CardHeader, CardTitle, CardContent } from '../components/ui/card';
 import { toast } from 'sonner';
+import { usePermission } from '../components/PermissionContext';
 import { 
   Link2, 
   Trash2, 
@@ -80,6 +81,8 @@ const CATEGORIES = [
 ];
 
 export default function ResourceHubView({ user }: { user: UserProfile }) {
+  const { canEdit, canDelete } = usePermission();
+
   const [links, setLinks] = useState<ResourceLink[]>([]);
   const [name, setName] = useState('');
   const [url, setUrl] = useState('');
@@ -92,7 +95,8 @@ export default function ResourceHubView({ user }: { user: UserProfile }) {
   const [showAddForm, setShowAddForm] = useState(false);
 
   // Auth check for content managers (Admins, Managers, QTLs, QAs, TLs)
-  const canManage = ['ADMIN', 'MANAGER', 'TEAM_LEAD', 'QA', 'STL', 'OPS_TL', 'QTL'].includes(user.role);
+  const canManage = canEdit('Important Quality Links');
+  const canDeleteResource = canDelete('Important Quality Links');
 
   const fetchLinks = async () => {
     try {
@@ -422,7 +426,7 @@ export default function ResourceHubView({ user }: { user: UserProfile }) {
                         {isCopied ? <Check size={13} className="text-emerald-500" /> : <Copy size={13} />}
                       </button>
                       
-                      {canManage && (
+                      {canDeleteResource && (
                         <button 
                           onClick={() => handleDelete(link.id, link.name)}
                           title="Delete link"

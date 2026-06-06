@@ -16,9 +16,11 @@ import {
   Activity,
   Award,
   ChevronLeft,
-  ChevronRight
+  ChevronRight,
+  Edit2
 } from 'lucide-react';
 import ProcessSelector from '../components/ProcessSelector';
+import SupervisorDashboard from '../components/tms/SupervisorDashboard';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle, CardFooter } from '../components/ui/card';
 
 import { Button } from '../components/ui/button';
@@ -26,6 +28,7 @@ import { Badge } from '../components/ui/badge';
 import { Input } from '../components/ui/input';
 import { Label } from '../components/ui/label';
 import { toast } from 'sonner';
+import { usePermission } from '../components/PermissionContext';
 import { auth, db, handleFirestoreError, OperationType } from '../lib/firebase';
 import { 
   doc, 
@@ -46,6 +49,7 @@ import {
 import { UserProfile, UserRole } from '../types';
 import { motion, AnimatePresence } from 'motion/react';
 import * as XLSX from 'xlsx';
+import { canActOn } from '../lib/hierarchy';
 // No Sheets imports
 
 interface TMSViewProps {
@@ -82,6 +86,15 @@ const BREAK_OPTIONS = [
 ];
 
 export default function TMSView({ user, allUsers }: TMSViewProps) {
+  const { canView, canCreate, canEdit, canDelete, hasTmsPermission } = usePermission();
+  
+  // Dynamic granular permission bindings instead of monolithic role/module checks
+  const isManagerRole = hasTmsPermission('can_close_sessions'); 
+  const canManageTMS = hasTmsPermission('can_edit_tms_records'); 
+  const canModifyTMS = hasTmsPermission('can_edit_tms_records');
+  const canDeleteTMS = hasTmsPermission('can_close_sessions');
+  const canViewReports = hasTmsPermission('view_workforce_dashboard');
+
   // Configured processes in the app
   const [processes, setProcesses] = useState<string[]>([]);
   const [recentProcesses, setRecentProcesses] = useState<string[]>(
@@ -119,6 +132,9 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
   const [currentPage, setCurrentPage] = useState(1);
   const [selectedProcessInput, setSelectedProcessInput] = useState('');
   const [selectedBreakInput, setSelectedBreakInput] = useState(BREAK_OPTIONS[0]);
+  const [activeShiftFilter, setActiveShiftFilter] = useState('all');
+  const [editingProcessName, setEditingProcessName] = useState<string | null>(null);
+  const [editingProcessValue, setEditingProcessValue] = useState<string>('');
 
   // Custom modal confirmations instead of window.confirm inside sandboxed iframe
   const [showClockOutConfirm, setShowClockOutConfirm] = useState(false);
@@ -138,43 +154,10 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
     const target = allUsers.find(u => u.uid === targetUid);
     if (!target) return false;
 
-    if (actor.role === UserRole.ADMIN) return true;
+    // Use granular key permission check and hierarchy check
+    if (!hasTmsPermission('can_force_logout')) return false;
 
-    if (actor.role === UserRole.MANAGER) {
-      // Manager can force logout Team Leads, SMEs, QAs, Trainers, and Agents reporting under them.
-      const eligibleRoles = [
-        UserRole.TEAM_LEAD, 
-        'TEAM_LEAD',
-        'OPS_TL', 
-        'QTL', 
-        'STL', 
-        'TRAINER_TL', 
-        UserRole.SME, 
-        UserRole.QA, 
-        UserRole.TRAINER, 
-        UserRole.AGENT
-      ];
-      if (!eligibleRoles.includes(target.role as any)) return false;
-
-      // reporting under them means directly mapped manager or indirectly mapped via team lead
-      const isDirectReport = target.mappedManagerId === actor.uid;
-      const isIndirectReport = allUsers.some(tl => {
-        const isTL = [UserRole.TEAM_LEAD, 'TEAM_LEAD', 'OPS_TL', 'QTL', 'STL', 'TRAINER_TL'].includes(tl.role as any);
-        return isTL && tl.mappedManagerId === actor.uid && target.teamLeadId === tl.uid;
-      });
-      return isDirectReport || isIndirectReport;
-    }
-
-    const isTL = [UserRole.TEAM_LEAD, 'TEAM_LEAD', 'OPS_TL', 'QTL', 'STL', 'TRAINER_TL'].includes(actor.role as any);
-    if (isTL) {
-      // Team Lead can force logout SMEs, QAs, Trainers, and Agents mapped under them.
-      const eligibleRoles = [UserRole.SME, UserRole.QA, UserRole.TRAINER, UserRole.AGENT];
-      if (!eligibleRoles.includes(target.role as any)) return false;
-
-      return target.teamLeadId === actor.uid;
-    }
-
-    return false;
+    return canActOn(actor, target, allUsers);
   };
 
   // Date Range and Format selection states for reports
@@ -205,33 +188,24 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
     return () => clearInterval(timer);
   }, []);
 
-  // Fetch Processes Config in Real-time
+  // Fetch Processes Config in Real-time from config/tmsProcesses document
   useEffect(() => {
     if (!user) return;
-    const docRef = doc(db, 'config', 'tmsProcesses');
-    const unsubscribe = onSnapshot(docRef, (snap) => {
-      if (snap.exists()) {
-        setProcesses(snap.data().list || []);
+    const unsub = onSnapshot(doc(db, 'config', 'tmsProcesses'), (snap) => {
+      let activeList: string[] = [];
+      if (snap.exists() && Array.isArray(snap.data()?.list)) {
+        activeList = snap.data()?.list;
+      }
+      if (activeList.length > 0) {
+        setProcesses(activeList);
       } else {
-        // Initialize default processes for the team if not exist and user has privileges
-        const isUserPrivileged = user.role === UserRole.ADMIN || user.role === UserRole.MANAGER;
-        if (isUserPrivileged) {
-          setDoc(docRef, { list: DEFAULT_PROCESSES })
-            .then(() => setProcesses(DEFAULT_PROCESSES))
-            .catch(e => {
-              console.warn('Failed to auto-seed tmsProcesses, using local defaults', e);
-              setProcesses(DEFAULT_PROCESSES);
-            });
-        } else {
-          setProcesses(DEFAULT_PROCESSES);
-        }
+        setProcesses(DEFAULT_PROCESSES);
       }
     }, (err) => {
-      console.warn('Failed to subscribe to tmsProcesses, using local defaults', err);
-      // Fallback only if we don't have any processes loaded yet
+      console.warn('Failed to subscribe to config/tmsProcesses, using local defaults', err);
       setProcesses(prev => prev.length > 0 ? prev : DEFAULT_PROCESSES);
     });
-    return () => unsubscribe();
+    return () => unsub();
   }, [user]);
 
   // Fetch User's Personal Shifts & Current Active Shift
@@ -308,21 +282,22 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
     return { start, end };
   };
 
-  // Fetch ALL Shifts for Admins, Managers or Team Leads to view workforce status
+  // Fetch ALL Shifts for Admins, Managers or Team Leads in real-time to view workforce status
   const fetchAllShifts = async () => {
-    const isManagerRole = user.role === UserRole.MANAGER;
-    const isTLRole = [UserRole.TEAM_LEAD, UserRole.OPS_TL, UserRole.QTL, UserRole.STL, UserRole.TRAINER_TL].includes(user.role as UserRole);
+    // Shifts are managed in real-time via the useEffect's onSnapshot subscription
+  };
 
-    if (user.role !== UserRole.ADMIN && !isManagerRole && !isTLRole) return;
-    try {
-      const qAllShifts = query(collection(db, 'tmsShifts'), orderBy('clockInTime', 'desc'), limit(500));
-      const snap = await getDocs(qAllShifts);
+  useEffect(() => {
+    if (!user || !canViewReports) return;
+    const qAllShifts = query(collection(db, 'tmsShifts'), orderBy('clockInTime', 'desc'));
+    const unsubscribe = onSnapshot(qAllShifts, (snap) => {
       const shifts = snap.docs.map(doc => ({ id: doc.id, ...doc.data() } as TMSShift));
       setAllShifts(shifts);
-    } catch (error) {
-      handleFirestoreError(error, OperationType.LIST, 'tmsShifts');
-    }
-  };
+    }, (error) => {
+      console.warn('Failed real-time subscription to tmsShifts', error);
+    });
+    return () => unsubscribe();
+  }, [user, canViewReports]);
 
   const startForceLogoutFlow = (shiftId: string, targetUid: string, targetName: string) => {
     setForceOutShiftId(shiftId);
@@ -363,6 +338,16 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
         clockOutTime: nowISO,
         status: 'COMPLETED'
       });
+
+      // 0. Update User Status to Offline in users collection
+      const userRef = doc(db, 'users', forceOutTargetUid);
+      const userSnap = await getDoc(userRef);
+      if (userSnap.exists()) {
+        await updateDoc(userRef, {
+          status: 'OFFLINE',
+          lastLogoutAt: nowISO
+        });
+      }
 
       // 1. Audit log process creation/alteration
       const logId = `tms-forcelogout-${Date.now()}`;
@@ -414,9 +399,15 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
     }
   };
 
+  // Trigger cleanup for managers on mount
   useEffect(() => {
     fetchAllShifts();
-  }, [user]);
+    if (isManagerRole) {
+      import('../services/tmsCleanupService').then(service => {
+        service.performTmsStaleSessionCleanup();
+      });
+    }
+  }, []);
 
   const saveShiftState = async (updatedShift: TMSShift) => {
     await setDoc(doc(db, 'tmsShifts', updatedShift.id), updatedShift);
@@ -504,9 +495,19 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
 
   // Switch/Punch Shift Operations:
   const handleClockIn = async () => {
+    if (!hasTmsPermission('can_punch_in')) {
+      toast.error('Access Denied: You do not have permissions to Punch In.');
+      return;
+    }
+
     const targetProcess = selectedProcessInput || (processes.length > 0 ? processes[0] : '');
     if (!targetProcess) {
       toast.error('Please select a starting process before Clocking In.');
+      return;
+    }
+
+    if (currentShift) {
+      toast.error('Action Blocked: You already have an active shift running.');
       return;
     }
 
@@ -528,6 +529,13 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
         ]
       };
 
+      // 0. Update User Status to Online in users collection
+      const userRef = doc(db, 'users', user.uid);
+      await updateDoc(userRef, {
+        status: 'ONLINE',
+        lastLoginAt: nowISO
+      });
+
       await saveShiftState(newShift);
       setSelectedProcessInput(targetProcess);
       toast.success(`Clocked In successfully! Process: ${targetProcess}`);
@@ -537,6 +545,11 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
   };
 
   const handleSwitchProcess = async (targetProcess: string) => {
+    if (!hasTmsPermission('can_switch_process')) {
+      toast.error('Access Denied: You do not have permissions to Switch Processes.');
+      return;
+    }
+
     if (!currentShift) return;
     if (currentShift.status === 'BREAK') {
       toast.error('Cannot switch processes while on a break. Please Resume Work first.');
@@ -587,6 +600,27 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
       return;
     }
 
+    const breakType = selectedBreakInput || '';
+    const isLunch = breakType.toLowerCase().includes('lunch');
+    const isMeeting = breakType.toLowerCase().includes('meeting') || breakType.toLowerCase().includes('coaching') || breakType.toLowerCase().includes('training');
+
+    if (isLunch) {
+      if (!hasTmsPermission('can_start_lunch')) {
+        toast.error('Access Denied: You do not have permission to Start Lunch.');
+        return;
+      }
+    } else if (isMeeting) {
+      if (!hasTmsPermission('can_start_meeting')) {
+        toast.error('Access Denied: You do not have permission to Start Meetings/Trainings.');
+        return;
+      }
+    } else {
+      if (!hasTmsPermission('can_start_break')) {
+        toast.error('Access Denied: You do not have permission to Start Breaks.');
+        return;
+      }
+    }
+
     try {
       const nowISO = new Date().toISOString();
       const updatedActivities = [...currentShift.activities];
@@ -626,6 +660,29 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
       return;
     }
 
+    // Find the break activity we are currently on to see which resume permission we need
+    const lastActivity = currentShift.activities[currentShift.activities.length - 1];
+    const breakName = lastActivity ? (lastActivity.name || '') : '';
+    const isLunch = breakName.toLowerCase().includes('lunch');
+    const isMeeting = breakName.toLowerCase().includes('meeting') || breakName.toLowerCase().includes('coaching') || breakName.toLowerCase().includes('training');
+
+    if (isLunch) {
+      if (!hasTmsPermission('can_end_lunch')) {
+        toast.error('Access Denied: You do not have permission to End Lunch.');
+        return;
+      }
+    } else if (isMeeting) {
+      if (!hasTmsPermission('can_end_meeting')) {
+        toast.error('Access Denied: You do not have permission to End Meetings/Trainings.');
+        return;
+      }
+    } else {
+      if (!hasTmsPermission('can_end_break')) {
+        toast.error('Access Denied: You do not have permission to End Breaks.');
+        return;
+      }
+    }
+
     try {
       const nowISO = new Date().toISOString();
       const updatedActivities = [...currentShift.activities];
@@ -657,6 +714,10 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
   };
 
   const handleClockOut = () => {
+    if (!hasTmsPermission('can_punch_out')) {
+      toast.error('Access Denied: You do not have permission to Clock Out.');
+      return;
+    }
     if (!currentShift) return;
     setShowClockOutConfirm(true);
   };
@@ -677,6 +738,13 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
         activities: updatedActivities,
         clockOutTime: nowISO,
         status: 'COMPLETED'
+      });
+
+      // Update User Status to Offline
+      const userRef = doc(db, 'users', user.uid);
+      await updateDoc(userRef, {
+        status: 'OFFLINE',
+        lastLogoutAt: nowISO
       });
 
       toast.success('Clocked Out successfully. Shift recorded.');
@@ -805,50 +873,95 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
     }
   };
 
-  const isAdminRole = user.role === UserRole.ADMIN;
-  const isManagerRole = user.role === UserRole.MANAGER;
-  const isTLRole = [UserRole.TEAM_LEAD, UserRole.OPS_TL, UserRole.QTL, UserRole.STL, UserRole.TRAINER_TL].includes(user.role as UserRole);
-
-  if (isTLRole || isManagerRole || isAdminRole) {
-
-    const getMappedAgentsAndQAsForTL = (tlUid: string) => {
-      return allUsers.filter(u => {
-        const isAgentOrQA = u.role === UserRole.AGENT || u.role === UserRole.QA;
-        return isAgentOrQA && u.teamLeadId === tlUid;
-      });
-    };
-
-    let mappedUsers: any[] = [];
-    
-    if (isAdminRole) {
-      mappedUsers = allUsers.filter(u => u.uid !== user.uid);
-    } else if (isTLRole) {
-      mappedUsers = getMappedAgentsAndQAsForTL(user.uid);
-    } else if (isManagerRole) {
-      const mappedTLs = allUsers.filter(u => {
-        const isMappedRole = [UserRole.TEAM_LEAD, UserRole.OPS_TL, UserRole.QTL, UserRole.STL, UserRole.TRAINER_TL].includes(u.role as UserRole);
-        return isMappedRole && u.mappedManagerId === user.uid;
-      });
-      mappedUsers = [...mappedTLs];
-      mappedTLs.forEach(tl => {
-        const agentsAndQAs = getMappedAgentsAndQAsForTL(tl.uid);
-        mappedUsers.push(...agentsAndQAs);
-      });
-      
-      const uniqueMUs = new Map();
-      mappedUsers.forEach(u => uniqueMUs.set(u.uid, u));
-      mappedUsers = Array.from(uniqueMUs.values());
+  const handleSaveEditProcess = async (oldName: string) => {
+    const trimmed = editingProcessValue.trim();
+    if (!trimmed) {
+      toast.error('Process name cannot be blank.');
+      return;
+    }
+    if (processes.includes(trimmed) && trimmed !== oldName) {
+      toast.error('A process with this name already exists.');
+      return;
     }
 
+    try {
+      const updatedList = processes.map(p => p === oldName ? trimmed : p);
+      await saveProcessesList(updatedList);
+      setProcesses(updatedList);
+      setEditingProcessName(null);
+      setEditingProcessValue('');
+
+      // Audit log process update
+      const logId = `log-process-${Date.now()}`;
+      await setDoc(doc(db, 'uploadAuditLogs', logId), {
+        id: logId,
+        targetId: 'tmsProcesses',
+        entityType: 'process',
+        fieldName: 'list',
+        oldValue: JSON.stringify(processes),
+        newValue: JSON.stringify(updatedList),
+        updatedBy: user.uid,
+        updatedByName: user.name,
+        updatedAt: new Date().toISOString(),
+        action: 'edit_process',
+        details: `Process updated from "${oldName}" to "${trimmed}".`
+      });
+      console.log(`[PROCESS UPDATE] Process successfully changed from "${oldName}" to "${trimmed}" by User ${user.name} (${user.email})`);
+
+      toast.success(`Successfully updated process name to "${trimmed}".`);
+    } catch (e) {
+      console.error('[TMS SAVE EDIT PROCESS ERROR]', e);
+      toast.error('Failed to update process name.');
+    }
+  };
+
+  const isDashboardUser = [UserRole.TEAM_LEAD, UserRole.QTL, UserRole.STL, UserRole.OPS_TL, UserRole.TRAINER_TL, UserRole.MANAGER, UserRole.ADMIN, UserRole.MIS].includes(user.role as UserRole);
+
+  if (isDashboardUser) {
+    return (
+      <SupervisorDashboard 
+        user={user} 
+        allUsers={allUsers} 
+        onRefreshAllData={fetchAllShifts}
+      />
+    );
+  }
+
+  function ___ignored_old_supervisor_logic___() {
+    let mappedUsers: any[] = [];
+    
+    // Use canActOn to filter who we can see in our report, excluding inactive users
+    mappedUsers = allUsers.filter(u => u.uid !== user.uid && u.status === 'Active' && canActOn(user, u, allUsers));
+
     console.log('--- TMS Dashboard Mapping Debug ---');
-    console.log('Current User Role:', user.role);
+    console.log('Can View Reports:', canViewReports);
     console.log('Mapped Users Found:', mappedUsers.map(u => ({ email: u.email, role: u.role })));
     console.log('Query Results Count:', mappedUsers.length);
     console.log('-----------------------------------');
 
-    const activeShiftsList = allShifts.filter(sh => 
-      mappedUsers.some(mu => mu.uid === sh.userId) && (sh.status === 'ACTIVE' || sh.status === 'BREAK')
-    );
+    // Single Source of Truth: Active Shifts
+    // A shift is active/logged in if it is not COMPLETED
+    const activeShiftsList = allShifts.filter(sh => {
+        const isMappedUser = mappedUsers.some(mu => mu.uid === sh.userId);
+        const isSessionRunning = sh.status !== 'COMPLETED';
+        
+        // Define stale: ACTIVE/BREAK but clockInTime > 24 hours ago
+        const isStale = isSessionRunning && (new Date().getTime() - new Date(sh.clockInTime).getTime() > 24 * 60 * 60 * 1000);
+        
+        if (isMappedUser && isSessionRunning && !isStale) {
+           return true; 
+        }
+        
+        // Trigger background cleanup for stale sessions
+        if (isMappedUser && isStale) {
+            // Note: In real production, this would be a cloud function.
+            // For now, we perform local cleanup or just exclude from count
+            console.log(`[TMS ALERT] Found stale shift for ${sh.userName}: ${sh.id}`);
+            // autoCloseSession(sh.id); // Potential future implementation
+        }
+        return false;
+    });
+    
     const currentActiveCount = activeShiftsList.length;
 
     let totalActiveMs = 0;
@@ -1130,9 +1243,26 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
     };
 
     const finalMappedUsers = mappedUsers.filter((u) => {
+      // 1. Filter by search
       const search = (tmsSearch || '').toLowerCase();
-      if (!search) return true;
-      return (u.name || '').toLowerCase().includes(search) || (u.email || '').toLowerCase().includes(search);
+      const matchesSearch = !search 
+        ? true 
+        : ((u.name || '').toLowerCase().includes(search) || (u.email || '').toLowerCase().includes(search));
+        
+      if (!matchesSearch) return false;
+
+      // 2. Filter by shift status
+      const activeShift = allShifts.find(s => 
+        s.userEmail?.toLowerCase() === u.email?.toLowerCase() && 
+        (s.status === 'ACTIVE' || s.status === 'BREAK')
+      );
+
+      if (activeShiftFilter === 'all') return true;
+      if (activeShiftFilter === 'offline') return !activeShift;
+      if (activeShiftFilter === 'active') return !!(activeShift && activeShift.status === 'ACTIVE');
+      if (activeShiftFilter === 'break') return !!(activeShift && activeShift.status === 'BREAK');
+
+      return true;
     });
 
     return (
@@ -1219,14 +1349,37 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
                 Live-monitored metrics for resources under your supervision.
               </CardDescription>
             </div>
-            <div className="relative w-full md:w-64">
-              <Search className="absolute left-3 top-2.5 h-4 w-4 text-slate-400" />
-              <Input
-                placeholder="Search resources..."
-                value={tmsSearch}
-                onChange={(e) => setTmsSearch(e.target.value)}
-                className="pl-9 h-9 text-xs focus-visible:ring-1 focus-visible:ring-sky-500 rounded-xl"
-              />
+            <div className="flex flex-col sm:flex-row items-center gap-3 w-full md:w-auto">
+              <div className="relative w-full sm:w-44 shrink-0">
+                <select
+                  value={activeShiftFilter}
+                  onChange={(e) => {
+                    setActiveShiftFilter(e.target.value);
+                    setCurrentPage(1);
+                  }}
+                  className="w-full bg-slate-50 border border-slate-250 hover:bg-slate-100 rounded-xl px-3 py-2 pr-8 text-xs text-slate-700 font-extrabold focus:outline-none focus:ring-1 focus:ring-sky-550 cursor-pointer appearance-none"
+                >
+                  <option value="all">🟢 Shift Filter: All</option>
+                  <option value="active">🟢 Active Shifts</option>
+                  <option value="break">🟠 Break Shifts</option>
+                  <option value="offline">⚪ Offline Resources</option>
+                </select>
+                <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-2.5 text-slate-450">
+                  <svg className="fill-current h-3.5 w-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><path d="M9.293 12.95l.707.707L15.657 8l-1.414-1.414L10 10.828 5.757 6.586 4.343 8z"/></svg>
+                </div>
+              </div>
+              <div className="relative w-full md:w-64">
+                <Search className="absolute left-3 top-2.5 h-4 w-4 text-slate-400" />
+                <Input
+                  placeholder="Search resources..."
+                  value={tmsSearch}
+                  onChange={(e) => {
+                    setTmsSearch(e.target.value);
+                    setCurrentPage(1);
+                  }}
+                  className="pl-9 h-9 text-xs focus-visible:ring-1 focus-visible:ring-sky-500 rounded-xl"
+                />
+              </div>
             </div>
           </CardHeader>
           <CardContent className="p-0">
@@ -1718,6 +1871,15 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
     }
   };
 
+  const showSelfService = hasTmsPermission('view_self_service');
+  const showOwnShiftSummary = hasTmsPermission('can_view_own_shift_summary');
+  const showOwnAttendance = hasTmsPermission('can_view_own_attendance_summary');
+  const showTimelineCol = showOwnShiftSummary || showOwnAttendance;
+
+  // Columns layout configuration
+  const punchColSpan = showTimelineCol ? "lg:col-span-5" : "lg:col-span-12";
+  const timelineColSpan = showSelfService ? "lg:col-span-7" : "lg:col-span-12";
+
   return (
     <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
       
@@ -1734,7 +1896,7 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
         </div>
 
         <div className="flex flex-wrap items-center gap-3">
-          {((user.role as any) === UserRole.ADMIN || (user.role as any) === UserRole.MANAGER) && (
+          {canViewReports && ![UserRole.AGENT, UserRole.QA, UserRole.SME, UserRole.TRAINER, UserRole.MIS].includes(user.role as UserRole) && (
             <Button
               onClick={handleExportAllShifts}
               className="bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold py-2.5 px-4 rounded-xl flex items-center gap-1.5 shadow-sm shadow-emerald-200 cursor-pointer"
@@ -1763,7 +1925,8 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
         
         {/* Punch Control / Agent Panel */}
-        <div className="lg:col-span-5 space-y-6">
+        {showSelfService && (
+          <div className={`${punchColSpan} space-y-6`}>
           <Card className="border-none shadow-md shadow-slate-200 overflow-visible">
             <CardHeader className="bg-slate-900 text-white rounded-t-2xl pb-6">
               <div className="flex items-center justify-between">
@@ -1926,7 +2089,7 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
           </Card>
 
           {/* Today's Shift Metrics Summary */}
-          {currentShift && (
+          {showOwnShiftSummary && currentShift && (
             <Card className="border-none shadow-md shadow-slate-200 bg-white">
               <CardHeader className="border-b border-rose-50/50 pb-3">
                 <CardTitle className="text-sm font-black text-slate-800">Shift Math & Utilization Summary</CardTitle>
@@ -1974,9 +2137,12 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
             </Card>
           )}
         </div>
+        )}
 
         {/* Shift Timeline / Session History Column */}
-        <div className="lg:col-span-7 space-y-6">
+        {showTimelineCol && (
+        <div className={`${timelineColSpan} space-y-6`}>
+          {showOwnShiftSummary && (
           <Card className="border-none shadow-md shadow-slate-200">
             <CardHeader className="border-b border-slate-100 pb-4">
               <div className="flex items-center justify-between">
@@ -2037,8 +2203,10 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
               )}
             </CardContent>
           </Card>
+          )}
 
           {/* Past Shift History Logs */}
+          {showOwnAttendance && (
           <Card className="border-none shadow-md shadow-slate-200">
             <CardHeader className="border-b border-slate-100 pb-4">
               <CardTitle className="text-base font-black text-slate-900">Your Shift History</CardTitle>
@@ -2079,70 +2247,27 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
               </div>
             </CardContent>
           </Card>
+          )}
         </div>
+        )}
 
       </div>
 
-      {/* ADMIN PANEL - PROCESSES & LIVE TRACKER */}
-      {(((user.role as any) === UserRole.ADMIN || (user.role as any) === UserRole.MANAGER)) && (
+      {/* ADMIN PANEL - LIVE TRACKER (Process settings moved to Admin Console) */}
+      {canViewReports && (
         <div className="border-t border-slate-200 pt-8 space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
           <div className="flex items-center gap-3 bg-red-50/50 p-4 border border-red-100 rounded-xl">
             <LockIcon className="text-red-500 shrink-0" size={18} />
             <div>
               <h3 className="text-sm font-black text-red-950 uppercase tracking-wide">Workforce Control: Clock Master Consolidation</h3>
-              <p className="text-[11px] font-bold text-red-800 leading-none mt-1">Supervise organization-wide utilization, live activity maps, and process configurations</p>
+              <p className="text-[11px] font-bold text-red-800 leading-none mt-1">Supervise organization-wide utilization and live activity maps</p>
             </div>
           </div>
 
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
+          <div className="grid grid-cols-1 gap-8">
             
-            {/* Processes Names Management (Add & Delete Process Names) */}
-            <div className="lg:col-span-5 space-y-6">
-              <Card className="border-none shadow-md shadow-slate-200">
-                <CardHeader className="border-b border-slate-100 pb-4">
-                  <CardTitle className="text-sm font-extrabold text-slate-900 uppercase tracking-widest">Process Settings Configuration</CardTitle>
-                  <CardDescription className="text-xs">Add/delete processes served in the Punch Station dropdown</CardDescription>
-                </CardHeader>
-                <CardContent className="pt-6 space-y-4">
-                  <div className="flex gap-2">
-                    <Input 
-                      placeholder="e.g. Bulk QC, Escalation Handling, translation..." 
-                      className="bg-white border-slate-200 focus:ring-sky-500 text-xs rounded-xl"
-                      value={newProcessName}
-                      onChange={(e) => setNewProcessName(e.target.value)}
-                    />
-                    <Button 
-                      onClick={handleAddProcess}
-                      className="bg-sky-500 hover:bg-sky-600 text-white font-bold text-xs h-10 px-4 shrink-0 rounded-xl cursor-pointer"
-                    >
-                      <Plus size={16} className="mr-1" /> Add Process
-                    </Button>
-                  </div>
-
-                  <div className="border border-slate-100 rounded-xl divide-y divide-slate-100 max-h-60 overflow-y-auto">
-                    {processes.map((proc) => (
-                      <div key={proc} className="flex items-center justify-between p-3 text-xs bg-slate-50/20 hover:bg-slate-50 transition-colors">
-                        <span className="font-extrabold text-slate-800">{proc}</span>
-                        <Button 
-                          variant="ghost" 
-                          size="icon" 
-                          className="h-8 w-8 text-rose-500 hover:text-rose-700 hover:bg-red-50 rounded-lg cursor-pointer"
-                          onClick={() => handleDeleteProcess(proc)}
-                        >
-                          <Trash2 size={14} />
-                        </Button>
-                      </div>
-                    ))}
-                    {processes.length === 0 && (
-                      <div className="text-center py-8 text-xs text-slate-400 font-bold">No custom processes defined</div>
-                    )}
-                  </div>
-                </CardContent>
-              </Card>
-            </div>
-
             {/* Realtime workforce dashboard & logs for Admin */}
-            <div className="lg:col-span-7 space-y-6">
+            <div className="space-y-6">
               <Card className="border-none shadow-md shadow-slate-200">
                 <CardHeader className="border-b border-slate-100 pb-4">
                   <div className="flex items-center justify-between">
@@ -2208,10 +2333,16 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
                                 </div>
                               </td>
                               <td className="p-4 text-center font-bold text-sm text-[#0F172A] font-mono">
-                                <div>{stats.utilization}%</div>
-                                <div className="text-[10px] text-slate-400 font-normal leading-none mt-1">
-                                  Productive: {stats.activeStr} / {stats.totalShiftStr}
-                                </div>
+                                {hasTmsPermission('view_team_productivity') ? (
+                                  <>
+                                    <div>{stats.utilization}%</div>
+                                    <div className="text-[10px] text-slate-400 font-normal leading-none mt-1">
+                                      Productive: {stats.activeStr} / {stats.totalShiftStr}
+                                    </div>
+                                  </>
+                                ) : (
+                                  <span className="text-slate-400 font-normal text-xs">-</span>
+                                )}
                               </td>
                               <td className="p-4 text-center">
                                 {(sh.status === 'ACTIVE' || sh.status === 'BREAK') && canUserForceLogoutTarget(user, sh.userId) ? (

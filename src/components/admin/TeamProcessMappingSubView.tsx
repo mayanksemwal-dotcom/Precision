@@ -1,8 +1,9 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { Users, Link2, Search, CheckSquare, Square, RefreshCcw, ChevronsRight } from 'lucide-react';
 import { db } from '../../lib/firebase';
-import { doc, writeBatch } from 'firebase/firestore';
+import { doc, writeBatch, collection, getDocs, getDoc } from 'firebase/firestore';
 import { toast } from 'sonner';
+import { UserPicker } from '../UserPicker';
 
 interface TeamProcessMappingSubViewProps {
   allUsers: any[];
@@ -27,6 +28,27 @@ export const TeamProcessMappingSubView: React.FC<TeamProcessMappingSubViewProps>
   const [targetTL, setTargetTL] = useState('');
   const [targetManager, setTargetManager] = useState('');
   const [targetProcess, setTargetProcess] = useState('');
+  const [registeredProcesses, setRegisteredProcesses] = useState<string[]>([]);
+
+  useEffect(() => {
+    const fetchRegisteredProcesses = async () => {
+      try {
+        const snap = await getDoc(doc(db, 'config', 'tmsProcesses'));
+        let list: string[] = [];
+        if (snap.exists() && Array.isArray(snap.data()?.list)) {
+          list = snap.data()?.list;
+        }
+        // Include default dynamic fallback if empty
+        if (list.length === 0) {
+            list = ['HITL', 'MPQC', 'OQC', 'SOP Training', 'QA Review', 'Team Alignment'];
+        }
+        setRegisteredProcesses(list);
+      } catch (err) {
+        console.warn('Failed to load registered processes', err);
+      }
+    };
+    fetchRegisteredProcesses();
+  }, []);
 
   // Lists
   const teamLeads = useMemo(() => allUsers.filter(u => u.role === 'TEAM_LEAD' || u.role === 'STL' || u.role === 'OPS_TL'), [allUsers]);
@@ -38,6 +60,7 @@ export const TeamProcessMappingSubView: React.FC<TeamProcessMappingSubViewProps>
       const matchesSearch = 
         (u.name || '').toLowerCase().includes(q) ||
         (u.fullName || '').toLowerCase().includes(q) ||
+        (u.employeeName || '').toLowerCase().includes(q) ||
         (u.email || '').toLowerCase().includes(q) ||
         (u.employeeId || '').toLowerCase().includes(q);
       const matchesRole = roleGroup ? u.role === roleGroup : true;
@@ -203,7 +226,7 @@ export const TeamProcessMappingSubView: React.FC<TeamProcessMappingSubViewProps>
                               {isSel ? <CheckSquare size={14} className="text-indigo-500" /> : <Square size={14} />}
                             </button>
                           </td>
-                          <td className="p-3 font-bold">{u.fullName || u.name}</td>
+                          <td className="p-3 font-bold">{u.fullName || u.name || u.employeeName}</td>
                           <td className="p-3"><span className="text-[10px] font-semibold bg-indigo-500/15 text-indigo-400 px-1.5 py-0.5 rounded">{u.role}</span></td>
                           <td className="p-3 font-medium opacity-85">{u.teamLeadName || 'Unassigned'}</td>
                           <td className="p-3 font-medium opacity-85">{u.mappedManagerName || u.Manager || 'Unassigned'}</td>
@@ -228,44 +251,36 @@ export const TeamProcessMappingSubView: React.FC<TeamProcessMappingSubViewProps>
             </div>
 
             {/* Assign TL */}
-            <div className="space-y-1">
-              <label className="block text-[10px] font-bold text-slate-400 uppercase">Map to Supervisor (Team Lead)</label>
-              <select 
-                value={targetTL} 
-                onChange={e => setTargetTL(e.target.value)}
-                className={`w-full text-xs p-2.5 rounded-lg border focus:outline-none focus:ring-1 focus:ring-indigo-500 ${adminTheme === 'dark' ? 'bg-slate-800 border-slate-700 text-slate-100' : 'bg-white border-slate-205 text-slate-800'}`}
-              >
-                <option value="">-- Click to choose supervisor --</option>
-                {teamLeads.map(tl => (
-                  <option key={tl.uid} value={tl.uid}>{tl.fullName || tl.name} ({tl.email})</option>
-                ))}
-              </select>
-            </div>
+            <UserPicker 
+              label="Map to Supervisor (Team Lead)"
+              onSelect={(u) => setTargetTL(u.uid)}
+              selectedUserId={targetTL}
+              placeholder="Select supervisor..."
+              roleFilter={['TEAM_LEAD', 'STL', 'OPS_TL']}
+            />
 
             {/* Assign Manager */}
-            <div className="space-y-1">
-              <label className="block text-[10px] font-bold text-slate-400 uppercase">Map to Executive (Manager)</label>
-              <select 
-                value={targetManager} 
-                onChange={e => setTargetManager(e.target.value)}
-                className={`w-full text-xs p-2.5 rounded-lg border focus:outline-none focus:ring-1 focus:ring-indigo-500 ${adminTheme === 'dark' ? 'bg-slate-800 border-slate-700 text-slate-100' : 'bg-white border-slate-205 text-slate-800'}`}
-              >
-                <option value="">-- Click to choose executive --</option>
-                {managers.map(m => (
-                  <option key={m.uid} value={m.uid}>{m.fullName || m.name} ({m.email})</option>
-                ))}
-              </select>
-            </div>
+            <UserPicker 
+              label="Map to Executive (Manager)"
+              onSelect={(u) => setTargetManager(u.uid)}
+              selectedUserId={targetManager}
+              placeholder="Select executive..."
+              roleFilter={['MANAGER', 'ADMIN']}
+            />
 
             {/* Assign Process */}
             <div className="space-y-1">
               <label className="block text-[10px] font-bold text-slate-400 uppercase">Map to Campaign (Process Work)</label>
-              <input 
+              <select 
                 value={targetProcess}
                 onChange={e => setTargetProcess(e.target.value)}
-                placeholder="e.g. Mobile QA Verticals"
-                className={`w-full text-xs p-2.5 rounded-lg border focus:outline-none focus:ring-1 focus:ring-indigo-500 ${adminTheme === 'dark' ? 'bg-slate-800 border-slate-700 text-slate-100' : 'bg-white border-slate-205 text-slate-800'}`}
-              />
+                className={`w-full text-xs p-2.5 rounded-lg border focus:outline-none focus:ring-1 focus:ring-indigo-500 ${adminTheme === 'dark' ? 'bg-slate-800 border-slate-700 text-slate-100' : 'bg-white border-slate-205 text-slate-850'}`}
+              >
+                <option value="">Select Process...</option>
+                {registeredProcesses.map(p => (
+                  <option key={p} value={p}>{p}</option>
+                ))}
+              </select>
             </div>
 
             <div className="pt-4 border-t border-slate-100 dark:border-slate-800/60 mt-auto">

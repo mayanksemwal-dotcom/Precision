@@ -7,6 +7,7 @@ import { Search, Download, Calendar } from 'lucide-react';
 import * as XLSX from 'xlsx';
 import { toast } from 'sonner';
 import { AuditRecord, UserProfile, UserRole, QAAlignment } from '../types';
+import { usePermission } from '../components/PermissionContext';
 
 interface CompletedAuditsViewProps {
   auditLogs: AuditRecord[];
@@ -15,6 +16,8 @@ interface CompletedAuditsViewProps {
 }
 
 export default function CompletedAuditsView({ auditLogs, user, alignments = [] }: CompletedAuditsViewProps) {
+  const { canEdit } = usePermission();
+  const canManageReports = canEdit('KPI Scorecard');
   const [searchTerm, setSearchTerm] = useState('');
   const [currentPage, setCurrentPage] = useState(1);
   const itemsPerPage = 10;
@@ -23,8 +26,9 @@ export default function CompletedAuditsView({ auditLogs, user, alignments = [] }
   const getVisibleAudits = () => {
     let logs = [...auditLogs];
     
-    if (user.role === UserRole.QA) {
-      logs = logs.filter(a => a.qaId === user.uid);
+    // If not management, filter to audits performed by the user (if they are QA) or for them (if they are Agent)
+    if (!canManageReports) {
+      logs = logs.filter(a => a.qaId === user.uid || a.agentId === user.uid || a.qvName === user.name);
     }
     
     if (searchTerm) {

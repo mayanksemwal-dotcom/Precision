@@ -9,8 +9,11 @@ import { Trash2, AlertTriangle, CheckSquare, Square, Download, Edit, Save, X } f
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogFooter } from '../components/ui/dialog';
 import { performCascadeDeleteKpiUploads } from '../lib/dataCleanupService';
 import * as XLSX from 'xlsx';
+import { usePermission } from '../components/PermissionContext';
 
 const ManageHistoricalRecordsView = ({ user }: { user: any }) => {
+  const { canEdit, canDelete } = usePermission();
+
   const [data, setData] = useState<any[]>([]);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(false);
@@ -22,7 +25,8 @@ const ManageHistoricalRecordsView = ({ user }: { user: any }) => {
   const [editForm, setEditForm] = useState<any>({});
 
   // Role restriction
-  const isAuthorized = user?.role?.toUpperCase() === 'ADMIN'; // Robust role check
+  const isAuthorized = canEdit('Historical Records');
+  const canDeleteRecords = canDelete('Historical Records');
   
   useEffect(() => {
     fetchData();
@@ -151,7 +155,7 @@ const ManageHistoricalRecordsView = ({ user }: { user: any }) => {
             <Button 
                 variant="destructive" 
                 onClick={() => setShowConfirm(true)}
-                disabled={selectedIds.size === 0 || loading || !isAuthorized}
+                disabled={selectedIds.size === 0 || loading || !canDeleteRecords}
             >
                 <Trash2 className="w-4 h-4 mr-2" />
                 Delete Selected

@@ -10,12 +10,14 @@ import {
   Sun,
   Moon,
   Upload,
-  RefreshCw
+  RefreshCw,
+  Activity
 } from 'lucide-react';
 import { db, auth } from '../lib/firebase';
 import { doc, setDoc, addDoc, collection, writeBatch } from 'firebase/firestore';
 import { UserProfile, UserRole } from '../types';
 import { toast } from 'sonner';
+import { usePermission } from '../components/PermissionContext';
 
 // Subview imports
 import { DashboardSubView } from '../components/admin/DashboardSubView';
@@ -25,6 +27,7 @@ import { TeamProcessMappingSubView } from '../components/admin/TeamProcessMappin
 import { AuditLogsSubView } from '../components/admin/AuditLogsSubView';
 import { DataManagementSubView } from '../components/admin/DataManagementSubView';
 import { BackupRestoreSubView } from '../components/admin/BackupRestoreSubView';
+import { ProcessManagementSubView } from '../components/admin/ProcessManagementSubView';
 
 interface AdminViewProps {
   activeTab: string;
@@ -47,9 +50,10 @@ export default function AdminView({
   allUsers,
   onRefresh
 }: AdminViewProps) {
+  const { canView, canCreate, canEdit, canDelete } = usePermission();
   
   // Tab Routing inside Admin Console
-  const [activeSubTab, setActiveSubTab] = useState<'dashboard' | 'users' | 'roles' | 'mapping' | 'audits' | 'data' | 'backup'>('dashboard');
+  const [activeSubTab, setActiveSubTab] = useState<'dashboard' | 'users' | 'roles' | 'mapping' | 'process' | 'audits' | 'data' | 'backup'>('dashboard');
   
   // Theme Toggle: Premium and professional dark & light themes supported locally inside Administration
   const [adminTheme, setAdminTheme] = useState<'light' | 'dark'>('light');
@@ -131,16 +135,19 @@ export default function AdminView({
     }
   };
 
-  // Nav arrays 
+  // Internal Navigation tabs 
   const subTabs = [
-    { id: 'dashboard', label: 'Dashboard', icon: ShieldCheck },
-    { id: 'users', label: 'User Directory', icon: Users },
-    { id: 'roles', label: 'Roles Matrix', icon: Settings },
-    { id: 'mapping', label: 'Team Mapping', icon: RefreshCw },
-    { id: 'audits', label: 'Audit Trail', icon: History },
-    { id: 'data', label: 'Data Management', icon: Database },
-    { id: 'backup', label: 'Backup & Restore', icon: CloudLightning }
+    { id: 'dashboard', label: 'Dashboard', icon: ShieldCheck, visible: true },
+    { id: 'users', label: 'User Directory', icon: Users, visible: canEdit('Console') || canCreate('Console') },
+    { id: 'process', label: 'Process Management', icon: Activity, visible: canEdit('Console') },
+    { id: 'roles', label: 'Roles Matrix', icon: Settings, visible: canEdit('Console') },
+    { id: 'mapping', label: 'Team Mapping', icon: RefreshCw, visible: canEdit('Console') },
+    { id: 'audits', label: 'Audit Trail', icon: History, visible: canView('Console') },
+    { id: 'data', label: 'Data Management', icon: Database, visible: canDelete('Console') },
+    { id: 'backup', label: 'Backup & Restore', icon: CloudLightning, visible: canEdit('Console') && canDelete('Console') }
   ] as const;
+
+  const visibleSubTabs = subTabs.filter(t => t.visible);
 
   // Root wrapper classes matching Local Theme values
   const themeClass = adminTheme === 'dark' 
@@ -190,7 +197,7 @@ export default function AdminView({
 
       {/* Internal Navigation tabs */}
       <div className="flex overflow-x-auto gap-1 border-b border-slate-150/5 pb-2 scrollbar-none">
-        {subTabs.map(tab => {
+        {visibleSubTabs.map(tab => {
           const Icon = tab.icon;
           const isAct = activeSubTab === tab.id;
           return (
@@ -235,6 +242,10 @@ export default function AdminView({
             onRefresh={onRefresh || (() => {})} 
             logAdminEvent={logAdminEvent} 
           />
+        )}
+
+        {activeSubTab === 'process' && (
+          <ProcessManagementSubView user={requesterUser} adminTheme={adminTheme} />
         )}
 
         {activeSubTab === 'audits' && (

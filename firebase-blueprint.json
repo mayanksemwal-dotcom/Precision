@@ -250,6 +250,22 @@
       },
       "required": ["role_name", "module_name", "can_view"]
     },
+    "TMSShift": {
+      "title": "TMS Shift",
+      "description": "Workforce shift and activity tracking",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "userName": { "type": "string" },
+        "userEmail": { "type": "string" },
+        "clockInTime": { "type": "string" },
+        "clockOutTime": { "type": "string" },
+        "status": { "type": "string", "enum": ["ACTIVE", "BREAK", "COMPLETED", "AUTO_CLOSED"] },
+        "activities": { "type": "array" }
+      },
+      "required": ["id", "userId", "clockInTime", "status"]
+    },
     "PermissionTemplate": {
       "title": "Permission Template",
       "description": "Standardized permission templates for roles",
@@ -347,6 +363,14 @@
         }
       },
       "description": "Workforce TMS processes"
+    },
+    "tmsShifts/{shiftId}": {
+      "schema": "TMSShift",
+      "description": "Workforce shifts"
+    },
+    "dashboardSummary/{id}": {
+      "schema": { "type": "object" },
+      "description": "Supervisor dashboard metrics cache"
     }
   }
 }

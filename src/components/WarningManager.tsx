@@ -7,6 +7,7 @@ import { toast } from 'sonner';
 import { auth, db, handleFirestoreError, OperationType } from '../lib/firebase';
 import { doc, setDoc, addDoc, collection } from 'firebase/firestore';
 import { WarningTicket, UserProfile, UserRole } from '../types';
+import { UserPicker } from './UserPicker';
 
 interface WarningManagerProps {
   agentName?: string;
@@ -19,8 +20,6 @@ export default function WarningManager({ agentName: initialName, agentId: initia
   const [level, setLevel] = useState<'1st' | '2nd' | 'Final' | string>('1st');
   const [remarks, setRemarks] = useState('');
   const [selectedAgentId, setSelectedAgentId] = useState(initialId || '');
-  const [dropdownOpen, setDropdownOpen] = useState(false);
-  const [dropdownSearch, setDropdownSearch] = useState('');
   const [severity, setSeverity] = useState<'Mild' | 'Moderate' | 'Severe' | 'Critical'>('Mild');
   const [sendEmailNotification, setSendEmailNotification] = useState(true);
 
@@ -93,10 +92,6 @@ export default function WarningManager({ agentName: initialName, agentId: initia
   };
 
   const eligibleTargets = getEligibleWarningTargets();
-  const filteredAgents = eligibleTargets.filter(u => 
-    (u.name || '').toLowerCase().includes(dropdownSearch.toLowerCase()) || 
-    (u.email || '').toLowerCase().includes(dropdownSearch.toLowerCase())
-  );
 
   const handleSubmit = async () => {
     if (!selectedAgentId) {
@@ -110,18 +105,23 @@ export default function WarningManager({ agentName: initialName, agentId: initia
 
     try {
       const fullAgent = allUsers.find(u => u.uid === selectedAgentId);
-      const email = fullAgent?.email || '';
-      const name = fullAgent?.name || initialName || selectedAgentId;
-      const employeeId = fullAgent?.uid
-        ? `EMP-2026-${fullAgent.uid.substring(0, 4).toUpperCase()}`
-        : `EMP-2026-${selectedAgentId.substring(0, 4).toUpperCase()}`;
+      if (!fullAgent) {
+        toast.error('Details not found in Employee Master for selected personnel.');
+        return;
+      }
+      
+      const email = fullAgent.email || '';
+      const name = fullAgent.employeeName || fullAgent.fullName || fullAgent.name || 'Unknown';
+      const employeeId = fullAgent.employeeId || 'N/A';
+      const process = fullAgent.process || 'Commonpool';
 
       const ticket: WarningTicket = {
         id: `wt-${Date.now()}`,
         agentId: selectedAgentId,
-        agentName: name,
+        agentName: name, 
         agentEmail: email,
         employeeId: employeeId,
+        process: process,
         qaId: auth.currentUser?.uid || 'unknown',
         level,
         remarks,
@@ -130,7 +130,7 @@ export default function WarningManager({ agentName: initialName, agentId: initia
         createdAt: new Date().toISOString(),
         history: [
           {
-            action: `Warning raised by QA/Supervisor`,
+            action: `Warning raised by Supervisor`,
             timestamp: new Date().toISOString()
           }
         ]
@@ -254,71 +254,21 @@ CC Checklist:
       <div className="space-y-4">
         {/* Target selection */}
         <div className="space-y-1 relative">
-          <Label className="text-xs uppercase font-bold text-slate-500 tracking-wider">Target Employee/Supervisor</Label>
           {!initialId ? (
-            <div className="w-full relative z-40">
-              <button
-                type="button"
-                onClick={() => setDropdownOpen(!dropdownOpen)}
-                className="mt-1 w-full h-11 bg-white border border-slate-200 text-slate-900 font-medium px-3 flex items-center justify-between rounded-lg shadow-sm hover:bg-slate-50 focus:ring-2 focus:ring-red-500 focus:outline-none text-left cursor-pointer"
-              >
-                <span>
-                  {selectedAgent 
-                    ? `${selectedAgent.name} (${allUsers.find(u => u.uid === selectedAgentId)?.email || selectedAgentId})` 
-                    : "Select an Employee..."
-                  }
-                </span>
-                <ChevronDown className="h-4 w-4 text-slate-400 shrink-0" />
-              </button>
-
-              {dropdownOpen && (
-                <div className="absolute left-0 right-0 mt-1 bg-white border border-slate-200 rounded-lg shadow-xl z-[9999] p-1 flex flex-col max-h-60">
-                  <div className="p-1 px-2 border-b border-slate-100 flex items-center gap-2">
-                    <Search size={14} className="text-slate-400 shrink-0" />
-                    <input
-                      type="text"
-                      placeholder="Search profile..."
-                      className="w-full text-xs p-1 focus:outline-none bg-transparent text-slate-900"
-                      value={dropdownSearch}
-                      onChange={(e) => setDropdownSearch(e.target.value)}
-                      onClick={(e) => e.stopPropagation()}
-                    />
-                  </div>
-                  <div className="overflow-y-auto max-h-48 pt-1 space-y-0.5">
-                    {filteredAgents.map(u => (
-                      <button
-                        key={u.uid}
-                        type="button"
-                        onClick={() => {
-                          setSelectedAgentId(u.uid);
-                          setDropdownOpen(false);
-                          setDropdownSearch('');
-                        }}
-                        className="w-full text-left font-semibold text-slate-900 p-2 rounded hover:bg-slate-50 flex items-center justify-between transition-colors cursor-pointer text-xs"
-                      >
-                        <div className="flex flex-col">
-                          <div className="flex items-center gap-2">
-                            <span>{u.fullName || u.name}</span>
-                            <span className="text-[9px] bg-slate-100 text-slate-600 px-1 py-0.2 rounded font-black font-mono uppercase">{u.role}</span>
-                          </div>
-                          <span className="text-[10px] text-slate-400 font-mono font-medium">{u.email}</span>
-                        </div>
-                        {selectedAgentId === u.uid && (
-                          <Check className="h-4 w-4 text-emerald-600 shrink-0" />
-                        )}
-                      </button>
-                    ))}
-                    {filteredAgents.length === 0 && (
-                      <div className="text-center text-xs text-slate-400 py-4 font-bold">No eligible employees found</div>
-                    )}
-                  </div>
-                </div>
-              )}
-            </div>
+            <UserPicker 
+              label="Target Employee/Supervisor"
+              onSelect={(u) => setSelectedAgentId(u.uid)}
+              selectedUserId={selectedAgentId}
+              placeholder="Search employee to warn..."
+              roleFilter={eligibleTargets.map(u => u.role)}
+            />
           ) : (
-            <div className="p-3 bg-slate-50 rounded border border-slate-200 mt-1">
-               <p className="font-bold">{initialName}</p>
-               <p className="text-xs text-slate-500">ID: {initialId}</p>
+            <div className="space-y-1">
+              <Label className="text-xs uppercase font-bold text-slate-500 tracking-wider">Target Employee/Supervisor</Label>
+              <div className="p-3 bg-slate-50 rounded border border-slate-200 mt-1">
+                 <p className="font-bold">{initialName}</p>
+                 <p className="text-xs text-slate-500">ID: {initialId}</p>
+              </div>
             </div>
           )}
         </div>

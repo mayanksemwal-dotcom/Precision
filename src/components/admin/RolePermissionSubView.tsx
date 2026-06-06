@@ -14,7 +14,10 @@ import {
   FileText, 
   RefreshCw, 
   SlidersHorizontal,
-  FolderLock
+  FolderLock,
+  ChevronDown,
+  AlertTriangle,
+  Heart
 } from 'lucide-react';
 import { db } from '../../lib/firebase';
 import { 
@@ -28,6 +31,7 @@ import {
   where 
 } from 'firebase/firestore';
 import { toast } from 'sonner';
+import { getDefaultTmsPermissions, TMSPermissions } from '../PermissionContext';
 
 // Defined standard roles matching UserRole
 const KNOWN_ROLES = [
@@ -70,6 +74,7 @@ export interface RolePermissionDoc {
   can_delete: boolean;
   can_export: boolean;
   can_approve: boolean;
+  tms_permissions?: TMSPermissions;
 }
 
 export const RolePermissionSubView: React.FC<RolePermissionSubViewProps> = ({ adminTheme, logAdminEvent }) => {
@@ -94,78 +99,82 @@ export const RolePermissionSubView: React.FC<RolePermissionSubViewProps> = ({ ad
 
   // Selected intersection cell for popover edit
   const [editingCell, setEditingCell] = useState<{ role: string; module: string } | null>(null);
+  const [errorStatus, setErrorStatus] = useState<string | null>(null);
+
+  const fetchSecurityData = async () => {
+    setLoading(true);
+    setErrorStatus(null);
+    try {
+      // 1. Fetch modules
+      const modulesSnap = await getDocs(collection(db, 'module_master'));
+      let fetchedModules = modulesSnap.docs.map(d => d.data().name as string).filter(mod => ALL_MASTER_MODULES.includes(mod));
+      if (fetchedModules.length < ALL_MASTER_MODULES.length) {
+        // Auto-seed modules
+        const fbBatch = writeBatch(db);
+        ALL_MASTER_MODULES.forEach(mod => {
+          fbBatch.set(doc(db, 'module_master', mod), { id: mod, name: mod, createdAt: new Date().toISOString() });
+        });
+        await fbBatch.commit();
+        fetchedModules = ALL_MASTER_MODULES;
+      }
+      setModules(fetchedModules);
+
+      // 2. Fetch custom fields and roles
+      const rolesSnap = await getDocs(collection(db, 'roles'));
+      let fetchedRoles = rolesSnap.docs.map(d => d.data().name as string);
+      if (fetchedRoles.length === 0) {
+        const fbBatch = writeBatch(db);
+        KNOWN_ROLES.forEach(role => {
+          fbBatch.set(doc(db, 'roles', role), { id: role, name: role, description: `${role} Role`, createdAt: new Date().toISOString() });
+        });
+        await fbBatch.commit();
+        fetchedRoles = KNOWN_ROLES;
+      }
+      setRolesList(fetchedRoles);
+
+      // 3. Fetch permissions matrix map
+      const permissionsSnap = await getDocs(collection(db, 'role_permissions'));
+      const permDocs = permissionsSnap.docs.map(d => d.data() as RolePermissionDoc);
+      
+      if (permDocs.length === 0) {
+        // Auto seed dynamic permission matrix
+        await seedDefaultPermissions(fetchedRoles, fetchedModules);
+      } else {
+        // Convert flat documents structure to nested Record structure
+        const matrixMap: Record<string, Record<string, Omit<RolePermissionDoc, 'role_name' | 'module_name'>>> = {};
+        
+        permDocs.forEach(docItem => {
+          const r = docItem.role_name;
+          const m = docItem.module_name;
+          if (!matrixMap[r]) matrixMap[r] = {};
+          matrixMap[r][m] = {
+            can_view: !!docItem.can_view,
+            can_create: !!docItem.can_create,
+            can_edit: !!docItem.can_edit,
+            can_delete: !!docItem.can_delete,
+            can_export: !!docItem.can_export,
+            can_approve: !!docItem.can_approve,
+            tms_permissions: docItem.tms_permissions || undefined
+          };
+        });
+        setPermissions(matrixMap);
+      }
+
+      // 4. Fetch templates
+      const templatesSnap = await getDocs(collection(db, 'permission_templates'));
+      setTemplates(templatesSnap.docs.map(d => ({ id: d.id, ...d.data() })));
+
+    } catch (err) {
+      console.error('Failed to pre-fetch security roles matrix:', err);
+      setErrorStatus(err instanceof Error ? err.message : 'Permission pre-fetch failed.');
+      toast.error('Unable to sync dynamic roles directory.');
+    } finally {
+      setLoading(false);
+    }
+  };
 
   // Fetch all modules, roles, and permissions
   useEffect(() => {
-    const fetchSecurityData = async () => {
-      setLoading(true);
-      try {
-        // 1. Fetch modules
-        const modulesSnap = await getDocs(collection(db, 'module_master'));
-        let fetchedModules = modulesSnap.docs.map(d => d.data().name as string).filter(mod => ALL_MASTER_MODULES.includes(mod));
-        if (fetchedModules.length < ALL_MASTER_MODULES.length) {
-          // Auto-seed modules
-          const fbBatch = writeBatch(db);
-          ALL_MASTER_MODULES.forEach(mod => {
-            fbBatch.set(doc(db, 'module_master', mod), { id: mod, name: mod, createdAt: new Date().toISOString() });
-          });
-          await fbBatch.commit();
-          fetchedModules = ALL_MASTER_MODULES;
-        }
-        setModules(fetchedModules);
-
-        // 2. Fetch custom fields and roles
-        const rolesSnap = await getDocs(collection(db, 'roles'));
-        let fetchedRoles = rolesSnap.docs.map(d => d.data().name as string);
-        if (fetchedRoles.length === 0) {
-          const fbBatch = writeBatch(db);
-          KNOWN_ROLES.forEach(role => {
-            fbBatch.set(doc(db, 'roles', role), { id: role, name: role, description: `${role} Role`, createdAt: new Date().toISOString() });
-          });
-          await fbBatch.commit();
-          fetchedRoles = KNOWN_ROLES;
-        }
-        setRolesList(fetchedRoles);
-
-        // 3. Fetch permissions matrix map
-        const permissionsSnap = await getDocs(collection(db, 'role_permissions'));
-        const permDocs = permissionsSnap.docs.map(d => d.data() as RolePermissionDoc);
-        
-        if (permDocs.length === 0) {
-          // Auto seed dynamic permission matrix
-          await seedDefaultPermissions(fetchedRoles, fetchedModules);
-        } else {
-          // Convert flat documents structure to nested Record structure
-          const matrixMap: Record<string, Record<string, Omit<RolePermissionDoc, 'role_name' | 'module_name'>>> = {};
-          
-          permDocs.forEach(docItem => {
-            const r = docItem.role_name;
-            const m = docItem.module_name;
-            if (!matrixMap[r]) matrixMap[r] = {};
-            matrixMap[r][m] = {
-              can_view: !!docItem.can_view,
-              can_create: !!docItem.can_create,
-              can_edit: !!docItem.can_edit,
-              can_delete: !!docItem.can_delete,
-              can_export: !!docItem.can_export,
-              can_approve: !!docItem.can_approve,
-            };
-          });
-          setPermissions(matrixMap);
-        }
-
-        // 4. Fetch templates
-        const templatesSnap = await getDocs(collection(db, 'permission_templates'));
-        setTemplates(templatesSnap.docs.map(d => ({ id: d.id, ...d.data() })));
-
-      } catch (err) {
-        console.error('Failed to pre-fetch security roles matrix:', err);
-        toast.error('Unable to sync dynamic roles directory.');
-      } finally {
-        setLoading(false);
-      }
-    };
-
     fetchSecurityData();
   }, []);
 
@@ -271,13 +280,19 @@ export const RolePermissionSubView: React.FC<RolePermissionSubViewProps> = ({ ad
             };
           }
 
-          matrixMap[role][mod] = defaults;
+          // If module is 'Workforce TMS', assign default granular permissions
+          const moduleDefaults: any = { ...defaults };
+          if (mod === 'Workforce TMS') {
+            moduleDefaults.tms_permissions = getDefaultTmsPermissions(role);
+          }
+
+          matrixMap[role][mod] = moduleDefaults;
           const mapId = `${role}_${mod}`;
           fbBatch.set(doc(db, 'role_permissions', mapId), {
             id: mapId,
             role_name: role,
             module_name: mod,
-            ...defaults
+            ...moduleDefaults
           });
         });
       });
@@ -401,6 +416,109 @@ export const RolePermissionSubView: React.FC<RolePermissionSubViewProps> = ({ ad
     }
   };
 
+  // Toggle dynamic permissions inside Workforce TMS
+  const handleToggleTmsPermission = (role: string, permKey: string) => {
+    if (role === 'ADMIN') {
+      toast.info('ADMIN role permissions are globally locked down to maintain server control.');
+      return;
+    }
+
+    setPermissions(prev => {
+      const copy = { ...prev };
+      if (!copy[role]) copy[role] = {};
+      const tmsMod = copy[role]['Workforce TMS'] || {
+        can_view: true,
+        can_create: false,
+        can_edit: false,
+        can_delete: false,
+        can_export: false,
+        can_approve: false,
+      };
+
+      const tmsPerms = (tmsMod as any).tms_permissions || getDefaultTmsPermissions(role);
+      const updatedTmsPerms = {
+        ...tmsPerms,
+        [permKey]: !tmsPerms[permKey as keyof TMSPermissions]
+      };
+
+      copy[role] = {
+        ...copy[role],
+        'Workforce TMS': {
+          ...tmsMod,
+          can_view: true, // Auto allow viewing if granular perms altered
+          tms_permissions: updatedTmsPerms
+        }
+      };
+      return copy;
+    });
+  };
+
+  // Run global database schema migration for existing role matrix records 
+  const runDynamicSelfHealingMigration = async () => {
+    setSyncing(true);
+    const migToast = toast.loading('Running self-healing security migration across all database roles...');
+    try {
+      const fbBatch = writeBatch(db);
+      
+      for (const r of rolesList) {
+        if (r === 'ADMIN') continue;
+
+        // Fetch current localized local structure
+        const rMap = permissions[r] || {};
+        const tmsItem = rMap['Workforce TMS'] || {
+          can_view: true,
+          can_create: false,
+          can_edit: false,
+          can_delete: false,
+          can_export: false,
+          can_approve: false,
+        };
+
+        const tmsPerms = (tmsItem as any).tms_permissions || getDefaultTmsPermissions(r);
+        const mapId = `${r}_Workforce TMS`;
+
+        fbBatch.set(doc(db, 'role_permissions', mapId), {
+          id: mapId,
+          role_name: r,
+          module_name: 'Workforce TMS',
+          ...tmsItem,
+          tms_permissions: tmsPerms
+        });
+      }
+
+      await fbBatch.commit();
+      
+      // Update local memory to ensure sync
+      setPermissions(prev => {
+        const copy = { ...prev };
+        rolesList.forEach(r => {
+          if (!copy[r]) copy[r] = {};
+          const tmsItem = copy[r]['Workforce TMS'] || {
+            can_view: true,
+            can_create: false,
+            can_edit: false,
+            can_delete: false,
+            can_export: false,
+            can_approve: false,
+          };
+          copy[r]['Workforce TMS'] = {
+            ...tmsItem,
+            tms_permissions: (tmsItem as any).tms_permissions || getDefaultTmsPermissions(r)
+          };
+        });
+        return copy;
+      });
+
+      toast.success('Successfully deployed dynamic TMS matrix overrides across all roles!');
+    } catch (err: any) {
+      console.error(err);
+      toast.error('Migration failed: ' + err.message);
+    } finally {
+      toast.dismiss(migToast);
+      setSyncing(false);
+    }
+  };
+
   // Toggle dynamic permissions inside state
   const handleToggleState = (role: string, mod: string, field: keyof Omit<RolePermissionDoc, 'role_name' | 'module_name'>) => {
     if (role === 'ADMIN') {
@@ -462,12 +580,19 @@ export const RolePermissionSubView: React.FC<RolePermissionSubViewProps> = ({ ad
           can_approve: false,
         };
         const mapId = `${roleName}_${mod}`;
-        fbBatch.set(doc(db, 'role_permissions', mapId), {
+        
+        const payload: any = {
           id: mapId,
           role_name: roleName,
           module_name: mod,
           ...item
-        });
+        };
+
+        if (mod === 'Workforce TMS') {
+          payload.tms_permissions = (item as any).tms_permissions || getDefaultTmsPermissions(roleName);
+        }
+
+        fbBatch.set(doc(db, 'role_permissions', mapId), payload);
       });
 
       await fbBatch.commit();
@@ -560,6 +685,24 @@ export const RolePermissionSubView: React.FC<RolePermissionSubViewProps> = ({ ad
       <div className="py-12 text-center text-slate-400 font-mono text-xs">
         <RefreshCw size={24} className="animate-spin text-indigo-500 mx-auto mb-3" />
         Synchronizing Enterprise Permission Matrix Columns...
+      </div>
+    );
+  }
+
+  if (errorStatus) {
+    return (
+      <div className="py-12 px-6 text-center max-w-md mx-auto bg-red-50/50 dark:bg-red-950/10 rounded-2xl border border-red-100 dark:border-red-900/20 my-8">
+        <Shield size={36} className="text-red-500 mx-auto mb-3" />
+        <h4 className="text-sm font-black text-slate-800 dark:text-red-200 mb-2">Unable to Sync Dynamic Roles Directory</h4>
+        <p className="text-xs text-slate-500 dark:text-slate-400 mb-4 font-sans leading-relaxed">
+          The database connection returned a permission error: {errorStatus}. This can happen due to custom rules or transient connection problems.
+        </p>
+        <button
+          onClick={fetchSecurityData}
+          className="inline-flex items-center gap-1.5 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-bold shadow-sm cursor-pointer transition-colors"
+        >
+          <RefreshCw size={14} className="animate-pulse" /> Retry Sync
+        </button>
       </div>
     );
   }
@@ -744,7 +887,7 @@ export const RolePermissionSubView: React.FC<RolePermissionSubViewProps> = ({ ad
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
-                  {modules.map(mod => {
+                  {modules.filter(m => m !== 'Workforce TMS').map(mod => {
                     const permState = (permissions[selectedRole] || {})[mod] || {
                       can_view: false,
                       can_create: false,
@@ -848,7 +991,218 @@ export const RolePermissionSubView: React.FC<RolePermissionSubViewProps> = ({ ad
                 </tbody>
               </table>
             </div>
-            
+
+            {/* Workforce TMS Sub-Module Granular Access Controls */}
+            <div className={`mt-8 border-t ${adminTheme === 'dark' ? 'border-slate-800' : 'border-slate-200'} pt-6 space-y-6`}>
+              <div>
+                <h4 className="text-sm font-black text-slate-800 dark:text-slate-100 uppercase tracking-wide flex items-center gap-2">
+                  <Shield size={16} className="text-indigo-500" />
+                  Workforce TMS Granular Controls ({selectedRole})
+                </h4>
+                <p className="text-xs text-slate-400 mt-1">
+                  Admins can dynamically toggle granular features, punches, tracking, and controls. Changes are persisted when saving the role matrix.
+                </p>
+              </div>
+
+              {/* Grid of categories */}
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                {[
+                  {
+                    title: 'Self Service Permissions',
+                    desc: 'Shift punches & summaries',
+                    color: 'text-emerald-500 bg-emerald-500/10 border-emerald-500/20',
+                    items: [
+                      { key: 'view_self_service', label: 'View Self Service TMS' },
+                      { key: 'can_punch_in', label: 'Can Punch In' },
+                      { key: 'can_punch_out', label: 'Can Punch Out' },
+                      { key: 'can_switch_process', label: 'Can Switch Process' },
+                      { key: 'can_start_break', label: 'Can Start Break' },
+                      { key: 'can_end_break', label: 'Can End Break' },
+                      { key: 'can_start_lunch', label: 'Can Start Lunch' },
+                      { key: 'can_end_lunch', label: 'Can End Lunch' },
+                      { key: 'can_start_meeting', label: 'Can Start Meeting' },
+                      { key: 'can_end_meeting', label: 'Can End Meeting' },
+                      { key: 'can_view_own_shift_summary', label: 'Can View Own Shift Summary' },
+                      { key: 'can_view_own_attendance_summary', label: 'Can View Own Attendance Summary' }
+                    ]
+                  },
+                  {
+                    title: 'Monitoring Permissions',
+                    desc: 'Realtime tracking dashboards',
+                    color: 'text-teal-500 bg-teal-500/10 border-teal-500/20',
+                    items: [
+                      { key: 'view_workforce_dashboard', label: 'View Workforce Dashboard' },
+                      { key: 'view_realtime_tracking', label: 'View Real-Time Tracking' },
+                      { key: 'view_logged_in_users', label: 'View Logged In Users' },
+                      { key: 'view_team_status', label: 'View Team Status' },
+                      { key: 'view_team_productivity', label: 'View Team Productivity' },
+                      { key: 'view_team_attendance', label: 'View Team Attendance' },
+                      { key: 'view_team_shift_summary', label: 'View Team Shift Summary' }
+                    ]
+                  },
+                  {
+                    title: 'Administrative Controls',
+                    desc: 'Overrides & auditing limits',
+                    color: 'text-rose-500 bg-rose-500/10 border-rose-500/20',
+                    items: [
+                      { key: 'view_workforce_control', label: 'View Workforce Control' },
+                      { key: 'can_force_logout', label: 'Can Force Logout Users' },
+                      { key: 'can_edit_tms_records', label: 'Can Edit TMS Records' },
+                      { key: 'can_modify_activities', label: 'Can Modify Activities' },
+                      { key: 'can_correct_punches', label: 'Can Correct Punches' },
+                      { key: 'can_close_sessions', label: 'Can Close Sessions' },
+                      { key: 'view_team_session_audit_logs', label: 'View Team Session Audit Logs' },
+                      { key: 'view_clock_master_consolidation', label: 'View Clock Master Consolidation' },
+                      { key: 'view_org_wide_workforce_data', label: 'View Organization-Wide Workforce Data' }
+                    ]
+                  }
+                ].map((cat, idx) => {
+                  const tmsMod = (permissions[selectedRole] || {})['Workforce TMS'] || {};
+                  const tmsPerms = (tmsMod as any).tms_permissions || getDefaultTmsPermissions(selectedRole);
+
+                  return (
+                    <div key={idx} className={`p-4 rounded-xl border ${adminTheme === 'dark' ? 'bg-slate-900/40 border-slate-800' : 'bg-slate-50 border-slate-200'} space-y-3`}>
+                      <div className="flex items-center gap-2">
+                        <span className={`px-2 py-0.5 rounded text-[10px] font-black uppercase tracking-wider ${cat.color}`}>
+                          {cat.title}
+                        </span>
+                      </div>
+                      <p className="text-[10px] text-slate-400">{cat.desc}</p>
+                      
+                      <div className="space-y-1 pt-1">
+                        {cat.items.map((item) => {
+                          const isActive = !!tmsPerms[item.key as keyof TMSPermissions];
+                          const isAdmin = selectedRole === 'ADMIN';
+
+                          return (
+                            <button
+                              key={item.key}
+                              type="button"
+                              onClick={() => handleToggleTmsPermission(selectedRole, item.key)}
+                              className={`w-full flex items-center justify-between text-left p-1.5 rounded text-xs transition ${
+                                adminTheme === 'dark' ? 'hover:bg-slate-800/50' : 'hover:bg-slate-100/50'
+                              } ${isActive ? 'text-indigo-400 font-extrabold' : 'text-slate-500'}`}
+                            >
+                              <span>{item.label}</span>
+                              <div className={isAdmin ? 'opacity-40 cursor-not-allowed text-indigo-500' : isActive ? 'text-indigo-500' : 'text-slate-400'}>
+                                {isActive ? <CheckSquare size={16} /> : <Square size={16} />}
+                              </div>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* Dynamic Security Verification Report */}
+              <div className={`p-5 rounded-2xl border ${adminTheme === 'dark' ? 'bg-slate-900/60 border-slate-800' : 'bg-slate-105/5 border-slate-200'} space-y-4`}>
+                <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-2 border-b pb-3 border-slate-100/10 dark:border-slate-800">
+                  <div>
+                    <h5 className="text-xs font-black uppercase tracking-wider text-amber-500 flex items-center gap-1.5">
+                      <AlertTriangle size={15} /> Workforce TMS Validation & Self-Healing Migration Report
+                    </h5>
+                    <p className="text-[10px] text-slate-400 mt-0.5">Automated security diagnostics run against active role matrices</p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={runDynamicSelfHealingMigration}
+                    className="px-2.5 py-1 text-[10px] font-bold bg-indigo-600 hover:bg-indigo-700 text-white rounded transition"
+                  >
+                    🚀 Trigger Global Self-Healing
+                  </button>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-[11px] font-medium leading-relaxed text-slate-400">
+                  <div>
+                    <span className="text-slate-400 font-bold block mb-1">🔍 Visible Workforce TMS Sections by Role:</span>
+                    <div className="space-y-1.5 font-mono text-[10px]">
+                      {rolesList.map(r => {
+                        const tmsMod = (permissions[r] || {})['Workforce TMS'] || {};
+                        const p = (tmsMod as any).tms_permissions || getDefaultTmsPermissions(r);
+                        
+                        // Count visibilities
+                        const selfServiceCount = Object.keys(p).filter(k => k.startsWith('can_punch_') || k.startsWith('view_self_service') || k.includes('own_')).filter(k => !!p[k as keyof TMSPermissions]).length;
+                        const monitoringCount = Object.keys(p).filter(k => k.startsWith('view_team_') || k.startsWith('view_workforce_dashboard') || k.startsWith('view_realtime') || k.startsWith('view_logged_')).filter(k => !!p[k as keyof TMSPermissions]).length;
+                        const adminCount = Object.keys(p).filter(k => k.startsWith('can_force') || k.includes('tms_records') || k.includes('modify_') || k.includes('correct_') || k.includes('close_') || k.includes('consolidation') || k.includes('org_wide_') || k.startsWith('view_workforce_control')).filter(k => !!p[k as keyof TMSPermissions]).length;
+
+                        return (
+                          <div key={r} className="flex justify-between border-b pb-1 border-slate-100/10 dark:border-slate-800">
+                            <span className="font-extrabold text-slate-400">{r}:</span>
+                            <span className="text-slate-500">
+                              SelfService ({selfServiceCount}/12) &middot; Monitoring ({monitoringCount}/7) &middot; Admin ({adminCount}/9)
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  <div>
+                    <span className="text-slate-400 font-bold block mb-1">⚠️ Security Anomalies / Conflict Matrix:</span>
+                    <div className="space-y-1">
+                      {rolesList.map(r => {
+                        const conflicts = [];
+                        const tmsMod = (permissions[r] || {})['Workforce TMS'] || {};
+                        const p = (tmsMod as any).tms_permissions || getDefaultTmsPermissions(r);
+
+                        const isAgentOrQA = ['AGENT', 'QA', 'SME', 'TRAINER'].includes(r);
+                        
+                        // Check if Agent holds admin controls
+                        const holdsAdminControls = Object.keys(p).some(k => (k.startsWith('can_force') || k.includes('tms_records') || k.includes('modify_') || k.includes('correct_') || k.includes('close_') || k.includes('consolidation') || k.includes('org_wide_') || k.startsWith('view_workforce_control')) && !!p[k as keyof TMSPermissions]);
+                        if (isAgentOrQA && holdsAdminControls) {
+                          conflicts.push('IC role holds Administrative privileges!');
+                        }
+
+                        // Check if can punch but view_self_service is false
+                        if (p.can_punch_in && !p.view_self_service) {
+                          conflicts.push('Can Punch In but view_self_service is disabled (Access Block).');
+                        }
+
+                        // Check if can force logout but view_workforce_control is false
+                        if (p.can_force_logout && !p.view_workforce_control) {
+                          conflicts.push('Can Force Logout but view_workforce_control is disabled.');
+                        }
+
+                        // Check if MIS holds punch controls
+                        if (r === 'MIS' && (p.can_punch_in || p.can_punch_out || p.can_start_break)) {
+                          conflicts.push('MIS holds active Self Service punch permissions!');
+                        }
+
+                        if (conflicts.length === 0) return null;
+
+                        return (
+                          <div key={r} className="text-rose-400 bg-rose-500/5 border border-rose-500/10 p-1.5 rounded-lg text-[10px] space-y-0.5">
+                            <span className="font-bold uppercase tracking-wider">{r} Conflict:</span>
+                            {conflicts.map((conf, cIdx) => (
+                              <p key={cIdx} className="pl-2 font-mono">&bull; {conf}</p>
+                            ))}
+                          </div>
+                        );
+                      })}
+
+                      {/* Happy state if zero anomalies */}
+                      {!rolesList.some(r => {
+                        const tmsMod = (permissions[r] || {})['Workforce TMS'] || {};
+                        const p = (tmsMod as any).tms_permissions || getDefaultTmsPermissions(r);
+                        if (['AGENT', 'QA', 'SME', 'TRAINER'].includes(r) && Object.keys(p).some(k => (k.startsWith('can_force') || k.includes('tms_records') || k.includes('modify_') || k.includes('correct_') || k.includes('close_') || k.includes('consolidation') || k.includes('org_wide_') || k.startsWith('view_workforce_control')) && !!p[k as keyof TMSPermissions])) return true;
+                        if (p.can_punch_in && !p.view_self_service) return true;
+                        if (p.can_force_logout && !p.view_workforce_control) return true;
+                        if (r === 'MIS' && (p.can_punch_in || p.can_punch_out || p.can_start_break)) return true;
+                        return false;
+                      }) && (
+                        <div className="text-emerald-500 dark:text-emerald-400 bg-emerald-500/5 border border-emerald-500/10 p-3 rounded-lg text-center flex flex-col items-center justify-center font-mono text-[10px]">
+                          <Heart size={14} className="animate-pulse text-emerald-500 mb-1 animate-infinite" />
+                          <span>No structural violations or role permission conflicts detected! Workforce matrix is fully optimal and safe.</span>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
             {/* Disclaimer */}
             <div className="flex gap-2.5 items-start p-4 mt-6 rounded-2xl bg-slate-50 border border-slate-200/60 dark:bg-slate-900/40 dark:border-slate-700/60">
               <Info size={16} className="text-indigo-500 shrink-0 mt-0.5" />

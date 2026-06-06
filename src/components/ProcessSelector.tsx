@@ -14,11 +14,11 @@ interface ProcessSelectorProps {
 }
 
 export default function ProcessSelector({
-  allProcesses,
+  allProcesses = [],
   currentProcess,
   onSelectProcess,
-  recentProcesses,
-  favoriteProcesses,
+  recentProcesses = [],
+  favoriteProcesses = [],
   onToggleFavorite
 }: ProcessSelectorProps) {
   const [searchTerm, setSearchTerm] = useState('');
@@ -38,8 +38,8 @@ export default function ProcessSelector({
   }, []);
 
   const filteredProcesses = useMemo(() => {
-    return allProcesses.filter(p => 
-      p.toLowerCase().includes(searchTerm.toLowerCase())
+    return (allProcesses || []).filter(p => 
+      p && typeof p === 'string' && p.toLowerCase().includes(searchTerm.toLowerCase())
     );
   }, [allProcesses, searchTerm]);
 
@@ -68,10 +68,10 @@ export default function ProcessSelector({
 
           <div className="max-h-[300px] overflow-y-auto space-y-1 py-1">
             {/* Favorites */}
-            {favoriteProcesses.length > 0 && !searchTerm && (
+            {(favoriteProcesses || []).length > 0 && !searchTerm && (
               <div className="mb-2">
                 <p className="text-[10px] font-bold text-slate-400 uppercase p-1">Favorites</p>
-                {favoriteProcesses.map(proc => (
+                {(favoriteProcesses || []).map(proc => (
                   <div key={proc} className="flex items-center justify-between p-1.5 text-xs hover:bg-slate-100 rounded cursor-pointer" onClick={() => { onSelectProcess(proc); setIsOpen(false); }}>
                     <div className="flex items-center gap-1.5 font-medium">
                       <Star size={12} className="text-yellow-500 fill-yellow-500 shrink-0" />
@@ -84,16 +84,16 @@ export default function ProcessSelector({
             )}
 
             {/* Recent */}
-            {recentProcesses.length > 0 && !searchTerm && (
+            {(recentProcesses || []).length > 0 && !searchTerm && (
               <div className="mb-2">
                 <p className="text-[10px] font-bold text-slate-400 uppercase p-1">Recent Processes</p>
-                {recentProcesses.map(proc => (
+                {(recentProcesses || []).map(proc => (
                   <div key={proc} className="flex items-center justify-between p-1.5 text-xs hover:bg-slate-100 rounded cursor-pointer" onClick={() => { onSelectProcess(proc); setIsOpen(false); }}>
                     <div className="flex items-center gap-1.5 font-medium text-slate-700">
                         <Clock size={12} className="text-slate-400 shrink-0"/>
                         {proc}
                     </div>
-                    <Star size={12} className={favoriteProcesses.includes(proc) ? "text-yellow-500 fill-yellow-500 shrink-0" : "text-slate-300 shrink-0 hover:text-yellow-400"} onClick={(e) => { e.stopPropagation(); onToggleFavorite(proc); }} />
+                    <Star size={12} className={(favoriteProcesses || []).includes(proc) ? "text-yellow-500 fill-yellow-500 shrink-0" : "text-slate-300 shrink-0 hover:text-yellow-400"} onClick={(e) => { e.stopPropagation(); onToggleFavorite(proc); }} />
                   </div>
                 ))}
               </div>
@@ -102,13 +102,13 @@ export default function ProcessSelector({
             {/* All */}
             <div>
               <p className="text-[10px] font-bold text-slate-400 uppercase p-1">{searchTerm ? 'Search Results' : 'All Processes'}</p>
-              {filteredProcesses.length === 0 ? (
+              {(filteredProcesses || []).length === 0 ? (
                 <div className="p-2 text-center text-xs text-slate-500">No processes found</div>
               ) : (
-                filteredProcesses.map(proc => (
+                (filteredProcesses || []).map(proc => (
                   <div key={proc} className="flex items-center justify-between p-1.5 text-xs hover:bg-slate-100 rounded cursor-pointer" onClick={() => { onSelectProcess(proc); setIsOpen(false); }}>
                     <span className="font-medium text-slate-700">{proc}</span>
-                    <Star size={12} className={favoriteProcesses.includes(proc) ? "text-yellow-500 fill-yellow-500 shrink-0" : "text-slate-300 hover:text-yellow-400 shrink-0"} onClick={(e) => { e.stopPropagation(); onToggleFavorite(proc); }} />
+                    <Star size={12} className={(favoriteProcesses || []).includes(proc) ? "text-yellow-500 fill-yellow-500 shrink-0" : "text-slate-300 hover:text-yellow-400 shrink-0"} onClick={(e) => { e.stopPropagation(); onToggleFavorite(proc); }} />
                   </div>
                 ))
               )}

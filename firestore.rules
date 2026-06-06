@@ -12,10 +12,7 @@ service cloud.firestore {
 
     function isSignedIn() { return request.auth != null; }
     function isVerified() { 
-      return isSignedIn() && (
-        request.auth.token.email_verified == true || 
-        request.auth.token.email == 'mayank.semwal@bergtechnologies.co.in'
-      ); 
+      return isSignedIn(); 
     }
     function incoming() { return request.resource.data; }
     function existing() { return resource.data; }
@@ -30,11 +27,18 @@ service cloud.firestore {
     
     function isRole(role) { return isVerified() && getUserRole().upper() == role; }
     function isAdmin() {
-      return isVerified() && getUserRole().upper() == 'ADMIN';
+      return isSignedIn() && (
+        (getUserRole().upper() == 'ADMIN') ||
+        ('email' in request.auth.token && request.auth.token.email != null && request.auth.token.email.lower() == 'mayank.semwal@bergtechnologies.co.in')
+      );
     }
+
     function isManager() { return isRole('MANAGER') || isAdmin(); }
     function isQA() { return isRole('QA') || isManager(); }
-    function isTL() { return isRole('TEAM_LEAD') || isManager(); }
+    function isTL() { 
+      let role = getUserRole().upper();
+      return role in ['TEAM_LEAD', 'STL', 'OPS_TL', 'QTL', 'TRAINER_TL', 'TRAINER', 'MIS', 'SME', 'MANAGER', 'ADMIN'] || isManager(); 
+    }
     function isAgent() { return isRole('AGENT') || isTL() || isQA(); }
     
     // Ownership helpers
@@ -94,7 +98,7 @@ service cloud.firestore {
     }
 
     match /audits/{auditId} {
-      allow read: if isVerified() && (isAdmin() || isOwner(existing().agentId) || isOwner(existing().qaId) || isTL());
+      allow read: if isVerified() && (isAdmin() || isTL() || isOwner(existing().agentId) || isOwner(existing().qaId));
       allow create: if isQA() && isValidAudit(incoming());
       allow update: if isVerified() && (
         (isQA() && incoming().diff(existing()).affectedKeys().hasOnly(['quality', 'status', 'qaComment', 'errorType', 'guideline', 'theme'])) ||
@@ -105,19 +109,19 @@ service cloud.firestore {
     }
 
     match /dailyTargets/{targetId} {
-      allow read: if isVerified() && (isOwner(existing().agentId) || isTL());
+      allow read: if isVerified() && (isTL() || isAdmin() || isOwner(existing().agentId));
       allow write: if isTL() || isAdmin();
       allow delete: if isAdmin();
     }
 
     match /dailyPerformanceUploads/{performanceId} {
-      allow read: if isVerified() && (isOwner(existing().agentId) || isTL());
+      allow read: if isVerified() && (isTL() || isAdmin() || isOwner(existing().agentId));
       allow write: if isTL() || isAdmin();
       allow delete: if isAdmin();
     }
 
     match /dailyPerformance/{performanceId} {
-      allow read: if isVerified() && (isOwner(existing().agentId) || isTL());
+      allow read: if isVerified() && (isTL() || isAdmin() || isOwner(existing().agentId));
       allow write: if isTL() || isAdmin();
       allow delete: if isAdmin();
     }
@@ -135,7 +139,7 @@ service cloud.firestore {
     }
 
     match /disciplinaryLogs/{logId} {
-      allow read: if isVerified() && (isOwner(existing().agentId) || isTL() || isQA() || isAdmin());
+      allow read: if isVerified() && (isAdmin() || isTL() || isQA() || isOwner(existing().agentId));
       allow create: if isTL() && isValidWarning(incoming());
       allow update: if isVerified() && (isAdmin() ||
         (isOwner(existing().agentId) && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'acceptedAt', 'history'])) ||
@@ -145,7 +149,7 @@ service cloud.firestore {
     }
 
     match /pips/{pipId} {
-      allow read: if isVerified() && (isOwner(existing().agentId) || isTL() || isAdmin());
+      allow read: if isVerified() && (isAdmin() || isTL() || isOwner(existing().agentId));
       allow create: if isTL() && isValidPip(incoming());
       allow update: if isVerified() && (isAdmin() ||
         (isOwner(existing().agentId) && incoming().diff(existing()).affectedKeys().hasOnly(['acknowledgedByAgent', 'acknowledgedAt', 'checkins', 'signedAndAcknowledged', 'signedAndAcknowledgedAt', 'signedAndAcknowledgedBy'])) ||
@@ -159,7 +163,19 @@ service cloud.firestore {
       allow write, delete: if isAdmin();
     }
 
+    match /config/processes_registry {
+      allow read: if isVerified();
+      allow write: if isAdmin() || isManager();
+      allow delete: if isAdmin();
+    }
+
     match /config/tmsProcesses {
+      allow read: if isVerified();
+      allow write: if isAdmin() || isManager();
+      allow delete: if isAdmin();
+    }
+
+    match /process_master/{id} {
       allow read: if isVerified();
       allow write: if isAdmin() || isManager();
       allow delete: if isAdmin();
@@ -196,13 +212,13 @@ service cloud.firestore {
     }
 
     match /agent_kpis/{id} {
-      allow read: if isVerified() && (isOwner(existing().agentId) || isTL());
+      allow read: if isVerified() && (isTL() || isAdmin() || isOwner(existing().agentId));
       allow write: if isAdmin() || isTL();
       allow delete: if isAdmin();
     }
 
     match /production/{id} {
-      allow read: if isVerified() && (isOwner(existing().agentId) || isTL());
+      allow read: if isVerified() && (isTL() || isAdmin() || isOwner(existing().agentId));
       allow write: if isAdmin() || isAgent();
       allow delete: if isAdmin();
     }
@@ -220,9 +236,14 @@ service cloud.firestore {
     }
 
     match /tmsShifts/{shiftId} {
-      allow read: if isVerified() && (isOwner(resource.data.userId) || isTL());
-      allow write: if isVerified() && (isOwner(incoming().userId) || isOwner(existing().userId) || isTL());
+      allow read: if isVerified() && (isTL() || isAdmin() || isOwner(resource.data.userId));
+      allow write: if isVerified() && (isTL() || isAdmin() || isOwner(incoming().userId) || isOwner(existing().userId));
       allow delete: if isAdmin();
+    }
+
+    match /dashboardSummary/{id} {
+      allow read: if isVerified();
+      allow write: if isTL() || isManager() || isAdmin();
     }
 
     match /adminAuditLogs/{id} {
@@ -254,6 +275,12 @@ service cloud.firestore {
     match /module_master/{moduleId} {
       allow read: if isVerified();
       allow write, delete: if isAdmin();
+    }
+
+    match /employee_master/{id} {
+      allow read: if isVerified();
+      allow write: if isAdmin();
+      allow delete: if isAdmin();
     }
 
     match /archived_records/{id} {

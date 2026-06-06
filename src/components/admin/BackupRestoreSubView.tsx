@@ -1,8 +1,9 @@
 import React, { useState, useEffect } from 'react';
 import { db, auth } from '../../lib/firebase';
 import { collection, getDocs, doc, setDoc, deleteDoc, writeBatch, query, orderBy, limit } from 'firebase/firestore';
-import { CloudLightning, Download, Upload, Check, RefreshCw, Calendar, Eye, Users, Database, Clock, CalendarRange } from 'lucide-react';
+import { CloudLightning, Download, Upload, Check, RefreshCw, Calendar, Eye, Users, Database, Clock, CalendarRange, ShieldAlert, Activity, FileSearch } from 'lucide-react';
 import { toast } from 'sonner';
+import { runPermissionDiagnostic, performPermissionRecovery, DiagnosticResult } from '../../lib/permissionRecovery';
 
 interface BackupRestoreSubViewProps {
   adminTheme: 'light' | 'dark';
@@ -17,6 +18,38 @@ export const BackupRestoreSubView: React.FC<BackupRestoreSubViewProps> = ({
 }) => {
   const [backups, setBackups] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
+  const [diagnosing, setDiagnosing] = useState(false);
+  const [diagResult, setDiagResult] = useState<DiagnosticResult | null>(null);
+
+  const handleRunDiagnostic = async () => {
+    setDiagnosing(true);
+    try {
+      const res = await runPermissionDiagnostic();
+      setDiagResult(res);
+      toast.success('Access diagnostic complete. Review the report below.');
+    } catch (err: any) {
+      toast.error('Diagnostic failed: ' + err.message);
+    } finally {
+      setDiagnosing(false);
+    }
+  };
+
+  const handleRecovery = async () => {
+    if (!window.confirm('URGENT: This will rebuild the entire Permission Matrix for all roles based on system defaults. This is intended to recover from "No Modules Assigned" errors. Proceed?')) return;
+    
+    const loader = toast.loading('Rebuilding permission matrix...');
+    try {
+      await performPermissionRecovery();
+      toast.success('Permission Matrix recovered successfully! Users should now see their modules.');
+      logAdminEvent('Emergency Access Recovery', 'Role Permissions', 'Empty/Corrupt', 'Restored to Defaults');
+      setDiagResult(null);
+      if (onRefresh) onRefresh();
+    } catch (err: any) {
+      toast.error('Recovery failed: ' + err.message);
+    } finally {
+      toast.dismiss(loader);
+    }
+  };
   
   // Settings
   const [backupInterval, setBackupInterval] = useState('Weekly');
@@ -294,6 +327,99 @@ export const BackupRestoreSubView: React.FC<BackupRestoreSubViewProps> = ({
             <div className="mt-4 flex gap-2 justify-end">
               <button onClick={() => setParsedRestoreData(null)} className="px-3 py-1 bg-slate-200 text-slate-700 rounded hover:bg-slate-350 text-xs font-bold cursor-pointer">Discard File</button>
               <button onClick={handleLocalRestoreApply} className="px-3 py-1 bg-emerald-600 text-white rounded hover:bg-emerald-700 text-xs font-bold cursor-pointer">Recover This Checkpoint</button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* URGENT ACCESS RECOVERY - EMERGENCY TOOL */}
+      <div className={`${cardClass} border-rose-500/30 bg-rose-500/5`}>
+        <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 mb-4">
+          <div className="space-y-1">
+            <h3 className="text-base font-black flex items-center gap-2 text-rose-500 uppercase tracking-tighter">
+              <ShieldAlert size={20} className="animate-pulse" /> Urgent Access Recovery Console
+            </h3>
+            <p className="text-xs text-slate-500 font-medium">
+              Diagnostic & Automated repair for "No Modules Assigned" errors.
+            </p>
+          </div>
+          <div className="flex items-center gap-2">
+             <button 
+               onClick={handleRunDiagnostic}
+               disabled={diagnosing}
+               className="px-4 py-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 hover:border-rose-400 text-slate-600 dark:text-slate-300 rounded-xl text-xs font-bold flex items-center gap-2 transition-all cursor-pointer disabled:opacity-50"
+             >
+               {diagnosing ? <RefreshCw size={14} className="animate-spin" /> : <FileSearch size={14} />}
+               Diagnostic Diagnostic
+             </button>
+             <button 
+               onClick={handleRecovery}
+               className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-xs font-black flex items-center gap-2 shadow-lg shadow-rose-600/20 transition-all cursor-pointer"
+             >
+               <Activity size={14} /> Rebuild Permissions
+             </button>
+          </div>
+        </div>
+
+        {diagResult && (
+          <div className="mt-4 p-5 rounded-2xl bg-white dark:bg-slate-950 border border-rose-500/20 animate-in slide-in-from-top-4 duration-300">
+            <h4 className="text-xs font-black text-slate-800 dark:text-white uppercase mb-4 flex items-center gap-2">
+              <Eye size={14} className="text-rose-500" /> Access Diagnostic Report
+            </h4>
+            
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              <div className="space-y-4">
+                <div>
+                  <label className="text-[10px] font-bold text-slate-400 uppercase">Missing Role Definitions</label>
+                  <div className="mt-1 flex flex-wrap gap-1.5">
+                    {diagResult.missingRoles.length > 0 ? diagResult.missingRoles.map(r => (
+                      <span key={r} className="px-2 py-0.5 bg-rose-100 text-rose-600 text-[10px] font-bold rounded border border-rose-200">{r}</span>
+                    )) : <span className="text-[10px] text-emerald-500 font-bold">● All defined</span>}
+                  </div>
+                </div>
+                <div>
+                  <label className="text-[10px] font-bold text-slate-400 uppercase">Roles with Broken Permissions</label>
+                  <div className="mt-1 flex flex-wrap gap-1.5">
+                    {diagResult.missingPermissionsRoles.length > 0 ? diagResult.missingPermissionsRoles.map(r => (
+                      <span key={r} className="px-2 py-0.5 bg-amber-100 text-amber-600 text-[10px] font-bold rounded border border-amber-200">{r}</span>
+                    )) : <span className="text-[10px] text-emerald-500 font-bold">● All synced</span>}
+                  </div>
+                </div>
+              </div>
+
+              <div className="bg-slate-50 dark:bg-slate-900 p-4 rounded-xl border border-slate-200 dark:border-slate-800">
+                <label className="text-[10px] font-bold text-slate-400 uppercase mb-2 block">System Log Events</label>
+                <div className="space-y-1.5 max-h-32 overflow-y-auto pr-2">
+                  {diagResult.reportLogs.map((log, i) => (
+                    <p key={i} className="text-[10px] font-mono text-slate-500 leading-tight">
+                      <span className="text-slate-300">[{i+1}]</span> {log}
+                    </p>
+                  ))}
+                  {diagResult.invalidRoleUsers.length > 0 && (
+                     <div className="mt-3 pt-3 border-t border-slate-200 dark:border-slate-800">
+                        <p className="text-[10px] text-rose-500 font-black mb-1">Users with Invalid Roles:</p>
+                        {diagResult.invalidRoleUsers.map((u, i) => (
+                          <p key={i} className="text-[10px] font-bold text-slate-600">{u}</p>
+                        ))}
+                     </div>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            <div className="mt-6 flex justify-end gap-2">
+              <button 
+                onClick={() => setDiagResult(null)}
+                className="px-4 py-1.5 text-[10px] font-bold text-slate-400 hover:text-slate-600 uppercase"
+              >
+                Close Report
+              </button>
+              <button 
+                onClick={handleRecovery}
+                className="px-4 py-1.5 bg-rose-600 text-white rounded-lg text-[10px] font-black uppercase shadow-sm"
+              >
+                Sync All Permissions Now
+              </button>
             </div>
           </div>
         )}

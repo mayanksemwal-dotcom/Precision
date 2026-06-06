@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { 
   Search, 
   UserPlus, 
@@ -17,10 +17,11 @@ import {
   ExternalLink
 } from 'lucide-react';
 import { db } from '../../lib/firebase';
-import { doc, setDoc, deleteDoc, writeBatch } from 'firebase/firestore';
-import { UserRole } from '../../types';
+import { doc, setDoc, deleteDoc, writeBatch, collection, getDocs, getDoc } from 'firebase/firestore';
+import { UserRole, UserProfile } from '../../types';
 import { toast } from 'sonner';
 import * as XLSX from 'xlsx';
+import { UserPicker } from '../UserPicker';
 
 interface UserManagementSubViewProps {
   allUsers: any[];
@@ -72,7 +73,10 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
     dateJoined: '',
     notes: '',
     teamLeadName: '',
-    mappedManagerName: ''
+    teamLeadUid: '',
+    mappedManagerName: '',
+    mappedManagerUid: '',
+    status: 'Active'
   });
 
   const [newForm, setNewForm] = useState({
@@ -85,13 +89,28 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
     dateJoined: new Date().toISOString().slice(0, 10),
     notes: '',
     teamLeadName: '',
+    teamLeadUid: '',
     mappedManagerName: '',
+    mappedManagerUid: '',
+    status: 'Active',
     password: 'Password360@'
   });
 
+  // Compute normalizedUsers
+  const normalizedUsers = useMemo(() => {
+    return allUsers.map(u => ({
+      ...u,
+      uid: u.uid || u.id || u.employeeId,
+      name: u.fullName || u.name || u.employeeName || '',
+      fullName: u.fullName || u.name || u.employeeName || '',
+      mappedManagerName: u.mappedManagerName || u.managerName || u.Manager || '',
+      teamLeadName: u.teamLeadName || '',
+    }));
+  }, [allUsers]);
+
   // Filter and Sort implementation
   const filteredUsers = useMemo(() => {
-    return allUsers.filter(u => {
+    return normalizedUsers.filter(u => {
       // search
       const q = searchTerm.toLowerCase();
       const matchSearch = 
@@ -119,7 +138,28 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
       if (fieldA > fieldB) return sortOrder === 'asc' ? 1 : -1;
       return 0;
     });
-  }, [allUsers, searchTerm, roleFilter, statusFilter, deptFilter, procFilter, sortBy, sortOrder]);
+  }, [normalizedUsers, searchTerm, roleFilter, statusFilter, deptFilter, procFilter, sortBy, sortOrder]);
+
+  const [registeredProcesses, setRegisteredProcesses] = useState<string[]>([]);
+
+  useEffect(() => {
+    const fetchRegisteredProcesses = async () => {
+      try {
+        const snap = await getDoc(doc(db, 'config', 'tmsProcesses'));
+        let list: string[] = [];
+        if (snap.exists() && Array.isArray(snap.data()?.list)) {
+          list = snap.data()?.list;
+        }
+        if (list.length === 0) {
+          list = ['HITL', 'MPQC', 'OQC', 'SOP Training', 'QA Review', 'Team Alignment'];
+        }
+        setRegisteredProcesses(list);
+      } catch (err) {
+        console.warn('Failed to load registered processes', err);
+      }
+    };
+    fetchRegisteredProcesses();
+  }, []);
 
   const departments = useMemo(() => {
     const s = new Set<string>();
@@ -130,8 +170,9 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
   const processes = useMemo(() => {
     const s = new Set<string>();
     allUsers.forEach(u => u.process && s.add(u.process));
+    registeredProcesses.forEach(p => s.add(p));
     return Array.from(s);
-  }, [allUsers]);
+  }, [allUsers, registeredProcesses]);
 
   // Paginated View
   const paginatedUsers = useMemo(() => {
@@ -183,6 +224,10 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
         isActive: !currentStatus,
         lastModifiedAt: new Date().toISOString()
       });
+      await setDoc(doc(db, 'employee_master', user.uid), {
+        status: nextStatus,
+        lastUpdated: new Date().toISOString()
+      }, { merge: true });
       toast.success(`User '${user.name || user.fullName}' status modified to ${nextStatus}.`);
       logAdminEvent('User Status Checked', user.email, currentStatus ? 'Active' : 'Inactive', nextStatus);
       onRefresh();
@@ -199,7 +244,7 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
     }
     try {
       const batch = writeBatch(db);
-      const list = allUsers.filter(u => selectedUids.has(u.uid));
+      const list = normalizedUsers.filter(u => selectedUids.has(u.uid));
       list.forEach(u => {
         batch.set(doc(db, 'users', u.uid), {
           ...u,
@@ -207,6 +252,10 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
           isActive: target === 'Active',
           lastModifiedAt: new Date().toISOString()
         });
+        batch.set(doc(db, 'employee_master', u.uid), {
+          status: target,
+          lastUpdated: new Date().toISOString()
+        }, { merge: true });
       });
       await batch.commit();
       toast.success(`Broadened status to ${target} for ${selectedUids.size} team profiles.`);
@@ -223,6 +272,7 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
     if (!window.confirm(`Are you absolutely sure you want to delete profile for ${name}? This cannot be undone.`)) return;
     try {
       await deleteDoc(doc(db, 'users', uid));
+      await deleteDoc(doc(db, 'employee_master', uid));
       toast.success(`Profile for '${name}' deleted successfully.`);
       logAdminEvent('Profile Terminated', name, 'Active Document', 'DeletedDoc');
       onRefresh();
@@ -330,13 +380,32 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
         dateJoined: newForm.dateJoined,
         notes: newForm.notes,
         teamLeadName: newForm.teamLeadName,
+        teamLeadUid: newForm.teamLeadUid,
         mappedManagerName: newForm.mappedManagerName,
-        status: 'Active',
-        isActive: true,
+        mappedManagerUid: newForm.mappedManagerUid,
+        status: newForm.status || 'Active',
+        isActive: (newForm.status || 'Active') === 'Active',
         createdAt: new Date().toISOString()
       };
 
       await setDoc(doc(db, 'users', generatedUid), finalProfile);
+
+      const masterDoc = {
+        employeeId: newForm.employeeId || '',
+        employeeName: newForm.name || '',
+        email: newForm.email.toLowerCase().trim(),
+        role: newForm.role,
+        department: newForm.department || 'Operations',
+        process: newForm.process || '',
+        teamLeadId: newForm.teamLeadUid || '',
+        teamLeadName: newForm.teamLeadName || '',
+        managerId: newForm.mappedManagerUid || '',
+        managerName: newForm.mappedManagerName || '',
+        status: newForm.status || 'Active',
+        dateJoined: newForm.dateJoined || '',
+        lastUpdated: new Date().toISOString()
+      };
+      await setDoc(doc(db, 'employee_master', generatedUid), masterDoc);
 
       toast.success(`Account for '${newForm.name}' successfully spawned.`);
       logAdminEvent('User Profile Spawned', newForm.email, '', JSON.stringify(finalProfile));
@@ -372,7 +441,10 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
       dateJoined: user.dateJoined || '',
       notes: user.notes || '',
       teamLeadName: user.teamLeadName || '',
-      mappedManagerName: user.mappedManagerName || user.Manager || ''
+      teamLeadUid: user.teamLeadUid || '',
+      mappedManagerName: user.mappedManagerName || user.Manager || '',
+      mappedManagerUid: user.mappedManagerUid || '',
+      status: user.status || (user.isActive === false ? 'Inactive' : 'Active')
     });
     setIsEditUserOpen(true);
   };
@@ -397,11 +469,32 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
         dateJoined: editForm.dateJoined,
         notes: editForm.notes,
         teamLeadName: editForm.teamLeadName,
+        teamLeadUid: editForm.teamLeadUid,
         mappedManagerName: editForm.mappedManagerName,
+        mappedManagerUid: editForm.mappedManagerUid,
+        status: editForm.status,
+        isActive: editForm.status === 'Active',
         lastModifiedAt: new Date().toISOString()
       };
 
       await setDoc(doc(db, 'users', editingUser.uid), updatedProfile);
+
+      const masterDoc = {
+        employeeId: editForm.employeeId || '',
+        employeeName: editForm.name || '',
+        email: (editingUser.email || '').toLowerCase().trim(),
+        role: editForm.role,
+        department: editForm.department || 'Operations',
+        process: editForm.process || '',
+        teamLeadId: editForm.teamLeadUid || '',
+        teamLeadName: editForm.teamLeadName || '',
+        managerId: editForm.mappedManagerUid || '',
+        managerName: editForm.mappedManagerName || '',
+        status: editForm.status || 'Active',
+        dateJoined: editForm.dateJoined || '',
+        lastUpdated: new Date().toISOString()
+      };
+      await setDoc(doc(db, 'employee_master', editingUser.uid), masterDoc);
 
       toast.success(`Profile for '${editForm.name}' successfully updated.`);
       logAdminEvent(
@@ -455,6 +548,23 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
         };
 
         batch.set(doc(db, 'users', fakeUid), profileDoc);
+
+        const masterData = {
+          employeeId: empId || '',
+          employeeName: name,
+          email: parsedEmail,
+          role: (roleStr as UserRole) || 'AGENT',
+          department: dept || 'Operations',
+          process: processStr || '',
+          teamLeadId: '',
+          teamLeadName: '',
+          managerId: '',
+          managerName: '',
+          status: 'Active',
+          dateJoined: joinDate || new Date().toISOString().slice(0,10),
+          lastUpdated: new Date().toISOString()
+        };
+        batch.set(doc(db, 'employee_master', fakeUid), masterData);
         commitCount++;
       }
       await batch.commit();
@@ -752,10 +862,10 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
                       <td className="p-4 text-slate-400 dark:text-slate-500 font-semibold">{user.email}</td>
                       <td className="p-4">
                         <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
-                          user.role === 'ADMIN' ? 'bg-red-500/10 text-red-500' :
-                          user.role === 'MANAGER' ? 'bg-indigo-500/10 text-indigo-500' :
-                          user.role === 'TEAM_LEAD' ? 'bg-amber-500/10 text-amber-500' :
-                          user.role === 'QA' ? 'bg-blue-500/10 text-blue-500' : 'bg-emerald-500/10 text-emerald-500'
+                          user.role.toUpperCase() === 'ADMIN' ? 'bg-red-500/10 text-red-500' :
+                          user.role.toUpperCase() === 'MANAGER' ? 'bg-indigo-500/10 text-indigo-500' :
+                          user.role.toUpperCase() === 'TEAM_LEAD' ? 'bg-amber-500/10 text-amber-500' :
+                          user.role.toUpperCase() === 'QA' ? 'bg-blue-500/10 text-blue-500' : 'bg-emerald-500/10 text-emerald-500'
                         }`}>
                           {user.role}
                         </span>
@@ -819,7 +929,7 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
                 })
               ) : (
                 <tr>
-                  <td colSpan={11} className="p-12 text-center text-slate-400 font-semibold text-xs">
+                  <td colSpan={14} className="p-12 text-center text-slate-400 font-semibold text-xs animate-pulse">
                     No results matched the specified query options. Expand searches or clear state toggles.
                   </td>
                 </tr>
@@ -914,7 +1024,35 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
                   required 
                   type="email"
                   value={newForm.email} 
-                  onChange={e => setNewForm({...newForm, email: e.target.value})} 
+                  onChange={e => {
+                    const emailVal = e.target.value;
+                    let nextName = newForm.name;
+                    
+                    const oldAutoPicked = newForm.email && newForm.email.includes('@') ? (() => {
+                      const part = newForm.email.split('@')[0];
+                      return part.split(/[\._\-]/).filter(Boolean).map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ');
+                    })() : '';
+
+                    if (!newForm.name || newForm.name.trim() === '' || newForm.name.trim() === oldAutoPicked) {
+                      if (emailVal.includes('@')) {
+                        const localPart = emailVal.split('@')[0];
+                        if (localPart) {
+                          nextName = localPart
+                            .split(/[\._\-]/)
+                            .filter(Boolean)
+                            .map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+                            .join(' ');
+                        }
+                      } else {
+                        nextName = emailVal
+                          .split(/[\._\-]/)
+                          .filter(Boolean)
+                          .map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+                          .join(' ');
+                      }
+                    }
+                    setNewForm({...newForm, email: emailVal, name: nextName});
+                  }} 
                   placeholder="e.g. satyen.vaishnavi@bergtechnologies.co.in" 
                   className={adminTheme === 'dark' ? 'w-full bg-slate-900 p-2 border border-slate-705 rounded-lg' : 'w-full bg-white border border-slate-200 p-2 rounded-lg'}
                 />
@@ -945,31 +1083,37 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
 
               <div>
                 <label className="block text-[10px] font-bold text-slate-400 mb-0.5">Product Campaign / Process</label>
-                <input 
+                <select 
                   value={newForm.process} 
                   onChange={e => setNewForm({...newForm, process: e.target.value})} 
-                  placeholder="e.g. Mobile Verticals" 
-                  className={adminTheme === 'dark' ? 'w-full bg-slate-900 p-2 border border-slate-705 rounded-lg' : 'w-full bg-white border border-slate-200 p-2 rounded-lg'}
+                  className={adminTheme === 'dark' ? 'w-full bg-slate-900 p-2 border border-slate-705 rounded-lg text-slate-350 text-xs' : 'w-full bg-white border border-slate-200 p-2 rounded-lg text-slate-650 text-xs'}
+                >
+                  <option value="">Select Process / Campaign...</option>
+                  {processes.map(p => (
+                    <option key={p} value={p}>{p}</option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-[10px] font-bold text-slate-400 mb-0.5 uppercase tracking-widest pl-1">Team Lead</label>
+                <UserPicker 
+                  onSelect={(u) => setNewForm({...newForm, teamLeadName: u.fullName || u.name, teamLeadUid: u.uid})}
+                  selectedUserId={newForm.teamLeadUid}
+                  placeholder="Map Team Lead..."
+                  roleFilter={[UserRole.TEAM_LEAD, UserRole.MANAGER, UserRole.ADMIN]}
+                  className="mt-1"
                 />
               </div>
 
               <div>
-                <label className="block text-[10px] font-bold text-slate-400 mb-0.5">Team Lead Name</label>
-                <input 
-                  value={newForm.teamLeadName} 
-                  onChange={e => setNewForm({...newForm, teamLeadName: e.target.value})} 
-                  placeholder="e.g. Mayank Rawat" 
-                  className={adminTheme === 'dark' ? 'w-full bg-slate-900 p-2 border border-slate-705 rounded-lg' : 'w-full bg-white border border-slate-200 p-2 rounded-lg'}
-                />
-              </div>
-
-              <div>
-                <label className="block text-[10px] font-bold text-slate-400 mb-0.5">Manager Name</label>
-                <input 
-                  value={newForm.mappedManagerName} 
-                  onChange={e => setNewForm({...newForm, mappedManagerName: e.target.value})} 
-                  placeholder="e.g. Mayank Semwal" 
-                  className={adminTheme === 'dark' ? 'w-full bg-slate-900 p-2 border border-slate-705 rounded-lg' : 'w-full bg-white border border-slate-200 p-2 rounded-lg'}
+                <label className="block text-[10px] font-bold text-slate-400 mb-0.5 uppercase tracking-widest pl-1">Mapped Manager</label>
+                <UserPicker 
+                  onSelect={(u) => setNewForm({...newForm, mappedManagerName: u.fullName || u.name, mappedManagerUid: u.uid})}
+                  selectedUserId={newForm.mappedManagerUid}
+                  placeholder="Map Manager..."
+                  roleFilter={[UserRole.MANAGER, UserRole.ADMIN]}
+                  className="mt-1"
                 />
               </div>
 
@@ -981,6 +1125,18 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
                   onChange={e => setNewForm({...newForm, dateJoined: e.target.value})} 
                   className={adminTheme === 'dark' ? 'w-full bg-slate-900 p-2 border border-slate-705 rounded-lg' : 'w-full bg-white border border-slate-200 p-2 rounded-lg'}
                 />
+              </div>
+
+              <div>
+                <label className="block text-[10px] font-bold text-slate-400 mb-0.5">Account Status</label>
+                <select 
+                  value={newForm.status} 
+                  onChange={e => setNewForm({...newForm, status: e.target.value})} 
+                  className={adminTheme === 'dark' ? 'w-full bg-slate-900 p-2 border border-slate-705 rounded-lg text-slate-350' : 'w-full bg-white border border-slate-200 p-2 rounded-lg text-slate-650'}
+                >
+                  <option value="Active">Active</option>
+                  <option value="Inactive">Inactive</option>
+                </select>
               </div>
 
               <div className="col-span-2">
@@ -1072,31 +1228,37 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
 
               <div>
                 <label className="block text-[10px] font-bold text-slate-400 mb-0.5">Product Campaign / Process</label>
-                <input 
+                <select 
                   value={editForm.process} 
                   onChange={e => setEditForm({...editForm, process: e.target.value})} 
-                  placeholder="e.g. Mobile Verticals" 
-                  className={adminTheme === 'dark' ? 'w-full bg-slate-900 p-2 border border-slate-700 rounded-lg' : 'w-full bg-white border border-slate-200 p-2 rounded-lg'}
+                  className={adminTheme === 'dark' ? 'w-full bg-slate-900 p-2 border border-slate-700 rounded-lg text-slate-350 text-xs' : 'w-full bg-white border border-slate-200 p-2 rounded-lg text-slate-650 text-xs'}
+                >
+                  <option value="">Select Process / Campaign...</option>
+                  {processes.map(p => (
+                    <option key={p} value={p}>{p}</option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-[10px] font-bold text-slate-400 mb-1 uppercase tracking-widest pl-1">Team Lead Mapping</label>
+                <UserPicker 
+                  onSelect={(u) => setEditForm({...editForm, teamLeadName: u.fullName || u.name, teamLeadUid: u.uid})}
+                  selectedUserId={editForm.teamLeadUid}
+                  placeholder="Reassign Team Lead..."
+                  roleFilter={[UserRole.TEAM_LEAD, UserRole.MANAGER, UserRole.ADMIN]}
+                  className="mt-1"
                 />
               </div>
 
               <div>
-                <label className="block text-[10px] font-bold text-slate-400 mb-0.5">Team Lead Name</label>
-                <input 
-                  value={editForm.teamLeadName} 
-                  onChange={e => setEditForm({...editForm, teamLeadName: e.target.value})} 
-                  placeholder="e.g. Mayank Rawat" 
-                  className={adminTheme === 'dark' ? 'w-full bg-slate-900 p-2 border border-slate-700 rounded-lg' : 'w-full bg-white border border-slate-200 p-2 rounded-lg'}
-                />
-              </div>
-
-              <div>
-                <label className="block text-[10px] font-bold text-slate-400 mb-0.5">Manager Name</label>
-                <input 
-                  value={editForm.mappedManagerName} 
-                  onChange={e => setEditForm({...editForm, mappedManagerName: e.target.value})} 
-                  placeholder="e.g. Mayank Semwal" 
-                  className={adminTheme === 'dark' ? 'w-full bg-slate-900 p-2 border border-slate-700 rounded-lg' : 'w-full bg-white border border-slate-200 p-2 rounded-lg'}
+                <label className="block text-[10px] font-bold text-slate-400 mb-1 uppercase tracking-widest pl-1">Manager Mapping</label>
+                <UserPicker 
+                  onSelect={(u) => setEditForm({...editForm, mappedManagerName: u.fullName || u.name, mappedManagerUid: u.uid})}
+                  selectedUserId={editForm.mappedManagerUid}
+                  placeholder="Reassign Manager..."
+                  roleFilter={[UserRole.MANAGER, UserRole.ADMIN]}
+                  className="mt-1"
                 />
               </div>
 
@@ -1108,6 +1270,18 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
                   onChange={e => setEditForm({...editForm, dateJoined: e.target.value})} 
                   className={adminTheme === 'dark' ? 'w-full bg-slate-900 p-2 border border-slate-700 rounded-lg' : 'w-full bg-white border border-slate-200 p-2 rounded-lg'}
                 />
+              </div>
+
+              <div>
+                <label className="block text-[10px] font-bold text-slate-400 mb-0.5">Account Status</label>
+                <select 
+                  value={editForm.status} 
+                  onChange={e => setEditForm({...editForm, status: e.target.value})} 
+                  className={adminTheme === 'dark' ? 'w-full bg-slate-900 p-2 border border-slate-700 rounded-lg text-slate-350' : 'w-full bg-white border border-slate-200 p-2 rounded-lg text-slate-650'}
+                >
+                  <option value="Active">Active</option>
+                  <option value="Inactive">Inactive</option>
+                </select>
               </div>
 
               <div className="col-span-2">

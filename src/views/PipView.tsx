@@ -29,6 +29,7 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../components/ui/select';
 import { Label } from '../components/ui/label';
 import { PipRecord, UserRole, UserProfile } from '../types';
+import { UserPicker } from '../components/UserPicker';
 
 interface TextareaProps extends React.TextareaHTMLAttributes<HTMLTextAreaElement> {}
 
@@ -48,6 +49,8 @@ Textarea.displayName = "Textarea";
 import { db, handleFirestoreError, OperationType } from '../lib/firebase';
 import { doc, setDoc, updateDoc, collection, addDoc, onSnapshot, query, where, orderBy, getDocs, serverTimestamp } from 'firebase/firestore';
 import { toast } from 'sonner';
+import { usePermission } from '../components/PermissionContext';
+import { canActOn } from '../lib/hierarchy';
 
 interface PipViewProps {
   user: UserProfile;
@@ -55,6 +58,7 @@ interface PipViewProps {
 }
 
 export default function PipView({ user, allUsers = [] }: PipViewProps) {
+  const { canCreate, canEdit, canDelete, canApprove } = usePermission();
   const [pips, setPips] = useState<PipRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [searchTerm, setSearchTerm] = useState('');
@@ -113,22 +117,23 @@ export default function PipView({ user, allUsers = [] }: PipViewProps) {
     return () => unsubscribe();
   }, []);
 
-  const canManagePip = user.role === UserRole.ADMIN || user.role === UserRole.MANAGER || user.role === UserRole.TEAM_LEAD;
+  const canIssuePip = canCreate('PIP Management');
+  const canModifyPip = canEdit('PIP Management');
+  const canDeletePip = canDelete('PIP Management');
+  const canApprovePip = canApprove('PIP Management');
+  const canManagePip = canModifyPip || canIssuePip;
 
   // Filter & Search Logic
   const filteredPips = pips.filter(p => {
-    // 1. Role-based restrictions
-    if (user.role === UserRole.AGENT) {
-      if (p.agentId !== user.uid) return false;
-    } else if (user.role === UserRole.TEAM_LEAD) {
-      // TLs can only see PIPs for agents under them or themselves
-      const agentProfile = allUsers.find(u => u.uid === p.agentId);
-      if (agentProfile?.teamLeadId !== user.uid && p.agentId !== user.uid) return false;
-    } else if (user.role === UserRole.MANAGER) {
-      // Managers can see all or agents mapped under them
-      const agentProfile = allUsers.find(u => u.uid === p.agentId);
-      if (agentProfile?.mappedManagerId !== user.uid && p.agentId !== user.uid) return false;
-    }
+    // 1. Visibility check: 
+    // Is it my own PIP?
+    const isMine = p.agentId === user.uid;
+    
+    // Is it someone I supervise?
+    const targetUser = allUsers.find(u => u.uid === p.agentId);
+    const isSubordinate = targetUser ? canActOn(user, targetUser, allUsers) : false;
+
+    if (!isMine && !isSubordinate) return false;
 
     // 2. Status Filter
     if (statusFilter !== 'All' && p.status !== statusFilter) return false;
@@ -162,7 +167,7 @@ export default function PipView({ user, allUsers = [] }: PipViewProps) {
     try {
       const targetAgent = allUsers.find(u => u.uid === newPipForm.agentId);
       if (!targetAgent) {
-        toast.error("Employee not found.");
+        toast.error("Employee record not found in Employee Master.");
         return;
       }
 
@@ -177,10 +182,12 @@ export default function PipView({ user, allUsers = [] }: PipViewProps) {
       const pipRecord: PipRecord = {
         id: pipId,
         agentId: targetAgent.uid,
-        agentName: targetAgent.name,
-        agentEmail: targetAgent.email,
+        agentName: targetAgent.employeeName || targetAgent.fullName || targetAgent.name || 'Unknown',
+        agentEmail: targetAgent.email || '',
+        employeeId: targetAgent.employeeId || 'N/A',
+        process: targetAgent.process || 'Commonpool',
         initiatorId: user.uid,
-        initiatorName: user.name,
+        initiatorName: user.fullName || user.name || user.email,
         title: newPipForm.title,
         description: newPipForm.description,
         startDate: newPipForm.startDate,
@@ -444,8 +451,8 @@ Berg Technologies Corp HS Division
   // Complete/Graduate/Extend PIP
   const handleUpdatePipStatus = async (newStatus: 'Passed' | 'Failed' | 'Extended', comments: string) => {
     if (!selectedPip) return;
-    if (!canManagePip) {
-        toast.error("You do not have permission to modify PIP status.");
+    if (!canApprovePip) {
+        toast.error("You do not have permission to approve/close PIP status.");
         return;
     }
     if (!comments.trim()) {
@@ -555,7 +562,7 @@ Berg Technologies Corp HS Division
             </p>
           </div>
           
-          {canManagePip && (
+          {canIssuePip && (
             <Dialog open={isNewPipOpen} onOpenChange={setIsNewPipOpen}>
                 <DialogTrigger 
                   render={
@@ -578,24 +585,13 @@ Berg Technologies Corp HS Division
 
                 <div className="space-y-4 py-4 text-left">
                   {/* Select Agent */}
-                  <div className="space-y-1.5">
-                    <Label className="text-xs font-bold text-slate-700">Select Employee (Agent)</Label>
-                    <Select 
-                      value={newPipForm.agentId}
-                      onValueChange={(val) => setNewPipForm({ ...newPipForm, agentId: val })}
-                    >
-                      <SelectTrigger className="w-full text-xs h-10 border-slate-200 bg-slate-50/50">
-                        <SelectValue placeholder="Choose employee profile..." />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {allUsers.filter(u => u.role === UserRole.AGENT).map(agent => (
-                          <SelectItem key={agent.uid} value={agent.uid}>
-                            {agent.name} ({agent.email})
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                  </div>
+                  <UserPicker 
+                    label="Select Employee (Agent)"
+                    onSelect={(u) => setNewPipForm({ ...newPipForm, agentId: u.uid })}
+                    selectedUserId={newPipForm.agentId}
+                    roleFilter={['AGENT']}
+                    placeholder="Search agent for PIP..."
+                  />
 
                   <div className="grid grid-cols-2 gap-4">
                     {/* PIP Title */}
@@ -727,10 +723,10 @@ Berg Technologies Corp HS Division
       {/* Stats Bento Grid */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         {[
-          { label: user.role === UserRole.AGENT ? 'My Active Roles' : 'Active PIP Programs', val: filteredPips.filter(p => ['Initiated', 'Under Review', 'Extended'].includes(p.status)).length, icon: Activity, color: 'text-indigo-600 bg-indigo-50 border-indigo-100' },
-          { label: user.role === UserRole.AGENT ? 'My Passed' : 'Graduated / Passed', val: filteredPips.filter(p => p.status === 'Passed').length, icon: CheckCircle, color: 'text-emerald-600 bg-emerald-50 border-emerald-100' },
-          { label: user.role === UserRole.AGENT ? 'My Failed' : 'Non-Graduated / Failed', val: filteredPips.filter(p => p.status === 'Failed').length, icon: TrendingDown, color: 'text-rose-600 bg-rose-50 border-rose-100' },
-          { label: user.role === UserRole.AGENT ? 'My Extended' : 'Extended Reviews', val: filteredPips.filter(p => p.status === 'Extended').length, icon: Clock, color: 'text-amber-600 bg-amber-50 border-amber-100' },
+          { label: canIssuePip ? 'Active PIP Programs' : 'My Active PIPs', val: filteredPips.filter(p => ['Initiated', 'Under Review', 'Extended'].includes(p.status)).length, icon: Activity, color: 'text-indigo-600 bg-indigo-50 border-indigo-100' },
+          { label: canIssuePip ? 'Graduated / Passed' : 'My Passed', val: filteredPips.filter(p => p.status === 'Passed').length, icon: CheckCircle, color: 'text-emerald-600 bg-emerald-50 border-emerald-100' },
+          { label: canIssuePip ? 'Non-Graduated / Failed' : 'My Failed', val: filteredPips.filter(p => p.status === 'Failed').length, icon: TrendingDown, color: 'text-rose-600 bg-rose-50 border-rose-100' },
+          { label: canIssuePip ? 'Extended Reviews' : 'My Extended', val: filteredPips.filter(p => p.status === 'Extended').length, icon: Clock, color: 'text-amber-600 bg-amber-50 border-amber-100' },
         ].map((stat, idx) => (
           <Card key={idx} className="border-slate-150 shadow-sm bg-white overflow-hidden text-left">
             <CardContent className="p-5 flex items-center justify-between">
@@ -814,6 +810,13 @@ Berg Technologies Corp HS Division
                     {filteredPips.map((p) => {
                       const { remains, pct } = getElapsedStats(p);
                       const isSelected = selectedPip && selectedPip.id === p.id;
+                      
+                      const targetUser = allUsers.find(u => u.uid === p.agentId);
+                      const agentName = targetUser?.employeeName || targetUser?.fullName || targetUser?.name || p.agentName || 'Corporate Agent';
+                      const agentEmail = targetUser?.email || p.agentEmail || 'agent@workforce.co';
+                      const employeeId = targetUser?.employeeId || p.employeeId || 'E-360';
+                      const process = targetUser?.process || p.process || 'N/A';
+
                       return (
                         <TableRow 
                           key={p.id} 
@@ -823,11 +826,17 @@ Berg Technologies Corp HS Division
                           <TableCell className="py-3.5">
                             <div className="flex items-center gap-2.5">
                               <div className="w-8 h-8 rounded-full bg-slate-100 border border-slate-200 flex items-center justify-center font-bold text-xs text-slate-600">
-                                {p.agentName?.charAt(0)}
+                                {agentName.charAt(0)}
                               </div>
                               <div className="flex flex-col text-left">
-                                <span className="font-bold text-xs text-[#0F172A]">{p.agentName}</span>
-                                <span className="text-[10px] text-slate-400 font-medium">{p.agentEmail}</span>
+                                <span className="font-bold text-xs text-[#0F172A]">{agentName}</span>
+                                <span className="text-[10px] text-slate-400 font-medium">{agentEmail}</span>
+                                {targetUser && (
+                                  <div className="flex flex-col mt-1">
+                                    <span className="text-[9px] font-black text-slate-400 uppercase tracking-tighter">Process: {targetUser.department || 'N/A'}</span>
+                                    <span className="text-[9px] font-black text-slate-400 uppercase tracking-tighter">Mapping: {targetUser.teamLeadName || 'No TL'}</span>
+                                  </div>
+                                )}
                               </div>
                             </div>
                           </TableCell>
@@ -872,8 +881,7 @@ Berg Technologies Corp HS Division
                               >
                                 View
                               </Button>
-                              {canManagePip && (
-                                <>
+                              {canModifyPip && (
                                   <Button 
                                     variant="ghost" 
                                     size="sm"
@@ -894,6 +902,8 @@ Berg Technologies Corp HS Division
                                   >
                                     Edit
                                   </Button>
+                              )}
+                              {canDeletePip && (
                                   <Button 
                                     variant="ghost" 
                                     size="sm"
@@ -914,7 +924,6 @@ Berg Technologies Corp HS Division
                                   >
                                     Delete
                                   </Button>
-                                </>
                               )}
                             </div>
                           </TableCell>
@@ -945,7 +954,9 @@ Berg Technologies Corp HS Division
                     {selectedPip.title}
                   </CardTitle>
                   <CardDescription className="text-xs text-slate-500">
-                    Active program for <strong className="text-slate-800">{selectedPip.agentName}</strong>
+                    Active program for <strong className="text-slate-800">
+                      {allUsers.find(u => u.uid === selectedPip.agentId)?.fullName || allUsers.find(u => u.uid === selectedPip.agentId)?.name || selectedPip.agentName}
+                    </strong>
                   </CardDescription>
                 </CardHeader>
                 <CardContent className="p-5 space-y-5">
@@ -1011,7 +1022,7 @@ Berg Technologies Corp HS Division
                     )}
                     
                     {/* Agent can sign if not already signed */}
-                    {user.role === UserRole.AGENT && !selectedPip.signedAndAcknowledged && (
+                    {user.uid === selectedPip.agentId && !selectedPip.signedAndAcknowledged && (
                       <Button
                         size="sm"
                         disabled={submittingAcknowledge}
@@ -1142,7 +1153,7 @@ Berg Technologies Corp HS Division
                                 ) : (
                                   <div className="pt-1 space-y-2">
                                     <span className="text-[9px] text-indigo-400 italic font-medium">Pending signature acknowledgment</span>
-                                    {user.role === UserRole.AGENT && (
+                                    {user.uid === selectedPip.agentId && (
                                       <div className="space-y-1.5 pt-1">
                                         <Input
                                           type="text"

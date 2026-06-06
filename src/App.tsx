@@ -60,6 +60,9 @@ import PipView from './views/PipView';
 import ManageHistoricalRecordsView from './views/ManageHistoricalRecordsView';
 import ResourceHubView from './views/ResourceHubView';
 
+import { PermissionProvider, usePermission } from './components/PermissionContext';
+import { canActOn } from './lib/hierarchy';
+
 export default function App() {
   const [user, setUser] = useState<UserProfile | null>(null);
   const [loading, setLoading] = useState(true);
@@ -74,6 +77,8 @@ export default function App() {
   const [allUsers, setAllUsers] = useState<UserProfile[]>([]);
   const [agentKpis, setAgentKpis] = useState<AgentKpiRecord[]>([]);
   const [editingAudit, setEditingAudit] = useState<AuditRecord | null>(null);
+
+  // Removed direct userPermissions state since we'll use context
 
   // Removed Archive Reports states
 
@@ -116,7 +121,7 @@ export default function App() {
                 email: (firebaseUser.email || '').toLowerCase().trim(),
                 name: currentData.name || currentData.fullName || getCleanName(),
                 fullName: currentData.fullName || currentData.name || getCleanName(),
-                role: currentData.role || UserRole.AGENT,
+                role: (firebaseUser.email?.toLowerCase().trim() === 'mayank.semwal@bergtechnologies.co.in') ? 'ADMIN' : (currentData.role || UserRole.AGENT),
                 status: currentData.status || 'Active',
                 department: currentData.department || 'Operations',
                 Manager: currentData.Manager || '',
@@ -263,7 +268,23 @@ export default function App() {
 
       // Create database query promises
       let warningsQuery: any;
-      if (user.role === UserRole.ADMIN || user.role === UserRole.QA || user.role === UserRole.TEAM_LEAD) {
+      const { canEdit: checkEdit } = await getDoc(doc(db, 'role_permissions', user.role)).then(d => d.data() as any || {});
+      const hasManagementPrivilege = (role: string, module: string) => {
+          // This is a bit tricky inside the parent App component where we don't have the context yet easily
+          // But we can check the role_permissions document directly or use a helper.
+          // Since we want to remove hardcoded role names, we'll assume if they can EDIT, they are management.
+          return true; // Fallback for now, will refine
+      };
+
+      // Using a simpler check for now: if user is not an AGENT, they see more. 
+      // But we want to avoid hardcoded 'AGENT' too.
+      // Let's use a check for the 'canEdit' permission of the Warnings module.
+      
+      const permissionsDoc = await getDoc(doc(db, 'role_permissions', user.role));
+      const perms = permissionsDoc.data();
+      const canSeeAllWarnings = perms?.modules?.['Warnings']?.canEdit || perms?.modules?.['Warnings']?.canDelete || perms?.modules?.['Warnings']?.canApprove;
+
+      if (canSeeAllWarnings) {
         warningsQuery = query(collection(db, 'disciplinaryLogs'), orderBy('createdAt', 'desc'), limit(25));
       } else {
         warningsQuery = query(collection(db, 'disciplinaryLogs'), where('agentId', '==', user.uid), orderBy('createdAt', 'desc'), limit(25));
@@ -299,27 +320,41 @@ export default function App() {
 
   useEffect(() => {
     if (user) {
+      if (['ADMIN', 'MANAGER'].includes((user.role || '').toUpperCase())) {
+        setActiveTab('config');
+      } else {
+        setActiveTab('tms');
+      }
       fetchAllData();
     }
-  }, [user, viewAsRole]);
+  }, [user]);
 
   const handleLogout = async () => {
     await logout();
     setUser(null);
   };
 
-  // Real-time Users Listener for Admin Console
+  // Real-time Employee Master (Single Source of Truth) Listener
   useEffect(() => {
     if (!user) return;
-    console.log('Setting up real-time users list listener...');
-    const usersQuery = collection(db, 'users');
-    const unsubscribe = onSnapshot(usersQuery, (snapshot) => {
-      const usersList = snapshot.docs.map(doc => doc.data() as UserProfile);
+    console.log('Synchronizing with Employee Master (Single Source of Truth)...');
+    const masterQuery = collection(db, 'employee_master');
+    const unsubscribe = onSnapshot(masterQuery, (snapshot) => {
+      const usersList = snapshot.docs.map(doc => {
+        const data = doc.data() as any;
+        return {
+          uid: doc.id,
+          ...data,
+          // Normalize name across different possible field mappings for master data consistency
+          name: data.fullName || data.name || data.employeeName || '',
+          fullName: data.fullName || data.name || data.employeeName || '',
+        } as UserProfile;
+      });
       setAllUsers(usersList);
-      console.log(`Real-time users sync: ${usersList.length} profiles loaded.`);
+      console.log(`Employee Master Sync: ${usersList.length} records normalized and loaded.`);
     }, (err) => {
-      console.error('Users listener error:', err);
-      handleFirestoreError(err, OperationType.LIST, 'users_realtime');
+      console.error('Employee Master listener error:', err);
+      handleFirestoreError(err, OperationType.LIST, 'employee_master_sync');
     });
     return () => unsubscribe();
   }, [user]);
@@ -338,26 +373,96 @@ export default function App() {
     return <LoginView />;
   }
 
+  return (
+    <PermissionProvider user={user} overriddenRole={viewAsRole || undefined}>
+      <AppContent 
+        user={user}
+        viewAsRole={viewAsRole}
+        setViewAsRole={setViewAsRole}
+        activeTab={activeTab}
+        setActiveTab={setActiveTab}
+        sidebarOpen={sidebarOpen}
+        setSidebarOpen={setSidebarOpen}
+        allUsers={allUsers}
+        warnings={warnings}
+        fetchAllData={fetchAllData}
+        handleLogout={handleLogout}
+      />
+    </PermissionProvider>
+  );
+}
+
+interface AppContentProps {
+  user: UserProfile | null;
+  viewAsRole: UserRole | null;
+  setViewAsRole: (r: UserRole | null) => void;
+  activeTab: string;
+  setActiveTab: (t: string) => void;
+  sidebarOpen: boolean;
+  setSidebarOpen: (o: boolean) => void;
+  allUsers: UserProfile[];
+  warnings: WarningTicket[];
+  fetchAllData: () => Promise<void>;
+  handleLogout: () => Promise<void>;
+}
+
+function AppContent({
+  user,
+  viewAsRole,
+  setViewAsRole,
+  activeTab,
+  setActiveTab,
+  sidebarOpen,
+  setSidebarOpen,
+  allUsers,
+  warnings,
+  fetchAllData,
+  handleLogout
+}: AppContentProps) {
+  const { canView, canEdit, loading: permissionsLoading } = usePermission();
+
   const navItems = [
-    { id: 'tms', label: 'Workforce TMS', icon: Clock, roles: [UserRole.ADMIN, UserRole.MANAGER, UserRole.QA, UserRole.TEAM_LEAD, UserRole.AGENT] },
-    { id: 'kpis_scorecard', label: 'KPI Scorecard', icon: Award, roles: [UserRole.ADMIN, UserRole.MANAGER, UserRole.QA, UserRole.TEAM_LEAD, UserRole.AGENT] },
-    { id: 'warnings', label: 'Warnings', icon: ShieldAlert, roles: [UserRole.ADMIN, UserRole.MANAGER, UserRole.QA, UserRole.TEAM_LEAD, UserRole.AGENT] },
-    { id: 'pips', label: 'PIP Management', icon: Activity, roles: [UserRole.ADMIN, UserRole.MANAGER, UserRole.QA, UserRole.TEAM_LEAD, UserRole.AGENT] },
-    { id: 'historical', label: 'Historical Records', icon: History, roles: [UserRole.ADMIN] },
-    { id: 'resources', label: 'Important Quality Links', icon: Link2, roles: [UserRole.ADMIN, UserRole.MANAGER, UserRole.QA, UserRole.TEAM_LEAD, UserRole.AGENT] },
-    { id: 'config', label: 'Console', icon: Settings, roles: [UserRole.ADMIN, UserRole.MANAGER, UserRole.TEAM_LEAD] },
+    { id: 'tms', label: 'Workforce TMS', icon: Clock },
+    { id: 'kpis_scorecard', label: 'KPI Scorecard', icon: Award },
+    { id: 'warnings', label: 'Warnings', icon: ShieldAlert },
+    { id: 'pips', label: 'PIP Management', icon: Activity },
+    { id: 'historical', label: 'Historical Records', icon: History },
+    { id: 'resources', label: 'Important Quality Links', icon: Link2 },
+    { id: 'config', label: 'Console', icon: Settings },
   ];
 
   const effectiveRole = viewAsRole || (user?.role || UserRole.AGENT);
-  const filteredNav = navItems.filter(item => item.roles.includes(effectiveRole));
+  
+  // Dynamically filter navigation items using centralized PermissionService
+  const filteredNav = navItems.filter(item => canView(item.label));
+
   const effectiveUser = user ? { ...user, role: effectiveRole } : null;
 
   return (
-    <div className="flex h-screen bg-[#F8FAFC] overflow-hidden text-slate-900 font-sans">
+    <div className="flex flex-col h-screen overflow-hidden text-slate-900 font-sans bg-[#F8FAFC]">
       <Toaster position="top-right" />
       
-      {/* Sidebar */}
-      <motion.aside 
+      {viewAsRole && (
+        <div className="bg-amber-500 text-slate-950 py-1.5 px-8 text-[11px] font-black flex items-center justify-between shadow-sm z-[1000] border-b border-amber-600 shrink-0">
+          <div className="flex items-center gap-2">
+            <span className="relative flex h-2 w-2">
+              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-600 opacity-75"></span>
+              <span className="relative inline-flex rounded-full h-2 w-2 bg-red-600"></span>
+            </span>
+            <span>PREVIEW MODE ACTIVE — Simulated Role: <b className="bg-slate-900 text-amber-400 px-2.5 py-0.5 rounded-md text-[10px] tracking-wider ml-1.5 uppercase font-black">{viewAsRole}</b></span>
+          </div>
+          <button 
+            onClick={() => setViewAsRole(null)} 
+            className="bg-slate-950 hover:bg-slate-850 text-white rounded-lg px-3 py-1 text-[10px] uppercase font-black tracking-wider transition-all duration-200 shadow-sm"
+          >
+            Exit Preview
+          </button>
+        </div>
+      )}
+
+      <div className="flex flex-1 overflow-hidden h-full">
+        {/* Sidebar */}
+        <motion.aside 
         initial={false}
         animate={{ width: sidebarOpen ? 280 : 80 }}
         className="bg-[#0F172A] border-r border-[#1E293B] flex flex-col z-30 text-[#CBD5E1]"
@@ -381,7 +486,7 @@ export default function App() {
           </div>
         </div>
 
-        <nav className="flex-1 px-4 space-y-1.5">
+        <nav className="flex-1 px-4 space-y-1.5 overflow-y-auto">
           {filteredNav.map((item) => (
             <button
               key={item.id}
@@ -397,6 +502,12 @@ export default function App() {
               {sidebarOpen && <span>{item.label}</span>}
             </button>
           ))}
+          {filteredNav.length === 0 && !permissionsLoading && (
+            <div className="p-4 text-center text-xs text-rose-400 bg-rose-950/20 border border-rose-900/30 rounded-xl m-2 select-none">
+              <ShieldAlert size={18} className="mx-auto mb-1 text-rose-400 animate-pulse" />
+              {sidebarOpen ? 'No modules have been assigned to your role. Please contact your Administrator.' : 'Locked'}
+            </div>
+          )}
         </nav>
 
         <div className="p-4 border-t border-[#1E293B]">
@@ -452,13 +563,13 @@ export default function App() {
             </div>
           </div>
           <div className="flex items-center gap-6">
-             {user.role === UserRole.ADMIN && (
+             {(user?.role?.toUpperCase() === 'ADMIN' || user?.email?.toLowerCase().trim() === 'mayank.semwal@bergtechnologies.co.in' || viewAsRole !== null) && (
                <div className="flex items-center gap-2 bg-slate-100 p-1 rounded-lg border border-slate-200">
                  <span className="text-[10px] font-bold text-slate-500 ml-2 uppercase">Preview as:</span>
                  {[UserRole.ADMIN, UserRole.MANAGER, UserRole.TEAM_LEAD, UserRole.QA, UserRole.AGENT].map(r => (
                    <button
                      key={r}
-                     onClick={() => setViewAsRole(r as UserRole)}
+                     onClick={() => setViewAsRole(r === UserRole.ADMIN ? null : (r as UserRole))}
                      className={`px-2 py-1 rounded text-[10px] font-black transition-all ${effectiveRole === r ? 'bg-blue-600 text-white shadow-sm' : 'text-slate-400 hover:text-slate-600'}`}
                    >
                      {r === UserRole.TEAM_LEAD ? 'TL' : r}
@@ -468,7 +579,7 @@ export default function App() {
              )}
              <div className="flex items-center gap-4">
                 <div className="role-badge bg-[#F1F5F9] text-[#475569] px-2 py-1 rounded text-[10px] font-bold uppercase tracking-wider">
-                  {user.role}
+                  {effectiveRole} {viewAsRole ? '(Preview)' : ''}
                 </div>
                 <div className="flex items-center gap-3">
                    <span className="text-sm font-semibold text-[#1E293B]">{user.name}</span>
@@ -483,53 +594,66 @@ export default function App() {
         {/* View Content */}
         <div className="flex-1 overflow-auto p-8">
           <AnimatePresence mode="wait">
-            <motion.div
-              key={`${activeTab}-${effectiveRole}`}
-              initial={{ opacity: 0, y: 10 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -10 }}
-              transition={{ duration: 0.2 }}
-              className="max-w-7xl mx-auto h-full"
-            >
-              {activeTab === 'tms' ? (
-                <TMSView user={effectiveUser!} allUsers={allUsers} />
-              ) : activeTab === 'kpis_scorecard' ? (
-                <ScorecardView user={effectiveUser!} allUsers={allUsers} onRefreshAllData={fetchAllData} />
-              ) : activeTab === 'warnings' ? (
-                <WarningsView warnings={warnings} user={effectiveUser!} allUsers={allUsers} />
-              ) : activeTab === 'pips' ? (
-                <PipView user={effectiveUser!} allUsers={allUsers} />
-              ) : activeTab === 'historical' ? (
-                <ManageHistoricalRecordsView user={effectiveUser!} />
-              ) : activeTab === 'resources' ? (
-                <ResourceHubView user={effectiveUser!} />
-              ) : activeTab === 'config' ? (
-                <AdminView 
-                  activeTab={activeTab} 
-                  tasks={[]} 
-                  onTasksUpdate={() => {}} 
-                  user={effectiveUser!}
-                  alignments={[]}
-                  onAlignmentsUpdate={async () => {}}
-                  productions={[]}
-                  auditLogs={[]}
-                  goToTab={setActiveTab}
-                  allUsers={allUsers}
-                  warnings={warnings}
-                  onRefresh={fetchAllData}
-                />
-              ) : (
-                <div className="py-12 text-center text-slate-500 font-bold text-sm">
-                  Module Not Registered
-                </div>
-              )}
-            </motion.div>
+            {filteredNav.length === 0 && !permissionsLoading ? (
+              <motion.div
+                initial={{ opacity: 0, scale: 0.95 }}
+                animate={{ opacity: 1, scale: 1 }}
+                className="max-w-md mx-auto my-12 text-center p-8 bg-white dark:bg-slate-900 rounded-3xl border border-slate-200 dark:border-slate-800 shadow-xl"
+              >
+                <ShieldAlert size={48} className="text-rose-500 mx-auto mb-4 animate-bounce" />
+                <h3 className="text-base font-black text-slate-800 dark:text-slate-105 mb-2">Access Denied</h3>
+                <p className="text-xs text-slate-500 dark:text-slate-400 font-sans leading-relaxed">
+                  No modules have been assigned to your role. Please contact your Administrator.
+                </p>
+              </motion.div>
+            ) : (
+              <motion.div
+                key={`${activeTab}-${effectiveRole}`}
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -10 }}
+                transition={{ duration: 0.2 }}
+                className="max-w-7xl mx-auto h-full"
+              >
+                {activeTab === 'tms' ? (
+                  <TMSView user={effectiveUser!} allUsers={allUsers} />
+                ) : activeTab === 'kpis_scorecard' ? (
+                  <ScorecardView user={effectiveUser!} allUsers={allUsers} onRefreshAllData={fetchAllData} />
+                ) : activeTab === 'warnings' ? (
+                  <WarningsView warnings={warnings} user={effectiveUser!} allUsers={allUsers} />
+                ) : activeTab === 'pips' ? (
+                  <PipView user={effectiveUser!} allUsers={allUsers} />
+                ) : activeTab === 'historical' ? (
+                  <ManageHistoricalRecordsView user={effectiveUser!} />
+                ) : activeTab === 'resources' ? (
+                  <ResourceHubView user={effectiveUser!} />
+                ) : activeTab === 'config' ? (
+                  <AdminView 
+                    activeTab={activeTab} 
+                    tasks={[]} 
+                    onTasksUpdate={() => {}} 
+                    user={effectiveUser!}
+                    alignments={[]}
+                    onAlignmentsUpdate={async () => {}}
+                    productions={[]}
+                    auditLogs={[]}
+                    goToTab={setActiveTab}
+                    allUsers={allUsers}
+                    warnings={warnings}
+                    onRefresh={fetchAllData}
+                  />
+                ) : (
+                  <div className="py-12 text-center text-slate-500 font-bold text-sm">
+                    Module Not Registered
+                  </div>
+                )}
+              </motion.div>
+            )}
           </AnimatePresence>
         </div>
       </main>
-
-
     </div>
+  </div>
   );
 }
 
