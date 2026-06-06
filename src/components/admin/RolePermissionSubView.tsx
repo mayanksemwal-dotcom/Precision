@@ -156,6 +156,11 @@ export const RolePermissionSubView: React.FC<RolePermissionSubViewProps> = ({ ad
             can_approve: !!docItem.can_approve,
             tms_permissions: docItem.tms_permissions || undefined
           };
+
+          // Clean undefined tms_permissions to avoid Firestore errors
+          if (matrixMap[r][m].tms_permissions === undefined) {
+             delete matrixMap[r][m].tms_permissions;
+          }
         });
         setPermissions(matrixMap);
       }
@@ -477,12 +482,18 @@ export const RolePermissionSubView: React.FC<RolePermissionSubViewProps> = ({ ad
         const tmsPerms = (tmsItem as any).tms_permissions || getDefaultTmsPermissions(r);
         const mapId = `${r}_Workforce TMS`;
 
+        const finalTmsItem = { ...tmsItem };
+        if (tmsPerms) {
+          finalTmsItem.tms_permissions = tmsPerms;
+        } else {
+          delete (finalTmsItem as any).tms_permissions;
+        }
+
         fbBatch.set(doc(db, 'role_permissions', mapId), {
           id: mapId,
           role_name: r,
           module_name: 'Workforce TMS',
-          ...tmsItem,
-          tms_permissions: tmsPerms
+          ...finalTmsItem
         });
       }
 
@@ -590,6 +601,9 @@ export const RolePermissionSubView: React.FC<RolePermissionSubViewProps> = ({ ad
 
         if (mod === 'Workforce TMS') {
           payload.tms_permissions = (item as any).tms_permissions || getDefaultTmsPermissions(roleName);
+        } else {
+          // Prevent undefined tms_permissions from breaking Firestore set()
+          delete payload.tms_permissions;
         }
 
         fbBatch.set(doc(db, 'role_permissions', mapId), payload);
@@ -1049,7 +1063,6 @@ export const RolePermissionSubView: React.FC<RolePermissionSubViewProps> = ({ ad
                       { key: 'can_force_logout', label: 'Can Force Logout Users' },
                       { key: 'can_edit_tms_records', label: 'Can Edit TMS Records' },
                       { key: 'can_modify_activities', label: 'Can Modify Activities' },
-                      { key: 'can_correct_punches', label: 'Can Correct Punches' },
                       { key: 'can_close_sessions', label: 'Can Close Sessions' },
                       { key: 'view_team_session_audit_logs', label: 'View Team Session Audit Logs' },
                       { key: 'view_clock_master_consolidation', label: 'View Clock Master Consolidation' },

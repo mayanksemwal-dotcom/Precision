@@ -1139,13 +1139,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
                 Operational Short-cuts & Quick Actions
               </h4>
               <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3">
-                <button 
-                  onClick={() => setShowCorrectionModal(true)}
-                  className="bg-indigo-600 hover:bg-indigo-750 text-white p-3 rounded-xl flex items-center justify-center gap-2 text-xs font-extrabold transition-colors shadow-sm cursor-pointer"
-                >
-                  <Plus size={15} /> Correction / Manual Punches
-                </button>
-
+                {/* Only one button here or just remove the correction one */}
                 <button 
                   onClick={openAuditLogsModal}
                   className="bg-slate-850 hover:bg-slate-900 border border-slate-700 text-slate-200 p-3 rounded-xl flex items-center justify-center gap-2 text-xs font-extrabold transition-all cursor-pointer"
@@ -1255,19 +1249,21 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
                   </select>
                 </div>
 
-                <div>
-                  <label className="block text-[10px] uppercase font-bold text-slate-400 mb-1">Manager Filter</label>
-                  <select 
-                    value={managerFilter}
-                    onChange={(e) => { setManagerFilter(e.target.value); setCurrentPage(1); }}
-                    className="w-full bg-white border border-slate-200 rounded-lg p-2 font-bold focus:outline-none focus:ring-1 focus:ring-indigo-500 cursor-pointer text-slate-700"
-                  >
-                    <option value="all">🏢 Manager: All</option>
-                    {managersList.map(mgr => (
-                      <option key={mgr.uid} value={mgr.uid}>{mgr.name}</option>
-                    ))}
-                  </select>
-                </div>
+                {['ADMIN', 'MANAGER'].includes((user.role || '').toUpperCase()) ? (
+                  <div>
+                    <label className="block text-[10px] uppercase font-bold text-slate-400 mb-1">Manager Filter</label>
+                    <select 
+                      value={managerFilter}
+                      onChange={(e) => { setManagerFilter(e.target.value); setCurrentPage(1); }}
+                      className="w-full bg-white border border-slate-200 rounded-lg p-2 font-bold focus:outline-none focus:ring-1 focus:ring-indigo-500 cursor-pointer text-slate-700"
+                    >
+                      <option value="all">🏢 Manager: All</option>
+                      {managersList.map(mgr => (
+                        <option key={mgr.uid} value={mgr.uid}>{mgr.name}</option>
+                      ))}
+                    </select>
+                  </div>
+                ) : <div className="hidden sm:block"></div>}
 
                 <div className="col-span-2 sm:col-span-1 flex flex-col justify-end">
                   <button 
@@ -1451,7 +1447,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
                         onClick={() => selectAndFocusUser(item.userName)}
                         className="bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-[10px] font-black px-2.5 py-1 rounded-lg shrink-0 cursor-pointer"
                       >
-                        Force Out / Correct
+                        Force Out / Audit
                       </button>
                     </div>
                   ))}
@@ -1511,7 +1507,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
                         onClick={() => selectAndFocusUser(item.userName)}
                         className="bg-amber-100 hover:bg-amber-150 text-amber-850 text-[10px] font-black px-2.5 py-1 rounded-lg shrink-0 cursor-pointer"
                       >
-                        Log Correct
+                        Audit Profile
                       </button>
                     </div>
                   ))}
@@ -1523,17 +1519,10 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
                         <div className="text-[10px] text-slate-500 font-bold mt-1 leading-none">{item.reason}</div>
                       </div>
                       <button 
-                        onClick={() => {
-                          setCorrectionUserId(item.userId);
-                          setCorrectionProcess('HITL');
-                          setCorrectionDate(new Date().toISOString().slice(0, 10));
-                          setCorrectionClockIn('09:00');
-                          setCorrectionClockOut('18:00');
-                          setShowCorrectionModal(true);
-                        }}
+                        onClick={() => selectAndFocusUser(item.userName)}
                         className="bg-indigo-600 hover:bg-indigo-750 text-white text-[10px] font-black px-2.5 py-1 rounded-lg shrink-0 cursor-pointer"
                       >
-                        Force Clock In
+                        Track Member
                       </button>
                     </div>
                   ))}

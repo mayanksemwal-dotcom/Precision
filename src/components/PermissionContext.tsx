@@ -32,7 +32,6 @@ export interface TMSPermissions {
   can_force_logout: boolean;
   can_edit_tms_records: boolean;
   can_modify_activities: boolean;
-  can_correct_punches: boolean;
   can_close_sessions: boolean;
   view_team_session_audit_logs: boolean;
   view_clock_master_consolidation: boolean;
@@ -83,7 +82,6 @@ export const getDefaultTmsPermissions = (roleName: string): TMSPermissions => {
     can_force_logout: isManager || isAdmin,
     can_edit_tms_records: isManager || isAdmin,
     can_modify_activities: isManager || isAdmin,
-    can_correct_punches: isManager || isAdmin,
     can_close_sessions: isManager || isAdmin,
     view_team_session_audit_logs: isManager || isAdmin,
     view_clock_master_consolidation: isManager || isAdmin,
@@ -115,7 +113,6 @@ export const getDefaultTmsPermissions = (roleName: string): TMSPermissions => {
       can_force_logout: true,
       can_edit_tms_records: true,
       can_modify_activities: true,
-      can_correct_punches: true,
       can_close_sessions: true,
       view_team_session_audit_logs: true,
       view_clock_master_consolidation: true,
