@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { db } from '../../lib/firebase';
 import { collection, getDocs, doc, setDoc, deleteDoc, writeBatch, query, limit } from 'firebase/firestore';
-import { Database, Trash2, Archive, RotateCcw, AlertTriangle, ShieldAlert, CheckSquare, Square, Inbox } from 'lucide-react';
+import { Database, Trash2, Archive, RotateCcw, AlertTriangle, ShieldAlert, CheckSquare, Square, Inbox, Activity, RefreshCw } from 'lucide-react';
 import { toast } from 'sonner';
 
 interface DataManagementSubViewProps {
@@ -374,7 +374,106 @@ export const DataManagementSubView: React.FC<DataManagementSubViewProps> = ({
             </tbody>
           </table>
         </div>
+      </div>
 
+      <div className={cardClass}>
+        <div className="flex items-center gap-4 mb-5">
+          <div className="w-12 h-12 bg-emerald-100 text-emerald-600 rounded-xl flex items-center justify-center">
+            <ShieldAlert size={24} />
+          </div>
+          <div>
+            <h4 className="text-sm font-black uppercase tracking-tight">User Roster Synchronization & Repair</h4>
+            <p className="text-[11px] text-slate-400 font-medium">Reconcile Firebase Auth, User Profiles, and Employee Master collections</p>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div className="p-4 rounded-xl border border-slate-100 dark:border-slate-800 space-y-3">
+            <h5 className="text-xs font-bold flex items-center gap-2"><Activity size={14} className="text-indigo-500" /> Database Health Checks</h5>
+            <p className="text-[10px] text-slate-500 leading-relaxed">
+              Scan all user documents for missing status flags, malformed IDs, or legacy schema fields that cause dashboard mismatch.
+            </p>
+            <button 
+              onClick={async () => {
+                const loader = toast.loading('Running User Database health scan...');
+                try {
+                  const usersSnap = await getDocs(collection(db, 'users'));
+                  const batch = writeBatch(db);
+                  let repairCount = 0;
+                  
+                  usersSnap.docs.forEach(d => {
+                    const data = d.data();
+                    let needsRepair = false;
+                    const updates: any = {};
+                    
+                    if (!data.status) { updates.status = 'Active'; needsRepair = true; }
+                    if (!data.uid) { updates.uid = d.id; needsRepair = true; }
+                    if (!data.createdAt) { updates.createdAt = new Date().toISOString(); needsRepair = true; }
+
+                    if (needsRepair) {
+                      batch.update(d.ref, updates);
+                      repairCount++;
+                    }
+                  });
+
+                  if (repairCount > 0) {
+                    await batch.commit();
+                    toast.success(`Scan complete: Repaired ${repairCount} user profile schemas.`);
+                    logAdminEvent('User Database Health Scan', 'System Users', 'Legacy Data', `Repaired ${repairCount} records`);
+                  } else {
+                    toast.success('Scan complete: No issues detected in User Profile collection.');
+                  }
+                  onRefresh();
+                } catch (err: any) {
+                  toast.error(`Scan failed: ${err.message}`);
+                } finally {
+                  toast.dismiss(loader);
+                }
+              }}
+              className="w-full py-2 bg-slate-100 dark:bg-slate-900 hover:bg-slate-200 text-slate-600 font-bold text-[10px] rounded-lg transition-all cursor-pointer"
+            >
+              Run Database Health Scan
+            </button>
+          </div>
+
+          <div className="p-4 rounded-xl border border-slate-100 dark:border-slate-800 space-y-3">
+            <h5 className="text-xs font-bold flex items-center gap-2"><RefreshCw size={14} className="text-emerald-500" /> Collection Reconciliation</h5>
+            <p className="text-[10px] text-slate-500 leading-relaxed">
+              Synchronize 'User Profiles' with 'Employee Master' to ensure 100% data mirroring and consistent dashboard reporting.
+            </p>
+            <button 
+              onClick={async () => {
+                const loader = toast.loading('Reconciling Roster collections...');
+                try {
+                  const usersSnap = await getDocs(collection(db, 'users'));
+                  const batch = writeBatch(db);
+                  
+                  usersSnap.docs.forEach(d => {
+                    const data = d.data();
+                    const masterDocRef = doc(db, 'employee_master', d.id);
+                    batch.set(masterDocRef, {
+                      ...data,
+                      uid: d.id,
+                      status: data.status || 'Active',
+                    }, { merge: true });
+                  });
+
+                  await batch.commit();
+                  toast.success(`Success: Mirrored ${usersSnap.size} profiles to Employee Master.`);
+                  logAdminEvent('Collection Reconciliation', 'Employee Master', 'Partial Sync', 'Full Mirror Sync Complete');
+                  onRefresh();
+                } catch (err: any) {
+                  toast.error(`Sync failed: ${err.message}`);
+                } finally {
+                  toast.dismiss(loader);
+                }
+              }}
+              className="w-full py-2 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-[10px] rounded-lg shadow-sm transition-all cursor-pointer"
+            >
+              Trigger Full Collection Mirror
+            </button>
+          </div>
+        </div>
       </div>
     </div>
   );

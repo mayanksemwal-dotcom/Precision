@@ -343,22 +343,6 @@ export const BackupRestoreSubView: React.FC<BackupRestoreSubViewProps> = ({
               Diagnostic & Automated repair for "No Modules Assigned" errors.
             </p>
           </div>
-          <div className="flex items-center gap-2">
-             <button 
-               onClick={handleRunDiagnostic}
-               disabled={diagnosing}
-               className="px-4 py-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 hover:border-rose-400 text-slate-600 dark:text-slate-300 rounded-xl text-xs font-bold flex items-center gap-2 transition-all cursor-pointer disabled:opacity-50"
-             >
-               {diagnosing ? <RefreshCw size={14} className="animate-spin" /> : <FileSearch size={14} />}
-               Diagnostic Diagnostic
-             </button>
-             <button 
-               onClick={handleRecovery}
-               className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-xs font-black flex items-center gap-2 shadow-lg shadow-rose-600/20 transition-all cursor-pointer"
-             >
-               <Activity size={14} /> Rebuild Permissions
-             </button>
-          </div>
         </div>
 
         {diagResult && (

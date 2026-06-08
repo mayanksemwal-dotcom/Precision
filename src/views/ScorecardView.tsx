@@ -126,11 +126,11 @@ function formatPeriodDisplay(p: string): string {
  * Get color classes for a given score based on organizational thresholds
  */
 function getRatingColor(score: number): string {
-  if (score >= 100) return "bg-emerald-50 text-emerald-700 border-emerald-100";
-  if (score >= 95) return "bg-sky-50 text-sky-700 border-sky-100";
-  if (score >= 85) return "bg-blue-50 text-blue-700 border-blue-100";
-  if (score >= 75) return "bg-orange-50 text-orange-700 border-orange-100";
-  return "bg-rose-50 text-rose-700 border-rose-100";
+  if (score >= 100) return "bg-emerald-50 text-emerald-700 border-emerald-100 dark:bg-emerald-900/20 dark:text-emerald-400 dark:border-emerald-800";
+  if (score >= 95) return "bg-sky-50 text-sky-700 border-sky-100 dark:bg-sky-900/20 dark:text-sky-400 dark:border-sky-800";
+  if (score >= 85) return "bg-blue-50 text-blue-700 border-blue-100 dark:bg-blue-900/20 dark:text-blue-400 dark:border-blue-800";
+  if (score >= 75) return "bg-orange-50 text-orange-700 border-orange-100 dark:bg-orange-900/20 dark:text-orange-400 dark:border-orange-800";
+  return "bg-rose-50 text-rose-700 border-rose-100 dark:bg-rose-900/20 dark:text-rose-400 dark:border-rose-800";
 }
 
 import { UserPicker } from '../components/UserPicker';
@@ -139,9 +139,11 @@ interface ScorecardViewProps {
   user: UserProfile;
   allUsers: UserProfile[];
   onRefreshAllData?: () => void;
+  externalTheme?: 'light' | 'dark';
 }
 
-export default function ScorecardView({ user, allUsers = [], onRefreshAllData }: ScorecardViewProps) {
+export default function ScorecardView({ user, allUsers = [], onRefreshAllData, externalTheme = 'light' }: ScorecardViewProps) {
+  const theme = externalTheme;
   const { canView, canCreate, canEdit, canDelete } = usePermission();
 
   const canManageKPIs = canEdit('KPI Scorecard');
@@ -1259,10 +1261,10 @@ export default function ScorecardView({ user, allUsers = [], onRefreshAllData }:
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
         
         {/* Workspace Toolbar card */}
-        <div className="lg:col-span-4 bg-white border border-slate-150 p-6 rounded-2xl shadow-sm space-y-5 h-fit">
+        <div className="lg:col-span-4 bg-white dark:bg-slate-900 border border-slate-150 dark:border-slate-800 p-6 rounded-2xl shadow-sm space-y-5 h-fit">
           <div>
-            <h3 className="text-sm font-black text-slate-900 uppercase tracking-wider">Workspace Controls</h3>
-            <p className="text-[11px] text-slate-400 font-medium">Select criteria for viewing and reporting</p>
+            <h3 className="text-sm font-black text-slate-900 dark:text-white uppercase tracking-wider">Workspace Controls</h3>
+            <p className="text-[11px] text-slate-400 dark:text-slate-500 font-medium">Select criteria for viewing and reporting</p>
           </div>
 
           <div className="space-y-4">
@@ -1270,12 +1272,12 @@ export default function ScorecardView({ user, allUsers = [], onRefreshAllData }:
             {/* Reporting Period dropdown selector */}
             <div className="space-y-3">
               <div className="flex items-center justify-between">
-                <label className="text-[10px] font-extrabold text-slate-500 uppercase tracking-wider">Reporting Period</label>
+                <label className="text-[10px] font-extrabold text-slate-500 dark:text-slate-400 uppercase tracking-wider">Reporting Period</label>
               </div>
               
               <div className="relative">
                 <div 
-                  className="w-full text-xs font-bold h-10 rounded-lg border border-slate-200 bg-white px-3 cursor-pointer outline-none flex items-center justify-between group hover:border-indigo-300 transition-colors"
+                  className="w-full text-xs font-bold h-10 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 cursor-pointer outline-none flex items-center justify-between group hover:border-indigo-300 dark:hover:border-indigo-500 transition-colors text-slate-900 dark:text-slate-100"
                   onClick={() => setIsPeriodDropdownOpen(!isPeriodDropdownOpen)}
                 >
                   <div className="flex items-center gap-2">
@@ -1288,18 +1290,18 @@ export default function ScorecardView({ user, allUsers = [], onRefreshAllData }:
                 {isPeriodDropdownOpen && (
                   <>
                     <div className="fixed inset-0 z-40" onClick={() => setIsPeriodDropdownOpen(false)} />
-                    <div className="absolute top-full left-0 right-0 mt-1 z-50 bg-white border border-slate-200 shadow-xl rounded-lg max-h-60 overflow-y-auto w-full p-1 space-y-0.5 animate-in fade-in zoom-in-95 duration-150">
+                    <div className="absolute top-full left-0 right-0 mt-1 z-50 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 shadow-xl rounded-lg max-h-60 overflow-y-auto w-full p-1 space-y-0.5 animate-in fade-in zoom-in-95 duration-150">
                       {availablePeriods.map(p => (
                         <div
                           key={p}
-                          className={`px-3 py-2.5 text-xs rounded-md cursor-pointer hover:bg-indigo-50 flex items-center justify-between transition-colors ${selectedPeriod === p ? "bg-indigo-50 text-indigo-700 font-bold" : "text-slate-700 font-medium"}`}
+                          className={`px-3 py-2.5 text-xs rounded-md cursor-pointer hover:bg-indigo-50 dark:hover:bg-indigo-900/50 flex items-center justify-between transition-colors ${selectedPeriod === p ? "bg-indigo-50 dark:bg-indigo-900/50 text-indigo-700 dark:text-indigo-400 font-bold" : "text-slate-700 dark:text-slate-300 font-medium"}`}
                           onClick={() => {
                             setSelectedPeriod(p);
                             setIsPeriodDropdownOpen(false);
                           }}
                         >
                           <span>{formatPeriodDisplay(p)}</span>
-                          {selectedPeriod === p && <Check size={12} className="text-indigo-600" />}
+                          {selectedPeriod === p && <Check size={12} className="text-indigo-600 dark:text-indigo-400" />}
                         </div>
                       ))}
                       {availablePeriods.length === 0 && (
@@ -1313,44 +1315,44 @@ export default function ScorecardView({ user, allUsers = [], onRefreshAllData }:
 
             {/* Work Date Filter */}
             <div className="space-y-3">
-              <label className="text-[10px] font-extrabold text-slate-500 uppercase tracking-wider">Work Date Filter</label>
+              <label className="text-[10px] font-extrabold text-slate-500 dark:text-slate-400 uppercase tracking-wider">Work Date Filter</label>
               <div className="relative">
                 <div 
-                  className="w-full text-xs font-bold h-10 rounded-lg border border-slate-200 bg-white px-3 cursor-pointer outline-none flex items-center justify-between group hover:border-indigo-300 transition-colors"
+                  className="w-full text-xs font-bold h-10 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 cursor-pointer outline-none flex items-center justify-between group hover:border-indigo-300 dark:hover:border-indigo-500 transition-colors text-slate-900 dark:text-slate-100"
                   onClick={() => setIsWorkDateDropdownOpen(!isWorkDateDropdownOpen)}
                 >
                   <div className="flex items-center gap-2">
-                    <Clock size={14} className="text-slate-400" />
+                    <Clock size={14} className="text-slate-400 dark:text-slate-500" />
                     <span className="truncate">{selectedWorkDate === 'All' ? 'All Work Dates' : selectedWorkDate}</span>
                   </div>
-                  <ChevronDown size={14} className={cn("text-slate-400 transition-transform duration-200", isWorkDateDropdownOpen && "rotate-180")} />
+                  <ChevronDown size={14} className={cn("text-slate-400 dark:text-slate-500 transition-transform duration-200", isWorkDateDropdownOpen && "rotate-180")} />
                 </div>
                 
                 {isWorkDateDropdownOpen && (
                   <>
                     <div className="fixed inset-0 z-40" onClick={() => setIsWorkDateDropdownOpen(false)} />
-                    <div className="absolute top-full left-0 right-0 mt-1 z-50 bg-white border border-slate-200 shadow-xl rounded-lg max-h-60 overflow-y-auto w-full p-1 space-y-0.5 animate-in fade-in zoom-in-95 duration-150">
+                    <div className="absolute top-full left-0 right-0 mt-1 z-50 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 shadow-xl rounded-lg max-h-60 overflow-y-auto w-full p-1 space-y-0.5 animate-in fade-in zoom-in-95 duration-150">
                       <div
-                        className={`px-3 py-2.5 text-xs rounded-md cursor-pointer hover:bg-indigo-50 flex items-center justify-between transition-colors ${selectedWorkDate === 'All' ? "bg-indigo-50 text-indigo-700 font-bold" : "text-slate-700 font-medium"}`}
+                        className={`px-3 py-2.5 text-xs rounded-md cursor-pointer hover:bg-indigo-50 dark:hover:bg-indigo-900/50 flex items-center justify-between transition-colors ${selectedWorkDate === 'All' ? "bg-indigo-50 dark:bg-indigo-900/50 text-indigo-700 dark:text-indigo-400 font-bold" : "text-slate-700 dark:text-slate-300 font-medium"}`}
                         onClick={() => {
                           setSelectedWorkDate('All');
                           setIsWorkDateDropdownOpen(false);
                         }}
                       >
                         <span>All Work Dates</span>
-                        {selectedWorkDate === 'All' && <Check size={12} className="text-indigo-600" />}
+                        {selectedWorkDate === 'All' && <Check size={12} className="text-indigo-600 dark:text-indigo-400" />}
                       </div>
                       {availableWorkDates.map(d => (
                         <div
                           key={d}
-                          className={`px-3 py-2.5 text-xs rounded-md cursor-pointer hover:bg-indigo-50 flex items-center justify-between transition-colors ${selectedWorkDate === d ? "bg-indigo-50 text-indigo-700 font-bold" : "text-slate-700 font-medium"}`}
+                          className={`px-3 py-2.5 text-xs rounded-md cursor-pointer hover:bg-indigo-50 dark:hover:bg-indigo-900/50 flex items-center justify-between transition-colors ${selectedWorkDate === d ? "bg-indigo-50 dark:bg-indigo-900/50 text-indigo-700 dark:text-indigo-400 font-bold" : "text-slate-700 dark:text-slate-300 font-medium"}`}
                           onClick={() => {
                             setSelectedWorkDate(d);
                             setIsWorkDateDropdownOpen(false);
                           }}
                         >
                           <span>{d}</span>
-                          {selectedWorkDate === d && <Check size={12} className="text-indigo-600" />}
+                          {selectedWorkDate === d && <Check size={12} className="text-indigo-600 dark:text-indigo-400" />}
                         </div>
                       ))}
                     </div>
@@ -1362,11 +1364,11 @@ export default function ScorecardView({ user, allUsers = [], onRefreshAllData }:
             {/* Dashboard specific Process filter (only when activeTab = dashboard) */}
             {activeTab === 'dashboard' && dashboardAvailableProcesses.length > 0 && (
               <div className="space-y-1.5 mt-4">
-                <label className="text-[10px] font-extrabold text-slate-500 uppercase tracking-wider">Process Filter</label>
+                <label className="text-[10px] font-extrabold text-slate-500 dark:text-slate-400 uppercase tracking-wider">Process Filter</label>
                 <select 
                   value={selectedDashboardProcess}
                   onChange={(e) => setSelectedDashboardProcess(e.target.value)}
-                  className="w-full text-xs font-bold h-10 rounded-lg border border-slate-200 bg-white px-3 flex items-center text-slate-900 outline-none focus:ring-1 focus:ring-indigo-500 transition-shadow appearance-none"
+                  className="w-full text-xs font-bold h-10 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 flex items-center text-slate-900 dark:text-slate-100 outline-none focus:ring-1 focus:ring-indigo-500 transition-shadow appearance-none"
                 >
                   <option value="All">All / Mixed Processes</option>
                   {dashboardAvailableProcesses.map(p => (
@@ -1377,9 +1379,9 @@ export default function ScorecardView({ user, allUsers = [], onRefreshAllData }:
             )}
             
             <div className="space-y-1.5 relative mt-4">
-              <label className="text-[10px] font-extrabold text-slate-500 uppercase tracking-wider pl-1">Employee Match</label>
+              <label className="text-[10px] font-extrabold text-slate-500 dark:text-slate-400 uppercase tracking-wider pl-1">Employee Match</label>
               {isQAorAgent ? (
-                <div className="w-full text-xs font-bold h-10 rounded-lg border border-slate-200 bg-slate-50/50 px-3 flex items-center text-slate-600">
+                <div className="w-full text-xs font-bold h-10 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50/50 dark:bg-slate-800/50 px-3 flex items-center text-slate-600 dark:text-slate-400">
                   {user.name} ({user.email})
                 </div>
               ) : (
@@ -1393,29 +1395,29 @@ export default function ScorecardView({ user, allUsers = [], onRefreshAllData }:
             </div>
           </div>
 
-          <hr className="border-slate-100" />
+          <hr className="border-slate-100 dark:border-slate-800" />
 
           {/* Quick Period Summary Statistics */}
-          <div className="space-y-3.5 bg-slate-50/60 p-4 rounded-xl border border-slate-100">
-            <h4 className="text-[10px] font-bold uppercase text-slate-400 tracking-widest">Period {selectedPeriod} Summary</h4>
+          <div className="space-y-3.5 bg-slate-50/60 dark:bg-slate-800/60 p-4 rounded-xl border border-slate-100 dark:border-slate-800">
+            <h4 className="text-[10px] font-bold uppercase text-slate-400 dark:text-slate-500 tracking-widest">Period {selectedPeriod} Summary</h4>
             <div className="grid grid-cols-3 gap-2 text-center">
               <div>
-                <span className="block text-[10px] font-bold text-slate-400">Published</span>
-                <span className="text-sm font-black text-slate-800">{periodStats.totalUploaded}</span>
+                <span className="block text-[10px] font-bold text-slate-400 dark:text-slate-500">Published</span>
+                <span className="text-sm font-black text-slate-800 dark:text-slate-200">{periodStats.totalUploaded}</span>
               </div>
-              <div className="border-x border-slate-200">
-                <span className="block text-[10px] font-bold text-slate-400">Avg Score</span>
-                <span className="text-sm font-black text-slate-800">{periodStats.averageScore}%</span>
+              <div className="border-x border-slate-200 dark:border-slate-800">
+                <span className="block text-[10px] font-bold text-slate-400 dark:text-slate-500">Avg Score</span>
+                <span className="text-sm font-black text-slate-800 dark:text-slate-200">{periodStats.averageScore}%</span>
               </div>
               <div>
-                <span className="block text-[10px] font-bold text-slate-400">Outstanding</span>
-                <span className="text-sm font-black text-slate-800">{periodStats.outstandingCount}</span>
+                <span className="block text-[10px] font-bold text-slate-400 dark:text-slate-500">Outstanding</span>
+                <span className="text-sm font-black text-slate-800 dark:text-slate-200">{periodStats.outstandingCount}</span>
               </div>
             </div>
             
             {/* Common Themes */}
-            <div className="mt-2 pt-2 border-t border-slate-200">
-              <span className="block text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1">Common Themes</span>
+            <div className="mt-2 pt-2 border-t border-slate-200 dark:border-slate-800">
+              <span className="block text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest mb-1">Common Themes</span>
               <div className="flex flex-wrap gap-1 justify-center">
                 {(() => {
                   const comments = dashboardDailyRecordsList.map(r => r.comments).filter(Boolean);
@@ -1430,21 +1432,21 @@ export default function ScorecardView({ user, allUsers = [], onRefreshAllData }:
                   });
                   const topThemes = Object.entries(counts).sort((a,b) => b[1] - a[1]).slice(0, 3).map(e => e[0]);
                   return topThemes.length > 0 ? topThemes.map(theme => (
-                      <Badge key={theme} variant="secondary" className="text-[10px] bg-indigo-100 text-indigo-700">{theme}</Badge>
-                  )) : <span className="text-[10px] text-slate-400 italic">No themes found</span>;
+                      <Badge key={theme} variant="secondary" className="text-[10px] bg-indigo-100 dark:bg-indigo-900/30 text-indigo-700 dark:text-indigo-400 border-none">{theme}</Badge>
+                  )) : <span className="text-[10px] text-slate-400 dark:text-slate-500 italic">No themes found</span>;
                 })()}
               </div>
             </div>
           </div>
 
-          <hr className="border-slate-50" />
+          <hr className="border-slate-50 dark:border-slate-800/40" />
 
           {/* Tab Selection */}
           <div className="flex flex-col gap-1">
             <Button 
               variant={activeTab === 'dashboard' ? 'default' : 'ghost'}
               onClick={() => setActiveTab('dashboard')}
-              className={`w-full justify-start font-black text-xs h-10 gap-2.5 px-4 cursor-pointer rounded-lg ${activeTab === 'dashboard' ? 'bg-slate-900 text-white' : 'text-slate-600 hover:bg-slate-50'}`}
+              className={`w-full justify-start font-black text-xs h-10 gap-2.5 px-4 cursor-pointer rounded-lg ${activeTab === 'dashboard' ? 'bg-slate-900 dark:bg-indigo-600 text-white shadow-lg' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-800'}`}
             >
               <LayoutGrid size={15} />
               Performance Dashboard
@@ -1453,7 +1455,7 @@ export default function ScorecardView({ user, allUsers = [], onRefreshAllData }:
             <Button 
               variant={activeTab === 'leaderboard' ? 'default' : 'ghost'}
               onClick={() => setActiveTab('leaderboard')}
-              className={`w-full justify-start font-black text-xs h-10 gap-2.5 px-4 cursor-pointer rounded-lg ${activeTab === 'leaderboard' ? 'bg-slate-900 text-white' : 'text-slate-600 hover:bg-slate-50'}`}
+              className={`w-full justify-start font-black text-xs h-10 gap-2.5 px-4 cursor-pointer rounded-lg ${activeTab === 'leaderboard' ? 'bg-slate-900 dark:bg-indigo-600 text-white shadow-lg' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-800'}`}
             >
               <Trophy size={15} />
               Role Leaderboards
@@ -1498,26 +1500,26 @@ export default function ScorecardView({ user, allUsers = [], onRefreshAllData }:
                   <div className="grid grid-cols-1 md:grid-cols-12 gap-5">
                     
                     {/* Primary final score output */}
-                    <Card className="md:col-span-5 bg-gradient-to-br from-indigo-50/50 to-white border-slate-150 shadow-sm rounded-2xl flex flex-col justify-between">
+                    <Card className="md:col-span-5 bg-gradient-to-br from-indigo-50/50 to-white dark:from-indigo-900/20 dark:to-slate-900 border-slate-150 dark:border-slate-800 shadow-sm rounded-2xl flex flex-col justify-between">
                       <CardHeader className="pb-2">
-                        <span className="text-[10px] font-extrabold uppercase text-slate-400 tracking-wider">Published Final Score</span>
+                        <span className="text-[10px] font-extrabold uppercase text-slate-400 dark:text-slate-500 tracking-wider">Published Final Score</span>
                         <div className="flex items-baseline gap-2">
-                          <span className="text-5xl font-black text-slate-900 tracking-tight">
+                          <span className="text-5xl font-black text-slate-900 dark:text-white tracking-tight">
                             {activeScorecard.finalScore}%
                           </span>
                         </div>
                       </CardHeader>
                       <CardContent className="py-2">
                         <div className="space-y-1">
-                          <span className="text-[10px] font-extrabold uppercase text-indigo-600 tracking-wider">Classification</span>
-                          <p className="text-lg font-black text-indigo-950 leading-none">
+                          <span className="text-[10px] font-extrabold uppercase text-indigo-600 dark:text-indigo-400 tracking-wider">Classification</span>
+                          <p className="text-lg font-black text-indigo-950 dark:text-indigo-100 leading-none">
                             {activeScorecard.rating}
                           </p>
                         </div>
                       </CardContent>
-                      <CardFooter className="bg-slate-50/40 border-t border-slate-100 py-3 px-6 rounded-b-2xl flex justify-between text-xs font-bold text-slate-500">
+                      <CardFooter className="bg-slate-50/40 dark:bg-slate-800/40 border-t border-slate-100 dark:border-slate-800 py-3 px-6 rounded-b-2xl flex justify-between text-xs font-bold text-slate-500 dark:text-slate-400">
                         <span className="flex items-center gap-1">
-                          <Calendar size={13} className="text-slate-400" />
+                          <Calendar size={13} className="text-slate-400 dark:text-slate-500" />
                           {activeScorecard.reportingPeriod}
                         </span>
                         <span>Rank #{activeScorecard.rank} inside {activeScorecard.role}</span>
@@ -1525,84 +1527,89 @@ export default function ScorecardView({ user, allUsers = [], onRefreshAllData }:
                     </Card>
 
                     {/* Meta information indicators */}
-                    <Card className="md:col-span-7 border-slate-150 shadow-sm rounded-2xl flex flex-col justify-between">
+                    <Card className="md:col-span-7 border-slate-150 dark:border-slate-800 shadow-sm rounded-2xl flex flex-col justify-between dark:bg-slate-900">
                       <CardHeader className="pb-3 flex flex-row items-center justify-between space-y-0">
                         <div>
-                          <CardTitle className="text-xs font-bold uppercase text-slate-400">Employee Details</CardTitle>
-                          <h4 className="text-md font-black text-slate-900 mt-1">{activeScorecard.employeeName}</h4>
-                          <p className="text-xs text-slate-400 font-semibold">{activeScorecard.employeeEmail}</p>
+                          <CardTitle className="text-xs font-bold uppercase text-slate-400 dark:text-slate-500">Employee Details</CardTitle>
+                          <h4 className="text-md font-black text-slate-900 dark:text-white mt-1">{activeScorecard.employeeName}</h4>
+                          <p className="text-xs text-slate-400 dark:text-slate-500 font-semibold">{activeScorecard.employeeEmail}</p>
                         </div>
-                        <Badge className="bg-slate-100 hover:bg-slate-200 border-none text-slate-800 text-[10px] font-black tracking-wider px-3.5 h-7">
+                        <Badge className="bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 border-none text-slate-800 dark:text-slate-200 text-[10px] font-black tracking-wider px-3.5 h-7">
                           {activeScorecard.role}
                         </Badge>
                       </CardHeader>
-                      <CardContent className="grid grid-cols-2 gap-4 pb-4 bg-slate-50/20 px-6 py-4 border-t border-slate-100 rounded-b-2xl">
+                      <CardContent className="grid grid-cols-2 gap-4 pb-4 bg-slate-50/20 dark:bg-slate-800/30 px-6 py-4 border-t border-slate-100 dark:border-slate-800 rounded-b-2xl">
                         <div>
-                          <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest block">Combined Bonus</span>
-                          <span className="text-sm font-black text-emerald-600">+{activeScorecard.bonusPoints} points</span>
+                          <span className="text-[9px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest block">Combined Bonus</span>
+                          <span className="text-sm font-black text-emerald-600 dark:text-emerald-500">+{activeScorecard.bonusPoints} points</span>
                         </div>
                         <div>
-                          <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest block">Combined Penalty</span>
-                          <span className="text-sm font-black text-rose-600">-{activeScorecard.penaltyPoints} points</span>
+                          <span className="text-[9px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest block">Combined Penalty</span>
+                          <span className="text-sm font-black text-rose-600 dark:text-rose-500">-{activeScorecard.penaltyPoints} points</span>
                         </div>
                         <div>
-                          <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest block">Major Esc. Penalty</span>
-                          <span className={`text-sm font-black ${activeScorecard.hasMajorEscalation ? "text-rose-600" : "text-slate-400"}`}>
+                          <span className="text-[9px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest block">Major Esc. Penalty</span>
+                          <span className={`text-sm font-black ${activeScorecard.hasMajorEscalation ? "text-rose-600 dark:text-rose-500" : "text-slate-400 dark:text-slate-500"}`}>
                             {activeScorecard.hasMajorEscalation ? `-${activeScorecard.majorEscalationPenalty} points` : 'N/A'}
                           </span>
                         </div>
                         <div>
-                          <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest block">KPI Weights Matched</span>
-                          <span className="text-sm font-black text-slate-800">{activeScorecard.overallKpiScore}% base</span>
+                          <span className="text-[9px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest block">KPI Weights Matched</span>
+                          <span className="text-sm font-black text-slate-800 dark:text-slate-200">{activeScorecard.overallKpiScore}% base</span>
                         </div>
                       </CardContent>
                     </Card>
                   </div>
 
                   {/* Dynamic KPI Breakdown Table (no hardcoding of fields!) */}
-                  <Card className="border-slate-150 shadow-sm rounded-2xl overflow-hidden">
-                    <CardHeader className="pb-3 border-b border-slate-100">
+                  <Card className="border-slate-150 dark:border-slate-800 shadow-sm rounded-2xl overflow-hidden dark:bg-slate-900">
+                    <CardHeader className="pb-3 border-b border-slate-100 dark:border-slate-800">
                       <div className="flex items-center gap-2">
-                        <Sliders size={17} className="text-indigo-600 animate-pulse" />
+                        <Sliders size={17} className="text-indigo-600 dark:text-indigo-400 animate-pulse" />
                         <div>
-                          <CardTitle className="text-sm font-black text-slate-900 uppercase tracking-wider">Dynamic KPI Target vs Actual breakdown</CardTitle>
-                          <CardDescription className="text-xs text-slate-400 font-medium">Auto-computed achievements derived from raw uploads for role {activeScorecard.role}</CardDescription>
+                          <CardTitle className="text-sm font-black text-slate-900 dark:text-white uppercase tracking-wider">Dynamic KPI Target vs Actual breakdown</CardTitle>
+                          <CardDescription className="text-xs text-slate-400 dark:text-slate-500 font-medium">Auto-computed achievements derived from raw uploads for role {activeScorecard.role}</CardDescription>
                         </div>
                       </div>
                     </CardHeader>
                     <Table>
-                      <TableHeader className="bg-slate-50/60 font-black">
-                        <TableRow className="border-b border-slate-150">
-                          <TableHead className="text-slate-600 text-xs font-black">KPI Name</TableHead>
-                          <TableHead className="text-slate-600 text-xs font-black text-center">Direction</TableHead>
-                          <TableHead className="text-slate-600 text-xs font-black text-center">Weight</TableHead>
-                          <TableHead className="text-slate-600 text-xs font-black text-center">Target</TableHead>
-                          <TableHead className="text-slate-600 text-xs font-black text-center">Actual</TableHead>
-                          <TableHead className="text-slate-600 text-xs font-black text-center">Achievement %</TableHead>
-                          <TableHead className="text-slate-600 text-xs font-black text-right">Weighted score</TableHead>
-                          <TableHead className="text-slate-600 text-xs font-black text-right">Actions</TableHead>
+                      <TableHeader className="bg-slate-50/60 dark:bg-slate-800/60 font-black">
+                        <TableRow className="border-b border-slate-150 dark:border-slate-800">
+                          <TableHead className="text-slate-600 dark:text-slate-300 text-xs font-black">KPI Name</TableHead>
+                          <TableHead className="text-slate-600 dark:text-slate-300 text-xs font-black text-center">Direction</TableHead>
+                          <TableHead className="text-slate-600 dark:text-slate-300 text-xs font-black text-center">Weight</TableHead>
+                          <TableHead className="text-slate-600 dark:text-slate-300 text-xs font-black text-center">Target</TableHead>
+                          <TableHead className="text-slate-600 dark:text-slate-300 text-xs font-black text-center">Actual</TableHead>
+                          <TableHead className="text-slate-600 dark:text-slate-300 text-xs font-black text-center">Achievement %</TableHead>
+                          <TableHead className="text-slate-600 dark:text-slate-300 text-xs font-black text-right">Weighted score</TableHead>
+                          <TableHead className="text-slate-600 dark:text-slate-300 text-xs font-black text-right">Actions</TableHead>
                         </TableRow>
                       </TableHeader>
                       <TableBody>
                         {(activeScorecard.kpiBreakdown || []).map((kpi, idx) => (
-                          <TableRow key={idx} className="border-b border-slate-100 hover:bg-slate-50/50 transition-colors">
-                            <TableCell className="font-extrabold text-xs text-slate-800">{kpi.name}</TableCell>
+                          <TableRow key={idx} className="border-b border-slate-100 dark:border-slate-800 hover:bg-slate-50/50 dark:hover:bg-slate-800/50 transition-colors">
+                            <TableCell className="font-extrabold text-xs text-slate-800 dark:text-slate-200">{kpi.name}</TableCell>
                             <TableCell className="text-center">
-                              <Badge variant="outline" className={`text-[9px] tracking-wide font-black uppercase ${kpi.type === 'higher_is_better' ? "text-emerald-700 bg-emerald-50/50 border-emerald-100" : "text-amber-700 bg-amber-50/50 border-amber-100"}`}>
+                              <Badge variant="outline" className={`text-[9px] tracking-wide font-black uppercase ${kpi.type === 'higher_is_better' ? "text-emerald-700 bg-emerald-50/50 dark:bg-emerald-900/20 border-emerald-100 dark:border-emerald-800" : "text-amber-700 bg-amber-50/50 dark:bg-amber-900/20 border-amber-100 dark:border-amber-800"}`}>
                                 {kpi.type === 'higher_is_better' ? 'Higher Is Better' : 'Lower Is Better'}
                               </Badge>
                             </TableCell>
-                            <TableCell className="text-center text-xs font-extrabold text-slate-500">{kpi.weight}%</TableCell>
-                            <TableCell className="text-center text-xs font-extrabold text-slate-900">{renderDataValue(kpi.target, kpi.dataValueFormat)}</TableCell>
-                            <TableCell className="text-center text-xs font-extrabold text-slate-900">{renderDataValue(kpi.actual, kpi.dataValueFormat)}</TableCell>
+                            <TableCell className="text-center text-xs font-extrabold text-slate-500 dark:text-slate-400">{kpi.weight}%</TableCell>
+                            <TableCell className="text-center text-xs font-extrabold text-slate-900 dark:text-white">{renderDataValue(kpi.target, kpi.dataValueFormat)}</TableCell>
+                            <TableCell className="text-center text-xs font-extrabold text-slate-900 dark:text-white">{renderDataValue(kpi.actual, kpi.dataValueFormat)}</TableCell>
                             <TableCell className="text-center">
                               <Badge className={cn("text-xs font-black border-none", getRatingColor(kpi.achievementPct))}>
                                 {kpi.achievementPct}%
                               </Badge>
                             </TableCell>
-                            <TableCell className="text-right text-xs font-black text-slate-900">{kpi.weightedScore}%</TableCell>
+                            <TableCell className="text-right text-xs font-black text-slate-900 dark:text-white">{kpi.weightedScore}%</TableCell>
                             <TableCell className="text-right">
-                                <Button variant="ghost" size="sm" onClick={() => setActiveKpiComment({ kpiName: kpi.name, email: activeScorecard.employeeEmail, period: activeScorecard.reportingPeriod })}>
+                                <Button 
+                                    variant="ghost" 
+                                    size="sm" 
+                                    onClick={() => setActiveKpiComment({ kpiName: kpi.name, email: activeScorecard.employeeEmail, period: activeScorecard.reportingPeriod })}
+                                    className="dark:text-slate-400 dark:hover:text-white dark:hover:bg-slate-800"
+                                >
                                     <History size={14} className="mr-1.5" />
                                     View History
                                 </Button>
@@ -1614,24 +1621,24 @@ export default function ScorecardView({ user, allUsers = [], onRefreshAllData }:
                   </Card>
 
                   {/* Metric comments/justification panel */}
-                  <Card className="border-slate-150 shadow-sm rounded-2xl p-6 space-y-4">
-                    <h4 className="text-xs font-black text-slate-900 uppercase tracking-wider flex items-center gap-1.5 border-b border-slate-100 pb-2">
+                  <Card className="border-slate-150 dark:border-slate-800 shadow-sm rounded-2xl p-6 space-y-4 dark:bg-slate-900">
+                    <h4 className="text-xs font-black text-slate-900 dark:text-white uppercase tracking-wider flex items-center gap-1.5 border-b border-slate-100 dark:border-slate-800 pb-2">
                        Comments & Highlights discovered
                     </h4>
                     {(activeScorecard.kpiBreakdown || []).some(k => k.latestComment) ? (
                       <div className="space-y-2.5">
                         {(activeScorecard.kpiBreakdown || []).filter(k => k.latestComment).map((kpi, kIdx) => (
-                            <div key={`latest-${kIdx}`} className="bg-slate-50 p-3 rounded-lg border border-slate-100 flex gap-2">
+                            <div key={`latest-${kIdx}`} className="bg-slate-50 dark:bg-slate-800/50 p-3 rounded-lg border border-slate-100 dark:border-slate-700 flex gap-2">
                               <div className="w-1.5 h-1.5 bg-indigo-500 rounded-full mt-1 shrink-0" />
-                              <p className="text-[11px] font-semibold text-slate-600 leading-relaxed">
-                                <strong className="text-slate-800 pr-1">{kpi.name} ({kpi.commentCount} comments):</strong>
+                              <p className="text-[11px] font-semibold text-slate-600 dark:text-slate-400 leading-relaxed">
+                                <strong className="text-slate-800 dark:text-slate-200 pr-1">{kpi.name} ({kpi.commentCount} comments):</strong>
                                 Latest: {kpi.latestComment}
                               </p>
                             </div>
                         ))}
                       </div>
                     ) : (
-                      <p className="text-xs text-slate-400 font-medium italic">No comments uploaded for this agent period.</p>
+                      <p className="text-xs text-slate-400 dark:text-slate-500 font-medium italic">No comments uploaded for this agent period.</p>
                     )}
                   </Card>
                   
@@ -1647,9 +1654,9 @@ export default function ScorecardView({ user, allUsers = [], onRefreshAllData }:
 
                   {/* Historic Trend Line Charts */}
                   {performanceChartData.length > 1 && (
-                    <Card className="border-slate-150 shadow-sm p-6 rounded-2xl">
-                      <h4 className="text-xs font-black text-slate-900 uppercase tracking-wider mb-4 flex items-center gap-1.5">
-                        <TrendingUp size={16} className="text-indigo-600" /> Scoring Progression over periods
+                    <Card className="border-slate-150 dark:border-slate-800 shadow-sm p-6 rounded-2xl dark:bg-slate-900">
+                      <h4 className="text-xs font-black text-slate-900 dark:text-white uppercase tracking-wider mb-4 flex items-center gap-1.5">
+                        <TrendingUp size={16} className="text-indigo-600 dark:text-indigo-400" /> Scoring Progression over periods
                       </h4>
                       <div className="h-60 w-full text-xs font-semibold">
                         <ResponsiveContainer width="100%" height="100%">
@@ -1660,10 +1667,14 @@ export default function ScorecardView({ user, allUsers = [], onRefreshAllData }:
                                 <stop offset="95%" stopColor="#6366f1" stopOpacity={0}/>
                               </linearGradient>
                             </defs>
-                            <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" />
+                            <CartesianGrid strokeDasharray="3 3" stroke={theme === 'dark' ? '#1e293b' : '#f1f5f9'} />
                             <XAxis dataKey="period" stroke="#94a3b8" />
                             <YAxis stroke="#94a3b8" domain={[0, 120]} />
-                            <Tooltip formatter={(value) => [`${value}%`]} />
+                            <Tooltip 
+                                contentStyle={theme === 'dark' ? { backgroundColor: '#0f172a', borderColor: '#1e293b', borderRaduis: '8px' } : undefined}
+                                itemStyle={theme === 'dark' ? { color: '#f8fafc' } : undefined}
+                                formatter={(value) => [`${value}%`]} 
+                            />
                             <Legend />
                             <Area type="monotone" dataKey="Score" stroke="#6366f1" strokeWidth={2.5} fillOpacity={1} fill="url(#scoreGrad)" name="Final Score %" />
                           </AreaChart>
@@ -2285,7 +2296,7 @@ export default function ScorecardView({ user, allUsers = [], onRefreshAllData }:
                 <CardHeader className="bg-slate-50/40 p-4 border-b border-slate-100 flex items-center justify-between">
                   <div>
                     <CardTitle className="text-xs font-black text-slate-900 uppercase tracking-widest leading-none mb-1">Manage Historical Records</CardTitle>
-                    <CardDescription className="text-[10px] text-slate-400 font-medium">Corrections desk: View or delete raw performance metrics globally.</CardDescription>
+                    <CardDescription className="text-[10px] text-slate-400 font-medium">Historical baseline: View raw performance metrics globally.</CardDescription>
                   </div>
                   <Button variant="ghost" size="sm" onClick={fetchRecentUploads} className="h-8 text-[10px] font-bold gap-1 text-indigo-600">
                     <RefreshCw size={12} /> Sync Recent
@@ -2301,7 +2312,6 @@ export default function ScorecardView({ user, allUsers = [], onRefreshAllData }:
                         <TableHead className="text-[10px] font-black uppercase text-slate-500 text-center">Process</TableHead>
                         <TableHead className="text-[10px] font-black uppercase text-slate-500 text-center">KPI</TableHead>
                         <TableHead className="text-[10px] font-black uppercase text-slate-500 text-center">Actual</TableHead>
-                        <TableHead className="text-[10px] font-black uppercase text-slate-500 text-right pr-4">Action</TableHead>
                       </TableRow>
                     </TableHeader>
                     <TableBody>
@@ -2363,36 +2373,6 @@ export default function ScorecardView({ user, allUsers = [], onRefreshAllData }:
                                   className="h-7 text-[10px] w-16 mx-auto"
                                 />
                               ) : row.actual}
-                            </TableCell>
-                            <TableCell className="text-right pr-4 shrink-0">
-                              <div className="flex items-center justify-end gap-1.5">
-                                {isEditing ? (
-                                  <Button 
-                                    onClick={() => handleUpdateHistoricalRecord(row.docId)}
-                                    size="sm"
-                                    className="bg-emerald-500 hover:bg-emerald-600 h-6 text-[9px] text-white px-2 py-0"
-                                  >
-                                    Save
-                                  </Button>
-                                ) : (
-                                  <Button 
-                                    onClick={() => handleStartHistoricalEdit(row)}
-                                    variant="ghost" 
-                                    size="sm" 
-                                    className="h-7 text-indigo-600 hover:bg-indigo-50 text-[10px] font-black"
-                                  >
-                                    Edit
-                                  </Button>
-                                )}
-                                <Button 
-                                  variant="ghost" 
-                                  size="sm" 
-                                  onClick={() => handleDeleteUpload(row.docId)}
-                                  className="h-7 text-rose-600 hover:bg-rose-50 text-[10px] font-black"
-                                >
-                                  Delete
-                                </Button>
-                              </div>
                             </TableCell>
                           </TableRow>
                         );

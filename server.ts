@@ -66,16 +66,9 @@ async function start() {
       const decodedToken = await admin.auth().verifyIdToken(token);
       const uid = decodedToken.uid;
 
-      // Fetch user profile from Firestore to determine their role
       const userDoc = await db.collection('users').doc(uid).get();
-      let role = 'AGENT';
-      if (userDoc.exists) {
-        const userData = userDoc.data();
-        if (userData && userData.role) {
-          role = userData.role;
-        }
-      }
-
+      const role = (userDoc.exists ? (userDoc.data()?.role || 'AGENT') : 'AGENT').toUpperCase();
+      
       // Assign claims
       const isAdminFlag = role === 'ADMIN' || decodedToken.email?.toLowerCase().trim() === 'mayank.semwal@bergtechnologies.co.in';
       const isQAFlag = role === 'QA';
@@ -114,7 +107,8 @@ async function start() {
       let isPrivileged = false;
       if (requesterDoc.exists) {
         const data = requesterDoc.data();
-        isPrivileged = data?.role === 'ADMIN' || data?.role === 'MANAGER';
+        const r = (data?.role || '').toUpperCase();
+        isPrivileged = r === 'ADMIN' || r === 'MANAGER';
       }
       if (decodedToken.email?.toLowerCase().trim() === 'mayank.semwal@bergtechnologies.co.in') {
         isPrivileged = true;
@@ -157,11 +151,18 @@ async function start() {
         name: name,
         email: emailLower,
         role: role || 'AGENT',
+        status: 'Active',
+        department: 'Operations',
+        createdAt: new Date().toISOString(),
         ...(teamLeadId ? { teamLeadId, teamLeadName: teamLeadName || '' } : {}),
         ...(mappedManagerId ? { mappedManagerId, mappedManagerName: mappedManagerName || '' } : {})
       };
 
       await userDocRef.set(userProfile, { merge: true });
+
+      // Also update employee_master
+      const masterDocRef = db.collection('employee_master').doc(targetUid);
+      await masterDocRef.set(userProfile, { merge: true });
 
       return res.json({ status: 'success', user: userProfile, wasCreatedInAuth });
     } catch (error) {
@@ -185,7 +186,8 @@ async function start() {
       let isPrivileged = false;
       if (requesterDoc.exists) {
         const data = requesterDoc.data();
-        isPrivileged = data?.role === 'ADMIN' || data?.role === 'MANAGER';
+        const r = (data?.role || '').toUpperCase();
+        isPrivileged = r === 'ADMIN' || r === 'MANAGER';
       }
       if (decodedToken.email?.toLowerCase().trim() === 'mayank.semwal@bergtechnologies.co.in') {
         isPrivileged = true;
@@ -214,10 +216,20 @@ async function start() {
             uid: authUser.uid,
             name: authUser.displayName || email.split('@')[0],
             email: email,
-            role: email === 'mayank.semwal@bergtechnologies.co.in' ? 'ADMIN' : 'AGENT'
+            role: email === 'mayank.semwal@bergtechnologies.co.in' ? 'ADMIN' : 'AGENT',
+            status: 'Active'
           };
           const udocRef = db.collection('users').doc(authUser.uid);
-          batch.set(udocRef, userProfile);
+          batch.set(udocRef, userProfile, { merge: true });
+          
+          // Also sync to employee_master to maintain consistency with the roster dashboard
+          const masterDocRef = db.collection('employee_master').doc(authUser.uid);
+          batch.set(masterDocRef, {
+            ...userProfile,
+            status: 'Active',
+            department: 'Operations',
+            createdAt: new Date().toISOString()
+          }, { merge: true });
         });
       }
 

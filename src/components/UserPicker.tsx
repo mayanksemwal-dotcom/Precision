@@ -69,24 +69,31 @@ export const UserPicker = ({
     fetchSelected();
   }, [selectedUserId]);
 
-  // Pre-load all active employee_master records once
+  // Pre-load all active users once
   const loadAllUsers = useCallback(async () => {
     setLoading(true);
     try {
       const q = query(
-        collection(db, 'employee_master'),
+        collection(db, 'users'),
         where('status', '==', 'Active')
       );
       const snap = await getDocs(q);
-      const results = snap.docs.map(d => ({ uid: d.id, ...(d.data() as object) } as UserProfile));
+      const results = snap.docs.map(d => {
+        const data = d.data() as any;
+        return { 
+          uid: d.id, 
+          ...data,
+          role: (data.role || '').toUpperCase()
+        } as UserProfile;
+      });
       results.sort((a, b) => {
-        const nameA = (a.employeeName || a.fullName || a.name || '').toLowerCase();
-        const nameB = (b.employeeName || b.fullName || b.name || '').toLowerCase();
+        const nameA = (a.fullName || a.name || a.employeeName || '').toLowerCase();
+        const nameB = (b.fullName || b.name || b.employeeName || '').toLowerCase();
         return nameA.localeCompare(nameB);
       });
       setAllFetchedUsers(results);
     } catch (err) {
-      console.error('Failed to pre-fetch employee master records:', err);
+      console.error('Failed to pre-fetch user records:', err);
     } finally {
       setLoading(false);
     }

@@ -635,14 +635,36 @@ export async function runDynamicKPIEngine(reportingPeriod: string, allUsersPasse
       try {
         const tmsProcessesRef = doc(db, 'config', 'tmsProcesses');
         const processSnap = await getDoc(tmsProcessesRef);
-        let existingProcesses: string[] = ['NCC', 'QC', 'Inbound Ops', 'NCC Digital'];
-        if (processSnap.exists() && processSnap.data().list) {
-          existingProcesses = processSnap.data().list;
+        
+        // Use standard system defaults instead of NCC-specific ones
+        const SYSTEM_DEFAULTS = ['HITL', 'MPQC', 'OQC', 'SOP Training', 'QA Review', 'Team Alignment'];
+        let existingProcesses: string[] = [...SYSTEM_DEFAULTS];
+        
+        if (processSnap.exists()) {
+          const data = processSnap.data();
+          if (Array.isArray(data.list) && data.list.length > 0) {
+            existingProcesses = data.list;
+          } else if (Array.isArray(data.processes)) {
+            existingProcesses = data.processes.map((p: any) => typeof p === 'string' ? p : p.name);
+          }
         }
+        
         const combined = Array.from(new Set([...existingProcesses, ...discoveredProcesses])).sort();
-        if (combined.length > existingProcesses.length) {
-          await setDoc(tmsProcessesRef, { list: combined }, { merge: true });
-          console.log(`[PROCESS DISCOVERY] Successfully registered new unique process list: ${combined}`);
+        
+        // Only write if new processes were actually discovered beyond existing or defaults
+        if (combined.length > existingProcesses.length || !processSnap.exists()) {
+          const structuredProcesses = combined.map(name => ({
+            name,
+            status: 'Active'
+          }));
+          
+          await setDoc(tmsProcessesRef, { 
+            list: combined, 
+            processes: structuredProcesses,
+            lastAutoDiscoveredAt: new Date().toISOString()
+          }, { merge: true });
+          
+          console.log(`[PROCESS DISCOVERY] Successfully registered/synced process list: ${combined}`);
         }
       } catch (errDiscovery) {
         console.warn('[KPI ENGINE] Optional process discovery storage did not sync:', errDiscovery);

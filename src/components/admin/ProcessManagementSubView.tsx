@@ -51,14 +51,15 @@ export const ProcessManagementSubView = ({ user, adminTheme }: ProcessManagement
       if (snap.exists()) {
         const data = snap.data();
         let loaded: MiniProcess[] = [];
-        if (Array.isArray(data.processes)) {
+        if (Array.isArray(data.processes) && data.processes.length > 0) {
           loaded = data.processes;
-        } else if (Array.isArray(data.list)) {
+        } else if (Array.isArray(data.list) && data.list.length > 0) {
           loaded = data.list.map((name: string) => ({
             name,
             status: 'Active' as const
           }));
         } else {
+          // Only use defaults if document has no data whatsoever
           loaded = DEFAULT_PROCESSES.map(name => ({
             name,
             status: 'Active' as const

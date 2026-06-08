@@ -51,8 +51,14 @@ export const TeamProcessMappingSubView: React.FC<TeamProcessMappingSubViewProps>
   }, []);
 
   // Lists
-  const teamLeads = useMemo(() => allUsers.filter(u => u.role === 'TEAM_LEAD' || u.role === 'STL' || u.role === 'OPS_TL'), [allUsers]);
-  const managers = useMemo(() => allUsers.filter(u => u.role === 'MANAGER' || u.role === 'ADMIN'), [allUsers]);
+  const teamLeads = useMemo(() => allUsers.filter(u => {
+    const r = (u.role || '').toUpperCase().trim();
+    return ['TEAM_LEAD', 'STL', 'QTL', 'OPS_TL', 'TEAM LEAD', 'TRAINER_TL', 'TRAINER TL', 'OPS TL'].includes(r);
+  }), [allUsers]);
+  const managers = useMemo(() => allUsers.filter(u => {
+    const r = (u.role || '').toUpperCase();
+    return r === 'MANAGER' || r === 'ADMIN';
+  }), [allUsers]);
   
   const filteredUsers = useMemo(() => {
     return allUsers.filter(u => {
@@ -63,7 +69,16 @@ export const TeamProcessMappingSubView: React.FC<TeamProcessMappingSubViewProps>
         (u.employeeName || '').toLowerCase().includes(q) ||
         (u.email || '').toLowerCase().includes(q) ||
         (u.employeeId || '').toLowerCase().includes(q);
-      const matchesRole = roleGroup ? u.role === roleGroup : true;
+      const matchesRole = !roleGroup ? true : (() => {
+        const userRole = (u.role || '').toUpperCase().trim();
+        const filterRole = roleGroup.toUpperCase().trim();
+        
+        if (filterRole === 'TEAM_LEAD' || filterRole === 'TEAM LEAD') {
+          return ['TEAM_LEAD', 'STL', 'QTL', 'OPS_TL', 'TEAM LEAD', 'TRAINER_TL', 'TRAINER TL', 'OPS TL'].includes(userRole);
+        }
+        
+        return userRole === filterRole;
+      })();
       return matchesSearch && matchesRole;
     });
   }, [allUsers, search, roleGroup]);
@@ -256,7 +271,7 @@ export const TeamProcessMappingSubView: React.FC<TeamProcessMappingSubViewProps>
               onSelect={(u) => setTargetTL(u.uid)}
               selectedUserId={targetTL}
               placeholder="Select supervisor..."
-              roleFilter={['TEAM_LEAD', 'STL', 'OPS_TL']}
+              roleFilter={['TEAM_LEAD', 'STL', 'OPS_TL', 'QTL', 'TRAINER_TL', 'TEAM LEAD']}
             />
 
             {/* Assign Manager */}

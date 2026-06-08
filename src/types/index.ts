@@ -1,16 +1,16 @@
 export enum UserRole {
   ADMIN = 'ADMIN',
-  MANAGER = 'Manager',
+  MANAGER = 'MANAGER',
   STL = 'STL',
-  OPS_TL = 'Ops_TL',
+  OPS_TL = 'OPS_TL',
   SME = 'SME',
   QTL = 'QTL',
   QA = 'QA',
-  TEAM_LEAD = 'Team_Lead',
-  TRAINER = 'Trainer',
-  TRAINER_TL = 'Trainer_TL',
+  TEAM_LEAD = 'TEAM_LEAD',
+  TRAINER = 'TRAINER',
+  TRAINER_TL = 'TRAINER_TL',
   MIS = 'MIS',
-  AGENT = 'Agent',
+  AGENT = 'AGENT',
 }
 
 export interface UserProfile {

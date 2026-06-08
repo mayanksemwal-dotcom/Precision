@@ -19,7 +19,9 @@ import {
   History,
   Clock,
   Award,
-  Link2
+  Link2,
+  Sun,
+  Moon
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { UserRole, UserProfile, SamplingTask, AuditRecord, QAAlignment, ProductionRecord, WarningTicket, AgentKpiRecord } from './types';
@@ -78,6 +80,22 @@ export default function App() {
   const [agentKpis, setAgentKpis] = useState<AgentKpiRecord[]>([]);
   const [editingAudit, setEditingAudit] = useState<AuditRecord | null>(null);
 
+  const [theme, setTheme] = useState<'light' | 'dark'>(() => {
+    if (typeof window !== 'undefined') {
+      return (localStorage.getItem('theme') as 'light' | 'dark') || 'light';
+    }
+    return 'light';
+  });
+
+  useEffect(() => {
+    if (theme === 'dark') {
+      document.documentElement.classList.add('dark');
+    } else {
+      document.documentElement.classList.remove('dark');
+    }
+    localStorage.setItem('theme', theme);
+  }, [theme]);
+
   // Removed direct userPermissions state since we'll use context
 
   // Removed Archive Reports states
@@ -121,7 +139,7 @@ export default function App() {
                 email: (firebaseUser.email || '').toLowerCase().trim(),
                 name: currentData.name || currentData.fullName || getCleanName(),
                 fullName: currentData.fullName || currentData.name || getCleanName(),
-                role: (firebaseUser.email?.toLowerCase().trim() === 'mayank.semwal@bergtechnologies.co.in') ? 'ADMIN' : (currentData.role || UserRole.AGENT),
+                role: (firebaseUser.email?.toLowerCase().trim() === 'mayank.semwal@bergtechnologies.co.in') ? 'ADMIN' : (currentData.role || UserRole.AGENT).toUpperCase(),
                 status: currentData.status || 'Active',
                 department: currentData.department || 'Operations',
                 Manager: currentData.Manager || '',
@@ -147,7 +165,7 @@ export default function App() {
                   email: (firebaseUser.email || '').toLowerCase().trim(),
                   name: matchedData.name || matchedData.fullName || getCleanName(),
                   fullName: matchedData.fullName || matchedData.name || getCleanName(),
-                  role: matchedData.role || UserRole.AGENT,
+                  role: (matchedData.role || UserRole.AGENT).toUpperCase(),
                   status: matchedData.status || 'Active',
                   department: matchedData.department || 'Operations',
                   Manager: matchedData.Manager || '',
@@ -186,7 +204,7 @@ export default function App() {
               email: (firebaseUser.email || '').toLowerCase().trim(),
               name: getCleanName(),
               fullName: getCleanName(),
-              role: (firebaseUser.email?.toLowerCase().trim() === 'mayank.semwal@bergtechnologies.co.in') ? UserRole.ADMIN : UserRole.AGENT,
+                  role: (firebaseUser.email?.toLowerCase().trim() === 'mayank.semwal@bergtechnologies.co.in') ? UserRole.ADMIN : UserRole.AGENT,
               status: 'Active',
               department: 'Operations',
               Manager: '',
@@ -337,24 +355,26 @@ export default function App() {
   // Real-time Employee Master (Single Source of Truth) Listener
   useEffect(() => {
     if (!user) return;
-    console.log('Synchronizing with Employee Master (Single Source of Truth)...');
-    const masterQuery = collection(db, 'employee_master');
+    console.log('Synchronizing with User Profiles (Single Source of Truth)...');
+    const masterQuery = collection(db, 'users');
     const unsubscribe = onSnapshot(masterQuery, (snapshot) => {
       const usersList = snapshot.docs.map(doc => {
         const data = doc.data() as any;
         return {
           uid: doc.id,
           ...data,
-          // Normalize name across different possible field mappings for master data consistency
+          // Normalize name across different possible field mappings
           name: data.fullName || data.name || data.employeeName || '',
           fullName: data.fullName || data.name || data.employeeName || '',
+          role: (data.role || UserRole.AGENT).toUpperCase(),
+          status: data.status || 'Active'
         } as UserProfile;
       });
       setAllUsers(usersList);
-      console.log(`Employee Master Sync: ${usersList.length} records normalized and loaded.`);
+      console.log(`User Database Sync: ${usersList.length} records normalized and loaded.`);
     }, (err) => {
-      console.error('Employee Master listener error:', err);
-      handleFirestoreError(err, OperationType.LIST, 'employee_master_sync');
+      console.error('User listener error:', err);
+      handleFirestoreError(err, OperationType.LIST, 'users_sync');
     });
     return () => unsubscribe();
   }, [user]);
@@ -387,6 +407,8 @@ export default function App() {
         warnings={warnings}
         fetchAllData={fetchAllData}
         handleLogout={handleLogout}
+        theme={theme}
+        setTheme={setTheme}
       />
     </PermissionProvider>
   );
@@ -417,8 +439,10 @@ function AppContent({
   allUsers,
   warnings,
   fetchAllData,
-  handleLogout
-}: AppContentProps) {
+  handleLogout,
+  theme,
+  setTheme
+}: AppContentProps & { theme: 'light' | 'dark', setTheme: (t: 'light' | 'dark') => void }) {
   const { canView, canEdit, loading: permissionsLoading } = usePermission();
 
   const navItems = [
@@ -439,7 +463,7 @@ function AppContent({
   const effectiveUser = user ? { ...user, role: effectiveRole } : null;
 
   return (
-    <div className="flex flex-col h-screen overflow-hidden text-slate-900 font-sans bg-[#F8FAFC]">
+    <div className="flex flex-col h-screen overflow-hidden text-slate-900 dark:text-slate-100 font-sans bg-[#F8FAFC] dark:bg-slate-950">
       <Toaster position="top-right" />
       
       {viewAsRole && (
@@ -465,7 +489,7 @@ function AppContent({
         <motion.aside 
         initial={false}
         animate={{ width: sidebarOpen ? 280 : 80 }}
-        className="bg-[#0F172A] border-r border-[#1E293B] flex flex-col z-30 text-[#CBD5E1]"
+        className="bg-[#0F172A] dark:bg-slate-900 border-r border-[#1E293B] dark:border-slate-800 flex flex-col z-30 text-[#CBD5E1]"
       >
         <div className="p-6 pb-4 flex flex-col items-center">
           <div className="w-full flex items-center justify-between mb-6">
@@ -510,7 +534,7 @@ function AppContent({
           )}
         </nav>
 
-        <div className="p-4 border-t border-[#1E293B]">
+        <div className="p-4 border-t border-[#1E293B] dark:border-slate-800">
           <DropdownMenu>
             <DropdownMenuTrigger
               render={
@@ -544,28 +568,28 @@ function AppContent({
       {/* Main Content */}
       <main className="flex-1 flex flex-col relative overflow-hidden">
         {/* Top Header */}
-        <header className="h-16 bg-white border-b border-[#E2E8F0] flex items-center justify-between px-8 sticky top-0 z-20">
+        <header className="h-16 bg-white dark:bg-slate-900 border-b border-[#E2E8F0] dark:border-slate-800 flex items-center justify-between px-8 sticky top-0 z-20">
           <div className="flex items-center gap-4">
             <button 
               onClick={() => setSidebarOpen(!sidebarOpen)}
-              className="p-2 hover:bg-slate-50 rounded-lg text-[#64748B]"
+              className="p-2 hover:bg-slate-50 dark:hover:bg-slate-800 rounded-lg text-[#64748B] dark:text-slate-400"
             >
               {sidebarOpen ? <X size={18} /> : <Menu size={18} />}
             </button>
-            <div className="flex items-center gap-2 text-sm text-[#64748B]">
+            <div className="flex items-center gap-2 text-sm text-[#64748B] dark:text-slate-400">
                <span className="capitalize">{activeTab}</span>
                {activeTab === 'sampling' && (
                  <>
-                   <span className="text-slate-300">/</span>
-                   <span className="font-semibold text-[#0F172A]">Active Desk</span>
+                   <span className="text-slate-300 dark:text-slate-700">/</span>
+                   <span className="font-semibold text-[#0F172A] dark:text-white">Active Desk</span>
                  </>
                )}
             </div>
           </div>
           <div className="flex items-center gap-6">
              {(user?.role?.toUpperCase() === 'ADMIN' || user?.email?.toLowerCase().trim() === 'mayank.semwal@bergtechnologies.co.in' || viewAsRole !== null) && (
-               <div className="flex items-center gap-2 bg-slate-100 p-1 rounded-lg border border-slate-200">
-                 <span className="text-[10px] font-bold text-slate-500 ml-2 uppercase">Preview as:</span>
+               <div className="flex items-center gap-2 bg-slate-100 dark:bg-slate-800 p-1 rounded-lg border border-slate-200 dark:border-slate-700">
+                 <span className="text-[10px] font-bold text-slate-500 dark:text-slate-400 ml-2 uppercase">Preview as:</span>
                  {[UserRole.ADMIN, UserRole.MANAGER, UserRole.TEAM_LEAD, UserRole.QA, UserRole.AGENT].map(r => (
                    <button
                      key={r}
@@ -578,12 +602,21 @@ function AppContent({
                </div>
              )}
              <div className="flex items-center gap-4">
-                <div className="role-badge bg-[#F1F5F9] text-[#475569] px-2 py-1 rounded text-[10px] font-bold uppercase tracking-wider">
+                {/* Global Theme Toggle */}
+                <button 
+                  onClick={() => setTheme(theme === 'light' ? 'dark' : 'light')}
+                  className="p-2 h-9 w-9 flex items-center justify-center rounded-xl bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-amber-400 hover:bg-slate-200 dark:hover:bg-slate-700 transition-all cursor-pointer"
+                  title={theme === 'dark' ? 'Switch to Light Mode' : 'Switch to Dark Mode'}
+                >
+                  {theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}
+                </button>
+
+                <div className="role-badge bg-[#F1F5F9] dark:bg-slate-800 text-[#475569] dark:text-slate-300 px-2 py-1 rounded text-[10px] font-bold uppercase tracking-wider">
                   {effectiveRole} {viewAsRole ? '(Preview)' : ''}
                 </div>
                 <div className="flex items-center gap-3">
-                   <span className="text-sm font-semibold text-[#1E293B]">{user.name}</span>
-                   <div className="w-8 h-8 rounded-full bg-[#E2E8F0] border border-white shadow-sm flex items-center justify-center font-bold text-xs text-[#64748B]">
+                   <span className="text-sm font-semibold text-[#1E293B] dark:text-white">{user.name}</span>
+                   <div className="w-8 h-8 rounded-full bg-[#E2E8F0] dark:bg-slate-800 border border-white dark:border-slate-700 shadow-sm flex items-center justify-center font-bold text-xs text-[#64748B] dark:text-slate-400">
                      {user.name.split(' ').map(n => n[0]).join('')}
                    </div>
                 </div>
@@ -618,7 +651,7 @@ function AppContent({
                 {activeTab === 'tms' ? (
                   <TMSView user={effectiveUser!} allUsers={allUsers} />
                 ) : activeTab === 'kpis_scorecard' ? (
-                  <ScorecardView user={effectiveUser!} allUsers={allUsers} onRefreshAllData={fetchAllData} />
+                  <ScorecardView user={effectiveUser!} allUsers={allUsers} onRefreshAllData={fetchAllData} externalTheme={theme} />
                 ) : activeTab === 'warnings' ? (
                   <WarningsView warnings={warnings} user={effectiveUser!} allUsers={allUsers} />
                 ) : activeTab === 'pips' ? (
@@ -641,6 +674,7 @@ function AppContent({
                     allUsers={allUsers}
                     warnings={warnings}
                     onRefresh={fetchAllData}
+                    externalTheme={theme}
                   />
                 ) : (
                   <div className="py-12 text-center text-slate-500 font-bold text-sm">

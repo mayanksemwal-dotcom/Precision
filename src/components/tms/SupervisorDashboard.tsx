@@ -21,7 +21,8 @@ import {
   Shield,
   Clock3,
   UserX,
-  Sparkles
+  Sparkles,
+  LogOut
 } from 'lucide-react';
 import { 
   BarChart, 
@@ -104,19 +105,9 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
 
   // Modals / Actions states
   const [isExporting, setIsExporting] = useState(false);
-  const [showCorrectionModal, setShowCorrectionModal] = useState(false);
   const [showLogsModal, setShowLogsModal] = useState(false);
   const [adminLogs, setAdminLogs] = useState<any[]>([]);
   const [isLoadingLogs, setIsLoadingLogs] = useState(false);
-
-  // Correction Form state
-  const [correctionUserId, setCorrectionUserId] = useState('');
-  const [correctionDate, setCorrectionDate] = useState(new Date().toISOString().slice(0, 10));
-  const [correctionClockIn, setCorrectionClockIn] = useState('09:00');
-  const [correctionClockOut, setCorrectionClockOut] = useState('18:00');
-  const [correctionRemarks, setCorrectionRemarks] = useState('');
-  const [correctionProcess, setCorrectionProcess] = useState('HITL');
-  const [isSavingCorrection, setIsSavingCorrection] = useState(false);
 
   // Force Logout Confirm States
   const [showForceLogoutConfirm, setShowForceLogoutConfirm] = useState(false);
@@ -243,10 +234,12 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
 
       if (cachedSummary) {
         setSummaryData(cachedSummary);
-        setActiveShifts(cachedSummary.activeShiftsList || []);
+        if (cachedSummary.activeShiftsList) {
+          setActiveShifts(cachedSummary.activeShiftsList);
+        }
         setLastRefreshed(new Date(cachedSummary.lastUpdated));
         setIsLoadingShifts(false);
-        return;
+        if (cachedSummary.activeShiftsList) return;
       }
 
       // If missing or expired: Perform optimized fetch of ONLY active shifts
@@ -470,7 +463,8 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
           activeAfterClockOut: [], // Profiles mark as active somewhere but clocked out
           teamInconsistencies: inconsistencies,
           countMismatches
-        }
+        },
+        activeShiftsList: teamActiveShifts
       };
 
       // Save summary data in Firestore to share/cache
@@ -601,72 +595,61 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
     return Array.from(map.entries()).map(([name, count]) => ({ name, count }));
   }, [mappedUsers]);
 
-  // Handle manual attendance insert
-  const handleAttendanceCorrectionSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!correctionUserId || !correctionProcess || !correctionClockIn || !correctionClockOut) {
-      toast.error('Please fill out all session parameters.');
+  const [syncing, setSyncing] = useState(false);
+
+  // Bulk Force Logout for shifts > 16h productive
+  const handleBulkForceLogout = async () => {
+    const thresholdMs = 16 * 60 * 60 * 1000;
+    const now = new Date();
+    const nowISO = now.toISOString();
+    
+    const shiftsToClose = activeShifts.filter(sh => {
+      const stats = calculateShiftStatsObj(sh);
+      return stats.activeMs > thresholdMs;
+    });
+
+    if (shiftsToClose.length === 0) {
+      toast.info('No shifts found with productive time > 16 hours.');
       return;
     }
 
-    setIsSavingCorrection(true);
-    const correctedUserRef = allUsers.find(u => u.uid === correctionUserId);
-    if (!correctedUserRef) {
-      toast.error('Profile not identified.');
-      setIsSavingCorrection(false);
-      return;
-    }
+    if (!window.confirm(`Are you sure you want to force clock-out ${shiftsToClose.length} users with > 16 hours of productive time?`)) return;
 
+    setSyncing(true);
+    const tid = toast.loading(`Forcing clock-out for ${shiftsToClose.length} users...`);
     try {
-      const inTime = new Date(`${correctionDate}T${correctionClockIn}:00`).toISOString();
-      const outTime = new Date(`${correctionDate}T${correctionClockOut}:00`).toISOString();
-
-      if (new Date(inTime) >= new Date(outTime)) {
-        toast.error('Clock Out timestamp must be after clock In.');
-        setIsSavingCorrection(false);
-        return;
-      }
-
-      const generatedShiftId = `shift-corrected-${Date.now()}`;
-      const correctionDataObj: TMSShift = {
-        id: generatedShiftId,
-        userId: correctionUserId,
-        userName: correctedUserRef.name,
-        userEmail: correctedUserRef.email,
-        clockInTime: inTime,
-        clockOutTime: outTime,
-        status: 'COMPLETED',
-        activities: [
-          {
-            type: 'productive',
-            name: correctionProcess,
-            startTime: inTime,
-            endTime: outTime
+      const fbBatch = writeBatch(db);
+      for (const sh of shiftsToClose) {
+        const updatedActivities = [...sh.activities];
+        if (updatedActivities.length > 0) {
+          const last = { ...updatedActivities[updatedActivities.length - 1] };
+          if (!last.endTime) {
+            last.endTime = nowISO;
+            updatedActivities[updatedActivities.length - 1] = last;
           }
-        ]
-      };
+        }
 
-      await setDoc(doc(db, 'tmsShifts', generatedShiftId), correctionDataObj);
+        fbBatch.update(doc(db, 'tmsShifts', sh.id), {
+          status: 'COMPLETED',
+          clockOutTime: nowISO,
+          activities: updatedActivities,
+          forceLogout: true,
+          logoutReason: 'Auto Bulk Force Logout (>16h productive)'
+        });
 
-      // Write admin audit log
-      await addDoc(collection(db, 'adminAuditLogs'), {
-        timestamp: new Date().toISOString(),
-        performedBy: `${user.name} (${user.email})`,
-        affectedUser: `${correctedUserRef.name} (${correctedUserRef.email})`,
-        action: 'Supervisor Attendance Correction Insert',
-        previousValue: 'Offline',
-        newValue: `Corrected Shift: ${correctionProcess} (${correctionClockIn} - ${correctionClockOut})`
-      });
-
-      toast.success(`Successfully recorded session correction punch for ${correctedUserRef.name}`);
-      setShowCorrectionModal(false);
+        fbBatch.update(doc(db, 'users', sh.userId), {
+          status: 'OFFLINE'
+        });
+      }
+      await fbBatch.commit();
+      toast.success(`Successfully force-closed ${shiftsToClose.length} sessions.`);
       loadAndRecomputeData(true);
-      if (onRefreshAllData) onRefreshAllData();
     } catch (err) {
-      console.error('[ATT_CORRECT_ERR]', err);
-      toast.error('Failed to create manual attendance punch record');
+      console.error('Bulk logout failed:', err);
+      toast.error('Failed to execute bulk logout.');
     } finally {
-      setIsSavingCorrection(false);
+      toast.dismiss(tid);
+      setSyncing(false);
     }
   };
 
@@ -952,7 +935,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
     <div className="space-y-6">
       
       {/* HEADER SECTION WITH AUTO REFRESH TICKER */}
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 bg-slate-900 text-white p-6 rounded-3xl shadow-xl">
+      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 bg-slate-900 dark:bg-slate-950 text-white p-6 rounded-3xl shadow-xl border border-slate-800">
         <div className="flex items-center gap-3">
           <div className="p-3 bg-indigo-600 rounded-2xl shadow-lg text-white">
             <Shield size={24} className="animate-pulse" />
@@ -982,62 +965,62 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
 
       {/* CORE STATS KPI TILES (TOP SUMMARY CARDS) */}
       <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3.5">
-        <div className="bg-white border border-slate-200/80 p-4.5 rounded-2xl shadow-sm text-center">
-          <span className="text-[10px] font-extrabold uppercase tracking-widest text-slate-400 leading-none">Total Assigned</span>
-          <h3 className="text-2xl font-black text-slate-900 mt-1">{summaryData?.totalAssigned ?? mappedUsers.length}</h3>
-          <p className="text-[10px] text-slate-500 font-bold mt-0.5 leading-none">Roster Mapped</p>
+        <div className="bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 p-4.5 rounded-2xl shadow-sm text-center">
+          <span className="text-[10px] font-extrabold uppercase tracking-widest text-slate-400 dark:text-slate-500 leading-none">Total Assigned</span>
+          <h3 className="text-2xl font-black text-slate-900 dark:text-white mt-1">{summaryData?.totalAssigned ?? mappedUsers.length}</h3>
+          <p className="text-[10px] text-slate-500 dark:text-slate-400 font-bold mt-0.5 leading-none">Roster Mapped</p>
         </div>
 
-        <div className="bg-white border border-emerald-200 p-4.5 rounded-2xl shadow-sm shadow-emerald-50/50 text-center">
-          <span className="text-[10px] font-extrabold uppercase tracking-widest text-emerald-600 leading-none">Logged In Now</span>
-          <h3 className="text-2xl font-black text-emerald-600 mt-1">{summaryData?.loggedInCount ?? 0}</h3>
-          <p className="text-[10px] text-emerald-500 font-bold mt-0.5 leading-none">On-Duty Shifts</p>
+        <div className="bg-white dark:bg-slate-900 border border-emerald-200 dark:border-emerald-900/30 p-4.5 rounded-2xl shadow-sm shadow-emerald-50/50 dark:shadow-none text-center">
+          <span className="text-[10px] font-extrabold uppercase tracking-widest text-emerald-600 dark:text-emerald-400 leading-none">Logged In Now</span>
+          <h3 className="text-2xl font-black text-emerald-600 dark:text-emerald-400 mt-1">{summaryData?.loggedInCount ?? 0}</h3>
+          <p className="text-[10px] text-emerald-500 dark:text-emerald-500/80 font-bold mt-0.5 leading-none">On-Duty Shifts</p>
         </div>
 
-        <div className="bg-white border border-amber-200 p-4.5 rounded-2xl shadow-sm shadow-amber-50/50 text-center">
-          <span className="text-[10px] font-extrabold uppercase tracking-widest text-amber-600 leading-none">On Break</span>
-          <h3 className="text-2xl font-black text-amber-500 mt-1">{summaryData?.onBreakCount ?? 0}</h3>
-          <p className="text-[10px] text-amber-500 font-bold mt-0.5 leading-none">Rest Periods</p>
+        <div className="bg-white dark:bg-slate-900 border border-amber-200 dark:border-amber-900/30 p-4.5 rounded-2xl shadow-sm shadow-amber-50/50 dark:shadow-none text-center">
+          <span className="text-[10px] font-extrabold uppercase tracking-widest text-amber-600 dark:text-amber-400 leading-none">On Break</span>
+          <h3 className="text-2xl font-black text-amber-500 dark:text-amber-400 mt-1">{summaryData?.onBreakCount ?? 0}</h3>
+          <p className="text-[10px] text-amber-500 dark:text-amber-500/80 font-bold mt-0.5 leading-none">Rest Periods</p>
         </div>
 
-        <div className="bg-white border border-slate-200 p-4.5 rounded-2xl shadow-sm text-center">
-          <span className="text-[10px] font-extrabold uppercase tracking-widest text-slate-400 leading-none">Offline</span>
-          <h3 className="text-2xl font-black text-slate-600 mt-1">{summaryData?.offlineCount ?? 0}</h3>
-          <p className="text-[10px] text-slate-400 font-bold mt-0.5 leading-none">Off-Duty staff</p>
+        <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4.5 rounded-2xl shadow-sm text-center">
+          <span className="text-[10px] font-extrabold uppercase tracking-widest text-slate-400 dark:text-slate-500 leading-none">Offline</span>
+          <h3 className="text-2xl font-black text-slate-600 dark:text-slate-300 mt-1">{summaryData?.offlineCount ?? 0}</h3>
+          <p className="text-[10px] text-slate-400 dark:text-slate-500 font-bold mt-0.5 leading-none">Off-Duty staff</p>
         </div>
 
-        <div className="bg-white border border-sky-200 p-4.5 rounded-2xl shadow-sm shadow-sky-50/50 text-center">
-          <span className="text-[10px] font-extrabold uppercase tracking-widest text-sky-600 leading-none">Attendance %</span>
-          <h3 className="text-2xl font-black text-sky-600 mt-1">{summaryData?.attendancePercent ?? 0}%</h3>
-          <p className="text-[10px] text-sky-500 font-bold mt-0.5 leading-none">Team Rate</p>
+        <div className="bg-white dark:bg-slate-900 border border-sky-200 dark:border-sky-900/30 p-4.5 rounded-2xl shadow-sm shadow-sky-50/50 dark:shadow-none text-center">
+          <span className="text-[10px] font-extrabold uppercase tracking-widest text-sky-600 dark:text-sky-400 leading-none">Attendance %</span>
+          <h3 className="text-2xl font-black text-sky-600 dark:text-sky-400 mt-1">{summaryData?.attendancePercent ?? 0}%</h3>
+          <p className="text-[10px] text-sky-500 dark:text-sky-500/80 font-bold mt-0.5 leading-none">Team Rate</p>
         </div>
 
-        <div className="bg-white border border-indigo-200 p-4.5 rounded-2xl shadow-sm shadow-indigo-50/50 text-center">
-          <span className="text-[10px] font-extrabold uppercase tracking-widest text-indigo-600 leading-none">Active Work</span>
-          <h3 className="text-2xl font-black text-indigo-600 mt-1">{summaryData?.activeCount ?? 0}</h3>
-          <p className="text-[10px] text-indigo-500 font-bold mt-0.5 leading-none">Productive Timers</p>
+        <div className="bg-white dark:bg-slate-900 border border-indigo-200 dark:border-indigo-900/30 p-4.5 rounded-2xl shadow-sm shadow-indigo-50/50 dark:shadow-none text-center">
+          <span className="text-[10px] font-extrabold uppercase tracking-widest text-indigo-600 dark:text-indigo-400 leading-none">Active Work</span>
+          <h3 className="text-2xl font-black text-indigo-600 dark:text-indigo-400 mt-1">{summaryData?.activeCount ?? 0}</h3>
+          <p className="text-[10px] text-indigo-500 dark:text-indigo-500/80 font-bold mt-0.5 leading-none">Productive Timers</p>
         </div>
       </div>
 
       {/* DASHBOARD TABS */}
-      <div className="flex gap-2 border-b border-slate-200 pb-1 overflow-x-auto scrollbar-none">
+      <div className="flex gap-2 border-b border-slate-200 dark:border-slate-800 pb-1 overflow-x-auto scrollbar-none">
         <button 
           onClick={() => setActiveTab('monitoring')}
-          className={`flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-black transition-all cursor-pointer ${activeTab === 'monitoring' ? 'bg-indigo-50 text-indigo-600 border border-indigo-100' : 'text-slate-500 hover:text-slate-800'}`}
+          className={`flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-black transition-all cursor-pointer ${activeTab === 'monitoring' ? 'bg-indigo-50 dark:bg-indigo-900/20 text-indigo-600 dark:text-indigo-400 border border-indigo-100 dark:border-indigo-800' : 'text-slate-500 dark:text-slate-400 hover:text-slate-800 dark:hover:text-slate-200'}`}
         >
           <Activity size={14} />
           Workforce Monitoring
         </button>
         <button 
           onClick={() => setActiveTab('controls')}
-          className={`flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-black transition-all cursor-pointer ${activeTab === 'controls' ? 'bg-indigo-50 text-indigo-600 border border-indigo-100' : 'text-slate-500 hover:text-slate-800'}`}
+          className={`flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-black transition-all cursor-pointer ${activeTab === 'controls' ? 'bg-indigo-50 dark:bg-indigo-900/20 text-indigo-600 dark:text-indigo-400 border border-indigo-100 dark:border-indigo-800' : 'text-slate-500 dark:text-slate-400 hover:text-slate-800 dark:hover:text-slate-200'}`}
         >
           <Users size={14} />
           Workforce Controls
         </button>
         <button 
           onClick={() => setActiveTab('exceptions')}
-          className={`flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-black transition-all cursor-pointer ${activeTab === 'exceptions' ? 'bg-rose-50 text-rose-600 border border-rose-100' : 'text-slate-500 hover:text-slate-800'}`}
+          className={`flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-black transition-all cursor-pointer ${activeTab === 'exceptions' ? 'bg-rose-50 dark:bg-rose-900/20 text-rose-600 dark:text-rose-400 border border-rose-100 dark:border-rose-800' : 'text-slate-500 dark:text-slate-400 hover:text-slate-800 dark:hover:text-slate-200'}`}
         >
           <AlertTriangle size={14} className="text-rose-500 animate-bounce-slow" />
           Audit & Exceptions
@@ -1057,28 +1040,28 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
             
             {/* Live Distribution Board */}
-            <div className="lg:col-span-4 bg-white border border-slate-200 rounded-2xl p-5 shadow-sm space-y-4">
-              <h4 className="text-xs font-extrabold text-slate-800 uppercase tracking-widest flex items-center gap-1.5">
+            <div className="lg:col-span-4 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-5 shadow-sm space-y-4">
+              <h4 className="text-xs font-extrabold text-slate-800 dark:text-slate-200 uppercase tracking-widest flex items-center gap-1.5">
                 <Sparkles size={14} className="text-amber-500" /> Live Workforce Distribution
               </h4>
               
               <div className="space-y-3 pt-2">
                 <div>
-                  <div className="flex justify-between text-xs font-bold text-slate-600 mb-1 leading-none">
+                  <div className="flex justify-between text-xs font-bold text-slate-600 dark:text-slate-400 mb-1 leading-none">
                     <span>Active Workflow</span>
-                    <span className="text-indigo-600">{summaryData?.distribution?.active ?? 0}</span>
+                    <span className="text-indigo-600 dark:text-indigo-400">{summaryData?.distribution?.active ?? 0}</span>
                   </div>
-                  <div className="w-full bg-slate-100 h-2.5 rounded-full overflow-hidden">
-                    <div className="bg-indigo-600 h-full rounded-full" style={{ width: `${(summaryData?.distribution?.active / (summaryData?.totalAssigned || 1)) * 100}%` }} />
+                  <div className="w-full bg-slate-100 dark:bg-slate-800 h-2.5 rounded-full overflow-hidden">
+                    <div className="bg-indigo-600 dark:bg-indigo-500 h-full rounded-full" style={{ width: `${(summaryData?.distribution?.active / (summaryData?.totalAssigned || 1)) * 100}%` }} />
                   </div>
                 </div>
 
                 <div>
-                  <div className="flex justify-between text-xs font-bold text-slate-600 mb-1 leading-none">
+                  <div className="flex justify-between text-xs font-bold text-slate-600 dark:text-slate-400 mb-1 leading-none">
                     <span>Break & Tea</span>
                     <span className="text-amber-500">{summaryData?.distribution?.break ?? 0}</span>
                   </div>
-                  <div className="w-full bg-slate-100 h-2.5 rounded-full overflow-hidden">
+                  <div className="w-full bg-slate-100 dark:bg-slate-800 h-2.5 rounded-full overflow-hidden">
                     <div className="bg-amber-500 h-full rounded-full" style={{ width: `${(summaryData?.distribution?.break / (summaryData?.totalAssigned || 1)) * 100}%` }} />
                   </div>
                 </div>
@@ -1140,6 +1123,17 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
               </h4>
               <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3">
                 {/* Only one button here or just remove the correction one */}
+                {/* Bulk Force Logout Action Button */}
+                {['ADMIN', 'MANAGER'].includes((user.role || '').toUpperCase()) && (
+                  <button 
+                    onClick={handleBulkForceLogout}
+                    disabled={syncing}
+                    className="bg-rose-600 hover:bg-rose-700 border border-rose-500 text-white p-3 rounded-xl flex items-center justify-center gap-2 text-xs font-extrabold transition-all cursor-pointer shadow-sm shadow-rose-200 disabled:opacity-50"
+                  >
+                    <LogOut size={15} /> Bulk Force Logout ({'>'}16h)
+                  </button>
+                )}
+
                 <button 
                   onClick={openAuditLogsModal}
                   className="bg-slate-850 hover:bg-slate-900 border border-slate-700 text-slate-200 p-3 rounded-xl flex items-center justify-center gap-2 text-xs font-extrabold transition-all cursor-pointer"
@@ -1249,7 +1243,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
                   </select>
                 </div>
 
-                {['ADMIN', 'MANAGER'].includes((user.role || '').toUpperCase()) ? (
+                {(user.role || '').toUpperCase() === 'ADMIN' ? (
                   <div>
                     <label className="block text-[10px] uppercase font-bold text-slate-400 mb-1">Manager Filter</label>
                     <select 
@@ -1263,7 +1257,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
                       ))}
                     </select>
                   </div>
-                ) : <div className="hidden sm:block"></div>}
+                ) : <div className="hidden"></div>}
 
                 <div className="col-span-2 sm:col-span-1 flex flex-col justify-end">
                   <button 
@@ -1403,7 +1397,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
               {/* Long Breaks Exception */}
               <div className="bg-white border border-rose-200 rounded-2xl p-5 shadow-sm space-y-4">
                 <h4 className="text-xs font-extrabold text-rose-700 uppercase tracking-widest flex items-center gap-1.5 leading-none">
-                  <Coffee size={14} className="text-rose-500 animate-pulse" /> Active Long Breaks Exception Limit {`> 45 mins`}
+                  <Coffee size={14} className="text-rose-500 animate-pulse" /> Active Long Breaks Exception Limit {' > 45 mins'}
                 </h4>
                 
                 <div className="space-y-3.5 max-h-64 overflow-y-auto pt-1.5">
@@ -1417,7 +1411,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
                         onClick={() => selectAndFocusUser(item.userName)}
                         className="bg-rose-100 hover:bg-rose-200 text-rose-800 text-[10px] font-black px-2.5 py-1 rounded-lg shrink-0 cursor-pointer"
                       >
-                        Correct
+                        Focus Profile
                       </button>
                     </div>
                   ))}
@@ -1433,7 +1427,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
               {/* Idle Users Exception */}
               <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm space-y-4">
                 <h4 className="text-xs font-extrabold text-slate-700 uppercase tracking-widest flex items-center gap-1.5 leading-none">
-                  <Clock size={14} className="text-orange-500" /> Currently Idle Active Timers {`> 2 hours`}
+                  <Clock size={14} className="text-orange-500" /> Currently Idle Active Timers {' > 2 hours'}
                 </h4>
 
                 <div className="space-y-3.5 max-h-64 overflow-y-auto pt-1.5">
@@ -1612,112 +1606,6 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
         )}
 
       </div>
-
-      {/* MODAL 1: ATTENDANCE CORRECTION / MANUAL PUNCHES */}
-      {showCorrectionModal && (
-        <div className="fixed inset-0 bg-slate-900/55 backdrop-blur-sm flex items-center justify-center z-[99999] p-4 text-slate-800 animate-in fade-in duration-200">
-          <div className="bg-white rounded-2xl w-full max-w-md p-6 border border-slate-200 shadow-2xl space-y-4">
-            <div className="flex items-center gap-3 border-b pb-3.5">
-              <div className="p-2.5 bg-indigo-50 text-indigo-600 rounded-xl">
-                <Plus size={20} />
-              </div>
-              <div className="text-left">
-                <h4 className="font-black text-slate-900 text-sm">Attendance Correction Insert</h4>
-                <p className="text-slate-450 text-[10px] font-bold">Log direct productive punches on target accounts</p>
-              </div>
-            </div>
-
-            <form onSubmit={handleAttendanceCorrectionSubmit} className="space-y-4 text-xs font-bold text-slate-600">
-              <div className="space-y-1.5 text-left">
-                <label className="text-[10px] uppercase font-black text-slate-400 tracking-wider">Select Employee Profile</label>
-                <select
-                  value={correctionUserId}
-                  onChange={(e) => setCorrectionUserId(e.target.value)}
-                  className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 text-xs font-bold focus:outline-none focus:ring-1 focus:ring-indigo-500 cursor-pointer text-slate-800"
-                >
-                  <option value="">Choose profile...</option>
-                  {mappedUsers.map(u => (
-                    <option key={u.uid} value={u.uid}>{u.name} ({u.email})</option>
-                  ))}
-                </select>
-              </div>
-
-              <div className="space-y-1.5 text-left">
-                <label className="text-[10px] uppercase font-black text-slate-400 tracking-wider">Process Name</label>
-                <select
-                  value={correctionProcess}
-                  onChange={(e) => setCorrectionProcess(e.target.value)}
-                  className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 text-xs font-bold focus:outline-none focus:ring-1 focus:ring-indigo-500 cursor-pointer text-slate-800"
-                >
-                  <option value="HITL">HITL</option>
-                  <option value="MPQC">MPQC</option>
-                  <option value="OQC">OQC</option>
-                  <option value="SOP Training">SOP Training</option>
-                  <option value="QA Review">QA Review</option>
-                </select>
-              </div>
-
-              <div className="space-y-1.5 text-left">
-                <label className="text-[10px] uppercase font-black text-slate-400 tracking-wider">Correction Date</label>
-                <input 
-                  type="date"
-                  value={correctionDate}
-                  onChange={(e) => setCorrectionDate(e.target.value)}
-                  className="w-full bg-slate-50 border border-slate-200 rounded-xl p-2.5 text-xs font-bold focus:outline-none text-slate-800"
-                />
-              </div>
-
-              <div className="grid grid-cols-2 gap-3">
-                <div className="space-y-1.5 text-left">
-                  <label className="text-[10px] uppercase font-black text-slate-400 tracking-wider">Clock In time</label>
-                  <input 
-                    type="time" 
-                    value={correctionClockIn}
-                    onChange={(e) => setCorrectionClockIn(e.target.value)}
-                    className="w-full bg-slate-50 border border-slate-200 rounded-xl p-2.5 text-xs font-bold focus:outline-none text-slate-800"
-                  />
-                </div>
-                <div className="space-y-1.5 text-left">
-                  <label className="text-[10px] uppercase font-black text-slate-400 tracking-wider">Clock Out time</label>
-                  <input 
-                    type="time" 
-                    value={correctionClockOut}
-                    onChange={(e) => setCorrectionClockOut(e.target.value)}
-                    className="w-full bg-slate-50 border border-slate-200 rounded-xl p-2.5 text-xs font-bold focus:outline-none text-slate-800"
-                  />
-                </div>
-              </div>
-
-              <div className="space-y-1.5 text-left">
-                <label className="text-[10px] uppercase font-black text-slate-400 tracking-wider">Approval Reason / Remarks</label>
-                <textarea
-                  value={correctionRemarks}
-                  onChange={(e) => setCorrectionRemarks(e.target.value)}
-                  placeholder="Enter supervisor justification remarks..."
-                  className="w-full bg-slate-50 border border-slate-200 focus:outline-none focus:ring-1 focus:ring-indigo-500 rounded-xl p-3 text-xs font-bold text-slate-800 h-20"
-                />
-              </div>
-
-              <div className="grid grid-cols-2 gap-3 pt-2">
-                <button
-                  type="button"
-                  onClick={() => setShowCorrectionModal(false)}
-                  className="bg-slate-100 hover:bg-slate-200 text-slate-700 py-2.5 rounded-xl font-bold cursor-pointer transition-colors"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  disabled={isSavingCorrection}
-                  className="bg-indigo-600 hover:bg-indigo-755 text-white py-2.5 rounded-xl font-black cursor-pointer transition-colors disabled:opacity-50"
-                >
-                  {isSavingCorrection ? 'Inserting punch...' : 'Apply Correction'}
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
 
       {/* MODAL 2: CONFIRM FORCE LOGOUT */}
       {showForceLogoutConfirm && (

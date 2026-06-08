@@ -55,11 +55,17 @@ export const DashboardSubView: React.FC<DashboardSubViewProps> = ({ allUsers, ad
     const total = allUsers.length;
     const active = allUsers.filter(u => u.status?.toLowerCase() === 'active' || u.isActive === true).length;
     const inactive = total - active;
-    const agents = allUsers.filter(u => u.role === 'AGENT').length;
-    const qas = allUsers.filter(u => u.role === 'QA').length;
-    const smes = allUsers.filter(u => u.role === 'SME').length;
-    const tls = allUsers.filter(u => u.role === 'TEAM_LEAD' || u.role === 'STL' || u.role === 'OPS_TL').length;
-    const mgrs = allUsers.filter(u => u.role === 'MANAGER' || u.role === 'ADMIN').length;
+    const agents = allUsers.filter(u => (u.role || '').toUpperCase() === 'AGENT').length;
+    const qas = allUsers.filter(u => (u.role || '').toUpperCase() === 'QA').length;
+    const smes = allUsers.filter(u => (u.role || '').toUpperCase() === 'SME').length;
+    const tls = allUsers.filter(u => {
+      const r = (u.role || '').toUpperCase();
+      return r === 'TEAM_LEAD' || r === 'STL' || r === 'OPS_TL' || r === 'QTL' || r === 'TRAINER_TL' || r === 'TEAM LEAD' || r === 'TRAINER TL' || r === 'OPS TL';
+    }).length;
+    const mgrs = allUsers.filter(u => {
+      const r = (u.role || '').toUpperCase();
+      return r === 'MANAGER' || r === 'ADMIN' || r === 'EXECUTIVE';
+    }).length;
 
     setStats(prev => ({
       ...prev,

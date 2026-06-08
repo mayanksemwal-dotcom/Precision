@@ -196,14 +196,14 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
   return (
     <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
       {/* Header Section */}
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 bg-white/80 backdrop-blur p-6 rounded-2xl border border-slate-100 shadow-sm">
+      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 bg-white/80 dark:bg-slate-900/80 backdrop-blur p-6 rounded-2xl border border-slate-100 dark:border-slate-800 shadow-sm">
         <div className="flex items-center gap-4">
           <div className="w-12 h-12 rounded-xl bg-red-600 flex items-center justify-center text-white shadow-lg shadow-red-250">
             <ShieldAlert size={24} />
           </div>
           <div>
-            <h2 className="text-2xl font-black text-slate-900 tracking-tight">Active Disciplinary Panel</h2>
-            <p className="text-sm font-medium text-slate-500">Acknowledge, track, and audit active feedback tickets</p>
+            <h2 className="text-2xl font-black text-slate-900 dark:text-white tracking-tight">Active Disciplinary Panel</h2>
+            <p className="text-sm font-medium text-slate-500 dark:text-slate-400">Acknowledge, track, and audit active feedback tickets</p>
           </div>
         </div>
         
@@ -212,15 +212,15 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
             <Dialog open={isWarningOpen} onOpenChange={setIsWarningOpen}>
               <DialogTrigger 
                 render={
-                  <Button className="bg-red-600 hover:bg-red-700 text-white font-bold gap-2 shadow-lg shadow-red-100 cursor-pointer">
+                  <Button className="bg-red-600 hover:bg-red-700 text-white font-bold gap-2 shadow-lg shadow-red-100 cursor-pointer border-none">
                     <Plus size={18} /> Raise Warning Ticket
                   </Button>
                 }
               />
-              <DialogContent className="sm:max-w-[500px] bg-white shadow-2xl border border-slate-200 [id^='dialog-content-']">
+              <DialogContent className="sm:max-w-[500px] bg-white dark:bg-slate-900 shadow-2xl border border-slate-200 dark:border-slate-800 [id^='dialog-content-']">
                 <DialogHeader>
-                  <DialogTitle className="text-xl font-bold">Raise Disciplinary Action</DialogTitle>
-                  <DialogDescription className="text-slate-500">
+                  <DialogTitle className="text-xl font-bold dark:text-white">Raise Disciplinary Action</DialogTitle>
+                  <DialogDescription className="text-slate-500 dark:text-slate-400">
                     Select an agent, warning severity, and notification path under the staircase policy.
                   </DialogDescription>
                 </DialogHeader>
@@ -229,8 +229,8 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
             </Dialog>
           )}
 
-          <div className="px-4 py-2 bg-slate-50/50 rounded-lg border border-slate-100 flex items-center gap-3">
-            <div className="text-right border-r border-slate-200 pr-3">
+          <div className="px-4 py-2 bg-slate-50/50 dark:bg-slate-800/50 rounded-lg border border-slate-100 dark:border-slate-700 flex items-center gap-3">
+            <div className="text-right border-r border-slate-200 dark:border-slate-700 pr-3">
               <p className="text-[10px] font-extrabold text-slate-400 uppercase tracking-widest">
                 {canCreate('Warnings') ? 'Pending' : 'My Pending'}
               </p>
@@ -242,12 +242,12 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
               <TrendingUp size={16} className="text-red-500 animate-pulse" />
             </div>
           </div>
-          <div className="px-4 py-2 bg-slate-50/50 rounded-lg border border-slate-100 flex items-center gap-3">
+          <div className="px-4 py-2 bg-slate-50/50 dark:bg-slate-800/50 rounded-lg border border-slate-100 dark:border-slate-700 flex items-center gap-3">
             <div className="text-right">
               <p className="text-[10px] font-extrabold text-slate-400 uppercase tracking-widest">
                 {canCreate('Warnings') ? 'Total Active' : 'My Total Warnings'}
               </p>
-              <p className="text-lg font-black text-slate-900 leading-none">{filteredWarnings.length}</p>
+              <p className="text-lg font-black text-slate-900 dark:text-white leading-none">{filteredWarnings.length}</p>
             </div>
           </div>
         </div>
@@ -256,46 +256,46 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
       <div className="grid grid-cols-1 lg:grid-cols-4 gap-8">
         {/* Policy Box */}
         <div className="space-y-6 lg:col-span-1">
-          <Card className="border border-slate-100 shadow-sm overflow-hidden bg-white">
-            <CardHeader className="bg-slate-900 text-white pb-6 pt-8">
+          <Card className="border border-slate-100 dark:border-slate-800 shadow-sm overflow-hidden bg-white dark:bg-slate-900">
+            <CardHeader className="bg-slate-900 dark:bg-black text-white pb-6 pt-8">
               <CardTitle className="text-xs font-extrabold tracking-widest uppercase opacity-80 mb-2">Staircase Policy Guidelines</CardTitle>
-              <CardDescription className="text-slate-300 text-xs leading-relaxed">
+              <CardDescription className="text-slate-300 dark:text-slate-400 text-xs leading-relaxed">
                 Rules governing process escalations, quality caps, and remedial paths.
               </CardDescription>
             </CardHeader>
             <CardContent className="pt-6 space-y-4">
               <div className="flex gap-3 items-start">
-                <div className="w-6 h-6 rounded bg-slate-50 flex items-center justify-center text-slate-600 shrink-0 mt-0.5">
+                <div className="w-6 h-6 rounded bg-slate-50 dark:bg-slate-800 flex items-center justify-center text-slate-600 dark:text-slate-300 shrink-0 mt-0.5">
                   <Info size={12} />
                 </div>
                 <div className="text-xs space-y-1">
-                  <p className="font-extrabold text-slate-900">Mild Severity</p>
-                  <p className="text-slate-500 leading-tight">General oral counseling, zero immediate impact on metrics.</p>
+                  <p className="font-extrabold text-slate-900 dark:text-white">Mild Severity</p>
+                  <p className="text-slate-500 dark:text-slate-400 leading-tight">General oral counseling, zero immediate impact on metrics.</p>
                 </div>
               </div>
               <div className="flex gap-3 items-start">
-                <div className="w-6 h-6 rounded bg-yellow-50 flex items-center justify-center text-yellow-600 shrink-0 mt-0.5">
+                <div className="w-6 h-6 rounded bg-yellow-50 dark:bg-yellow-900/30 flex items-center justify-center text-yellow-600 dark:text-yellow-500 shrink-0 mt-0.5">
                   <AlertTriangle size={12} />
                 </div>
                 <div className="text-xs space-y-1">
-                  <p className="font-extrabold text-slate-900">Moderate Severity</p>
-                  <p className="text-slate-500 leading-tight font-medium">Official 1st/2nd reprimand, restricts top performer incentives.</p>
+                  <p className="font-extrabold text-slate-900 dark:text-white">Moderate Severity</p>
+                  <p className="text-slate-500 dark:text-slate-400 leading-tight font-medium">Official 1st/2nd reprimand, restricts top performer incentives.</p>
                 </div>
               </div>
               <div className="flex gap-3 items-start">
-                <div className="w-6 h-6 rounded bg-red-50 flex items-center justify-center text-red-650 shrink-0 mt-0.5">
+                <div className="w-6 h-6 rounded bg-red-50 dark:bg-red-900/30 flex items-center justify-center text-red-650 dark:text-red-500 shrink-0 mt-0.5">
                   <ShieldAlert size={12} />
                 </div>
                 <div className="text-xs space-y-1">
-                  <p className="font-extrabold text-slate-950">Critical Severity</p>
-                  <p className="text-slate-500 leading-tight font-semibold">Immediate target appraisal caps. Action required within 48h.</p>
+                  <p className="font-extrabold text-slate-950 dark:text-white">Critical Severity</p>
+                  <p className="text-slate-500 dark:text-slate-400 leading-tight font-semibold">Immediate target appraisal caps. Action required within 48h.</p>
                 </div>
               </div>
             </CardContent>
-            <CardFooter className="bg-slate-50/50 border-t border-slate-100 flex justify-center py-4">
+            <CardFooter className="bg-slate-50/50 dark:bg-slate-800/30 border-t border-slate-100 dark:border-slate-800 flex justify-center py-4">
               <Button 
                 variant="link" 
-                className="text-xs font-bold text-slate-500 flex items-center gap-1"
+                className="text-xs font-bold text-slate-500 dark:text-slate-400 flex items-center gap-1"
                 render={
                   <a 
                     href="https://docs.google.com/document/d/1zAu2KCCUfOFBA8-nopnc1YRNycaDhCtRPfI7CIgFl7Y/edit?tab=t.ttcgryfeyu7#heading=h.ra63ci5w7hx3" 
@@ -312,12 +312,12 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
 
         {/* Dynamic Disciplinary Logs Table list with Glassmorphism styling */}
         <div className="lg:col-span-3 space-y-6">
-          <div className="flex flex-col sm:flex-row items-center gap-4 bg-white p-4 rounded-xl border border-slate-100">
+          <div className="flex flex-col sm:flex-row items-center gap-4 bg-white dark:bg-slate-900 p-4 rounded-xl border border-slate-100 dark:border-slate-800">
             <div className="relative flex-1 w-full group">
               <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 group-focus-within:text-blue-550 transition-colors" size={18} />
               <Input 
                 placeholder="Search Agent Name, Email, ID, or Description comments..." 
-                className="pl-10 h-10 w-full bg-slate-50/50 border-slate-150 focus:bg-white focus:ring-blue-550 rounded-lg text-sm"
+                className="pl-10 h-10 w-full bg-slate-50/50 dark:bg-slate-800/50 border-slate-150 dark:border-slate-700 focus:bg-white dark:focus:bg-slate-900 focus:ring-blue-550 rounded-lg text-sm dark:text-white"
                 value={searchTerm}
                 onChange={(e) => setSearchTerm(e.target.value)}
               />
@@ -325,13 +325,13 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
             
             <div className="flex items-center gap-2 w-full sm:w-auto shrink-0 select-none">
               <span className="text-xs font-bold text-slate-400 uppercase hidden sm:inline">Status:</span>
-              <div className="flex gap-1 bg-slate-100 p-0.5 rounded-lg border border-slate-200">
+              <div className="flex gap-1 bg-slate-100 dark:bg-slate-800 p-0.5 rounded-lg border border-slate-200 dark:border-slate-700">
                 {['All', 'Pending', 'Accepted'].map((st) => (
                   <button
                     key={st}
                     onClick={() => setStatusFilter(st)}
                     className={`px-2.5 py-1 text-xs font-black rounded-md transition-all cursor-pointer ${
-                      statusFilter === st ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-800'
+                      statusFilter === st ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-white shadow-sm' : 'text-slate-500 hover:text-slate-800 dark:hover:text-slate-300'
                     }`}
                   >
                     {st}
@@ -341,22 +341,22 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
             </div>
           </div>
 
-          <Card className="border border-slate-100 shadow-sm overflow-hidden bg-white">
-            <CardHeader className="border-b border-slate-100 pb-4">
+          <Card className="border border-slate-100 dark:border-slate-800 shadow-sm overflow-hidden bg-white dark:bg-slate-900">
+            <CardHeader className="border-b border-slate-100 dark:border-slate-800 pb-4">
               <div>
-                <CardTitle className="text-lg font-black text-slate-900 tracking-tight">Active Disciplinary Logs</CardTitle>
-                <CardDescription className="text-xs font-medium text-slate-400">Quarterly disciplinary record index across teams</CardDescription>
+                <CardTitle className="text-lg font-black text-slate-900 dark:text-white tracking-tight">Active Disciplinary Logs</CardTitle>
+                <CardDescription className="text-xs font-medium text-slate-400 dark:text-slate-500">Quarterly disciplinary record index across teams</CardDescription>
               </div>
             </CardHeader>
             <CardContent className="p-0">
               <Table>
-                <TableHeader className="bg-slate-50/50">
-                  <TableRow className="hover:bg-transparent border-slate-100">
-                    <TableHead className="w-[110px] font-bold text-slate-800 text-[10px] uppercase tracking-widest pl-6">Type</TableHead>
-                    <TableHead className="font-bold text-slate-800 text-[10px] uppercase tracking-widest">Employee & Agent Info</TableHead>
-                    <TableHead className="font-bold text-slate-800 text-[10px] uppercase tracking-widest w-[110px]">Severity</TableHead>
-                    <TableHead className="font-bold text-slate-800 text-[10px] uppercase tracking-widest w-[110px]">Status</TableHead>
-                    <TableHead className="font-bold text-slate-800 text-[10px] uppercase tracking-widest">Remarks & History</TableHead>
+                <TableHeader className="bg-slate-50/50 dark:bg-slate-800/50">
+                  <TableRow className="hover:bg-transparent border-slate-100 dark:border-slate-800">
+                    <TableHead className="w-[110px] font-bold text-slate-800 dark:text-slate-200 text-[10px] uppercase tracking-widest pl-6">Type</TableHead>
+                    <TableHead className="font-bold text-slate-800 dark:text-slate-200 text-[10px] uppercase tracking-widest">Employee & Agent Info</TableHead>
+                    <TableHead className="font-bold text-slate-800 dark:text-slate-200 text-[10px] uppercase tracking-widest w-[110px]">Severity</TableHead>
+                    <TableHead className="font-bold text-slate-800 dark:text-slate-200 text-[10px] uppercase tracking-widest w-[110px]">Status</TableHead>
+                    <TableHead className="font-bold text-slate-800 dark:text-slate-200 text-[10px] uppercase tracking-widest">Remarks & History</TableHead>
                     <TableHead className="w-[160px] text-right pr-6">Action</TableHead>
                   </TableRow>
                 </TableHeader>
@@ -371,7 +371,7 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
                     const agentDisplayEmpId = targetUser?.uid ? `EMP-2026-${targetUser.uid.substring(0, 4).toUpperCase()}` : (ticket.employeeId || 'EMP-360');
 
                     return (
-                      <TableRow key={ticket.id} className="hover:bg-slate-50/50 border-slate-100 group transition-colors">
+                      <TableRow key={ticket.id} className="hover:bg-slate-50/50 dark:hover:bg-slate-800/50 border-slate-100 dark:border-slate-800 group transition-colors">
                         <TableCell className="pl-6">
                           <Badge className={`border px-2 py-0.5 rounded-full font-extrabold text-[10px] shadow-sm ${getLevelColor(ticket.level)}`}>
                             {ticket.level} Notice
@@ -382,18 +382,18 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
                         </TableCell>
                         <TableCell>
                           <div className="flex flex-col gap-0.5 py-1">
-                            <span className="font-black text-xs text-slate-900">{agentDisplayName}</span>
-                            <span className="text-[10px] text-slate-500 font-mono font-medium">{agentDisplayEmail}</span>
-                            <span className="text-[9px] text-blue-650 font-bold bg-blue-50/80 px-1.5 py-0.5 rounded border border-blue-105 inline-block w-fit font-mono mt-1">
+                            <span className="font-black text-xs text-slate-900 dark:text-white">{agentDisplayName}</span>
+                            <span className="text-[10px] text-slate-500 dark:text-slate-400 font-mono font-medium">{agentDisplayEmail}</span>
+                            <span className="text-[9px] text-blue-650 dark:text-blue-400 font-bold bg-blue-50/80 dark:bg-blue-900/30 px-1.5 py-0.5 rounded border border-blue-105 dark:border-blue-800 inline-block w-fit font-mono mt-1">
                               {agentDisplayEmpId}
                             </span>
                             {targetUser && (
                               <div className="mt-1.5 space-y-0.5">
-                                <p className="text-[9px] font-bold text-slate-400 uppercase tracking-tighter">
-                                  Process: <span className="text-slate-600">{targetUser.department || targetUser.team || 'N/A'}</span>
+                                <p className="text-[9px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-tighter">
+                                  Process: <span className="text-slate-600 dark:text-slate-300">{targetUser.department || targetUser.team || 'N/A'}</span>
                                 </p>
-                                <p className="text-[9px] font-bold text-slate-400 uppercase tracking-tighter">
-                                  TL: <span className="text-slate-600">{targetUser.teamLeadName || 'Unmapped'}</span>
+                                <p className="text-[9px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-tighter">
+                                  TL: <span className="text-slate-600 dark:text-slate-300">{targetUser.teamLeadName || 'Unmapped'}</span>
                                 </p>
                               </div>
                             )}
@@ -411,11 +411,11 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
                         </TableCell>
                         <TableCell>
                           <div className="flex flex-col gap-1 max-w-[280px]">
-                            <p className="text-xs text-slate-650 font-semibold italic leading-relaxed line-clamp-3">
+                            <p className="text-xs text-slate-650 dark:text-slate-300 font-semibold italic leading-relaxed line-clamp-3">
                               "{ticket.remarks}"
                             </p>
                             {ticket.acceptedAt && (
-                              <span className="text-[9px] text-slate-400 font-mono font-bold flex items-center gap-1">
+                              <span className="text-[9px] text-slate-400 dark:text-slate-500 font-mono font-bold flex items-center gap-1">
                                 <CheckCircle size={10} className="text-emerald-500" />
                                 Accepted on: {new Date(ticket.acceptedAt).toLocaleString()}
                               </span>
@@ -427,7 +427,7 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
                             {isSelfTarget && isPending && (
                               <Button 
                                 size="sm" 
-                                className="bg-emerald-650 hover:bg-emerald-700 text-white text-[10px] font-black h-8 px-2.5 rounded-lg shadow-sm cursor-pointer"
+                                className="bg-emerald-650 hover:bg-emerald-700 text-white text-[10px] font-black h-8 px-2.5 rounded-lg shadow-sm cursor-pointer border-none"
                                 onClick={() => handleAccept(ticket)}
                               >
                                 Accept Warning
@@ -436,7 +436,7 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
                             {isSelfTarget && !isPending && ticket.status === 'Accepted' && (
                               <Button 
                                 size="sm" 
-                                className="bg-emerald-100 text-emerald-800 text-[10px] font-black h-8 px-2.5 rounded-lg shadow-sm cursor-default flex items-center gap-1"
+                                className="bg-emerald-100 dark:bg-emerald-900/30 text-emerald-800 dark:text-emerald-400 text-[10px] font-black h-8 px-2.5 rounded-lg shadow-sm cursor-default flex items-center gap-1 border-none"
                                 disabled
                               >
                                 Accepted <CheckCircle size={12} />
@@ -446,7 +446,7 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
                                 <Button 
                                   size="sm" 
                                   variant="ghost" 
-                                  className="text-slate-500 hover:bg-slate-100 h-8 w-8 p-0 cursor-pointer"
+                                  className="text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800 h-8 w-8 p-0 cursor-pointer"
                                   onClick={async () => {
                                     const newRemarks = prompt('Edit warning remarks:', ticket.remarks);
                                     if (newRemarks && newRemarks !== ticket.remarks) {
@@ -468,7 +468,7 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
                                 <Button 
                                   size="sm" 
                                   variant="ghost" 
-                                  className="text-red-500 hover:bg-red-50 h-8 w-8 p-0 cursor-pointer"
+                                  className="text-red-500 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/30 h-8 w-8 p-0 cursor-pointer"
                                   onClick={() => handleDelete(ticket)}
                                 >
                                   <Trash2 size={16} />
@@ -485,7 +485,7 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
                       <TableCell colSpan={6} className="py-24 text-center">
                         <div className="flex flex-col items-center gap-2 opacity-30">
                           <ShieldAlert size={48} strokeWidth={1} />
-                          <p className="text-sm font-bold uppercase tracking-widest text-slate-400">No Disciplinary Log Found</p>
+                          <p className="text-sm font-bold uppercase tracking-widest text-slate-400 dark:text-slate-500">No Disciplinary Log Found</p>
                         </div>
                       </TableCell>
                     </TableRow>

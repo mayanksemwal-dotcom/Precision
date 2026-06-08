@@ -493,8 +493,11 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
     }
   };
 
+  const [isProcessingPunch, setIsProcessingPunch] = useState(false);
+
   // Switch/Punch Shift Operations:
   const handleClockIn = async () => {
+    if (isProcessingPunch) return;
     if (!hasTmsPermission('can_punch_in')) {
       toast.error('Access Denied: You do not have permissions to Punch In.');
       return;
@@ -511,6 +514,25 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
       return;
     }
 
+    // Restriction: Only one clock-in allowed per calendar day IST (unless the user is an admin for testing)
+    const roleUpper = (user.role || '').toUpperCase();
+    if (roleUpper !== 'ADMIN') {
+      // Calculate today in IST
+      const istDate = new Date(new Date().getTime() + (5.5 * 60 * 60 * 1000));
+      const todayIST = istDate.toISOString().split('T')[0];
+      
+      const hasTodayShift = myPastShifts.some(s => {
+        const sIST = new Date(new Date(s.clockInTime).getTime() + (5.5 * 60 * 60 * 1000));
+        return sIST.toISOString().split('T')[0] === todayIST;
+      });
+
+      if (hasTodayShift) {
+        toast.error('Policy Restriction: You have already completed a shift today. Multiple clock-ins in a single cycle are restricted.');
+        return;
+      }
+    }
+
+    setIsProcessingPunch(true);
     try {
       const nowISO = new Date().toISOString();
       const newShift: TMSShift = {
@@ -541,6 +563,8 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
       toast.success(`Clocked In successfully! Process: ${targetProcess}`);
     } catch (e) {
       handleFirestoreError(e, OperationType.WRITE, 'tmsShifts');
+    } finally {
+      setIsProcessingPunch(false);
     }
   };
 
@@ -1985,10 +2009,16 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
                     />
                   </div>
                   <Button 
-                    className="w-full h-12 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-sm rounded-xl flex items-center justify-center gap-2 shadow-sm shadow-emerald-200 cursor-pointer"
+                    disabled={isProcessingPunch}
+                    className="w-full h-12 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-sm rounded-xl flex items-center justify-center gap-2 shadow-sm shadow-emerald-200 cursor-pointer disabled:opacity-50"
                     onClick={handleClockIn}
                   >
-                    <Play size={16} /> GO TO WORK & CLOCK IN
+                    {isProcessingPunch ? (
+                      <RefreshCw size={16} className="animate-spin" />
+                    ) : (
+                      <Play size={16} />
+                    )}
+                    {isProcessingPunch ? 'CLOCKING IN...' : 'GO TO WORK & CLOCK IN'}
                   </Button>
                 </div>
               ) : currentShift.status === 'BREAK' ? (
@@ -2646,10 +2676,10 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
                   onChange={(e) => setReportType(e.target.value as any)}
                   className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 text-xs text-slate-800 font-bold focus:outline-none focus:ring-2 focus:ring-sky-500 cursor-pointer"
                 >
-                  <option value="summary">Utilization Summary Report</option>
-                  <option value="chronological">Detailed Chronological Activity Log (Breaks & Switches)</option>
+                  <option value="summary">Organizational Report</option>
+                  <option value="chronological">Chronological Activity</option>
                   {exportFormat === 'excel' && (
-                    <option value="both">Both Reports (Separate Sheets)</option>
+                    <option value="both">Both Reports</option>
                   )}
                 </select>
               </div>

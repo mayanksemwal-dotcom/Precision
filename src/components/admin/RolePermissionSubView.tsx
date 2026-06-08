@@ -121,7 +121,7 @@ export const RolePermissionSubView: React.FC<RolePermissionSubViewProps> = ({ ad
 
       // 2. Fetch custom fields and roles
       const rolesSnap = await getDocs(collection(db, 'roles'));
-      let fetchedRoles = rolesSnap.docs.map(d => d.data().name as string);
+      let fetchedRoles = Array.from(new Set(rolesSnap.docs.map(d => (d.data().name as string).toUpperCase())));
       if (fetchedRoles.length === 0) {
         const fbBatch = writeBatch(db);
         KNOWN_ROLES.forEach(role => {
@@ -144,8 +144,9 @@ export const RolePermissionSubView: React.FC<RolePermissionSubViewProps> = ({ ad
         const matrixMap: Record<string, Record<string, Omit<RolePermissionDoc, 'role_name' | 'module_name'>>> = {};
         
         permDocs.forEach(docItem => {
-          const r = docItem.role_name;
+          const r = (docItem.role_name || '').toUpperCase();
           const m = docItem.module_name;
+          if (!r || !m) return;
           if (!matrixMap[r]) matrixMap[r] = {};
           matrixMap[r][m] = {
             can_view: !!docItem.can_view,
@@ -596,14 +597,16 @@ export const RolePermissionSubView: React.FC<RolePermissionSubViewProps> = ({ ad
           id: mapId,
           role_name: roleName,
           module_name: mod,
-          ...item
+          can_view: !!item.can_view,
+          can_create: !!item.can_create,
+          can_edit: !!item.can_edit,
+          can_delete: !!item.can_delete,
+          can_export: !!item.can_export,
+          can_approve: !!item.can_approve
         };
 
         if (mod === 'Workforce TMS') {
           payload.tms_permissions = (item as any).tms_permissions || getDefaultTmsPermissions(roleName);
-        } else {
-          // Prevent undefined tms_permissions from breaking Firestore set()
-          delete payload.tms_permissions;
         }
 
         fbBatch.set(doc(db, 'role_permissions', mapId), payload);

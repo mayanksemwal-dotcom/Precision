@@ -14,7 +14,8 @@ import {
   Users, 
   FileText,
   Clock,
-  ExternalLink
+  ExternalLink,
+  RefreshCw
 } from 'lucide-react';
 import { db } from '../../lib/firebase';
 import { doc, setDoc, deleteDoc, writeBatch, collection, getDocs, getDoc } from 'firebase/firestore';
@@ -119,7 +120,16 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
         (u.email || '').toLowerCase().includes(q) ||
         (u.employeeId || '').toLowerCase().includes(q);
       
-      const matchRole = roleFilter ? u.role === roleFilter : true;
+      const matchRole = !roleFilter ? true : (() => {
+        const userRole = (u.role || '').toUpperCase().trim();
+        const filterRole = roleFilter.toUpperCase().trim();
+        
+        if (filterRole === 'TEAM_LEAD' || filterRole === 'TEAM LEAD') {
+          return ['TEAM_LEAD', 'STL', 'QTL', 'OPS_TL', 'TEAM LEAD', 'TRAINER_TL', 'TRAINER TL', 'OPS TL'].includes(userRole);
+        }
+        
+        return userRole === filterRole;
+      })();
       const matchStatus = statusFilter 
         ? (statusFilter === 'Active' ? (u.status?.toLowerCase() === 'active' || u.isActive === true) : (u.status?.toLowerCase() !== 'active' && u.isActive !== true)) 
         : true;
@@ -612,8 +622,18 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
     };
 
     allUsers.forEach(u => {
-      if (counts[u.role] !== undefined) {
-        counts[u.role]++;
+      const role = (u.role || '').toUpperCase();
+      // Normalize common variations to standard internal keys
+      if (['TEAM_LEAD', 'STL', 'QTL', 'OPS_TL', 'TEAM LEAD', 'TRAINER_TL', 'TRAINER TL'].includes(role)) {
+        counts.TEAM_LEAD++;
+      } else if (counts[role] !== undefined) {
+        counts[role]++;
+      } else if (role === 'QA') {
+        counts.QA++;
+      } else if (role === 'AGENT' || role === 'SME' || role === 'TRAINER') {
+        if (role === 'SME') counts.SME++;
+        else if (role === 'TRAINER') counts.TRAINER++;
+        else counts.AGENT++;
       }
     });
 
@@ -862,9 +882,9 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
                       <td className="p-4 text-slate-400 dark:text-slate-500 font-semibold">{user.email}</td>
                       <td className="p-4">
                         <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
-                          user.role.toUpperCase() === 'ADMIN' ? 'bg-red-500/10 text-red-500' :
-                          user.role.toUpperCase() === 'MANAGER' ? 'bg-indigo-500/10 text-indigo-500' :
-                          user.role.toUpperCase() === 'TEAM_LEAD' ? 'bg-amber-500/10 text-amber-500' :
+                          ['ADMIN'].includes(user.role.toUpperCase()) ? 'bg-red-500/10 text-red-500' :
+                          ['MANAGER', 'ASSISTANT_MANAGER'].includes(user.role.toUpperCase()) ? 'bg-indigo-500/10 text-indigo-500' :
+                          ['TEAM_LEAD', 'STL', 'QTL', 'OPS_TL', 'TEAM LEAD'].includes(user.role.toUpperCase()) ? 'bg-amber-500/10 text-amber-500' :
                           user.role.toUpperCase() === 'QA' ? 'bg-blue-500/10 text-blue-500' : 'bg-emerald-500/10 text-emerald-500'
                         }`}>
                           {user.role}
@@ -1101,7 +1121,7 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
                   onSelect={(u) => setNewForm({...newForm, teamLeadName: u.fullName || u.name, teamLeadUid: u.uid})}
                   selectedUserId={newForm.teamLeadUid}
                   placeholder="Map Team Lead..."
-                  roleFilter={[UserRole.TEAM_LEAD, UserRole.MANAGER, UserRole.ADMIN]}
+                  roleFilter={['TEAM_LEAD', 'STL', 'QTL', 'OPS_TL', 'TRAINER_TL', 'TEAM LEAD', 'MANAGER', 'ADMIN']}
                   className="mt-1"
                 />
               </div>
@@ -1246,7 +1266,7 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
                   onSelect={(u) => setEditForm({...editForm, teamLeadName: u.fullName || u.name, teamLeadUid: u.uid})}
                   selectedUserId={editForm.teamLeadUid}
                   placeholder="Reassign Team Lead..."
-                  roleFilter={[UserRole.TEAM_LEAD, UserRole.MANAGER, UserRole.ADMIN]}
+                  roleFilter={['TEAM_LEAD', 'STL', 'QTL', 'OPS_TL', 'TRAINER_TL', 'TEAM LEAD', 'MANAGER', 'ADMIN']}
                   className="mt-1"
                 />
               </div>

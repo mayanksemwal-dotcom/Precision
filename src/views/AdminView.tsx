@@ -42,21 +42,29 @@ interface AdminViewProps {
   allUsers: any[];
   warnings: any[];
   onRefresh?: () => void;
+  externalTheme?: 'light' | 'dark';
 }
 
 export default function AdminView({
   activeTab: mainTab,
   user: requesterUser,
   allUsers,
-  onRefresh
+  onRefresh,
+  externalTheme
 }: AdminViewProps) {
   const { canView, canCreate, canEdit, canDelete } = usePermission();
   
   // Tab Routing inside Admin Console
   const [activeSubTab, setActiveSubTab] = useState<'dashboard' | 'users' | 'roles' | 'mapping' | 'process' | 'audits' | 'data' | 'backup'>('dashboard');
   
-  // Theme Toggle: Premium and professional dark & light themes supported locally inside Administration
-  const [adminTheme, setAdminTheme] = useState<'light' | 'dark'>('light');
+  // Theme Toggle: Sync with global theme if provided, else manage locally
+  const [adminTheme, setAdminTheme] = useState<'light' | 'dark'>(externalTheme || 'light');
+
+  useEffect(() => {
+    if (externalTheme) {
+      setAdminTheme(externalTheme);
+    }
+  }, [externalTheme]);
 
   // Logs admin event helper
   const logAdminEvent = async (action: string, affectedUser: string, prevValue: string, newValue: string) => {
@@ -78,64 +86,6 @@ export default function AdminView({
     }
   };
 
-  // Sync Auth Users
-  const handleSyncAuthUsers = async () => {
-    const loader = toast.loading('Synchronizing Auth collection tables...');
-    try {
-      const response = await fetch('/api/sync-users', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${sessionStorage.getItem('idToken') || ''}`
-        }
-      });
-
-      if (!response.ok) {
-        throw new Error('API server rejected syncing protocol credentials.');
-      }
-
-      const data = await response.json();
-      toast.success(`Successfully synchronized Auth. Synced ${data.syncedCount} new profiles.`);
-      logAdminEvent('User Auth Integration Sync', 'Authorization Database', 'Sync Triggered', `Synced ${data.syncedCount} records`);
-      
-      if (onRefresh) onRefresh();
-    } catch (err: any) {
-      toast.error('Sync failed: ' + err.message);
-    } finally {
-      toast.dismiss(loader);
-    }
-  };
-
-  // Preserved Demo Seeder procedure 
-  const handleSeedDemoUsers = async () => {
-    const loader = toast.loading('Seeding baseline demo profiles...');
-    try {
-      const demoUsers = [
-        { uid: 'demo_tl_1', fullName: 'Satyen Vaishnavi', name: 'Satyen Vaishnavi', email: 'satyen.vaishnavi@bergtechnologies.co.in', role: 'TEAM_LEAD', employeeId: 'BT-TL11', department: 'Operations', process: 'Campaign Core', dateJoined: '2025-01-01', status: 'Active', isActive: true },
-        { uid: 'demo_tl_2', fullName: 'Akshit Sodhi', name: 'Akshit Sodhi', email: 'akshit.sodhi@bergtechnologies.co.in', role: 'TEAM_LEAD', employeeId: 'BT-TL12', department: 'Operations', process: 'Mobile Verticals', dateJoined: '2025-01-05', status: 'Active', isActive: true },
-        { uid: 'demo_mgr_1', fullName: 'Mayank Semwal', name: 'Mayank Semwal', email: 'mayank.semwal@bergtechnologies.co.in', role: 'ADMIN', employeeId: 'BT-MGR01', department: 'Management', process: 'Core Platform', dateJoined: '2024-06-01', status: 'Active', isActive: true },
-        { uid: 'demo_agt_1', fullName: 'Aatish Gupta', name: 'Aatish Gupta', email: 'aatish.gupta@bergtechnologies.co.in', role: 'AGENT', employeeId: 'BT-AG01', department: 'Operations', process: 'Campaign Core', teamLeadId: 'demo_tl_1', teamLeadName: 'Satyen Vaishnavi', status: 'Active', isActive: true },
-        { uid: 'demo_agt_2', fullName: 'Aaryan Gurung', name: 'Aaryan Gurung', email: 'aaryan.gurung@bergtechnologies.co.in', role: 'AGENT', employeeId: 'BT-AG02', department: 'Operations', process: 'Mobile Verticals', teamLeadId: 'demo_tl_2', teamLeadName: 'Akshit Sodhi', status: 'Active', isActive: true }
-      ];
-
-      const batch = writeBatch(db);
-      demoUsers.forEach(u => {
-        batch.set(doc(db, 'users', u.uid), u);
-      });
-
-      await batch.commit();
-      toast.success('Demo organizational baseline profiles seeded successfully.');
-      logAdminEvent('Organizational Demo Seeder Run', 'Enterprise Roster', 'Baseline', '5 Demo Accounts Pre-provisioned');
-      
-      if (onRefresh) onRefresh();
-    } catch (err: any) {
-      toast.error('Demo seeder failed to complete: ' + err.message);
-    } finally {
-      toast.dismiss(loader);
-    }
-  };
-
-  // Internal Navigation tabs 
   const subTabs = [
     { id: 'dashboard', label: 'Dashboard', icon: ShieldCheck, visible: true },
     { id: 'users', label: 'User Directory', icon: Users, visible: canEdit('Console') || canCreate('Console') },
@@ -175,22 +125,6 @@ export default function AdminView({
             title="Toggle Console Color Space"
           >
             {adminTheme === 'dark' ? <Sun size={15} /> : <Moon size={15} />}
-          </button>
-
-          {/* Sync Auth buttons */}
-          <button 
-            onClick={handleSyncAuthUsers}
-            className={`px-3 py-1.5 text-xs font-bold rounded-xl border flex items-center gap-1.5 cursor-pointer ${adminTheme === 'dark' ? 'bg-slate-800 border-slate-700 hover:bg-slate-705 text-slate-200' : 'bg-white border-slate-202 hover:bg-slate-55'}`}
-          >
-            <RefreshCw size={12} className="animate-spin-slow animate-pulse" /> Sync Credentials
-          </button>
-
-          {/* Demo seeder */}
-          <button 
-            onClick={handleSeedDemoUsers} 
-            className="px-3 py-1.5 text-xs font-bold rounded-xl cursor-pointer text-white bg-indigo-600 hover:bg-indigo-700 shadow-md flex items-center gap-1.5 flex-wrap"
-          >
-            <Upload size={12} /> Seed Core Demo Users
           </button>
         </div>
       </div>
