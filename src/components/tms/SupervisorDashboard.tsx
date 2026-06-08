@@ -126,6 +126,44 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
   const [exportReportType, setExportReportType] = useState<'summary' | 'chrono' | 'both'>('both');
   const [exportFormat, setExportFormat] = useState<'excel' | 'csv'>('excel');
 
+  // Searchable Dropdowns States & Refs
+  const [isTlDropdownOpen, setIsTlDropdownOpen] = useState(false);
+  const [tlSearchQuery, setTlSearchQuery] = useState('');
+  const tlDropdownRef = React.useRef<HTMLDivElement>(null);
+
+  const [isStatusDropdownOpen, setIsStatusDropdownOpen] = useState(false);
+  const statusDropdownRef = React.useRef<HTMLDivElement>(null);
+
+  const [isProcessDropdownOpen, setIsProcessDropdownOpen] = useState(false);
+  const [processSearchQuery, setProcessSearchQuery] = useState('');
+  const processDropdownRef = React.useRef<HTMLDivElement>(null);
+
+  const [isManagerDropdownOpen, setIsManagerDropdownOpen] = useState(false);
+  const [managerSearchQuery, setManagerSearchQuery] = useState('');
+  const managerDropdownRef = React.useRef<HTMLDivElement>(null);
+
+  // Close dropdowns click-outside listener
+  useEffect(() => {
+    function handleClickOutside(event: MouseEvent) {
+      if (tlDropdownRef.current && !tlDropdownRef.current.contains(event.target as Node)) {
+        setIsTlDropdownOpen(false);
+      }
+      if (statusDropdownRef.current && !statusDropdownRef.current.contains(event.target as Node)) {
+        setIsStatusDropdownOpen(false);
+      }
+      if (processDropdownRef.current && !processDropdownRef.current.contains(event.target as Node)) {
+        setIsProcessDropdownOpen(false);
+      }
+      if (managerDropdownRef.current && !managerDropdownRef.current.contains(event.target as Node)) {
+        setIsManagerDropdownOpen(false);
+      }
+    }
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside);
+    };
+  }, []);
+
   // Hierarchy validation helper (checks if current supervisor is authorized to edit target)
   const canModifyTarget = (targetUid: string) => {
     if (user.uid === targetUid) return false;
@@ -157,15 +195,46 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
     return allUsers.filter(u => u.status === 'Active' && canActOn(user, u, allUsers));
   }, [allUsers, user, tlFilter]);
 
-  // List of unique Team Leads who have members in mappedUsers
+  // List of unique Team Leads who have members in mappedUsers or have a TL role
   const teamLeadsList = useMemo(() => {
-    const leads = new Map<string, string>();
+    const leads = new Map<string, { name: string; role: string }>();
+    
+    // 1. Add anyone explicitly referenced as a team lead in any active user's profile
     allUsers.forEach(u => {
       if (u.teamLeadId && u.teamLeadName) {
-        leads.set(u.teamLeadId, u.teamLeadName);
+        // Find their actual role if exists, otherwise fallback to 'TEAM_LEAD'
+        const tlObj = allUsers.find(candidate => candidate.uid === u.teamLeadId);
+        const roleStr = tlObj ? (tlObj.role || 'TEAM_LEAD') : 'TEAM_LEAD';
+        leads.set(u.teamLeadId, { name: u.teamLeadName, role: String(roleStr) });
       }
     });
-    const list = Array.from(leads.entries()).map(([id, name]) => ({ id, name }));
+
+    // 2. Add anyone who holds a Team Lead/Supervisor-like role and has status = 'Active'
+    const tlRoles = ['TEAM_LEAD', 'STL', 'OPS_TL', 'QTL', 'TRAINER_TL', 'TEAM LEAD', 'OPS TL', 'TRAINER TL'];
+    allUsers.forEach(u => {
+      const roleUpper = (u.role || '').toString().toUpperCase().trim();
+      if (u.status === 'Active' && tlRoles.includes(roleUpper)) {
+        const tlName = u.fullName || u.name || u.employeeName;
+        if (tlName) {
+          leads.set(u.uid, { name: tlName, role: String(u.role) });
+        }
+      }
+    });
+
+    const getFriendlyRole = (role: string): string => {
+      const r = (role || '').toString().toUpperCase().trim().replace(/_/g, ' ');
+      if (r === 'TEAM LEAD') return 'TL';
+      if (r === 'TRAINER TL') return 'Trainer TL';
+      if (r === 'OPS TL') return 'Ops TL';
+      return r;
+    };
+
+    const list = Array.from(leads.entries()).map(([id, item]) => ({ 
+      id, 
+      name: item.name, 
+      roleDisplay: getFriendlyRole(item.role)
+    }));
+
     // Prioritize showing the current user's entry first if they are a Team Lead
     return list.sort((a, b) => {
       if (a.id === user.uid) return -1;
@@ -1218,61 +1287,326 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
 
               {/* Multiple Advanced Pull-down Options */}
               <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-5 gap-3 text-xs">
-                <div>
+                <div className="relative" ref={statusDropdownRef}>
                   <label className="block text-[10px] uppercase font-bold text-slate-400 mb-1">Status Filter</label>
-                  <select 
-                    value={shiftFilter}
-                    onChange={(e) => { setShiftFilter(e.target.value); setCurrentPage(1); }}
-                    className="w-full bg-white border border-slate-200 rounded-lg p-2 font-bold focus:outline-none focus:ring-1 focus:ring-indigo-500 cursor-pointer text-slate-700"
+                  <button
+                    type="button"
+                    onClick={() => setIsStatusDropdownOpen(!isStatusDropdownOpen)}
+                    className="w-full bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg p-2 font-bold text-left text-slate-700 dark:text-slate-200 cursor-pointer flex justify-between items-center text-xs shadow-xs focus:ring-1 focus:ring-indigo-500"
                   >
-                    <option value="all">🟢 Status: All</option>
-                    <option value="active">🟢 Active Workflow</option>
-                    <option value="break">🟠 Rest Breaks</option>
-                    <option value="offline">⚪ Offline Staff</option>
-                  </select>
-                </div>
+                    <span className="truncate">
+                      {shiftFilter === 'all' && "🟢 Status: All"}
+                      {shiftFilter === 'active' && "🟢 Active Workflow"}
+                      {shiftFilter === 'break' && "🟠 Rest Breaks"}
+                      {shiftFilter === 'offline' && "⚪ Offline Staff"}
+                    </span>
+                    <span className="text-slate-400 text-[10px]">▼</span>
+                  </button>
 
-                <div>
-                  <label className="block text-[10px] uppercase font-bold text-slate-400 mb-1">Process Filter</label>
-                  <select 
-                    value={processFilter}
-                    onChange={(e) => { setProcessFilter(e.target.value); setCurrentPage(1); }}
-                    className="w-full bg-white border border-slate-200 rounded-lg p-2 font-bold focus:outline-none focus:ring-1 focus:ring-indigo-500 cursor-pointer text-slate-700"
-                  >
-                    <option value="all">🚀 Process: All</option>
-                    {uniqueActiveProcesses.map(proc => (
-                      <option key={proc} value={proc}>{proc}</option>
-                    ))}
-                  </select>
-                </div>
-
-                <div>
-                  <label className="block text-[10px] uppercase font-bold text-slate-400 mb-1">Team Lead Mapped</label>
-                  <select 
-                    value={tlFilter}
-                    onChange={(e) => { setTlFilter(e.target.value); setCurrentPage(1); }}
-                    className="w-full bg-white border border-slate-200 rounded-lg p-2 font-bold focus:outline-none focus:ring-1 focus:ring-indigo-500 cursor-pointer text-slate-700"
-                  >
-                    <option value="all">🗺️ Team Lead: All</option>
-                    {teamLeadsList.map(tl => (
-                      <option key={tl.id} value={tl.id}>{tl.name}</option>
-                    ))}
-                  </select>
-                </div>
-
-                {(user.role || '').toUpperCase() === 'ADMIN' ? (
-                  <div>
-                    <label className="block text-[10px] uppercase font-bold text-slate-400 mb-1">Manager Filter</label>
-                    <select 
-                      value={managerFilter}
-                      onChange={(e) => { setManagerFilter(e.target.value); setCurrentPage(1); }}
-                      className="w-full bg-white border border-slate-200 rounded-lg p-2 font-bold focus:outline-none focus:ring-1 focus:ring-indigo-500 cursor-pointer text-slate-700"
-                    >
-                      <option value="all">🏢 Manager: All</option>
-                      {managersList.map(mgr => (
-                        <option key={mgr.uid} value={mgr.uid}>{mgr.name}</option>
+                  {isStatusDropdownOpen && (
+                    <div className="absolute left-0 right-0 mt-1 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg shadow-lg z-50 p-1 space-y-0.5 max-h-60 overflow-y-auto animate-in fade-in slide-in-from-top-1 duration-100">
+                      {[
+                        { val: 'all', label: '🟢 Status: All' },
+                        { val: 'active', label: '🟢 Active Workflow' },
+                        { val: 'break', label: '🟠 Rest Breaks' },
+                        { val: 'offline', label: '⚪ Offline Staff' }
+                      ].map(opt => (
+                        <button
+                          key={opt.val}
+                          type="button"
+                          onClick={() => {
+                            setShiftFilter(opt.val);
+                            setCurrentPage(1);
+                            setIsStatusDropdownOpen(false);
+                          }}
+                          className={`w-full text-left text-xs px-2.5 py-1.5 rounded-md font-bold transition-all ${
+                            shiftFilter === opt.val 
+                              ? 'bg-indigo-50 dark:bg-indigo-950/40 text-indigo-600 dark:text-indigo-400 border-l-2 border-indigo-500' 
+                              : 'text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-850'
+                          }`}
+                        >
+                          {opt.label}
+                        </button>
                       ))}
-                    </select>
+                    </div>
+                  )}
+                </div>
+
+                <div className="relative" ref={processDropdownRef}>
+                  <label className="block text-[10px] uppercase font-bold text-slate-400 mb-1">Process Filter</label>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsProcessDropdownOpen(!isProcessDropdownOpen);
+                      setProcessSearchQuery('');
+                    }}
+                    className="w-full bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg p-2 font-bold text-left text-slate-700 dark:text-slate-200 cursor-pointer flex justify-between items-center text-xs shadow-xs focus:ring-1 focus:ring-indigo-500"
+                  >
+                    <span className="truncate">
+                      {processFilter === 'all' ? "🚀 Process: All" : `🚀 ${processFilter}`}
+                    </span>
+                    <span className="text-slate-400 text-[10px]">▼</span>
+                  </button>
+
+                  {isProcessDropdownOpen && (
+                    <div className="absolute left-0 right-0 mt-1 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg shadow-lg z-50 max-h-64 flex flex-col overflow-hidden animate-in fade-in slide-in-from-top-1 duration-100">
+                      <div className="p-1 px-2 border-b border-slate-100 dark:border-slate-850 flex items-center gap-1.5 bg-slate-50 dark:bg-slate-950">
+                        <Search size={12} className="text-slate-400 shrink-0" />
+                        <input
+                          type="text"
+                          value={processSearchQuery}
+                          onChange={(e) => setProcessSearchQuery(e.target.value)}
+                          placeholder="Search processes..."
+                          className="w-full bg-transparent text-xs py-1.5 font-medium text-slate-700 dark:text-slate-200 focus:outline-none placeholder-slate-400"
+                          autoFocus
+                        />
+                        {processSearchQuery && (
+                          <button 
+                            type="button" 
+                            onClick={() => setProcessSearchQuery('')} 
+                            className="text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 text-xs font-bold px-1"
+                          >
+                            ×
+                          </button>
+                        )}
+                      </div>
+                      <div className="overflow-y-auto max-h-48 p-1 space-y-0.5">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setProcessFilter('all');
+                            setCurrentPage(1);
+                            setIsProcessDropdownOpen(false);
+                          }}
+                          className={`w-full text-left text-xs px-2.5 py-1.5 rounded-md font-bold transition-all ${
+                            processFilter === 'all' 
+                              ? 'bg-indigo-50 dark:bg-indigo-950/40 text-indigo-600 dark:text-indigo-400' 
+                              : 'text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-850'
+                          }`}
+                        >
+                          🚀 Process: All
+                        </button>
+                        {uniqueActiveProcesses
+                          .filter(proc => proc.toLowerCase().includes(processSearchQuery.toLowerCase()))
+                          .map(proc => (
+                            <button
+                              key={proc}
+                              type="button"
+                              onClick={() => {
+                                setProcessFilter(proc);
+                                setCurrentPage(1);
+                                setIsProcessDropdownOpen(false);
+                              }}
+                              className={`w-full text-left text-xs px-2.5 py-1.5 rounded-md font-bold transition-all flex items-center gap-1.5 overflow-hidden text-ellipsis ${
+                                processFilter === proc 
+                                  ? 'bg-indigo-50 dark:bg-indigo-950/40 text-indigo-600 dark:text-indigo-400 border-l-2 border-indigo-500' 
+                                  : 'text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-850'
+                              }`}
+                            >
+                              <span className="truncate">{proc}</span>
+                            </button>
+                          ))}
+                        {uniqueActiveProcesses.filter(proc => proc.toLowerCase().includes(processSearchQuery.toLowerCase())).length === 0 && (
+                          <div className="text-center text-slate-400 dark:text-slate-500 text-[11px] py-4">
+                            No matching processes
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                <div className="relative" ref={tlDropdownRef}>
+                  <label className="block text-[10px] uppercase font-bold text-slate-400 mb-1">Team Lead Mapped</label>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsTlDropdownOpen(!isTlDropdownOpen);
+                      setTlSearchQuery('');
+                    }}
+                    className="w-full bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg p-2 font-bold text-left text-slate-700 dark:text-slate-200 cursor-pointer flex justify-between items-center text-xs shadow-xs focus:ring-1 focus:ring-indigo-500"
+                  >
+                    <span className="truncate">
+                      {tlFilter === 'all' ? (
+                        "🗺️ Team Lead: All"
+                      ) : (
+                        `👤 ${teamLeadsList.find(tl => tl.id === tlFilter)?.name || tlFilter} ${
+                          teamLeadsList.find(tl => tl.id === tlFilter)?.roleDisplay 
+                            ? `(${teamLeadsList.find(tl => tl.id === tlFilter)?.roleDisplay})` 
+                            : ''
+                        }`
+                      )}
+                    </span>
+                    <span className="text-slate-400 text-[10px]">▼</span>
+                  </button>
+
+                  {isTlDropdownOpen && (
+                    <div className="absolute left-0 right-0 mt-1 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg shadow-lg z-50 max-h-64 flex flex-col overflow-hidden animate-in fade-in slide-in-from-top-1 duration-100">
+                      <div className="p-1 px-2 border-b border-slate-100 dark:border-slate-850 flex items-center gap-1.5 bg-slate-50 dark:bg-slate-950">
+                        <Search size={12} className="text-slate-400 shrink-0" />
+                        <input
+                          type="text"
+                          value={tlSearchQuery}
+                          onChange={(e) => setTlSearchQuery(e.target.value)}
+                          placeholder="Search supervisors..."
+                          className="w-full bg-transparent text-xs py-1.5 font-medium text-slate-700 dark:text-slate-200 focus:outline-none placeholder-slate-400"
+                          autoFocus
+                        />
+                        {tlSearchQuery && (
+                          <button 
+                            type="button" 
+                            onClick={() => setTlSearchQuery('')} 
+                            className="text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 text-xs font-bold px-1"
+                          >
+                            ×
+                          </button>
+                        )}
+                      </div>
+                      <div className="overflow-y-auto max-h-48 p-1 space-y-0.5">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setTlFilter('all');
+                            setCurrentPage(1);
+                            setIsTlDropdownOpen(false);
+                          }}
+                          className={`w-full text-left text-xs px-2.5 py-1.5 rounded-md font-bold transition-all flex items-center gap-1.5 ${
+                            tlFilter === 'all' 
+                              ? 'bg-indigo-50 dark:bg-indigo-950/40 text-indigo-600 dark:text-indigo-400' 
+                              : 'text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-850'
+                          }`}
+                        >
+                          🗺️ Team Lead: All
+                        </button>
+                        {teamLeadsList
+                          .filter(tl => 
+                            tl.name.toLowerCase().includes(tlSearchQuery.toLowerCase()) || 
+                            (tl.roleDisplay && tl.roleDisplay.toLowerCase().includes(tlSearchQuery.toLowerCase()))
+                          )
+                          .map(tl => (
+                            <button
+                              key={tl.id}
+                              type="button"
+                              onClick={() => {
+                                setTlFilter(tl.id);
+                                setCurrentPage(1);
+                                setIsTlDropdownOpen(false);
+                              }}
+                              className={`w-full text-left text-xs px-2.5 py-1.5 rounded-md font-bold transition-all flex items-center gap-1.5 overflow-hidden text-ellipsis ${
+                                tlFilter === tl.id 
+                                  ? 'bg-indigo-50 dark:bg-indigo-950/40 text-indigo-600 dark:text-indigo-400 border-l-2 border-indigo-500' 
+                                  : 'text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-850'
+                              }`}
+                            >
+                              <span className="shrink-0">👤</span>
+                              <span className="truncate">{tl.name}</span>
+                              {tl.roleDisplay && (
+                                <span className="text-[10px] opacity-60 font-mono shrink-0 ml-auto bg-slate-100 dark:bg-slate-800 px-1 py-0.5 rounded">
+                                  {tl.roleDisplay}
+                                </span>
+                              )}
+                            </button>
+                          ))}
+                        {teamLeadsList.filter(tl => 
+                          tl.name.toLowerCase().includes(tlSearchQuery.toLowerCase()) || 
+                          (tl.roleDisplay && tl.roleDisplay.toLowerCase().includes(tlSearchQuery.toLowerCase()))
+                        ).length === 0 && (
+                          <div className="text-center text-slate-400 dark:text-slate-500 text-[11px] py-4">
+                            No matching supervisors
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                {['ADMIN', 'MANAGER'].includes((user.role || '').toUpperCase()) ? (
+                  <div className="relative" ref={managerDropdownRef}>
+                    <label className="block text-[10px] uppercase font-bold text-slate-400 mb-1">Manager Filter</label>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsManagerDropdownOpen(!isManagerDropdownOpen);
+                        setManagerSearchQuery('');
+                      }}
+                      className="w-full bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg p-2 font-bold text-left text-slate-700 dark:text-slate-200 cursor-pointer flex justify-between items-center text-xs shadow-xs focus:ring-1 focus:ring-indigo-500"
+                    >
+                      <span className="truncate">
+                        {managerFilter === 'all' ? (
+                          "🏢 Manager: All"
+                        ) : (
+                          `🏢 ${managersList.find(m => m.uid === managerFilter)?.name || managerFilter}`
+                        )}
+                      </span>
+                      <span className="text-slate-400 text-[10px]">▼</span>
+                    </button>
+
+                    {isManagerDropdownOpen && (
+                      <div className="absolute left-0 right-0 mt-1 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg shadow-lg z-50 max-h-64 flex flex-col overflow-hidden animate-in fade-in slide-in-from-top-1 duration-100">
+                        <div className="p-1 px-2 border-b border-slate-100 dark:border-slate-850 flex items-center gap-1.5 bg-slate-50 dark:bg-slate-950">
+                          <Search size={12} className="text-slate-400 shrink-0" />
+                          <input
+                            type="text"
+                            value={managerSearchQuery}
+                            onChange={(e) => setManagerSearchQuery(e.target.value)}
+                            placeholder="Search managers..."
+                            className="w-full bg-transparent text-xs py-1.5 font-medium text-slate-700 dark:text-slate-200 focus:outline-none placeholder-slate-400"
+                            autoFocus
+                          />
+                          {managerSearchQuery && (
+                            <button 
+                              type="button" 
+                              onClick={() => setManagerSearchQuery('')} 
+                              className="text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 text-xs font-bold px-1"
+                            >
+                              ×
+                            </button>
+                          )}
+                        </div>
+                        <div className="overflow-y-auto max-h-48 p-1 space-y-0.5">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setManagerFilter('all');
+                              setCurrentPage(1);
+                              setIsManagerDropdownOpen(false);
+                            }}
+                            className={`w-full text-left text-xs px-2.5 py-1.5 rounded-md font-bold transition-all ${
+                              managerFilter === 'all' 
+                                ? 'bg-indigo-50 dark:bg-indigo-950/40 text-indigo-600 dark:text-indigo-400' 
+                                : 'text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-850'
+                            }`}
+                          >
+                            🏢 Manager: All
+                          </button>
+                          {managersList
+                            .filter(m => m.name.toLowerCase().includes(managerSearchQuery.toLowerCase()))
+                            .map(m => (
+                              <button
+                                key={m.uid}
+                                type="button"
+                                onClick={() => {
+                                  setManagerFilter(m.uid);
+                                  setCurrentPage(1);
+                                  setIsManagerDropdownOpen(false);
+                                }}
+                                className={`w-full text-left text-xs px-2.5 py-1.5 rounded-md font-bold transition-all flex items-center gap-1.5 overflow-hidden text-ellipsis ${
+                                  managerFilter === m.uid 
+                                    ? 'bg-indigo-50 dark:bg-indigo-950/40 text-indigo-600 dark:text-indigo-400 border-l-2 border-indigo-500' 
+                                    : 'text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-850'
+                                }`}
+                              >
+                                <span className="truncate">{m.name}</span>
+                              </button>
+                            ))}
+                          {managersList.filter(m => m.name.toLowerCase().includes(managerSearchQuery.toLowerCase())).length === 0 && (
+                            <div className="text-center text-slate-400 dark:text-slate-500 text-[11px] py-4">
+                              No matching managers
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    )}
                   </div>
                 ) : <div className="hidden"></div>}
 
@@ -1295,10 +1629,10 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
             </div>
 
             {/* Table layout */}
-            <div className="overflow-x-auto">
+            <div className="overflow-auto max-h-[650px] border border-slate-150 dark:border-slate-800 rounded-xl scrollbar-thin">
               <table className="w-full text-left text-xs border-collapse">
-                <thead>
-                  <tr className="bg-slate-100 text-slate-600 font-black text-[9px] uppercase tracking-wider select-none border-b border-slate-200">
+                <thead className="sticky top-0 z-10 bg-slate-100 dark:bg-slate-850 shadow-xs">
+                  <tr className="bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 font-black text-[9px] uppercase tracking-wider select-none border-b border-slate-200 dark:border-slate-700">
                     <th className="p-4 pl-6 cursor-pointer" onClick={() => { setSortKey('name'); setSortOrder(prev => prev === 'asc' ? 'desc' : 'asc'); }}>Employee Name</th>
                     <th className="p-4">Process Mapping</th>
                     <th className="p-4">Current Activity</th>

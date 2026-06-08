@@ -53,7 +53,13 @@ export function canActOn(actor: UserProfile, target: UserProfile, allUsers: User
   // 1. Admin bypass
   if (actorRole === UserRole.ADMIN) return true;
 
-  // 2. Check if actor role is allowed to supervise target role
+  // 2. Manager bypass: Managers are executive roles that have global authority over all subordinate roles.
+  if (actorRole === UserRole.MANAGER) {
+    const subordinates = HIERARCHY_MAP[UserRole.MANAGER] || [];
+    return subordinates.includes(targetRole);
+  }
+
+  // 3. Check if actor role is allowed to supervise target role
   const subordinates = HIERARCHY_MAP[actorRole] || [];
   const isRoleAuthorized = subordinates.includes(targetRole);
 

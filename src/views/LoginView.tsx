@@ -103,7 +103,7 @@ export default function LoginView() {
             <CardHeader className="text-center pt-10 pb-2">
             <div className="flex justify-center mb-4">
                 <div className="bg-white p-2.5 rounded-2xl shadow-inner overflow-hidden flex items-center justify-center">
-                <BergLogo className="h-14 w-48" showSubtitle={false} scaleClass="scale-[1.9]" />
+                <BergLogo className="h-14 w-48" showSubtitle={false} />
                 </div>
             </div>
             <CardTitle className="text-2xl font-black text-white tracking-tight">Login</CardTitle>

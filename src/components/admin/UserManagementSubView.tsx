@@ -522,7 +522,7 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
     }
   };
 
-  // Offline parsing for bulk csv copy-paste
+  // Offline parsing for bulk csv copy-paste with support for updating existing users
   const handleBulkImport = async () => {
     if (!bulkText.trim()) {
       toast.error('Please paste CSV raw string.');
@@ -531,62 +531,87 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
     const lines = bulkText.split('\n');
     let commitCount = 0;
     try {
-      const batch = writeBatch(db);
+      let batch = writeBatch(db);
+      let opCount = 0;
+
       for (let line of lines) {
         if (!line.trim()) continue;
         const [empId, name, email, roleStr, dept, processStr, joinDate, notesStr] = line.split(',').map(s => s?.trim() || '');
         if (!email || !name) continue;
 
-        // Generate safe document id or mock uid hash
+        // Skip CSV header line if pasted
         const parsedEmail = email.toLowerCase();
-        const fakeUid = 'local_' + btoa(parsedEmail).replace(/=/g, '').slice(0,12);
+        if (parsedEmail === 'email') continue;
+
+        // Find existing user to update instead of blindly generating a local_ uid
+        const existingUser = allUsers.find(u => u.email?.toLowerCase().trim() === parsedEmail);
+        const targetUid = existingUser?.uid || existingUser?.id || ('local_' + btoa(parsedEmail).replace(/=/g, '').slice(0,12));
 
         const profileDoc = {
-          uid: fakeUid,
-          employeeId: empId || '',
-          name: name,
-          fullName: name,
+          uid: targetUid,
+          employeeId: empId || existedOrEmpty(existingUser, 'employeeId'),
+          name: name || existedOrEmpty(existingUser, 'name') || existedOrEmpty(existingUser, 'fullName') || '',
+          fullName: name || existedOrEmpty(existingUser, 'fullName') || existedOrEmpty(existingUser, 'name') || '',
           email: parsedEmail,
-          role: (roleStr as UserRole) || 'AGENT',
-          department: dept || 'Operations',
-          process: processStr || '',
-          dateJoined: joinDate || new Date().toISOString().slice(0,10),
-          notes: notesStr || '',
+          role: (roleStr as UserRole) || existedOrEmpty(existingUser, 'role') || 'AGENT',
+          department: dept || existedOrEmpty(existingUser, 'department') || 'Operations',
+          process: processStr || existedOrEmpty(existingUser, 'process') || '',
+          dateJoined: joinDate || existedOrEmpty(existingUser, 'dateJoined') || new Date().toISOString().slice(0,10),
+          notes: notesStr || existedOrEmpty(existingUser, 'notes') || '',
           status: 'Active',
           isActive: true,
-          createdAt: new Date().toISOString()
+          ...(!existingUser && { createdAt: new Date().toISOString() })
         };
-
-        batch.set(doc(db, 'users', fakeUid), profileDoc);
 
         const masterData = {
-          employeeId: empId || '',
-          employeeName: name,
+          employeeId: empId || existedOrEmpty(existingUser, 'employeeId'),
+          employeeName: name || existedOrEmpty(existingUser, 'fullName') || existedOrEmpty(existingUser, 'name') || '',
           email: parsedEmail,
-          role: (roleStr as UserRole) || 'AGENT',
-          department: dept || 'Operations',
-          process: processStr || '',
-          teamLeadId: '',
-          teamLeadName: '',
-          managerId: '',
-          managerName: '',
+          role: (roleStr as UserRole) || existedOrEmpty(existingUser, 'role') || 'AGENT',
+          department: dept || existedOrEmpty(existingUser, 'department') || 'Operations',
+          process: processStr || existedOrEmpty(existingUser, 'process') || '',
+          teamLeadId: existedOrEmpty(existingUser, 'teamLeadId'),
+          teamLeadName: existedOrEmpty(existingUser, 'teamLeadName'),
+          managerId: existedOrEmpty(existingUser, 'managerId'),
+          managerName: existedOrEmpty(existingUser, 'managerName'),
           status: 'Active',
-          dateJoined: joinDate || new Date().toISOString().slice(0,10),
+          dateJoined: joinDate || existedOrEmpty(existingUser, 'dateJoined') || new Date().toISOString().slice(0,10),
           lastUpdated: new Date().toISOString()
         };
-        batch.set(doc(db, 'employee_master', fakeUid), masterData);
+
+        // Standard Firestore batch limit is 500 operations. We chunk at 400 operations.
+        if (opCount >= 400) {
+          await batch.commit();
+          batch = writeBatch(db);
+          opCount = 0;
+        }
+
+        batch.set(doc(db, 'users', targetUid), profileDoc, { merge: true });
+        batch.set(doc(db, 'employee_master', targetUid), masterData, { merge: true });
+        opCount += 2;
         commitCount++;
       }
-      await batch.commit();
-      toast.success(`Successfully initialized ${commitCount} agent directories.`);
-      logAdminEvent('CSV Roster Upload', `${commitCount} batch entries`, 'Blank', 'Pre-authorized users');
+
+      if (opCount > 0) {
+        await batch.commit();
+      }
+
+      toast.success(`Successfully updated/initialized ${commitCount} user profiles.`);
+      logAdminEvent('CSV Roster Upload', `${commitCount} batch entries`, 'Blank', 'Roster update/creation sync');
       setIsBulkOpen(false);
       setBulkText('');
       onRefresh();
     } catch (err: any) {
+      console.error(err);
       toast.error('CSV Import runtime parsing failed.');
     }
   };
+
+  // Helper helper to get values robustly
+  function existedOrEmpty(userObj: any, fieldKey: string): string {
+    if (!userObj) return '';
+    return userObj[fieldKey] || '';
+  }
 
   const handleNotesSave = async () => {
     if (!isNotesOpen) return;
@@ -831,9 +856,9 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
 
       {/* Directory Table Grid */}
       <div className={`overflow-hidden border rounded-2xl ${adminTheme === 'dark' ? 'bg-slate-900/60 border-slate-800' : 'bg-white border-slate-200 shadow-sm'}`}>
-        <div className="overflow-x-auto">
-          <table className="w-full text-left text-xs">
-            <thead className={adminTheme === 'dark' ? 'bg-slate-800 text-slate-300 font-bold uppercase text-[10px]' : 'bg-slate-50 text-slate-500 font-bold uppercase text-[10px]'}>
+        <div className="overflow-auto max-h-[650px] scrollbar-thin">
+          <table className="w-full text-left text-xs border-collapse">
+            <thead className={`sticky top-0 z-10 shadow-xs backdrop-blur-sm ${adminTheme === 'dark' ? 'bg-slate-800 text-slate-305 font-bold uppercase text-[10px]' : 'bg-slate-50 text-slate-505 font-bold uppercase text-[10px]'}`}>
               <tr>
                 <th className="p-4 w-10 text-center">
                   <button onClick={toggleSelectAll} className="p-0.5 text-slate-400">

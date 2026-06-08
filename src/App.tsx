@@ -176,6 +176,22 @@ export default function App() {
                 await setDoc(userDocRef, userProfile);
                 if (matchedDoc.id !== firebaseUser.uid) {
                   await deleteDoc(doc(db, 'users', matchedDoc.id));
+                  // Synchronize employee_master record if exists
+                  try {
+                    const oldMasterRef = doc(db, 'employee_master', matchedDoc.id);
+                    const oldMasterSnap = await getDoc(oldMasterRef);
+                    if (oldMasterSnap.exists()) {
+                      const oldMasterData = oldMasterSnap.data();
+                      await setDoc(doc(db, 'employee_master', firebaseUser.uid), {
+                        ...oldMasterData,
+                        lastUpdated: new Date().toISOString()
+                      }, { merge: true });
+                      await deleteDoc(oldMasterRef);
+                      console.log(`Migrated employee_master record for ${firebaseUser.email} from ${matchedDoc.id} to ${firebaseUser.uid}`);
+                    }
+                  } catch (err) {
+                    console.error('Error during employee_master migration in App.tsx:', err);
+                  }
                 }
               } else {
                 console.log('No pre-provisioned profile, creating clean profile...');
@@ -498,7 +514,6 @@ function AppContent({
                 <BergLogo 
                   className={sidebarOpen ? 'h-9 w-28' : 'h-8 w-12'} 
                   showSubtitle={false} 
-                  scaleClass="scale-[1.9]"
                 />
               </div>
               {sidebarOpen && (

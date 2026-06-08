@@ -424,11 +424,6 @@ export const RolePermissionSubView: React.FC<RolePermissionSubViewProps> = ({ ad
 
   // Toggle dynamic permissions inside Workforce TMS
   const handleToggleTmsPermission = (role: string, permKey: string) => {
-    if (role === 'ADMIN') {
-      toast.info('ADMIN role permissions are globally locked down to maintain server control.');
-      return;
-    }
-
     setPermissions(prev => {
       const copy = { ...prev };
       if (!copy[role]) copy[role] = {};
@@ -533,11 +528,6 @@ export const RolePermissionSubView: React.FC<RolePermissionSubViewProps> = ({ ad
 
   // Toggle dynamic permissions inside state
   const handleToggleState = (role: string, mod: string, field: keyof Omit<RolePermissionDoc, 'role_name' | 'module_name'>) => {
-    if (role === 'ADMIN') {
-      toast.info('ADMIN role permissions are globally locked down to maintain server control.');
-      return;
-    }
-
     setPermissions(prev => {
       const copy = { ...prev };
       if (!copy[role]) copy[role] = {};
@@ -925,7 +915,6 @@ export const RolePermissionSubView: React.FC<RolePermissionSubViewProps> = ({ ad
                             type="button"
                             onClick={() => handleToggleState(selectedRole, mod, 'can_view')}
                             className={`p-1.5 rounded transition ${
-                              isAdmin ? 'text-indigo-500 opacity-60 cursor-not-allowed' :
                               permState.can_view ? 'text-indigo-500 hover:bg-slate-500/10' : 'text-slate-500 hover:bg-slate-500/10'
                             }`}
                           >
@@ -939,7 +928,6 @@ export const RolePermissionSubView: React.FC<RolePermissionSubViewProps> = ({ ad
                             type="button"
                             onClick={() => handleToggleState(selectedRole, mod, 'can_create')}
                             className={`p-1.5 rounded transition ${
-                              isAdmin ? 'text-indigo-500 opacity-60 cursor-not-allowed' :
                               permState.can_create ? 'text-emerald-500 hover:bg-slate-500/10' : 'text-slate-500 hover:bg-slate-500/10'
                             }`}
                           >
@@ -953,7 +941,6 @@ export const RolePermissionSubView: React.FC<RolePermissionSubViewProps> = ({ ad
                             type="button"
                             onClick={() => handleToggleState(selectedRole, mod, 'can_edit')}
                             className={`p-1.5 rounded transition ${
-                              isAdmin ? 'text-indigo-500 opacity-60 cursor-not-allowed' :
                               permState.can_edit ? 'text-amber-500 hover:bg-slate-500/10' : 'text-slate-500 hover:bg-slate-500/10'
                             }`}
                           >
@@ -967,7 +954,6 @@ export const RolePermissionSubView: React.FC<RolePermissionSubViewProps> = ({ ad
                             type="button"
                             onClick={() => handleToggleState(selectedRole, mod, 'can_delete')}
                             className={`p-1.5 rounded transition ${
-                              isAdmin ? 'text-indigo-500 opacity-60 cursor-not-allowed' :
                               permState.can_delete ? 'text-rose-500 hover:bg-slate-500/10' : 'text-slate-500 hover:bg-slate-500/10'
                             }`}
                           >
@@ -981,7 +967,6 @@ export const RolePermissionSubView: React.FC<RolePermissionSubViewProps> = ({ ad
                             type="button"
                             onClick={() => handleToggleState(selectedRole, mod, 'can_export')}
                             className={`p-1.5 rounded transition ${
-                              isAdmin ? 'text-indigo-500 opacity-60 cursor-not-allowed' :
                               permState.can_export ? 'text-indigo-500 hover:bg-slate-500/10' : 'text-slate-500 hover:bg-slate-500/10'
                             }`}
                           >
@@ -995,7 +980,6 @@ export const RolePermissionSubView: React.FC<RolePermissionSubViewProps> = ({ ad
                             type="button"
                             onClick={() => handleToggleState(selectedRole, mod, 'can_approve')}
                             className={`p-1.5 rounded transition ${
-                              isAdmin ? 'text-indigo-500 opacity-60 cursor-not-allowed' :
                               permState.can_approve ? 'text-sky-500 hover:bg-slate-500/10' : 'text-slate-500 hover:bg-slate-500/10'
                             }`}
                           >
@@ -1100,7 +1084,7 @@ export const RolePermissionSubView: React.FC<RolePermissionSubViewProps> = ({ ad
                               } ${isActive ? 'text-indigo-400 font-extrabold' : 'text-slate-500'}`}
                             >
                               <span>{item.label}</span>
-                              <div className={isAdmin ? 'opacity-40 cursor-not-allowed text-indigo-500' : isActive ? 'text-indigo-500' : 'text-slate-400'}>
+                              <div className={isActive ? 'text-indigo-500' : 'text-slate-400'}>
                                 {isActive ? <CheckSquare size={16} /> : <Square size={16} />}
                               </div>
                             </button>

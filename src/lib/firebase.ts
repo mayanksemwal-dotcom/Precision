@@ -70,20 +70,65 @@ export async function syncUserProfile(user: User, authProvider: 'google' | 'emai
     const userDoc = await getDoc(userRef);
     
     if (!userDoc.exists()) {
-      await setDoc(userRef, {
-        uid: user.uid,
-        email: user.email,
-        name: user.displayName || 'New Agent',
-        fullName: user.displayName || 'New Agent',
-        role: 'AGENT',
-        createdAt: new Date().toISOString(),
-        lastLogin: new Date().toISOString(),
-        authProvider: authProvider,
-        isActive: true,
-        department: 'N/A',
-        Manager: 'N/A'
-      });
-      console.log(`Created new profile for: ${user.email}`);
+      // Check for pre-provisioned profile under a different ID (like a local_ ID)
+      const usersRef = collection(db, 'users');
+      const checkQuery = query(usersRef, where('email', '==', (user.email || '').toLowerCase().trim()));
+      const querySnap = await getDocs(checkQuery);
+      
+      if (!querySnap.empty) {
+        const matchedDoc = querySnap.docs[0];
+        const matchedData = matchedDoc.data() as any;
+        console.log(`Pre-provisioned user found matching email. Linking to Auth uid... ${matchedDoc.id} -> ${user.uid}`);
+        
+        const mergedData = {
+          ...matchedData,
+          uid: user.uid,
+          email: (user.email || '').toLowerCase().trim(),
+          authProvider: authProvider,
+          createdAt: matchedData.createdAt || new Date().toISOString(),
+          lastLogin: new Date().toISOString(),
+          lastLoginAt: new Date().toISOString(),
+          isActive: true,
+          status: matchedData.status || 'Active'
+        };
+        
+        await setDoc(userRef, mergedData);
+        
+        if (matchedDoc.id !== user.uid) {
+          await deleteDoc(doc(db, 'users', matchedDoc.id));
+          // Migrate employee master if existed
+          try {
+            const oldMasterRef = doc(db, 'employee_master', matchedDoc.id);
+            const oldMasterSnap = await getDoc(oldMasterRef);
+            if (oldMasterSnap.exists()) {
+              const oldMasterData = oldMasterSnap.data();
+              await setDoc(doc(db, 'employee_master', user.uid), {
+                ...oldMasterData,
+                lastUpdated: new Date().toISOString()
+              }, { merge: true });
+              await deleteDoc(oldMasterRef);
+              console.log(`Synchronized employee_master for ${user.email} from ${matchedDoc.id} to ${user.uid}`);
+            }
+          } catch(err) {
+            console.error('Master sync err during syncUserProfile:', err);
+          }
+        }
+      } else {
+        await setDoc(userRef, {
+          uid: user.uid,
+          email: user.email,
+          name: user.displayName || 'New Agent',
+          fullName: user.displayName || 'New Agent',
+          role: 'AGENT',
+          createdAt: new Date().toISOString(),
+          lastLogin: new Date().toISOString(),
+          authProvider: authProvider,
+          isActive: true,
+          department: 'N/A',
+          Manager: 'N/A'
+        });
+        console.log(`Created new profile for: ${user.email}`);
+      }
     } else {
       const data = userDoc.data();
       if (data.status === 'Inactive' || data.isActive === false) {

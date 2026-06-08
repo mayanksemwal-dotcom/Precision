@@ -1407,7 +1407,7 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
             </div>
           </CardHeader>
           <CardContent className="p-0">
-            <div className="overflow-x-auto max-h-[500px]">
+            <div className="overflow-auto max-h-[600px] border border-slate-100 rounded-lg scrollbar-thin">
               <table className="w-full text-left text-xs border-collapse">
                 <thead className="sticky top-0 z-10 bg-slate-50 shadow-sm shadow-slate-200/50">
                   <tr className="bg-slate-50 text-slate-500 border-b border-slate-200 font-bold uppercase tracking-widest text-[9px] select-none">
@@ -2335,11 +2335,10 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
                     </div>
                   </div>
                 </CardHeader>
-                <CardContent className="p-0 max-h-[500px] overflow-y-auto">
-                  <div className="overflow-x-auto">
-                    <table className="w-full text-left text-xs border-collapse">
-                      <thead>
-                        <tr className="bg-slate-50 text-slate-500 border-b border-slate-100 font-bold uppercase tracking-widest text-[9px] select-none">
+                <CardContent className="p-0 max-h-[500px] overflow-auto scrollbar-thin border border-slate-150 rounded-xl">
+                  <table className="w-full text-left text-xs border-collapse">
+                    <thead className="sticky top-0 z-10 bg-slate-50 shadow-xs">
+                      <tr className="bg-slate-50 text-slate-500 border-b border-slate-100 font-bold uppercase tracking-widest text-[9px] select-none">
                           <th className="p-4 pl-6">Profile</th>
                           <th className="p-4">Process / Status</th>
                           <th className="p-4">Clocked Interval</th>
@@ -2416,7 +2415,6 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
                         )}
                       </tbody>
                     </table>
-                  </div>
                 </CardContent>
                 <CardFooter className="py-3 px-6 border-t border-slate-100 flex flex-col sm:flex-row items-center justify-between text-xs text-slate-500 bg-slate-50/50 rounded-b-xl gap-3">
                   <div>

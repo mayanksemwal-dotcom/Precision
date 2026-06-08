@@ -124,9 +124,9 @@ export default function CompletedAuditsView({ auditLogs, user, alignments = [] }
           </div>
         </CardHeader>
         <CardContent className="p-0">
-          <div className="overflow-x-auto">
+          <div className="overflow-auto max-h-[600px] border border-slate-100 rounded-lg scrollbar-thin">
             <Table>
-              <TableHeader className="bg-slate-50">
+              <TableHeader className="bg-slate-50 sticky top-0 z-10 shadow-xs">
                 <TableRow>
                   <TableHead className="font-bold whitespace-nowrap pl-6">Task ID</TableHead>
                   <TableHead className="font-bold whitespace-nowrap">Agent</TableHead>
