@@ -1447,36 +1447,52 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
                         <td className="p-4">
                           <Badge variant="outline" className="text-[10px] uppercase font-bold tracking-wider">{u.role}</Badge>
                         </td>
-                        <td className="p-4 flex items-center gap-2">
-                          {activeShift ? (
-                            <>
-                              <Badge className={`text-[10px] font-black uppercase ${
-                                activeShift.status === 'BREAK' 
-                                  ? 'bg-amber-100 text-amber-800 border-amber-200' 
-                                  : 'bg-emerald-100 text-emerald-800 border-emerald-200'
-                              }`}>
-                                LIVE - {activeShift.status}
+                        <td className="p-4">
+                          <div className="flex flex-col gap-1 items-start">
+                            {activeShift ? (
+                              <>
+                                <div className="flex items-center gap-1.5">
+                                  <Badge className={`text-[10px] font-black uppercase ${
+                                    activeShift.status === 'BREAK' 
+                                      ? 'bg-amber-100 text-amber-800 border-amber-200' 
+                                      : 'bg-emerald-100 text-emerald-800 border-emerald-200'
+                                  }`}>
+                                    LIVE - {activeShift.status}
+                                  </Badge>
+                                  {canUserForceLogoutTarget(user, u.uid) && (
+                                    <Button 
+                                      size="sm" 
+                                      variant="ghost" 
+                                      className="text-[9px] text-red-500 hover:text-red-700 hover:bg-red-50 border border-transparent hover:border-red-200 rounded-lg shrink-0 h-6 px-1.5 font-bold" 
+                                      onClick={() => startForceLogoutFlow(activeShift.id, u.uid, u.name)}
+                                    >
+                                      Force Out
+                                    </Button>
+                                  )}
+                                </div>
+                                {activeShift.status === 'BREAK' && activeShift.activities.length > 0 && (
+                                  <span className="text-[10px] font-bold text-amber-600 dark:text-amber-400 font-mono animate-pulse mt-0.5 animate-pulse">
+                                    Break: {formatMs(Math.max(0, currentTime.getTime() - new Date(activeShift.activities[activeShift.activities.length - 1].startTime).getTime()))}
+                                  </span>
+                                )}
+                              </>
+                            ) : (
+                              <Badge variant="secondary" className="text-[10px] bg-slate-100 text-slate-500 font-bold uppercase">
+                                Offline
                               </Badge>
-                              {canUserForceLogoutTarget(user, u.uid) && (
-                                <Button 
-                                  size="sm" 
-                                  variant="ghost" 
-                                  className="text-[9px] text-red-500 hover:text-red-700 hover:bg-red-50 border border-transparent hover:border-red-200 rounded-lg shrink-0 h-6 px-1.5 ml-1 font-bold" 
-                                  onClick={() => startForceLogoutFlow(activeShift.id, u.uid, u.name)}
-                                >
-                                  Force Out
-                                </Button>
-                              )}
-                            </>
-                          ) : (
-                            <Badge variant="secondary" className="text-[10px] bg-slate-100 text-slate-500 font-bold uppercase">
-                              Offline
-                            </Badge>
-                          )}
+                            )}
+                          </div>
                         </td>
                         <td className="p-4 font-semibold text-slate-700">
                           {activeShift ? (
-                            activeShift.activities[activeShift.activities.length - 1]?.name || 'N/A'
+                            <div className="flex flex-col gap-0.5">
+                              <span>{activeShift.activities[activeShift.activities.length - 1]?.name || 'N/A'}</span>
+                              {activeShift.status === 'BREAK' && activeShift.activities.length > 0 && (
+                                <span className="text-[9px] font-bold text-amber-500 font-mono">
+                                  Duration: {formatMs(Math.max(0, currentTime.getTime() - new Date(activeShift.activities[activeShift.activities.length - 1].startTime).getTime()))}
+                                </span>
+                              )}
+                            </div>
                           ) : (
                             <span className="text-slate-400">N/A</span>
                           )}

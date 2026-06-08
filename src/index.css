@@ -95,3 +95,106 @@ body {
 .mono-value {
   @apply font-mono tracking-tight;
 }
+
+/* Universal Dark Mode Override Layer */
+.dark {
+  /* Colors */
+  --bg-dark-base: #020617;     /* slate-950 equivalent */
+  --bg-dark-card: #0f172a;     /* slate-900 equivalent */
+  --bg-dark-item: #1e293b;     /* slate-800 equivalent */
+  --border-dark-line: #1e293b;  /* slate-800 equivalent */
+  --border-dark-focus: #334155; /* slate-700 equivalent */
+  --text-dark-primary: #f8fafc; /* slate-50 equivalent */
+  --text-dark-secondary: #cbd5e1; /* slate-300 equivalent */
+  --text-dark-muted: #94a3b8;   /* slate-400 equivalent */
+
+  /* Force background colors */
+  .bg-white, .metric-card {
+    background-color: var(--bg-dark-card) !important;
+  }
+  .bg-slate-50, .bg-\[\#FAFAFA\], .bg-\[\#F8FAFC\], .bg-\[\#FAFAFA\], .bg-slate-50\/50, .bg-slate-50\/40, .bg-slate-50\/20, .bg-slate-55, .bg-slate-40 {
+    background-color: var(--bg-dark-base) !important;
+  }
+  .bg-slate-100 {
+    background-color: var(--bg-dark-item) !important;
+  }
+  .bg-slate-50\/60 {
+    background-color: rgba(30, 41, 59, 0.4) !important;
+  }
+  .bg-sky-50 {
+    background-color: rgba(56, 189, 248, 0.1) !important;
+  }
+
+  /* Force borders and dividers */
+  .border, .border-slate-200, .border-slate-150, .border-slate-155, .border-slate-100, .border-\[\#E2E8F0\], .border-\[\#CBD5E1\], hr {
+    border-color: var(--border-dark-line) !important;
+  }
+  
+  /* Text colors overriding */
+  .text-slate-900, .text-slate-950, .text-slate-800, .text-slate-705, .text-slate-700, .text-slate-600, .text-\[\#0F172A\], .text-\[\#1E293B\], .text-\[\#1a1f2c\], .text-slate-750 {
+    color: var(--text-dark-primary) !important;
+  }
+  .text-slate-500, .text-slate-400, .text-\[\#64748B\] {
+    color: var(--text-dark-secondary) !important;
+  }
+  .text-slate-300, .text-slate-200 {
+    color: var(--text-dark-muted) !important;
+  }
+
+  /* Tables & Lists */
+  tbody tr, .data-table-row {
+    border-bottom-color: var(--border-dark-line) !important;
+  }
+  .data-table-row:hover, tbody tr:hover, .hover\:bg-slate-50:hover, .hover\:bg-slate-100:hover, .hover\:bg-slate-50\/40:hover {
+    background-color: rgba(30, 41, 59, 0.4) !important;
+  }
+  thead, th, thead tr {
+    background-color: var(--bg-dark-item) !important;
+    color: var(--text-dark-primary) !important;
+  }
+
+  /* Shadow controls for dark mode (no white glows) */
+  .shadow-sm, .shadow-md, .shadow-lg, .shadow-xl, .shadow-2xl {
+    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.5), 0 2px 4px -2px rgba(0, 0, 0, 0.5) !important;
+  }
+
+  /* Inputs, selects and standard interactive widgets */
+  input, select, textarea, .bg-white select, .bg-white input {
+    background-color: var(--bg-dark-base) !important;
+    color: var(--text-dark-primary) !important;
+    border-color: var(--border-dark-line) !important;
+  }
+  input:focus, select:focus, textarea:focus {
+    border-color: var(--border-dark-focus) !important;
+    outline: none !important;
+  }
+
+  /* Dialogs & Modal sheets */
+  [role="dialog"], .dialog-content, .bg-white[style*="position: fixed"] {
+    background-color: var(--bg-dark-card) !important;
+    color: var(--text-dark-primary) !important;
+    border-color: var(--border-dark-line) !important;
+  }
+
+  /* Custom badge enhancements under dark theme */
+  .bg-slate-100.text-slate-800 {
+    background-color: var(--bg-dark-item) !important;
+    color: var(--text-dark-primary) !important;
+  }
+  .bg-indigo-100.text-indigo-700 {
+    background-color: rgba(99, 102, 241, 0.2) !important;
+    color: #a5b4fc !important;
+  }
+  .bg-emerald-100.text-emerald-700 {
+    background-color: rgba(16, 185, 129, 0.2) !important;
+    color: #6ee7b7 !important;
+  }
+  .bg-rose-100.text-rose-700 {
+    background-color: rgba(244, 63, 94, 0.2) !important;
+    color: #fda4af !important;
+  }
+  .bg-amber-100.text-amber-700 {
+    background-color: rgba(245, 158, 11, 0.2) !important;
+    color: #fde047 !important;
+  }
+}

@@ -196,14 +196,14 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
   return (
     <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
       {/* Header Section */}
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 bg-white/80 dark:bg-slate-900/80 backdrop-blur p-6 rounded-2xl border border-slate-100 dark:border-slate-800 shadow-sm">
-        <div className="flex items-center gap-4">
-          <div className="w-12 h-12 rounded-xl bg-red-600 flex items-center justify-center text-white shadow-lg shadow-red-250">
-            <ShieldAlert size={24} />
+      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 bg-white dark:bg-slate-900 p-5 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm">
+        <div className="flex items-center gap-3">
+          <div className="w-10 h-10 rounded-xl bg-red-50 dark:bg-red-950/30 text-red-600 dark:text-red-400 border border-red-100 dark:border-red-900/40 flex items-center justify-center">
+            <ShieldAlert size={20} />
           </div>
           <div>
-            <h2 className="text-2xl font-black text-slate-900 dark:text-white tracking-tight">Active Disciplinary Panel</h2>
-            <p className="text-sm font-medium text-slate-500 dark:text-slate-400">Acknowledge, track, and audit active feedback tickets</p>
+            <h2 className="text-lg font-bold text-slate-900 dark:text-white tracking-tight">Active Disciplinary Panel</h2>
+            <p className="text-xs font-medium text-slate-500 dark:text-slate-400">Acknowledge, track, and audit active feedback tickets</p>
           </div>
         </div>
         
@@ -212,8 +212,8 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
             <Dialog open={isWarningOpen} onOpenChange={setIsWarningOpen}>
               <DialogTrigger 
                 render={
-                  <Button className="bg-red-600 hover:bg-red-700 text-white font-bold gap-2 shadow-lg shadow-red-100 cursor-pointer border-none">
-                    <Plus size={18} /> Raise Warning Ticket
+                  <Button className="bg-red-600 hover:bg-red-700 text-white font-bold text-xs h-9 px-4 gap-2 rounded-xl cursor-pointer border-none shadow-none">
+                    <Plus size={16} /> Raise Warning Ticket
                   </Button>
                 }
               />
@@ -255,7 +255,7 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
 
       <div className="grid grid-cols-1 lg:grid-cols-4 gap-8">
         {/* Policy Box */}
-        <div className="space-y-6 lg:col-span-1">
+        <div className="space-y-6 lg:col-span-1 lg:sticky lg:top-6 lg:max-h-[calc(100vh-10rem)] lg:overflow-y-auto">
           <Card className="border border-slate-100 dark:border-slate-800 shadow-sm overflow-hidden bg-white dark:bg-slate-900">
             <CardHeader className="bg-slate-900 dark:bg-black text-white pb-6 pt-8">
               <CardTitle className="text-xs font-extrabold tracking-widest uppercase opacity-80 mb-2">Staircase Policy Guidelines</CardTitle>

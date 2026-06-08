@@ -1215,31 +1215,33 @@ export default function ScorecardView({ user, allUsers = [], onRefreshAllData, e
     <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-300">
       
       {/* Banner Heading */}
-      <div className="bg-gradient-to-r from-slate-900 via-indigo-950 to-slate-900 text-white p-8 rounded-2xl border border-slate-800 shadow-xl relative overflow-hidden">
-        <div className="absolute right-0 top-0 opacity-10 pointer-events-none transform translate-x-12 -translate-y-12">
-          <Award size={220} className="text-white" />
+      <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-5 rounded-2xl shadow-sm relative overflow-hidden">
+        <div className="absolute right-0 top-0 opacity-5 pointer-events-none transform translate-x-8 -translate-y-8 dark:opacity-10 text-indigo-500">
+          <Award size={140} />
         </div>
-        <div className="relative z-10 flex flex-col md:flex-row md:items-center justify-between gap-6">
-          <div className="space-y-1.5">
-            <Badge className="bg-indigo-500 hover:bg-indigo-600 text-[10px] font-extrabold uppercase tracking-widest px-3 py-1">
-              SYSTEM CONSOLE
-            </Badge>
-            <h1 className="text-3xl font-black tracking-tight flex items-center gap-2">
-              Precision360 <span className="text-indigo-400 font-extrabold">KPI Scorecard Engine</span>
+        <div className="relative z-10 flex flex-col md:flex-row md:items-center justify-between gap-4">
+          <div className="space-y-1">
+            <div className="flex items-center gap-2">
+              <Badge className="bg-indigo-50 dark:bg-indigo-950 text-indigo-600 dark:text-indigo-400 border border-indigo-150 dark:border-indigo-900/40 text-[9px] font-bold uppercase tracking-widest px-2 py-0.5 shadow-none">
+                SYSTEM CONSOLE
+              </Badge>
+            </div>
+            <h1 className="text-xl font-bold tracking-tight text-slate-900 dark:text-white mt-1">
+              Precision360 <span className="text-indigo-600 dark:text-indigo-400 font-extrabold">KPI Scorecard Engine</span>
             </h1>
-            <p className="text-sm font-medium text-slate-300 max-w-xl">
+            <p className="text-xs font-medium text-slate-500 dark:text-slate-400 max-w-xl">
               Fully dynamic, template-driven analytics workstation. Configure templates, upload universal files, resolve weights, and calculate scorecards without editing code.
             </p>
           </div>
 
-          <div className="flex flex-wrap items-center gap-3 shrink-0">
+          <div className="flex flex-wrap items-center gap-2.5 shrink-0">
             <Button 
               onClick={fetchAllKPIData} 
               disabled={loading}
               variant="outline"
-              className="border-slate-700 bg-slate-900/60 text-white hover:bg-slate-800 h-10 px-4 font-bold text-xs gap-2 cursor-pointer"
+              className="border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700 h-9 px-3.5 font-bold text-xs gap-1.5 cursor-pointer"
             >
-              <RefreshCw size={14} className={loading ? "animate-spin" : ""} />
+              <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
               Sync DB Indexes
             </Button>
             
@@ -1247,9 +1249,9 @@ export default function ScorecardView({ user, allUsers = [], onRefreshAllData, e
               <Button 
                 onClick={handleRecalculatePeriodScorecards} 
                 disabled={processingRecalc || loading}
-                className="bg-indigo-600 hover:bg-indigo-700 text-white h-10 px-4 font-extrabold text-xs gap-2 shadow-lg cursor-pointer"
+                className="bg-indigo-600 hover:bg-indigo-700 text-white h-9 px-3.5 font-bold text-xs gap-1.5 shadow-none border-none cursor-pointer"
               >
-                <Sliders size={14} className={processingRecalc ? "animate-spin" : ""} />
+                <Sliders size={12} className={processingRecalc ? "animate-spin" : ""} />
                 {processingRecalc ? 'Recalculating...' : 'Publish Scorecards'}
               </Button>
             )}
@@ -1261,7 +1263,7 @@ export default function ScorecardView({ user, allUsers = [], onRefreshAllData, e
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
         
         {/* Workspace Toolbar card */}
-        <div className="lg:col-span-4 bg-white dark:bg-slate-900 border border-slate-150 dark:border-slate-800 p-6 rounded-2xl shadow-sm space-y-5 h-fit">
+        <div className="lg:col-span-4 bg-white dark:bg-slate-900 border border-slate-150 dark:border-slate-800 p-6 rounded-2xl shadow-sm space-y-5 h-fit lg:sticky lg:top-6 lg:max-h-[calc(100vh-10rem)] lg:overflow-y-auto">
           <div>
             <h3 className="text-sm font-black text-slate-900 dark:text-white uppercase tracking-wider">Workspace Controls</h3>
             <p className="text-[11px] text-slate-400 dark:text-slate-500 font-medium">Select criteria for viewing and reporting</p>

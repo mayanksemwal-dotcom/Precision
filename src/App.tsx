@@ -488,22 +488,23 @@ function AppContent({
         {/* Sidebar */}
         <motion.aside 
         initial={false}
-        animate={{ width: sidebarOpen ? 280 : 80 }}
+        animate={{ width: sidebarOpen ? 290 : 80 }}
         className="bg-[#0F172A] dark:bg-slate-900 border-r border-[#1E293B] dark:border-slate-800 flex flex-col z-30 text-[#CBD5E1]"
       >
-        <div className="p-6 pb-4 flex flex-col items-center">
+        <div className="px-4 pt-6 pb-4 flex flex-col items-start">
           <div className="w-full flex items-center justify-between mb-6">
-            <div className={`flex items-center gap-3 ${!sidebarOpen && 'justify-center w-full'}`}>
-              <div className="bg-white p-2 rounded-xl flex items-center justify-center shadow-lg border border-slate-100 flex-shrink-0">
+            <div className={`flex items-center gap-2.5 ${!sidebarOpen && 'justify-center w-full'}`}>
+              <div className="bg-white p-1 rounded-xl flex items-center justify-center shadow-lg border border-slate-100 flex-shrink-0 overflow-hidden">
                 <BergLogo 
-                  className={sidebarOpen ? 'h-7 w-20' : 'h-6 w-10'} 
+                  className={sidebarOpen ? 'h-9 w-28' : 'h-8 w-12'} 
                   showSubtitle={false} 
+                  scaleClass="scale-[1.9]"
                 />
               </div>
               {sidebarOpen && (
                 <div className="flex flex-col min-w-0 overflow-hidden">
-                  <span className="font-black text-lg leading-none tracking-tighter text-white truncate">Precision360</span>
-                  <span className="text-[9px] font-bold text-sky-400 uppercase tracking-widest mt-1 opacity-90 truncate">Berg Technologies</span>
+                  <span className="font-black text-[17px] leading-none tracking-tight text-white truncate">Precision360</span>
+                  <span className="text-[9px] font-bold text-sky-400 uppercase tracking-wider mt-1 opacity-90 truncate">Berg Technologies</span>
                 </div>
               )}
             </div>

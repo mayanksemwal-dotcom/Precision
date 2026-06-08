@@ -88,7 +88,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
   const [activeShifts, setActiveShifts] = useState<TMSShift[]>([]);
   const [isLoadingShifts, setIsLoadingShifts] = useState(false);
   const [lastRefreshed, setLastRefreshed] = useState<Date>(new Date());
-  const [countdown, setCountdown] = useState(90); // 90 seconds refresh cycle
+  const [countdown, setCountdown] = useState(20); // 20 seconds quick refresh cycle
 
   // Filters state for control table
   const [searchTerm, setSearchTerm] = useState('');
@@ -139,12 +139,23 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
     // ADMIN and MANAGER can see organization-wide; other roles filter by team hierarchy
     const roleNormalized = (user.role || '').toUpperCase();
     const isManagerOrAdmin = ['ADMIN', 'MANAGER'].includes(roleNormalized);
+    const isTeamLeadOrSupervisor = ['TEAM_LEAD', 'LEAD', 'STL', 'QTL', 'OPS_TL', 'TRAINER_TL'].includes(roleNormalized);
     
     if (isManagerOrAdmin) {
+      if (tlFilter !== 'all') {
+        return allUsers.filter(u => u.status === 'Active' && u.teamLeadId === tlFilter);
+      }
       return allUsers.filter(u => u.status === 'Active');
+    } else if (isTeamLeadOrSupervisor) {
+      // If a specific Team Lead is selected, show resources belonging to that Team Lead
+      if (tlFilter !== 'all') {
+        return allUsers.filter(u => u.status === 'Active' && u.teamLeadId === tlFilter);
+      }
+      // By default (tlFilter === 'all'), fallback to their own mapped resources
+      return allUsers.filter(u => u.status === 'Active' && canActOn(user, u, allUsers));
     }
     return allUsers.filter(u => u.status === 'Active' && canActOn(user, u, allUsers));
-  }, [allUsers, user]);
+  }, [allUsers, user, tlFilter]);
 
   // List of unique Team Leads who have members in mappedUsers
   const teamLeadsList = useMemo(() => {
@@ -154,8 +165,14 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
         leads.set(u.teamLeadId, u.teamLeadName);
       }
     });
-    return Array.from(leads.entries()).map(([id, name]) => ({ id, name }));
-  }, [allUsers]);
+    const list = Array.from(leads.entries()).map(([id, name]) => ({ id, name }));
+    // Prioritize showing the current user's entry first if they are a Team Lead
+    return list.sort((a, b) => {
+      if (a.id === user.uid) return -1;
+      if (b.id === user.uid) return 1;
+      return a.name.localeCompare(b.name);
+    });
+  }, [allUsers, user.uid]);
 
   // List of unique Managers
   const managersList = useMemo(() => {
@@ -225,8 +242,8 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
         if (docSnap.exists()) {
           const data = docSnap.data();
           const age = new Date().getTime() - new Date(data.lastUpdated).getTime();
-          // Cache validity: 90 seconds
-          if (age < 90000) {
+          // Cache validity: 20 seconds
+          if (age < 20000) {
             cachedSummary = data;
           }
         }
@@ -482,17 +499,17 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
     }
   };
 
-  // Run on mount, and schedule recurring pull every 90 seconds
+  // Run on mount, and schedule recurring pull when allUsers or tlFilter changes
   useEffect(() => {
-    loadAndRecomputeData(false);
-  }, [allUsers]);
+    loadAndRecomputeData(true);
+  }, [allUsers, tlFilter]);
 
   useEffect(() => {
     const timer = setInterval(() => {
       setCountdown(prev => {
         if (prev <= 1) {
           loadAndRecomputeData(false);
-          return 90;
+          return 20;
         }
         return prev - 1;
       });
@@ -935,27 +952,27 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
     <div className="space-y-6">
       
       {/* HEADER SECTION WITH AUTO REFRESH TICKER */}
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 bg-slate-900 dark:bg-slate-950 text-white p-6 rounded-3xl shadow-xl border border-slate-800">
+      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 bg-white dark:bg-slate-900 text-slate-800 dark:text-white p-5 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm">
         <div className="flex items-center gap-3">
-          <div className="p-3 bg-indigo-600 rounded-2xl shadow-lg text-white">
-            <Shield size={24} className="animate-pulse" />
+          <div className="p-2.5 bg-indigo-55 bg-indigo-50 dark:bg-indigo-950/40 text-indigo-600 dark:text-indigo-400 border border-indigo-100 dark:border-indigo-900/40 rounded-xl shadow-xs">
+            <Shield size={20} className="animate-pulse" />
           </div>
           <div>
-            <h2 className="text-xl font-extrabold tracking-tight">Workforce Management Command</h2>
-            <p className="text-xs text-slate-400 font-sans mt-0.5">Separate controls for monitoring, supervision rosters, exceptions & live statistics.</p>
+            <h2 className="text-lg font-bold tracking-tight">Workforce Management Command</h2>
+            <p className="text-xs text-slate-500 dark:text-slate-400 font-sans mt-0.5">Separate controls for monitoring, supervision rosters, exceptions & live statistics.</p>
           </div>
         </div>
 
         <div className="flex items-center gap-3 flex-wrap">
-          <div className="flex items-center gap-1.5 bg-slate-800 text-slate-300 border border-slate-700 px-3 py-1.5 rounded-xl font-mono text-[11px]">
-            <Clock3 size={13} className="text-indigo-400" />
+          <div className="flex items-center gap-1.5 bg-slate-50 dark:bg-slate-800 text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-slate-700 px-3 py-1.5 rounded-xl font-mono text-[11px]">
+            <Clock3 size={13} className="text-indigo-500" />
             <span>Refreshes in {countdown}s</span>
           </div>
           
           <button 
             onClick={() => loadAndRecomputeData(true)}
             disabled={isLoadingShifts}
-            className="flex items-center gap-1.5 bg-indigo-600 hover:bg-indigo-750 text-white px-3 py-1.5 rounded-xl text-xs font-black cursor-pointer transition-colors disabled:opacity-50"
+            className="flex items-center gap-1.5 bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-1.5 rounded-xl text-xs font-bold cursor-pointer transition-colors disabled:opacity-50"
           >
             <RefreshCw size={13} className={isLoadingShifts ? 'animate-spin' : ''} />
             <span>Sync & Audit</span>
@@ -1308,7 +1325,17 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
                           <span className="bg-slate-150/60 font-semibold px-2 py-0.5 rounded text-slate-700">{u.process || 'General'}</span>
                         </td>
                         <td className="p-4 font-semibold text-slate-800">
-                          {live ? (lastAct?.name || 'In transition') : <span className="text-slate-400">-</span>}
+                          {live ? (
+                            <div className="flex flex-col gap-0.5">
+                              <span>{lastAct?.name || 'In transition'}</span>
+                              {live.status === 'BREAK' && lastAct && (
+                                <span className="text-[10px] font-bold text-amber-600 dark:text-amber-400 animate-pulse flex items-center gap-1 font-mono">
+                                  <Clock3 size={11} className="inline text-amber-500" />
+                                  <span>Break time: {formatMs(Math.max(0, new Date().getTime() - new Date(lastAct.startTime).getTime()))}</span>
+                                </span>
+                              )}
+                            </div>
+                          ) : <span className="text-slate-400">-</span>}
                         </td>
                         <td className="p-4 text-slate-500 font-mono text-[10px]">
                           {live ? new Date(live.clockInTime).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }) : <span className="text-slate-400">Not Clocked</span>}
@@ -1318,9 +1345,16 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
                         </td>
                         <td className="p-4">
                           {live ? (
-                            <span className={`px-2.5 py-0.5 rounded-full text-[9px] font-black uppercase ${live.status === 'BREAK' ? 'bg-amber-150 text-amber-800' : 'bg-emerald-150 text-emerald-800'}`}>
-                              {live.status}
-                            </span>
+                            <div className="flex flex-col gap-1">
+                              <span className={`w-fit px-2.5 py-0.5 rounded-full text-[9px] font-black uppercase ${live.status === 'BREAK' ? 'bg-amber-150 text-amber-800' : 'bg-emerald-150 text-emerald-800'}`}>
+                                {live.status}
+                              </span>
+                              {live.status === 'BREAK' && lastAct && (
+                                <span className="text-[9px] font-medium font-mono text-amber-600 dark:text-amber-450 leading-none">
+                                  Duration: {formatMs(Math.max(0, new Date().getTime() - new Date(lastAct.startTime).getTime()))}
+                                </span>
+                              )}
+                            </div>
                           ) : (
                             <span className="bg-slate-150 text-slate-450 px-2.5 py-0.5 rounded-full text-[9px] font-black uppercase select-none">Offline</span>
                           )}

@@ -548,16 +548,15 @@ Berg Technologies Corp HS Division
   return (
     <div className="space-y-8 max-w-7xl mx-auto pb-12">
       {/* Banner / Hero Header */}
-      <div className="relative overflow-hidden rounded-2xl bg-gradient-to-r from-[#1E293B] to-[#0F172A] p-8 text-white shadow-xl">
-        <div className="absolute right-0 top-0 h-full w-1/3 opacity-10 bg-[radial-gradient(ellipse_at_top_right,_var(--tw-gradient-stops))] from-blue-300 to-transparent"></div>
+      <div className="relative overflow-hidden rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-5 text-slate-900 dark:text-white shadow-sm">
         <div className="relative z-10 flex flex-col md:flex-row md:items-center justify-between gap-6">
-          <div className="space-y-2">
-            <div className="inline-flex items-center gap-1.5 bg-indigo-500/20 text-indigo-300 px-3 py-1 rounded-full text-xs font-black uppercase tracking-wider border border-indigo-500/30">
-              <Activity size={12} className="animate-pulse" />
+          <div className="space-y-1">
+            <div className="inline-flex items-center gap-1.5 bg-indigo-55 bg-indigo-50 dark:bg-indigo-950/40 text-indigo-600 dark:text-indigo-400 px-2.5 py-0.5 rounded-full text-[9px] font-bold uppercase tracking-wider border border-indigo-100 dark:border-indigo-900/40">
+              <Activity size={11} className="animate-pulse" />
               Coaching & Excellence Bureau
             </div>
-            <h1 className="text-3xl font-black tracking-tight font-sans text-white">Performance Improvement Plans (PIP)</h1>
-            <p className="text-sm text-slate-300 font-medium max-w-2xl leading-relaxed">
+            <h1 className="text-xl font-bold tracking-tight text-slate-900 dark:text-white mt-1.5">Performance Improvement Plans (PIP)</h1>
+            <p className="text-xs text-slate-500 dark:text-slate-400 font-medium max-w-2xl leading-relaxed">
               Track, review, and support workforce calibration objectives through structured 30/60/90-day progress check-ins and key metrics.
             </p>
           </div>
@@ -566,8 +565,8 @@ Berg Technologies Corp HS Division
             <Dialog open={isNewPipOpen} onOpenChange={setIsNewPipOpen}>
                 <DialogTrigger 
                   render={
-                    <Button className="bg-[#38BDF8] text-[#0F172A] hover:bg-sky-400 font-black text-xs h-11 px-5 gap-2 rounded-xl border-none shadow-lg cursor-pointer">
-                      <Plus size={16} />
+                    <Button className="bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-xs h-9 px-4 gap-1.5 rounded-xl border-none shadow-none cursor-pointer">
+                      <Plus size={14} />
                       Initiate Performance Plan
                     </Button>
                   }
@@ -938,7 +937,7 @@ Berg Technologies Corp HS Division
         </div>
 
         {/* Right Side: Detail Panel */}
-        <div className="lg:col-span-4">
+        <div className="lg:col-span-4 lg:sticky lg:top-6 lg:max-h-[calc(100vh-10rem)] lg:overflow-y-auto">
           {selectedPip ? (
             <div className="space-y-4 text-left">
               <Card className="border-indigo-200 shadow-md bg-white overflow-hidden relative">
