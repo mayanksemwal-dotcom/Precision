@@ -671,8 +671,16 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
 
       // Manager filter
       if (managerFilter !== 'all') {
-        // Find if user is under that manager
-        if (u.role !== 'AGENT' || u.teamLeadId !== managerFilter) return false;
+        const checkHierarchy = (userToCheck: UserProfile, visited: Set<string>): boolean => {
+          if (userToCheck.uid === managerFilter) return true;
+          if (visited.has(userToCheck.uid)) return false;
+          visited.add(userToCheck.uid);
+          const parentId = userToCheck.managerId || userToCheck.mappedManagerId || userToCheck.teamLeadId;
+          if (!parentId) return false;
+          const parent = allUsers.find(u => u.uid === parentId);
+          return parent ? checkHierarchy(parent, visited) : false;
+        };
+        if (!checkHierarchy(u, new Set())) return false;
       }
 
       return true;
