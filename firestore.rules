@@ -255,7 +255,7 @@ service cloud.firestore {
     }
 
     match /attendanceAuditLogs/{id} {
-      allow read: if isVerified() && (isTL() || isAdmin());
+      allow read: if isVerified() && (isTL() || isAdmin() || (resource.data.employeeEmail == request.auth.token.email));
       allow create: if isVerified();
       allow update, delete: if isAdmin();
     }

@@ -282,15 +282,16 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
       const shiftsSnap = await getDocs(qShifts);
       
       // Fetch existing attendances to prevent duplicate logic
-      const attSnap = await getDocs(collection(db, 'attendanceSummary'));
+      const attSnap = await getDocs(query(collection(db, 'attendanceSummary'), where('attendanceDate', '>=', lastWeek.toISOString().split('T')[0])));
       const existingShiftIds = new Set(attSnap.docs.map(d => d.data().shiftId));
 
-      const batch = writeBatch(db);
+      let batch = writeBatch(db);
       let newCount = 0;
+      let batchCount = 0;
 
-      shiftsSnap.docs.forEach(docSnap => {
+      for (const docSnap of shiftsSnap.docs) {
         const shift = docSnap.data();
-        if (existingShiftIds.has(shift.id)) return; // Already generated
+        if (existingShiftIds.has(shift.id)) continue; 
 
         // Calculate
         const startMs = new Date(shift.clockInTime).getTime();
@@ -320,7 +321,7 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
           userId: shift.userId,
           employeeName: shift.userName || shift.userEmail,
           employeeEmail: shift.userEmail,
-          employeeId: shift.employeeId || '', // Adjust if added
+          employeeId: shift.employeeId || '',
           process: shift.process || 'N/A',
           mappedTL: shift.mappedTL || 'N/A',
           mappedManager: shift.mappedManager || 'N/A',
@@ -337,10 +338,20 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
         const attDocRef = doc(db, 'attendanceSummary', shift.id);
         batch.set(attDocRef, summary);
         newCount++;
-      });
+        batchCount++;
+
+        if (batchCount >= 450) {
+            await batch.commit();
+            batch = writeBatch(db);
+            batchCount = 0;
+        }
+      }
+
+      if (batchCount > 0) {
+        await batch.commit();
+      }
 
       if (newCount > 0) {
-        await batch.commit();
         toast.success(`Successfully synchronized ${newCount} new attendance records.`);
         loadData();
       } else {
@@ -453,7 +464,13 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
               <Download size={14} /> Export
             </button>
           )}
-          <button onClick={handleSyncAttendance} disabled={syncing} className="flex items-center gap-2 px-3 py-2 bg-indigo-500 text-white hover:bg-indigo-600 rounded-xl font-bold text-xs transition-colors">
+          <button onClick={() => {
+            if (['ADMIN', 'MANAGER', 'MIS'].includes(user.role.toUpperCase())) {
+              handleSyncAttendance();
+            } else {
+              toast.error('Only Admins or Managers can perform a full sync.');
+            }
+          }} disabled={syncing} className="flex items-center gap-2 px-3 py-2 bg-indigo-500 text-white hover:bg-indigo-600 rounded-xl font-bold text-xs transition-colors">
             <RefreshCw size={14} className={syncing ? 'animate-spin' : ''} /> {syncing ? 'Syncing...' : 'Sync From TMS'}
           </button>
         </div>

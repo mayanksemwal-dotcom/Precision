@@ -326,10 +326,9 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
       if (externalSnapshot) {
         allActiveShifts = externalSnapshot.docs.map((d: any) => ({ id: d.id, ...d.data() } as TMSShift));
       } else {
-        const activeShiftsQuery = query(
-          collection(db, 'tmsShifts'),
-          where('status', 'in', ['ACTIVE', 'BREAK'])
-        );
+        const activeShiftsQuery = (['ADMIN', 'MANAGER', 'MIS'].includes(user.role.toUpperCase())) 
+          ? query(collection(db, 'tmsShifts'), where('status', 'in', ['ACTIVE', 'BREAK']))
+          : query(collection(db, 'tmsShifts'), where('status', 'in', ['ACTIVE', 'BREAK']), where('mappedTL', '==', user.email));
         const snapshot = await getDocs(activeShiftsQuery);
         allActiveShifts = snapshot.docs.map(d => ({ id: d.id, ...d.data() } as TMSShift));
       }
