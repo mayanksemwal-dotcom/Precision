@@ -6,6 +6,7 @@ import {
   LogOut, 
   RefreshCw, 
   User, 
+  Users,
   Trash2, 
   Plus, 
   Search, 
@@ -57,6 +58,8 @@ import { canActOn } from '../lib/hierarchy';
 interface TMSViewProps {
   user: UserProfile;
   allUsers: UserProfile[];
+  onRefreshAllData?: () => void;
+  externalTheme?: 'light' | 'dark';
 }
 
 export interface ShiftActivity {
@@ -71,6 +74,8 @@ export interface TMSShift {
   userId: string;
   userName: string;
   userEmail: string;
+  mappedTL?: string;
+  mappedManager?: string;
   clockInTime: string; // ISO
   clockOutTime?: string; // ISO
   activities: ShiftActivity[];
@@ -87,7 +92,7 @@ const BREAK_OPTIONS = [
   'Bio Break'
 ];
 
-export default function TMSView({ user, allUsers }: TMSViewProps) {
+export default function TMSView({ user, allUsers, onRefreshAllData, externalTheme }: TMSViewProps) {
   const { canView, canCreate, canEdit, canDelete, hasTmsPermission } = usePermission();
   
   // Dynamic granular permission bindings instead of monolithic role/module checks
@@ -326,6 +331,14 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
   // Fetch ALL Shifts for Admins, Managers or Team Leads in real-time to view workforce status
   const fetchAllShifts = async () => {
     // Shifts are managed in real-time via the useEffect's onSnapshot subscription
+    // But we can trigger a manual re-fetch of users or just give feedback
+    if (onRefreshAllData) {
+      onRefreshAllData();
+    } else {
+      toast.info('Synchronization pulse sent. Roster state is live.', {
+        icon: <RefreshCw size={14} className="animate-spin" />
+      });
+    }
   };
 
   useEffect(() => {
@@ -587,6 +600,8 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
         userId: user.uid || '',
         userName: user.name || 'Anonymous User',
         userEmail: user.email || '',
+        mappedTL: (user as any).teamLeadEmail || (user as any).mappedTL || 'N/A',
+        mappedManager: (user as any).mappedManagerEmail || (user as any).mappedManager || 'N/A',
         clockInTime: nowISO,
         status: 'ACTIVE',
         activities: [
@@ -991,7 +1006,17 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
     }
   };
 
-  const isDashboardUser = [UserRole.TEAM_LEAD, UserRole.QTL, UserRole.STL, UserRole.OPS_TL, UserRole.TRAINER_TL, UserRole.MANAGER, UserRole.ADMIN, UserRole.MIS].includes(user.role as UserRole);
+  const dashboardRoles = [
+    UserRole.TEAM_LEAD, 
+    UserRole.QTL, 
+    UserRole.STL, 
+    UserRole.OPS_TL, 
+    UserRole.TRAINER_TL, 
+    UserRole.MANAGER, 
+    UserRole.ADMIN, 
+    UserRole.MIS
+  ];
+  const isDashboardUser = dashboardRoles.includes(user.role as UserRole);
 
   if (isDashboardUser) {
     return (
@@ -999,6 +1024,7 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
         user={user} 
         allUsers={allUsers} 
         onRefreshAllData={fetchAllShifts}
+        externalTheme={externalTheme}
       />
     );
   }

@@ -693,15 +693,15 @@ function AppContent({
                 className="max-w-7xl mx-auto h-full"
               >
                 {activeTab === 'tms' ? (
-                  <TMSView user={effectiveUser!} allUsers={allUsers} />
+                  <TMSView user={effectiveUser!} allUsers={allUsers} onRefreshAllData={fetchAllData} externalTheme={theme} />
                 ) : activeTab === 'attendance' ? (
-                  <AttendanceView user={effectiveUser!} allUsers={allUsers} />
+                  <AttendanceView user={effectiveUser!} allUsers={allUsers} externalTheme={theme} />
                 ) : activeTab === 'kpis_scorecard' ? (
                   <ScorecardView user={effectiveUser!} allUsers={allUsers} onRefreshAllData={fetchAllData} externalTheme={theme} />
                 ) : activeTab === 'warnings' ? (
-                  <WarningsView warnings={warnings} user={effectiveUser!} allUsers={allUsers} />
+                  <WarningsView warnings={warnings} user={effectiveUser!} allUsers={allUsers} externalTheme={theme} />
                 ) : activeTab === 'pips' ? (
-                  <PipView user={effectiveUser!} allUsers={allUsers} />
+                  <PipView user={effectiveUser!} allUsers={allUsers} externalTheme={theme} />
                 ) : activeTab === 'historical' ? (
                   <ManageHistoricalRecordsView user={effectiveUser!} />
                 ) : activeTab === 'resources' ? (

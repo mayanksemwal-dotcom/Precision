@@ -60,6 +60,7 @@ interface SupervisorDashboardProps {
   user: UserProfile;
   allUsers: UserProfile[];
   onRefreshAllData?: () => void;
+  externalTheme?: 'light' | 'dark';
 }
 
 interface ShiftActivity {
@@ -74,17 +75,20 @@ interface TMSShift {
   userId: string;
   userName: string;
   userEmail: string;
+  mappedTL?: string;
+  mappedManager?: string;
   clockInTime: string;
   clockOutTime?: string;
   activities: ShiftActivity[];
   status: 'ACTIVE' | 'BREAK' | 'COMPLETED' | 'AUTO_CLOSED';
 }
 
-export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }: SupervisorDashboardProps) {
+export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, externalTheme }: SupervisorDashboardProps) {
   const { hasTmsPermission } = usePermission();
+  const isDark = document.documentElement.classList.contains('dark') || externalTheme === 'dark';
   
   // Tab control
-  const [activeTab, setActiveTab] = useState<'monitoring' | 'controls' | 'exceptions'>('monitoring');
+  const [activeTab, setActiveTab] = useState<'monitoring' | 'controls' | 'exceptions' | 'hierarchy'>('monitoring');
   
   // Real-time active shifts & audit logs status loaded locally for performance
   const [activeShifts, setActiveShifts] = useState<TMSShift[]>([]);
@@ -182,22 +186,34 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
     // ADMIN and MANAGER can see organization-wide; other roles filter by team hierarchy
     const roleNormalized = (user.role || '').toUpperCase();
     const isManagerOrAdmin = ['ADMIN', 'MANAGER'].includes(roleNormalized);
-    const isTeamLeadOrSupervisor = ['TEAM_LEAD', 'LEAD', 'STL', 'QTL', 'OPS_TL', 'TRAINER_TL'].includes(roleNormalized);
+    const isTeamLeadOrSupervisor = ['TEAM_LEAD', 'STL', 'QTL', 'OPS_TL', 'TRAINER_TL'].includes(roleNormalized);
     
+    // Status normalization
+    const isActive = (u: UserProfile) => {
+      const s = (u.status || '').toLowerCase();
+      return s === 'active' || s === 'online' || s === 'break' || s === '';
+    };
+
     if (isManagerOrAdmin) {
       if (tlFilter !== 'all') {
-        return allUsers.filter(u => u.status === 'Active' && u.teamLeadId === tlFilter);
+        return allUsers.filter(u => isActive(u) && (u.teamLeadId === tlFilter || u.uid === tlFilter));
       }
-      return allUsers.filter(u => u.status === 'Active');
+      return allUsers.filter(u => isActive(u));
     } else if (isTeamLeadOrSupervisor) {
-      // If a specific Team Lead is selected, show resources belonging to that Team Lead
+      // If a specific Team Lead is selected, show resources belonging to that Team Lead, plus that Team Lead itself
       if (tlFilter !== 'all') {
-        return allUsers.filter(u => u.status === 'Active' && u.teamLeadId === tlFilter);
+        const tlLower = tlFilter.toLowerCase();
+        return allUsers.filter(u => isActive(u) && (
+          u.teamLeadId === tlFilter || 
+          u.uid === tlFilter || 
+          (u.teamLeadEmail && u.teamLeadEmail.toLowerCase() === tlLower) ||
+          (u.email && u.email.toLowerCase() === tlLower)
+        ));
       }
-      // By default (tlFilter === 'all'), fallback to their own mapped resources
-      return allUsers.filter(u => u.status === 'Active' && canActOn(user, u, allUsers));
+      // By default (tlFilter === 'all'), fallback to their own mapped resources, plus themselves so they see their own status & attendance
+      return allUsers.filter(u => isActive(u) && (u.uid === user.uid || canActOn(user, u, allUsers)));
     }
-    return allUsers.filter(u => u.status === 'Active' && canActOn(user, u, allUsers));
+    return allUsers.filter(u => isActive(u) && (u.uid === user.uid || canActOn(user, u, allUsers)));
   }, [allUsers, user, tlFilter]);
 
   // Keep a ref of the latest mappedUsers and dependencies so the snapshot closure doesn't become stale
@@ -329,16 +345,15 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
       if (externalSnapshot) {
         allActiveShifts = externalSnapshot.docs.map((d: any) => ({ id: d.id, ...d.data() } as TMSShift));
       } else {
-        const activeShiftsQuery = (['ADMIN', 'MANAGER', 'MIS'].includes(user.role.toUpperCase())) 
-          ? query(collection(db, 'tmsShifts'), where('status', 'in', ['ACTIVE', 'BREAK']))
-          : query(collection(db, 'tmsShifts'), where('status', 'in', ['ACTIVE', 'BREAK']), where('mappedTL', '==', user.email));
+        // Fetch all active shifts to ensure supervisor can see their own status and team's status
+        const activeShiftsQuery = query(collection(db, 'tmsShifts'), where('status', 'in', ['ACTIVE', 'BREAK']));
         const snapshot = await getDocs(activeShiftsQuery);
         allActiveShifts = snapshot.docs.map(d => ({ id: d.id, ...d.data() } as TMSShift));
       }
 
-      // Filter active shifts matching the team scope
+      // Filter active shifts matching the team scope OR the current supervisor's own shift
       const scopeIds = new Set(currentMappedUsers.map(u => u.uid));
-      const teamActiveShiftsRaw = allActiveShifts.filter(sh => scopeIds.has(sh.userId));
+      const teamActiveShiftsRaw = allActiveShifts.filter(sh => scopeIds.has(sh.userId) || sh.userId === user.uid);
 
       // Group active shifts by userId to identify and heal duplicates
       const shiftsByUser: { [userId: string]: TMSShift[] } = {};
@@ -447,34 +462,6 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
         const lastActObj = shActs.length > 0 ? shActs[shActs.length - 1] : null;
         const lastActTime = lastActObj ? new Date(lastActObj.startTime).getTime() : clockInMs;
         
-        // 1. Stale shifts (>16 hours active) - Auto closed
-        if (nowMs - clockInMs > 16 * 60 * 60 * 1000) {
-          stales.push({
-            id: sh.id,
-            userId: sh.userId,
-            userName: sh.userName,
-            clockInTime: sh.clockInTime
-          });
-
-          // Auto-punch logic: close the shift
-          const nowISO = new Date().toISOString();
-          const updatedActivities = [...(sh.activities || [])];
-          if (updatedActivities.length > 0) {
-            const lastIndex = updatedActivities.length - 1;
-            if (!updatedActivities[lastIndex].endTime) {
-              updatedActivities[lastIndex].endTime = nowISO;
-            }
-          }
-
-          staleBatch.set(doc(db, 'tmsShifts', sh.id), {
-            ...sh,
-            activities: updatedActivities,
-            status: 'AUTO_CLOSED',
-            clockOutTime: nowISO
-          });
-          
-          staleFound = true;
-        }
 
         // 2. Long break (>45 minutes on break)
         if (sh.status === 'BREAK' && lastActObj && !lastActObj.endTime) {
@@ -492,20 +479,6 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
           }
         }
 
-        // 3. Idle Users (in active status but no updates for >2 hours)
-        if (sh.status === 'ACTIVE' && lastActObj) {
-          const idleMins = (nowMs - lastActTime) / (60 * 1000);
-          if (idleMins > 120) {
-            idles.push({
-              userId: sh.userId,
-              userName: sh.userName,
-              email: sh.userEmail,
-              lastActivity: lastActObj.name,
-              lastActivityTime: lastActObj.startTime,
-              shiftId: sh.id
-            });
-          }
-        }
       });
 
       // Team Inconsistencies Scan
@@ -534,23 +507,6 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
         }
       });
 
-      // Commit auto-punch batch if any found
-      if (staleFound) {
-        console.log(`[AUTO-PUNCH] Found ${stales.length} shifts active for >16h. Auto-closing...`);
-        await staleBatch.commit();
-        // Record auto-audit
-        stales.forEach(async (stale) => {
-          await addDoc(collection(db, 'adminAuditLogs'), {
-            timestamp: new Date().toISOString(),
-            performedBy: 'System Engine (Auto-Punch)',
-            affectedUser: `${stale.userName} (${stale.userId})`,
-            action: 'System Auto Force Logout',
-            previousValue: 'STALE_SHIFT > 16H',
-            newValue: 'AUTO_CLOSED'
-          });
-        });
-        toast.info(`System auto-closed ${stales.length} shifts that exceeded 16 hours.`);
-      }
 
       // Counts discrepancies
       const countMismatches: any[] = [];
@@ -581,21 +537,14 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
           offline: offlineCount
         },
         exceptionCounts: {
-          missingPunchOuts: stales.length,
-          longBreaks: longBreaks.length,
-          idleUsers: idles.length,
           autoClosed: teamAutoClosed.length,
           attendanceExceptions: attendanceExceptions.length
         },
         exceptionsList: {
-          missingPunchOuts: stales,
-          longBreaks,
-          idleUsers: idles,
           autoClosed: teamAutoClosed,
           attendanceExceptions
         },
         validationReport: {
-          staleSessions: stales,
           activeAfterClockOut: [], // Profiles mark as active somewhere but clocked out
           teamInconsistencies: inconsistencies,
           countMismatches
@@ -762,61 +711,6 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
 
   const [syncing, setSyncing] = useState(false);
 
-  // Bulk Force Logout for shifts > 16h productive
-  const handleBulkForceLogout = async () => {
-    const thresholdMs = 16 * 60 * 60 * 1000;
-    const now = new Date();
-    const nowISO = now.toISOString();
-    
-    const shiftsToClose = activeShifts.filter(sh => {
-      const stats = calculateShiftStatsObj(sh);
-      return stats.activeMs > thresholdMs;
-    });
-
-    if (shiftsToClose.length === 0) {
-      toast.info('No shifts found with productive time > 16 hours.');
-      return;
-    }
-
-    if (!window.confirm(`Are you sure you want to force clock-out ${shiftsToClose.length} users with > 16 hours of productive time?`)) return;
-
-    setSyncing(true);
-    const tid = toast.loading(`Forcing clock-out for ${shiftsToClose.length} users...`);
-    try {
-      const fbBatch = writeBatch(db);
-      for (const sh of shiftsToClose) {
-        const updatedActivities = [...sh.activities];
-        if (updatedActivities.length > 0) {
-          const last = { ...updatedActivities[updatedActivities.length - 1] };
-          if (!last.endTime) {
-            last.endTime = nowISO;
-            updatedActivities[updatedActivities.length - 1] = last;
-          }
-        }
-
-        fbBatch.update(doc(db, 'tmsShifts', sh.id), {
-          status: 'COMPLETED',
-          clockOutTime: nowISO,
-          activities: updatedActivities,
-          forceLogout: true,
-          logoutReason: 'Auto Bulk Force Logout (>16h productive)'
-        });
-
-        fbBatch.update(doc(db, 'users', sh.userId), {
-          status: 'OFFLINE'
-        });
-      }
-      await fbBatch.commit();
-      toast.success(`Successfully force-closed ${shiftsToClose.length} sessions.`);
-      loadAndRecomputeData(true);
-    } catch (err) {
-      console.error('Bulk logout failed:', err);
-      toast.error('Failed to execute bulk logout.');
-    } finally {
-      toast.dismiss(tid);
-      setSyncing(false);
-    }
-  };
 
   // Perform operational Force Out
   const executeSupervisorClockOut = async () => {
@@ -1210,13 +1104,22 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
                     userId: user.uid,
                     userName: user.name,
                     userEmail: user.email,
+                    mappedTL: (user as any).teamLeadEmail || (user as any).mappedTL || 'N/A',
+                    mappedManager: (user as any).mappedManagerEmail || (user as any).mappedManager || 'N/A',
                     clockInTime: new Date().toISOString(),
                     activities: [{ type: 'productive', name: 'Work Start', startTime: new Date().toISOString() }],
                     status: 'ACTIVE'
                   };
-                  addDoc(collection(db, 'tmsShifts'), newShift).then(() => {
+                  addDoc(collection(db, 'tmsShifts'), newShift).then((docRef) => {
                     toast.success('Clocked in successfully');
-                    // Give Firestore a moment before recomputing
+                    // Optimistic update to UI state
+                    const shiftWithId = { ...newShift, id: docRef.id };
+                    setActiveShifts(prev => {
+                      // Remove any existing for same user just in case
+                      const filtered = prev.filter(s => s.userId !== user.uid);
+                      return [shiftWithId, ...filtered];
+                    });
+                    // Refresh data fully
                     setTimeout(() => loadAndRecomputeData(true), 500);
                   }).catch(err => {
                     console.error('Clock-in failed:', err);
@@ -1343,11 +1246,173 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
             </span>
           )}
         </button>
+        {user.role === 'ADMIN' && (
+          <button 
+            onClick={() => setActiveTab('hierarchy')}
+            className={`flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-black transition-all cursor-pointer ${activeTab === 'hierarchy' ? 'bg-indigo-50 dark:bg-indigo-900/20 text-indigo-600 dark:text-indigo-400 border border-indigo-100 dark:border-indigo-800' : 'text-slate-500 dark:text-slate-400 hover:text-slate-800 dark:hover:text-slate-200'}`}
+          >
+            <Shield size={14} />
+            Diagnostics
+          </button>
+        )}
       </div>
 
       {/* RENDER SELECTED TAB VIEWS */}
       <div className="space-y-6">
         
+        {/* TAB 4: HIERARCHY VALIDATION REPORT (ADMIN ONLY) */}
+        {activeTab === 'hierarchy' && user.role === 'ADMIN' && (
+          <div className="space-y-6 animate-in fade-in slide-in-from-bottom-2 duration-300">
+            <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-6 shadow-sm">
+              <div className="flex items-center justify-between mb-6">
+                <div>
+                  <h3 className="text-sm font-black text-slate-900 dark:text-white uppercase tracking-wider flex items-center gap-2">
+                    <Shield size={18} className="text-indigo-500" /> Organization Hierarchy Validation Report
+                  </h3>
+                  <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">Diagnostic view showing synchronization between employee roster and team mapping.</p>
+                </div>
+                <button 
+                  onClick={() => onRefreshAllData?.()}
+                  className="bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-colors"
+                >
+                  <RefreshCw size={14} /> Sync Roster
+                </button>
+              </div>
+
+              {/* Statistics Overview */}
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
+                <div className="bg-slate-50 dark:bg-slate-950/40 p-4 rounded-xl border border-slate-100 dark:border-slate-800">
+                  <span className="text-[10px] font-black uppercase text-slate-400 tracking-wider">Unmapped Users</span>
+                  <div className="flex items-center gap-3 mt-1">
+                    <span className="text-2xl font-black text-rose-500">{allUsers.filter(u => !u.teamLeadId && !u.mappedManagerId && !u.managerId && u.role !== 'ADMIN').length}</span>
+                    <span className="text-[10px] bg-rose-50 dark:bg-rose-900/20 text-rose-600 px-2 py-0.5 rounded-full font-bold">Needs Mapping</span>
+                  </div>
+                </div>
+                <div className="bg-slate-50 dark:bg-slate-950/40 p-4 rounded-xl border border-slate-100 dark:border-slate-800">
+                  <span className="text-[10px] font-black uppercase text-slate-400 tracking-wider">Total Active Units</span>
+                  <div className="flex items-center gap-3 mt-1">
+                    <span className="text-2xl font-black text-slate-800 dark:text-slate-200">{allUsers.filter(u => u.status === 'Active').length}</span>
+                    <span className="text-[10px] bg-indigo-50 dark:bg-indigo-900/20 text-indigo-600 px-2 py-0.5 rounded-full font-bold">Roster Capacity</span>
+                  </div>
+                </div>
+                <div className="bg-slate-50 dark:bg-slate-950/40 p-4 rounded-xl border border-slate-100 dark:border-slate-800">
+                  <span className="text-[10px] font-black uppercase text-slate-400 tracking-wider">Supervisors Identified</span>
+                  <div className="flex items-center gap-3 mt-1">
+                    <span className="text-2xl font-black text-slate-800 dark:text-slate-200">{teamLeadsList.length}</span>
+                    <span className="text-[10px] bg-emerald-50 dark:bg-emerald-900/20 text-emerald-600 px-2 py-0.5 rounded-full font-bold">TL Variants</span>
+                  </div>
+                </div>
+                <div className="bg-slate-50 dark:bg-slate-950/40 p-4 rounded-xl border border-slate-100 dark:border-slate-800">
+                  <span className="text-[10px] font-black uppercase text-slate-400 tracking-wider">Missing Manager Link</span>
+                  <div className="flex items-center gap-3 mt-1">
+                    <span className="text-2xl font-black text-orange-500">{allUsers.filter(u => !u.managerId && !u.mappedManagerId && u.role !== 'ADMIN' && u.role !== 'MANAGER').length}</span>
+                    <span className="text-[10px] bg-orange-50 dark:bg-orange-900/20 text-orange-600 px-2 py-0.5 rounded-full font-bold">Incomplete</span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Detailed Mapping Table */}
+              <div className="space-y-4">
+                <h4 className="text-xs font-black text-slate-700 dark:text-slate-300 uppercase tracking-widest px-1">Team Mapping Summary</h4>
+                <div className="overflow-x-auto border border-slate-100 dark:border-slate-800 rounded-xl">
+                  <table className="w-full text-left border-collapse">
+                    <thead className="bg-slate-50 dark:bg-slate-800/50 text-[10px] uppercase font-black text-slate-500">
+                      <tr>
+                        <th className="px-4 py-3 border-b border-slate-100 dark:border-slate-800">Resource (Supervisor)</th>
+                        <th className="px-4 py-3 border-b border-slate-100 dark:border-slate-800 text-center">Mapped Count</th>
+                        <th className="px-4 py-3 border-b border-slate-100 dark:border-slate-800">Mapped Role types</th>
+                        <th className="px-4 py-3 border-b border-slate-100 dark:border-slate-800 text-right">Status</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-50 dark:divide-slate-850">
+                      {teamLeadsList.map((tl) => {
+                        const directReports = allUsers.filter(u => u.teamLeadId === tl.id || (u.teamLeadEmail && u.teamLeadEmail.toLowerCase() === tl.id.toLowerCase()));
+                        const roles = Array.from(new Set(directReports.map(u => u.role))).join(', ');
+                        const isInvalid = !['TEAM_LEAD', 'STL', 'OPS_TL', 'QTL', 'TRAINER_TL'].includes((allUsers.find(u => u.uid === tl.id)?.role || '').toString().toUpperCase());
+                        
+                        return (
+                          <tr key={tl.id} className="hover:bg-slate-50 dark:hover:bg-slate-850/40 transition-colors">
+                            <td className="px-4 py-3">
+                              <div className="font-extrabold text-xs text-slate-800 dark:text-slate-200">{tl.name}</div>
+                              <div className="text-[9px] font-bold text-slate-400">{tl.roleDisplay} • {tl.id}</div>
+                            </td>
+                            <td className="px-4 py-3 text-center">
+                              <span className={`text-xs font-black ${directReports.length === 0 ? 'text-slate-400' : 'text-indigo-600 dark:text-indigo-400'}`}>
+                                {directReports.length}
+                              </span>
+                            </td>
+                            <td className="px-4 py-3">
+                              <span className="text-[10px] font-bold text-slate-500 whitespace-nowrap overflow-hidden text-ellipsis max-w-48 block">
+                                {roles || 'No active mappings'}
+                              </span>
+                            </td>
+                            <td className="px-4 py-3 text-right">
+                              {isInvalid ? (
+                                <span className="bg-amber-50 dark:bg-amber-950/20 text-amber-600 text-[9px] font-black px-2 py-0.5 rounded-full uppercase">Invalid TL Role</span>
+                              ) : (
+                                <span className="bg-emerald-50 dark:bg-emerald-950/20 text-emerald-600 text-[9px] font-black px-2 py-0.5 rounded-full uppercase">Verified</span>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+
+                <div className="mt-6 space-y-4">
+                  <h4 className="text-xs font-black text-slate-700 dark:text-slate-300 uppercase tracking-widest px-1">Integrity Alerts</h4>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div className="bg-rose-50/30 dark:bg-rose-950/10 border border-rose-100 dark:border-rose-900/30 p-4 rounded-xl">
+                      <h5 className="text-[11px] font-black text-rose-700 dark:text-rose-400 flex items-center gap-1.5 mb-2 uppercase">
+                        <AlertTriangle size={14} /> Unmapped Users (No TL/Mgr)
+                      </h5>
+                      <div className="max-h-40 overflow-y-auto space-y-2">
+                        {allUsers.filter(u => !u.teamLeadId && !u.mappedManagerId && !u.managerId && u.role === 'AGENT').slice(0, 10).map(u => (
+                          <div key={u.uid} className="text-[10px] flex justify-between items-center text-slate-600 dark:text-slate-400 bg-white/50 dark:bg-slate-900/50 p-2 rounded-lg">
+                            <span>{u.fullName || u.name}</span>
+                            <span className="font-mono text-slate-400">{u.process || 'NO_PROCESS'}</span>
+                          </div>
+                        ))}
+                        {allUsers.filter(u => !u.teamLeadId && !u.mappedManagerId && !u.managerId && u.role === 'AGENT').length > 10 && (
+                          <div className="text-[9px] text-center text-slate-400 font-bold italic pt-1">
+                            +{allUsers.filter(u => !u.teamLeadId && !u.mappedManagerId && !u.managerId && u.role === 'AGENT').length - 10} more unmapped
+                          </div>
+                        )}
+                        {allUsers.filter(u => !u.teamLeadId && !u.mappedManagerId && !u.managerId && u.role === 'AGENT').length === 0 && (
+                          <div className="text-[10px] text-emerald-600 font-bold text-center py-2 italic">All active users have valid mappings</div>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="bg-amber-50/30 dark:bg-amber-950/10 border border-amber-100 dark:border-amber-900/30 p-4 rounded-xl">
+                      <h5 className="text-[11px] font-black text-amber-700 dark:text-amber-400 flex items-center gap-1.5 mb-2 uppercase">
+                        <Shield size={14} /> Duplicate/Orphan Logic
+                      </h5>
+                      <div className="text-[10px] space-y-2.5 text-slate-600 dark:text-slate-400">
+                        <div className="flex justify-between items-center p-2 rounded-lg bg-white/50 dark:bg-slate-900/50">
+                          <span>Users with Multiple Sync IDs</span>
+                          <span className="font-black text-slate-900 dark:text-white">0</span>
+                        </div>
+                        <div className="flex justify-between items-center p-2 rounded-lg bg-white/50 dark:bg-slate-900/50">
+                          <span>Legacy Mapping Entries</span>
+                          <span className="font-black text-slate-900 dark:text-white">
+                            {allUsers.filter(u => !!u.Manager || !!u.mappedManager).length}
+                          </span>
+                        </div>
+                        <div className="flex justify-between items-center p-2 rounded-lg bg-white/50 dark:bg-slate-900/50">
+                          <span>Master Roster Sync Health</span>
+                          <span className="font-black text-emerald-600">Active</span>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* TAB 1: WORKFORCE MONITORING (ANALYTICS & DISTRIBUTION VISUALS) */}
         {activeTab === 'monitoring' && (
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
@@ -1412,17 +1477,23 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
             </div>
 
             {/* Role Dispersion Graph */}
-            <div className="lg:col-span-8 bg-white border border-slate-200 rounded-2xl p-5 shadow-sm space-y-4">
-              <h4 className="text-xs font-extrabold text-slate-800 uppercase tracking-widest">
+            <div className="lg:col-span-8 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-5 shadow-sm space-y-4">
+              <h4 className="text-xs font-extrabold text-slate-800 dark:text-white uppercase tracking-widest">
                 Team Role Allocation Mapping
               </h4>
               <div className="h-[210px] w-full pt-2">
                 <ResponsiveContainer width="100%" height="100%">
                   <BarChart data={roleChartData}>
                     <CartesianGrid strokeDasharray="3 3" opacity={0.1} />
-                    <XAxis dataKey="name" stroke="#64748B" fontSize={11} />
-                    <YAxis stroke="#64748B" fontSize={11} />
-                    <Tooltip contentStyle={{ borderRadius: '12px', fontSize: '12px' }} />
+                    <XAxis dataKey="name" stroke={isDark ? '#94A3B8' : '#64748B'} fontSize={11} />
+                    <YAxis stroke={isDark ? '#94A3B8' : '#64748B'} fontSize={11} />
+                    <Tooltip contentStyle={{ 
+                      borderRadius: '12px', 
+                      fontSize: '12px',
+                      backgroundColor: isDark ? '#1e293b' : '#ffffff',
+                      borderColor: isDark ? '#334155' : '#e2e8f0',
+                      color: isDark ? '#ffffff' : '#0f172a'
+                    }} />
                     <Bar dataKey="count" fill="#6366F1" radius={[6, 6, 0, 0]} maxBarSize={35} />
                   </BarChart>
                 </ResponsiveContainer>
@@ -1430,53 +1501,18 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
             </div>
 
             {/* QUICK SUPERVISOR TOOLS RAIL */}
-            <div className="lg:col-span-12 bg-white border border-slate-200 rounded-2xl p-5 shadow-sm">
-              <h4 className="text-xs font-extrabold text-slate-800 uppercase tracking-widest mb-4">
+            <div className="lg:col-span-12 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-5 shadow-sm">
+              <h4 className="text-xs font-extrabold text-slate-800 dark:text-white uppercase tracking-widest mb-4">
                 Operational Short-cuts & Quick Actions
               </h4>
               <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3">
-                {/* Only one button here or just remove the correction one */}
-                {/* Bulk Force Logout Action Button */}
-                {['ADMIN', 'MANAGER'].includes((user.role || '').toUpperCase()) && (
-                  <button 
-                    onClick={handleBulkForceLogout}
-                    disabled={syncing}
-                    className="bg-rose-600 hover:bg-rose-700 border border-rose-500 text-white p-3 rounded-xl flex items-center justify-center gap-2 text-xs font-extrabold transition-all cursor-pointer shadow-sm shadow-rose-200 disabled:opacity-50"
-                  >
-                    <LogOut size={15} /> Bulk Force Logout ({'>'}16h)
-                  </button>
-                )}
-
-                <button 
-                  onClick={openAuditLogsModal}
-                  className="bg-slate-850 hover:bg-slate-900 border border-slate-700 text-slate-200 p-3 rounded-xl flex items-center justify-center gap-2 text-xs font-extrabold transition-all cursor-pointer"
-                >
-                  <Calendar size={15} /> View System Trial Logs
-                </button>
-
                 <button 
                   onClick={handleSpreadsheetExport}
                   disabled={isExporting}
-                  className="bg-emerald-600 hover:bg-emerald-700 text-white p-3 rounded-xl flex items-center justify-center gap-2 text-xs font-extrabold transition-colors cursor-pointer"
+                  className="bg-emerald-600 hover:bg-emerald-700 text-white p-3 rounded-xl flex items-center justify-center gap-2 text-xs font-extrabold transition-colors cursor-pointer w-full"
                 >
                   <FileSpreadsheet size={15} /> Export Workforce Roster State
                 </button>
-
-                <button 
-                  onClick={() => setActiveTab('exceptions')}
-                  className="bg-rose-50 hover:bg-rose-100 border border-rose-200 text-rose-700 p-3 rounded-xl flex items-center justify-center gap-2 text-xs font-extrabold transition-colors cursor-pointer"
-                >
-                  <AlertTriangle size={15} /> Access Diagnostics Center
-                </button>
-
-                {hasTmsPermission('can_force_logout') && (
-                  <button 
-                    onClick={() => setShowBulkLogoutModal(true)}
-                    className="bg-rose-600 hover:bg-rose-700 text-white p-3 rounded-xl flex items-center justify-center gap-2 text-xs font-extrabold transition-colors shadow-sm cursor-pointer shadow-rose-300"
-                  >
-                    <UserX size={15} /> Emergency Bulk Logout
-                  </button>
-                )}
               </div>
             </div>
 
@@ -1485,16 +1521,16 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
 
         {/* TAB 2: ROSTER WORKFORCE CONTROLS (ADVANCED FILTERS & POWER LIST) */}
         {activeTab === 'controls' && (
-          <div className="bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden space-y-4">
+          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl shadow-sm overflow-hidden space-y-4 text-slate-800 dark:text-white">
             
             {/* Header + Multi filters */}
-            <div className="p-5 border-b border-slate-100 space-y-4 bg-slate-50/50">
+            <div className="p-5 border-b border-slate-100 dark:border-slate-800 space-y-4 bg-slate-50/50 dark:bg-slate-950/25">
               <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
                 <div>
-                  <h4 className="text-sm font-black text-slate-900 uppercase tracking-wide">
+                  <h4 className="text-sm font-black text-slate-900 dark:text-white uppercase tracking-wide">
                     Live Operational Supervision Table
                   </h4>
-                  <p className="text-xs text-slate-500">Conduct direct searches, force logout actions, filters and page navigation.</p>
+                  <p className="text-xs text-slate-500 dark:text-slate-400">Conduct direct searches, force logout actions, filters and page navigation.</p>
                 </div>
 
                 <div className="relative w-full md:w-72">
@@ -2048,92 +2084,6 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
                 </div>
               </div>
 
-              {/* Long-Running Active Sessions Exception (Previously Idle active timers) */}
-              <div className="relative bg-white dark:bg-slate-900 border border-slate-100 dark:border-slate-850 rounded-2xl p-6 shadow-xs hover:shadow-md hover:-translate-y-0.5 transition-all duration-300">
-                <div className="absolute top-0 bottom-0 left-0 w-1 bg-amber-500 rounded-l-2xl" />
-                <div className="flex items-center justify-between border-b border-slate-50 dark:border-slate-850 pb-3 mb-4">
-                  <h4 className="text-xs font-extrabold text-amber-700 dark:text-amber-400 uppercase tracking-widest flex items-center gap-2 leading-none">
-                    <Clock size={15} className="text-amber-500 animate-pulse" /> Long-Running Active Sessions {`> 2 hours`}
-                  </h4>
-                  <span className="bg-amber-50 dark:bg-amber-950/40 text-amber-700 dark:text-amber-400 text-[10px] font-black px-2.5 py-1 rounded-full leading-none font-mono">
-                    {summaryData?.exceptionsList?.idleUsers?.length || 0} active
-                  </span>
-                </div>
-
-                <div className="space-y-3.5 max-h-68 overflow-y-auto">
-                  {summaryData?.exceptionsList?.idleUsers?.map((item: any, idx: number) => (
-                    <div key={idx} className="flex justify-between items-center text-xs bg-amber-50/10 dark:bg-amber-950/10 p-3 rounded-xl border border-amber-100/20 dark:border-amber-950/20 font-sans">
-                      <div className="flex items-center gap-2.5 min-w-0">
-                        <div className="w-8 h-8 rounded-full bg-amber-100 dark:bg-amber-950 text-amber-700 dark:text-amber-400 flex items-center justify-center font-extrabold text-[11px] uppercase shrink-0">
-                          {item.userName ? item.userName.charAt(0) : 'U'}
-                        </div>
-                        <div className="min-w-0">
-                          <div className="font-extrabold text-slate-800 dark:text-slate-200 leading-tight truncate">{item.userName}</div>
-                          <div className="text-[10px] text-amber-600 dark:text-amber-400 font-bold mt-0.5 leading-none">Running: {item.lastActivity} for {item.idleMins || 120}+ mins</div>
-                        </div>
-                      </div>
-                      <button 
-                        onClick={() => selectAndFocusUser(item.userName)}
-                        className="bg-amber-100 hover:bg-amber-150 dark:bg-amber-950 dark:text-amber-300 dark:hover:bg-amber-900/60 text-amber-800 text-[10px] font-extrabold px-3 py-1.5 rounded-lg shrink-0 cursor-pointer transition-colors"
-                      >
-                        Force Out / Audit
-                      </button>
-                    </div>
-                  ))}
-
-                  {(!summaryData?.exceptionsList?.idleUsers || summaryData.exceptionsList.idleUsers.length === 0) && (
-                    <div className="text-center py-8">
-                      <p className="text-xs text-slate-400 dark:text-slate-500 font-bold uppercase tracking-widest leading-none">
-                        ✅ No long-running active sessions
-                      </p>
-                    </div>
-                  )}
-                </div>
-              </div>
-
-              {/* Missing Punch Outs Exception */}
-              <div className="relative bg-white dark:bg-slate-900 border border-indigo-100 dark:border-indigo-950 rounded-2xl p-6 shadow-xs hover:shadow-md hover:-translate-y-0.5 transition-all duration-300">
-                <div className="absolute top-0 bottom-0 left-0 w-1 bg-indigo-500 rounded-l-2xl" />
-                <div className="flex items-center justify-between border-b border-indigo-5/60 dark:border-indigo-950/40 pb-3 mb-4">
-                  <h4 className="text-xs font-extrabold text-indigo-700 dark:text-indigo-400 uppercase tracking-widest flex items-center gap-2 leading-none">
-                    <UserX size={15} className="text-indigo-500" /> Missing Clock Punch Outs {`> 16 hours`}
-                  </h4>
-                  <span className="bg-indigo-50 dark:bg-indigo-950/40 text-indigo-700 dark:text-indigo-400 text-[10px] font-black px-2.5 py-1 rounded-full leading-none font-mono">
-                    {summaryData?.exceptionsList?.missingPunchOuts?.length || 0} active
-                  </span>
-                </div>
-
-                <div className="space-y-3.5 max-h-68 overflow-y-auto">
-                  {summaryData?.exceptionsList?.missingPunchOuts?.map((item: any, idx: number) => (
-                    <div key={idx} className="flex justify-between items-center text-xs bg-indigo-50/50 dark:bg-indigo-950/10 p-3 rounded-xl border border-indigo-100/20 dark:border-indigo-950/20 font-sans">
-                      <div className="flex items-center gap-2.5 min-w-0">
-                        <div className="w-8 h-8 rounded-full bg-indigo-100 dark:bg-indigo-950 text-indigo-700 dark:text-indigo-400 flex items-center justify-center font-extrabold text-[11px] uppercase shrink-0">
-                          {item.userName ? item.userName.charAt(0) : 'U'}
-                        </div>
-                        <div className="min-w-0">
-                          <div className="font-extrabold text-slate-800 dark:text-slate-200 leading-tight truncate">{item.userName}</div>
-                          <div className="text-[10px] text-indigo-600 dark:text-indigo-400 font-bold mt-0.5 leading-none">On-duty since: {new Date(item.clockInTime).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</div>
-                        </div>
-                      </div>
-                      <button 
-                        onClick={() => selectAndFocusUser(item.userName)}
-                        className="bg-indigo-600 hover:bg-indigo-700 text-white text-[10px] font-extrabold px-3 py-1.5 rounded-lg shrink-0 cursor-pointer transition-colors"
-                      >
-                        Force Log Out
-                      </button>
-                    </div>
-                  ))}
-
-                  {(!summaryData?.exceptionsList?.missingPunchOuts || summaryData.exceptionsList.missingPunchOuts.length === 0) && (
-                    <div className="text-center py-8">
-                      <p className="text-xs text-slate-400 dark:text-slate-500 font-bold uppercase tracking-widest leading-none">
-                        ✅ No missing punch-out compliance alerts
-                      </p>
-                    </div>
-                  )}
-                </div>
-              </div>
-
               {/* Auto-Closed & Missed Attendance Exceptions */}
               <div className="relative bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-6 shadow-xs hover:shadow-md hover:-translate-y-0.5 transition-all duration-300">
                 <div className="absolute top-0 bottom-0 left-0 w-1 bg-sky-500 rounded-l-2xl" />
@@ -2216,20 +2166,6 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
 
               <div className="grid grid-cols-1 md:grid-cols-2 gap-6 pt-2">
                 <div className="space-y-4">
-                  <div>
-                    <h5 className="text-[10px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest mb-2 font-mono">Users with Stale Sessions (&gt;24 Hours Running)</h5>
-                    <div className="space-y-2 max-h-40 overflow-y-auto pr-1">
-                      {summaryData?.validationReport?.staleSessions?.map((item: any, idx: number) => (
-                        <div key={idx} className="flex justify-between items-center text-xs p-3 bg-yellow-50/30 dark:bg-yellow-950/10 border border-yellow-200/30 dark:border-yellow-900/20 rounded-xl">
-                          <span className="font-extrabold text-slate-850 dark:text-slate-200">{item.userName}</span>
-                          <span className="text-[10px] text-yellow-700 dark:text-yellow-450 font-bold font-mono">Clock In: {new Date(item.clockInTime).toLocaleDateString()}</span>
-                        </div>
-                      ))}
-                      {(!summaryData?.validationReport?.staleSessions || summaryData.validationReport.staleSessions.length === 0) && (
-                        <p className="text-[11px] text-slate-400 dark:text-slate-500 font-medium font-sans">No stale sessions active beyond compliance limits.</p>
-                      )}
-                    </div>
-                  </div>
 
                   <div>
                     <h5 className="text-[10px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest mb-2 font-mono">Inconsistencies & Profile Mappings</h5>

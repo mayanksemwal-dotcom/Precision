@@ -517,7 +517,20 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
       };
       await setDoc(doc(db, 'employee_master', generatedUid), masterDoc);
 
-      toast.success(`Account for '${newForm.name}' successfully spawned.`);
+      // 4. Sync Team Mapping (Ongoing Auto-Sync)
+      const mappingDoc = {
+        userId: generatedUid,
+        userName: newForm.name,
+        teamLeadId: newForm.teamLeadUid || '',
+        teamLeadName: newForm.teamLeadName || '',
+        managerId: newForm.mappedManagerUid || '',
+        managerName: newForm.mappedManagerName || '',
+        process: newForm.process || '',
+        lastUpdated: new Date().toISOString()
+      };
+      await setDoc(doc(db, 'teamMappings', generatedUid), mappingDoc);
+
+      toast.success(`Account for '${newForm.name}' spawned and hierarchy synchronized.`);
       logAdminEvent('User Profile Spawned', newForm.email, '', JSON.stringify(finalProfile));
       setIsNewUserOpen(false);
       setNewForm({
@@ -606,7 +619,20 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
       };
       await setDoc(doc(db, 'employee_master', editingUser.uid), masterDoc);
 
-      toast.success(`Profile for '${editForm.name}' successfully updated.`);
+      // 3. Sync Team Mapping (Ongoing Auto-Sync)
+      const mappingDoc = {
+        userId: editingUser.uid,
+        userName: editForm.name,
+        teamLeadId: editForm.teamLeadUid || '',
+        teamLeadName: editForm.teamLeadName || '',
+        managerId: editForm.mappedManagerUid || '',
+        managerName: editForm.mappedManagerName || '',
+        process: editForm.process || '',
+        lastUpdated: new Date().toISOString()
+      };
+      await setDoc(doc(db, 'teamMappings', editingUser.uid), mappingDoc);
+
+      toast.success(`Profile for '${editForm.name}' updated and hierarchy synchronized.`);
       logAdminEvent(
         'User Profile Updated', 
         editingUser.email, 

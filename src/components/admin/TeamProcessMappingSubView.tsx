@@ -142,10 +142,34 @@ export const TeamProcessMappingSubView: React.FC<TeamProcessMappingSubViewProps>
         }
 
         batch.set(uRef, payload);
+
+        // SYNC Team Mappings (Ongoing Auto-Sync)
+        const mappingRef = doc(db, 'teamMappings', u.uid);
+        batch.set(mappingRef, {
+          userId: u.uid,
+          userName: u.fullName || u.name || '',
+          teamLeadId: payload.teamLeadId || u.teamLeadId || '',
+          teamLeadName: payload.teamLeadName || u.teamLeadName || '',
+          managerId: payload.mappedManagerId || u.mappedManagerId || '',
+          managerName: payload.mappedManagerName || u.mappedManagerName || '',
+          process: payload.process || u.process || '',
+          lastUpdated: new Date().toISOString()
+        }, { merge: true });
+
+        // SYNC employee_master
+        const masterRef = doc(db, 'employee_master', u.uid);
+        batch.set(masterRef, {
+          teamLeadId: payload.teamLeadId || u.teamLeadId || '',
+          teamLeadName: payload.teamLeadName || u.teamLeadName || '',
+          managerId: payload.mappedManagerId || u.mappedManagerId || '',
+          managerName: payload.mappedManagerName || u.mappedManagerName || '',
+          process: payload.process || u.process || '',
+          lastUpdated: new Date().toISOString()
+        }, { merge: true });
       });
 
       await batch.commit();
-      toast.success(`Broadened alignments successfully inside ${selection.size} employee directories!`);
+      toast.success(`Broadened alignments and synchronized hierarchy for ${selection.size} employee directories!`);
       logAdminEvent(
         'Staff Network Reconfigured',
         `${selection.size} users`,

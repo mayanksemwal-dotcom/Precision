@@ -158,9 +158,18 @@ service cloud.firestore {
       allow delete: if isAdmin();
     }
 
-    match /config/attendanceSettings {
+    // Config Collection Rules
+    match /config/{configId} {
       allow read: if isVerified();
       allow write: if isAdmin();
+      
+      // Specialize rules for registry if needed
+      match /processes_registry {
+        allow write: if isAdmin() || isManager();
+      }
+      match /tmsProcesses {
+        allow write: if isAdmin() || isManager();
+      }
     }
 
     match /config/master {
@@ -168,16 +177,14 @@ service cloud.firestore {
       allow write, delete: if isAdmin();
     }
 
-    match /config/processes_registry {
+    match /config/notificationSettings {
       allow read: if isVerified();
-      allow write: if isAdmin() || isManager();
-      allow delete: if isAdmin();
+      allow write: if isAdmin();
     }
 
-    match /config/tmsProcesses {
+    match /config/attendanceSettings {
       allow read: if isVerified();
-      allow write: if isAdmin() || isManager();
-      allow delete: if isAdmin();
+      allow write: if isAdmin();
     }
 
     match /process_master/{id} {

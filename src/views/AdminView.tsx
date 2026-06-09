@@ -11,7 +11,8 @@ import {
   Moon,
   Upload,
   RefreshCw,
-  Activity
+  Activity,
+  Shield
 } from 'lucide-react';
 import { db, auth } from '../lib/firebase';
 import { doc, setDoc, addDoc, collection, writeBatch } from 'firebase/firestore';
@@ -29,9 +30,10 @@ import { DataManagementSubView } from '../components/admin/DataManagementSubView
 import { BackupRestoreSubView } from '../components/admin/BackupRestoreSubView';
 import { ProcessManagementSubView } from '../components/admin/ProcessManagementSubView';
 import { AttendanceSettingsSubView } from '../components/admin/AttendanceSettingsSubView';
+import { HierarchySyncWizard } from '../components/admin/HierarchySyncWizard';
 
 // Subview type definition
-type SubTabType = 'dashboard' | 'users' | 'roles' | 'mapping' | 'process' | 'audits' | 'data' | 'backup' | 'attendancecfg';
+type SubTabType = 'dashboard' | 'users' | 'roles' | 'mapping' | 'process' | 'audits' | 'data' | 'backup' | 'attendancecfg' | 'hierarchy';
 
 interface AdminViewProps {
   activeTab: string;
@@ -99,6 +101,7 @@ export default function AdminView({
     { id: 'audits', label: 'Audit Trail', icon: History, visible: canView('Console') },
     { id: 'data', label: 'Data Management', icon: Database, visible: canDelete('Console') },
     { id: 'attendancecfg', label: 'Attendance Rules', icon: FileText, visible: canEdit('Console') },
+    { id: 'hierarchy', label: 'Hierarchy Repair', icon: Shield, visible: requesterUser.role === 'ADMIN' },
     { id: 'backup', label: 'Backup & Restore', icon: CloudLightning, visible: canEdit('Console') && canDelete('Console') }
   ] as const;
 
@@ -209,6 +212,15 @@ export default function AdminView({
 
         {activeSubTab === 'attendancecfg' && (
           <AttendanceSettingsSubView />
+        )}
+        
+        {activeSubTab === 'hierarchy' && (
+          <HierarchySyncWizard 
+            allUsers={allUsers} 
+            adminTheme={adminTheme} 
+            onRefresh={onRefresh || (() => {})} 
+            logAdminEvent={logAdminEvent} 
+          />
         )}
       </div>
 

@@ -38,9 +38,10 @@ interface WarningsViewProps {
   user: UserProfile;
   allUsers: UserProfile[];
   onRefresh?: () => void;
+  externalTheme?: 'light' | 'dark';
 }
 
-export default function WarningsView({ warnings = [], user, allUsers = [], onRefresh }: WarningsViewProps) {
+export default function WarningsView({ warnings = [], user, allUsers = [], onRefresh, externalTheme }: WarningsViewProps) {
   const { canCreate, canEdit, canDelete } = usePermission();
   const [searchTerm, setSearchTerm] = useState('');
   const [isWarningOpen, setIsWarningOpen] = useState(false);
@@ -410,15 +411,29 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
                           </Badge>
                         </TableCell>
                         <TableCell>
-                          <div className="flex flex-col gap-1 max-w-[280px]">
-                            <p className="text-xs text-slate-650 dark:text-slate-300 font-semibold italic leading-relaxed line-clamp-3">
+                          <div className="flex flex-col gap-1.5 py-1 min-w-[300px] max-w-[550px]">
+                            <p className="text-xs text-slate-650 dark:text-slate-300 font-semibold italic leading-relaxed whitespace-pre-wrap break-words">
                               "{ticket.remarks}"
                             </p>
                             {ticket.acceptedAt && (
-                              <span className="text-[9px] text-slate-400 dark:text-slate-500 font-mono font-bold flex items-center gap-1">
+                              <span className="text-[9px] text-slate-400 dark:text-slate-500 font-mono font-bold flex items-center gap-1 mt-1">
                                 <CheckCircle size={10} className="text-emerald-500" />
                                 Accepted on: {new Date(ticket.acceptedAt).toLocaleString()}
                               </span>
+                            )}
+                            {ticket.history && (ticket.history as any[]).length > 0 && (
+                              <div className="mt-2 text-[10px] text-slate-500 dark:text-slate-400 border-t border-slate-100 dark:border-slate-800 pt-1.5 space-y-1 font-sans">
+                                <p className="font-extrabold text-[8px] uppercase tracking-widest text-slate-400">Action History & Logs</p>
+                                {(ticket.history as any[]).map((hist, hIdx) => {
+                                  const formattedTime = hist.timestamp ? new Date(hist.timestamp).toLocaleDateString() : '';
+                                  return (
+                                    <div key={hIdx} className="leading-tight">
+                                      • <span className="font-semibold">{hist.action}</span> by <span className="font-semibold">{hist.userName || 'System'}</span> ({formattedTime})
+                                      {hist.remarks && <p className="text-[9px] italic text-slate-400 dark:text-slate-500 pl-2">"{hist.remarks}"</p>}
+                                    </div>
+                                  );
+                                })}
+                              </div>
                             )}
                           </div>
                         </TableCell>

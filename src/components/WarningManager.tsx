@@ -5,7 +5,7 @@ import { Label } from './ui/label';
 import { Separator } from './ui/separator';
 import { toast } from 'sonner';
 import { auth, db, handleFirestoreError, OperationType } from '../lib/firebase';
-import { doc, setDoc, addDoc, collection } from 'firebase/firestore';
+import { doc, setDoc, addDoc, collection, getDoc } from 'firebase/firestore';
 import { WarningTicket, UserProfile, UserRole } from '../types';
 import { UserPicker } from './UserPicker';
 
@@ -185,14 +185,53 @@ CC Checklist:
 - HR Operations (hr@bergtechnologies.co.in)
       `;
 
-      const ccList = ['hr@bergtechnologies.co.in'];
-      if (fullAgent.teamLeadId) {
-        const tlObj = allUsers.find(u => u.uid === fullAgent.teamLeadId);
-        if (tlObj && tlObj.email) ccList.push(tlObj.email);
-      }
-      if (fullAgent.mappedManagerId) {
-        const mgrObj = allUsers.find(u => u.uid === fullAgent.mappedManagerId);
-        if (mgrObj && mgrObj.email) ccList.push(mgrObj.email);
+      let finalTo = email;
+      let finalCc = ['hr@bergtechnologies.co.in'];
+      let fromEmail = auth.currentUser?.email || '';
+
+      // Initialize defaults to only HR as per user's requests
+      const defaultCc = ['hr@bergtechnologies.co.in'];
+      finalCc = defaultCc;
+
+      // Query database configuration
+      try {
+        const notifSnap = await getDoc(doc(db, 'config', 'notificationSettings'));
+        if (notifSnap.exists()) {
+          const conf = notifSnap.data();
+          if (conf.warningToMode === 'custom' && conf.warningToCustom) {
+            finalTo = conf.warningToCustom;
+          } else {
+            finalTo = email;
+          }
+
+          let ccAddresses: string[] = [];
+          if (conf.warningCc) {
+            ccAddresses = conf.warningCc.split(',').map((s: string) => s.trim()).filter(Boolean);
+          } else {
+            ccAddresses = ['hr@bergtechnologies.co.in'];
+          }
+
+          if (conf.warningIncludeTlCc === true) {
+            if (fullAgent.teamLeadId) {
+              const tlObj = allUsers.find(u => u.uid === fullAgent.teamLeadId);
+              if (tlObj && tlObj.email && !ccAddresses.includes(tlObj.email)) {
+                ccAddresses.push(tlObj.email);
+              }
+            }
+          }
+
+          if (conf.warningIncludeManagerCc === true) {
+            if (fullAgent.mappedManagerId) {
+              const mgrObj = allUsers.find(u => u.uid === fullAgent.mappedManagerId);
+              if (mgrObj && mgrObj.email && !ccAddresses.includes(mgrObj.email)) {
+                ccAddresses.push(mgrObj.email);
+              }
+            }
+          }
+          finalCc = ccAddresses;
+        }
+      } catch (err) {
+        console.warn("Failed to load warning notification settings, using standard defaults.", err);
       }
 
       if (sendEmailNotification) {
@@ -204,10 +243,10 @@ CC Checklist:
           affectedUser: `${name} (${email})`,
           previousValue: 'None',
           newValue: 'Email Triggered = Yes',
-          remarks: `Subject: Disciplinary Warning Issued - To: ${email} | CC: ${ccList.join(', ')}`,
+          remarks: `Subject: Disciplinary Warning Issued - To: ${finalTo} | CC: ${finalCc.join(', ')}`,
           emailDetails: {
-            to: email,
-            sender: auth.currentUser?.email,
+            to: finalTo,
+            sender: fromEmail,
             subject: `[DISCIPLINARY ACTION] Disciplinary Warning Issued - ${name} (${level})`,
             body: emailText,
             timestamp: nowISO
@@ -216,8 +255,9 @@ CC Checklist:
 
         // Write real email documents for Firestore Trigger Email extension
         const realEmailDoc = {
-          to: email,
-          cc: ccList,
+          to: finalTo,
+          cc: finalCc,
+          from: fromEmail, // From: The user who triggered it
           message: {
             subject: `[DISCIPLINARY ACTION] Disciplinary Warning Issued - ${name} (${level})`,
             text: emailText,
@@ -257,7 +297,7 @@ CC Checklist:
                 </div>
 
                 <p style="font-size: 12px; color: #64748b; margin-top: 30px; border-top: 1px solid #e2e8f0; padding-top: 10px;">
-                  This is a system generated email CC'd to: ${ccList.join(', ')}
+                  This is a system generated email CC'd to: ${finalCc.join(', ')}
                 </p>
               </div>
             `

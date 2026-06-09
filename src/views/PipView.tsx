@@ -47,7 +47,7 @@ const Textarea = React.forwardRef<HTMLTextAreaElement, TextareaProps>(
 Textarea.displayName = "Textarea";
 
 import { db, handleFirestoreError, OperationType } from '../lib/firebase';
-import { doc, setDoc, updateDoc, collection, addDoc, onSnapshot, query, where, orderBy, getDocs, serverTimestamp } from 'firebase/firestore';
+import { doc, setDoc, updateDoc, collection, addDoc, onSnapshot, query, where, orderBy, getDocs, serverTimestamp, getDoc } from 'firebase/firestore';
 import { toast } from 'sonner';
 import { usePermission } from '../components/PermissionContext';
 import { canActOn } from '../lib/hierarchy';
@@ -55,9 +55,10 @@ import { canActOn } from '../lib/hierarchy';
 interface PipViewProps {
   user: UserProfile;
   allUsers: UserProfile[];
+  externalTheme?: 'light' | 'dark';
 }
 
-export default function PipView({ user, allUsers = [] }: PipViewProps) {
+export default function PipView({ user, allUsers = [], externalTheme }: PipViewProps) {
   const { canCreate, canEdit, canDelete, canApprove } = usePermission();
   const [pips, setPips] = useState<PipRecord[]>([]);
   const [loading, setLoading] = useState(true);
@@ -232,16 +233,54 @@ export default function PipView({ user, allUsers = [] }: PipViewProps) {
 
       // 2. Automated Trigger Email Simulation
       if (sendEmailNotification) {
-        const reportingLineCC = [];
-        if (targetAgent.teamLeadId) {
-          const tlObj = allUsers.find(u => u.uid === targetAgent.teamLeadId);
-          reportingLineCC.push(tlObj ? tlObj.email : `${targetAgent.teamLeadId}@bergtechnologies.co.in`);
+        let finalTo = targetAgent.email || '';
+        let finalCc = ['hr@bergtechnologies.co.in'];
+        const fromEmail = user.email || '';
+
+        // Default reporting level cc: only HR as per user request
+        const defaultCc = ['hr@bergtechnologies.co.in'];
+        finalCc = defaultCc;
+
+        // Query database configuration
+        try {
+          const notifSnap = await getDoc(doc(db, 'config', 'notificationSettings'));
+          if (notifSnap.exists()) {
+            const conf = notifSnap.data();
+            if (conf.pipToMode === 'custom' && conf.pipToCustom) {
+              finalTo = conf.pipToCustom;
+            } else {
+              finalTo = targetAgent.email || '';
+            }
+
+            let ccAddresses: string[] = [];
+            if (conf.pipCc) {
+              ccAddresses = conf.pipCc.split(',').map((s: string) => s.trim()).filter(Boolean);
+            } else {
+              ccAddresses = ['hr@bergtechnologies.co.in'];
+            }
+
+            if (conf.pipIncludeTlCc === true) {
+              if (targetAgent.teamLeadId) {
+                const tlObj = allUsers.find(u => u.uid === targetAgent.teamLeadId);
+                const tlEmail = tlObj ? tlObj.email : `${targetAgent.teamLeadId}@bergtechnologies.co.in`;
+                if (!ccAddresses.includes(tlEmail)) ccAddresses.push(tlEmail);
+              }
+            }
+
+            if (conf.pipIncludeManagerCc === true) {
+              if (targetAgent.mappedManagerId) {
+                const mgrObj = allUsers.find(u => u.uid === targetAgent.mappedManagerId);
+                const mgrEmail = mgrObj ? mgrObj.email : `${targetAgent.mappedManagerId}@bergtechnologies.co.in`;
+                if (!ccAddresses.includes(mgrEmail)) ccAddresses.push(mgrEmail);
+              }
+            }
+            finalCc = ccAddresses;
+          }
+        } catch (err) {
+          console.warn("Failed to load PIP notification settings, using defaults.", err);
         }
-        if (targetAgent.mappedManagerId) {
-          const mgrObj = allUsers.find(u => u.uid === targetAgent.mappedManagerId);
-          reportingLineCC.push(mgrObj ? mgrObj.email : `${targetAgent.mappedManagerId}@bergtechnologies.co.in`);
-        }
-        reportingLineCC.push('hr@bergtechnologies.co.in');
+
+        const reportingLineCC = finalCc; // Alias back for rendering below
 
         const emailSubject = `[URGENT] Performance Improvement Plan Initiated - ${targetAgent.name}`;
         const emailBody = `
@@ -275,10 +314,10 @@ Berg Technologies Corp HS Division
           performedBy: `${performerName} (${user.email})`,
           affectedUser: `${targetAgent.name} (${targetAgent.email})`,
           previousValue: 'N/A',
-          newValue: `Recipient: ${targetAgent.email}`,
+          newValue: `Recipient: ${finalTo}`,
           remarks: `Automated PIP initiation notification email sent. Status: Dispatch simulated successfully.`,
           details: {
-            to: targetAgent.email,
+            to: finalTo,
             cc: reportingLineCC,
             subject: emailSubject,
             body: emailBody
@@ -287,8 +326,9 @@ Berg Technologies Corp HS Division
 
         // Write real email documents for Firestore Trigger Email extension
         const realEmailDoc = {
-          to: targetAgent.email || '',
+          to: finalTo,
           cc: reportingLineCC,
+          from: fromEmail, // From: The user who triggered it
           message: {
             subject: emailSubject,
             text: emailBody,

@@ -23,8 +23,8 @@ const HIERARCHY_MAP: Record<UserRole, UserRole[]> = {
   ],
   [UserRole.OPS_TL]: [UserRole.SME, UserRole.TRAINER, UserRole.QA, UserRole.AGENT],
   [UserRole.STL]: [UserRole.SME, UserRole.TRAINER, UserRole.QA, UserRole.AGENT],
-  [UserRole.QTL]: [UserRole.QA, UserRole.AGENT],
-  [UserRole.TRAINER_TL]: [UserRole.TRAINER, UserRole.AGENT],
+  [UserRole.QTL]: [UserRole.SME, UserRole.TRAINER, UserRole.QA, UserRole.AGENT],
+  [UserRole.TRAINER_TL]: [UserRole.SME, UserRole.TRAINER, UserRole.QA, UserRole.AGENT],
   [UserRole.TEAM_LEAD]: [UserRole.SME, UserRole.TRAINER, UserRole.QA, UserRole.AGENT],
   [UserRole.QA]: [],
   [UserRole.AGENT]: [],
@@ -65,20 +65,18 @@ export function canActOn(actor: UserProfile, target: UserProfile, allUsers: User
 
   if (!isRoleAuthorized) return false;
 
-  // 3. Verify reporting structure
-  const isDirectReport = target.teamLeadId === actor.uid || target.mappedManagerId === actor.uid;
+  // 3. Verify reporting structure (Authoritative Source: Team Mapping fields)
+  const isDirectReport = 
+    target.teamLeadId === actor.uid || 
+    target.mappedManagerId === actor.uid ||
+    target.managerId === actor.uid;
   
   // indirect report check (e.g. Manager -> TL -> Agent)
   const isIndirectReport = allUsers.some(tl => {
-    const tlIsSubordinate = tl.mappedManagerId === actor.uid;
+    const tlIsSubordinate = tl.mappedManagerId === actor.uid || tl.managerId === actor.uid;
     const targetReportsToTL = target.teamLeadId === tl.uid;
     return tlIsSubordinate && targetReportsToTL;
   });
 
-  // 4. Sandbox/Initial state fallback: 
-  // If no hierarchy mappings are defined for ANYONE in the list, allow action based on role mapping only.
-  const hasAnyHierarchy = allUsers.some(u => !!u.mappedManagerId || !!u.teamLeadId);
-  if (!hasAnyHierarchy) return true;
-
-  return isDirectReport || isIndirectReport;
+  return !!isDirectReport || isIndirectReport;
 }

@@ -165,7 +165,9 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
   // Authorization for edits
   const canModifyAttendance = canEdit('Attendance');
   const canExportAttendance = canExport('Attendance');
-  const isManagerOrAdmin = ['ADMIN', 'MANAGER', 'MIS', 'QTL', 'STL', 'OPS_TL', 'TRAINER_TL', 'TL'].includes(user.role.toUpperCase());
+  const isTopAdmin = ['ADMIN', 'MIS'].includes(user.role.toUpperCase());
+  const isStrictAdminOrManager = ['ADMIN', 'MANAGER', 'MIS'].includes(user.role.toUpperCase());
+  const isTLRole = ['QTL', 'STL', 'OPS_TL', 'TRAINER_TL', 'TEAM_LEAD'].includes(user.role.toUpperCase());
 
   // Dynamic Process filter: If IC, only show processes user has worked in
   const availableProcesses = useMemo(() => {
@@ -196,7 +198,7 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
 
   useEffect(() => {
     loadData();
-  }, [dateRange]);
+  }, [dateRange, allUsers]);
   const loadData = async () => {
     setLoading(true);
     try {
@@ -250,10 +252,59 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
       attData.sort((a, b) => new Date(b.sessionStart).getTime() - new Date(a.sessionStart).getTime());
       
       let filtered = attData;
-      // If not manager/admin, filter to see only their team/self (if required)
-      // Assuming a manager/admin can view all. Based on role.
-      if (!['ADMIN', 'MANAGER', 'MIS'].includes(user.role.toUpperCase())) {
-         filtered = attData.filter(r => r.userId === user.uid || r.mappedTL === user.email || r.mappedManager === user.email);
+      // If not organization-wide admin, filter to see only their team/self
+      if (!isTopAdmin) {
+         filtered = attData.filter(r => {
+           if (r.userId === user.uid) return true;
+
+           const userEmail = (user.email || '').toLowerCase();
+           const userName = (user.fullName || user.name || '').toLowerCase();
+           const rTL = (r.mappedTL || '').toLowerCase();
+           const rMgr = (r.mappedManager || '').toLowerCase();
+
+           const employeeProfile = allUsers.find(u => u.uid === r.userId || u.email.toLowerCase() === r.employeeEmail.toLowerCase());
+           
+           // STERN RULE: TLs cannot see Managers or Admins
+           if (employeeProfile) {
+             const targetRole = (employeeProfile.role || '').toString().toUpperCase();
+             const isSelf = employeeProfile.uid === user.uid;
+             const privilegedRoles = ['ADMIN', 'MANAGER', 'TEAM_LEAD', 'STL', 'OPS_TL', 'QTL', 'TRAINER_TL'];
+             if (!isSelf && privilegedRoles.includes(targetRole)) return false;
+           }
+
+           // If specific TLs/Managers are selected, allow TL role users to view them IF they follow the mapping
+           // But actually, the prompt says "Can ONLY view their mapped agents/QA/SME/trainers".
+           // So if they select a filter, it must still be within their authority.
+           
+           if (employeeProfile) {
+             const empTLId = employeeProfile.teamLeadId;
+             const empMgrId = employeeProfile.mappedManagerId || employeeProfile.managerId;
+             const empTLEmail = (employeeProfile.teamLeadEmail || '').toLowerCase();
+             const empMgrEmail = (employeeProfile.mappedManagerEmail || employeeProfile.managerEmail || '').toLowerCase();
+
+             const isReport = (empTLId === user.uid || 
+                              empMgrId === user.uid || 
+                              (empTLEmail && empTLEmail === userEmail) ||
+                              (empMgrEmail && empMgrEmail === userEmail));
+             
+             if (isReport) {
+               // Apply specific dropdown filters if active
+               const matchesTLFilter = selectedTLs.length === 0 || selectedTLs.includes(r.mappedTL) || selectedTLs.map(s => s.toLowerCase()).includes(rTL);
+               const matchesMgrFilter = selectedManagers.length === 0 || selectedManagers.includes(r.mappedManager) || selectedManagers.map(s => s.toLowerCase()).includes(rMgr);
+               return matchesTLFilter && matchesMgrFilter;
+             }
+           }
+           
+           // Fallback for when profile is missing but record has names
+           const isNameMatch = (rTL === userName || rTL === userEmail || rMgr === userEmail || rMgr === userName);
+           if (isNameMatch) {
+              const matchesTLFilter = selectedTLs.length === 0 || selectedTLs.includes(r.mappedTL) || selectedTLs.map(s => s.toLowerCase()).includes(rTL);
+              const matchesMgrFilter = selectedManagers.length === 0 || selectedManagers.includes(r.mappedManager) || selectedManagers.map(s => s.toLowerCase()).includes(rMgr);
+              return matchesTLFilter && matchesMgrFilter;
+           }
+
+           return false;
+         });
       }
 
       setRecords(filtered);
@@ -513,13 +564,13 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
           onToggle={(val) => setSelectedProcesses(prev => prev.includes(val) ? prev.filter(v => v !== val) : [...prev, val])}
           placeholder="All Processes"
         />
-        {isManagerOrAdmin && (
+        {isStrictAdminOrManager && (
           <>
             <MultiSelectDropdown 
               options={availableTLs}
               selectedValues={selectedTLs}
               onToggle={(val) => setSelectedTLs(prev => prev.includes(val) ? prev.filter(v => v !== val) : [...prev, val])}
-              placeholder="All Team Leads"
+              placeholder="All Team Leaders"
             />
             <MultiSelectDropdown 
               options={availableManagers}
@@ -528,6 +579,14 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
               placeholder="All Managers"
             />
           </>
+        )}
+        {(isTLRole && !isStrictAdminOrManager) && (
+          <MultiSelectDropdown 
+            options={availableTLs}
+            selectedValues={selectedTLs}
+            onToggle={(val) => setSelectedTLs(prev => prev.includes(val) ? prev.filter(v => v !== val) : [...prev, val])}
+            placeholder="Team Leader Filter"
+          />
         )}
       </div>
 

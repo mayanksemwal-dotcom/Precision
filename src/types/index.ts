@@ -32,10 +32,13 @@ export interface UserProfile {
   team?: string;
   teamLeadId?: string;
   teamLeadName?: string;
+  teamLeadEmail?: string;
   managerId?: string; // Master field
   managerName?: string; // Master field
+  managerEmail?: string;
   mappedManagerId?: string; // Legacy/Auth field
   mappedManagerName?: string; // Legacy/Auth field
+  mappedManagerEmail?: string;
   mappedTL?: string;
   mappedQA?: string;
   mappedManager?: string;
