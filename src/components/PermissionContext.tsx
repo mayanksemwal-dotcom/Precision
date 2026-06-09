@@ -30,6 +30,7 @@ export interface TMSPermissions {
   // ADMINISTRATIVE PERMISSIONS
   view_workforce_control: boolean;
   can_force_logout: boolean;
+  can_force_out: boolean;
   can_edit_tms_records: boolean;
   can_modify_activities: boolean;
   can_close_sessions: boolean;
@@ -79,7 +80,8 @@ export const getDefaultTmsPermissions = (roleName: string): TMSPermissions => {
 
   const administrative = {
     view_workforce_control: isManager || isAdmin,
-    can_force_logout: isManager || isAdmin,
+    can_force_logout: isTLOrSupervisor || isManager || isAdmin,
+    can_force_out: isTLOrSupervisor || isManager || isAdmin,
     can_edit_tms_records: isManager || isAdmin,
     can_modify_activities: isManager || isAdmin,
     can_close_sessions: isManager || isAdmin,
@@ -111,6 +113,7 @@ export const getDefaultTmsPermissions = (roleName: string): TMSPermissions => {
       view_team_shift_summary: true,
       view_workforce_control: true,
       can_force_logout: true,
+      can_force_out: true,
       can_edit_tms_records: true,
       can_modify_activities: true,
       can_close_sessions: true,
@@ -134,6 +137,20 @@ interface PermissionActions {
   can_delete: boolean;
   can_export: boolean;
   can_approve: boolean;
+  view_team: boolean;
+  view_all: boolean;
+  assign: boolean;
+  override: boolean;
+  force_action: boolean;
+  manage_settings: boolean;
+  manage_masters: boolean;
+  audit_access: boolean;
+  email_trigger: boolean;
+  bulk_action: boolean;
+  reopen_records: boolean;
+  escalate: boolean;
+  comment: boolean;
+  view_sensitive_data: boolean;
   tms_permissions?: TMSPermissions;
 }
 
@@ -191,7 +208,8 @@ export const PermissionProvider: React.FC<PermissionProviderProps> = ({ children
         'PIP Management', 
         'Historical Records', 
         'Important Quality Links', 
-        'Console'
+        'Console',
+        'Attendance'
       ];
       modules.forEach(mod => {
         permMap[mod] = {
@@ -201,6 +219,20 @@ export const PermissionProvider: React.FC<PermissionProviderProps> = ({ children
           can_delete: true,
           can_export: true,
           can_approve: true,
+          view_team: true,
+          view_all: true,
+          assign: true,
+          override: true,
+          force_action: true,
+          manage_settings: true,
+          manage_masters: true,
+          audit_access: true,
+          email_trigger: true,
+          bulk_action: true,
+          reopen_records: true,
+          escalate: true,
+          comment: true,
+          view_sensitive_data: true,
           tms_permissions: getDefaultTmsPermissions('ADMIN')
         };
       });
@@ -253,13 +285,31 @@ export const PermissionProvider: React.FC<PermissionProviderProps> = ({ children
 
   // Utility to get permissions for a module with fallback
   const getModPerms = (module: string): PermissionActions => {
-    return permissions[module] || {
+    // Legacy support for 'Attendance System' -> 'Attendance'
+    const targetModule = module === 'Attendance' ? 'Attendance' : module;
+    const fallbackModule = module === 'Attendance' ? 'Attendance System' : module;
+    
+    return permissions[targetModule] || permissions[fallbackModule] || {
       can_view: false,
       can_create: false,
       can_edit: false,
       can_delete: false,
       can_export: false,
       can_approve: false,
+      view_team: false,
+      view_all: false,
+      assign: false,
+      override: false,
+      force_action: false,
+      manage_settings: false,
+      manage_masters: false,
+      audit_access: false,
+      email_trigger: false,
+      bulk_action: false,
+      reopen_records: false,
+      escalate: false,
+      comment: false,
+      view_sensitive_data: false,
     };
   };
 

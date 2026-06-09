@@ -6,127 +6,63 @@ interface BergLogoProps {
   scaleClass?: string;
 }
 
-export default function BergLogo({ className = "h-8", showSubtitle = true, scaleClass = "scale-100" }: BergLogoProps) {
+export default function BergLogo({ className = "h-8", showSubtitle = true, scaleClass = "" }: BergLogoProps) {
   return (
-    <div className={`flex items-center justify-center overflow-hidden h-14 ${className} ${scaleClass}`}>
+    <div className={`flex items-center justify-center ${className || ''} ${scaleClass || ''} transition-transform duration-300`}>
       <svg 
-        className="w-full h-full object-contain select-none" 
-        viewBox="0 0 175 48" 
+        viewBox={showSubtitle ? "0 0 420 120" : "0 0 320 120"} 
         fill="none" 
         xmlns="http://www.w3.org/2000/svg"
+        className="w-full h-full"
       >
-        {/* Gradients */}
         <defs>
-          {/* Light-blue gradient for top mountain peaks and 'RG' text */}
-          <linearGradient id="bergLightCyan" x1="0" y1="5" x2="35" y2="35" gradientUnits="userSpaceOnUse">
-            <stop offset="0%" stopColor="#60CDFF" />
-            <stop offset="100%" stopColor="#0EA5E9" />
-          </linearGradient>
-          {/* Royal blue gradient for bottom chevrons and 'BE' text */}
-          <linearGradient id="bergRoyalBlue" x1="0" y1="15" x2="40" y2="40" gradientUnits="userSpaceOnUse">
-            <stop offset="0%" stopColor="#3B82F6" />
-            <stop offset="100%" stopColor="#1E40AF" />
+          {/* BERG Text Gradient */}
+          <linearGradient id="berg-gradient" x1="0%" y1="0%" x2="100%" y2="0%">
+            <stop offset="0%" stopColor="#3A83CA" />
+            <stop offset="100%" stopColor="#64C4ED" />
           </linearGradient>
         </defs>
 
-        {/* 1. MOUNTAIN LOGO GRAPHIC MARK (Left Side) */}
-        <g transform="translate(2, 2)">
-          {/* Back left peak */}
-          <path 
-            d="M5 29 L18 13 L23 29" 
-            stroke="#60CDFF" 
-            strokeWidth="1.5" 
-            strokeLinejoin="round" 
-            fill="url(#bergLightCyan)" 
-            opacity="0.85"
-          />
-          {/* Central high peak */}
-          <path 
-            d="M13 29 L24 6 L33 29" 
-            stroke="#60CDFF" 
-            strokeWidth="2" 
-            strokeLinejoin="round" 
-            fill="url(#bergLightCyan)"
-          />
-          {/* Back right peak */}
-          <path 
-            d="M23 29 M23 29 L32 12 L41 29" 
-            stroke="#60CDFF" 
-            strokeWidth="1.5" 
-            strokeLinejoin="round" 
-            fill="url(#bergLightCyan)" 
-            opacity="0.85"
-          />
+        {/* --- MOUNTAIN GRAPHIC --- */}
+        <g transform="translate(10, 15)">
+          {/* Main Top Light Blue Outline/Base (Connecting them) */}
+          <path d="M0,60 L24,30 L40,48 L56,15 L72,48 L86,30 L112,60 Z" fill="#64C4ED" />
 
-          {/* Bottom overlapping geometric dark blue facets */}
-          {/* Left diamond facet fold */}
-          <path 
-            d="M5 29 L18 38 L23 20 Z" 
-            fill="url(#bergRoyalBlue)" 
-            stroke="#1D4ED8" 
-            strokeWidth="1" 
-            strokeLinejoin="round" 
-          />
-          {/* Right diamond facet fold */}
-          <path 
-            d="M23 20 L27 38 L41 29 Z" 
-            fill="url(#bergRoyalBlue)" 
-            stroke="#1E40AF" 
-            strokeWidth="1" 
-            strokeLinejoin="round" 
-          />
-          {/* Center key line separation */}
-          <path 
-            d="M18 38 L23 20 L27 38" 
-            stroke="#FFFFFF" 
-            strokeWidth="1" 
-            strokeLinejoin="round" 
-            opacity="0.9"
-          />
-        </g>
-
-        {/* 2. BRAND TEXT TYPOGRAPHY (Right Side) */}
-        <g transform="translate(48, 2)">
-          {/* "BE" in Royal Blue, "RG" in Cyan Blue */}
-          <text 
-            x="0" 
-            y="26" 
-            fontFamily="system-ui, -apple-system, sans-serif" 
-            fontWeight="900" 
-            fontSize="26" 
-            letterSpacing="-0.02em"
-          >
-            <tspan fill="url(#bergRoyalBlue)">BE</tspan>
-            <tspan fill="url(#bergLightCyan)">RG</tspan>
-          </text>
+          {/* Bottom Dark Blue/Geometric Layer */}
+          <path d="M0,63 L34,75 L56,53 L78,75 L112,63 L56,102 Z" fill="#3A83CA" />
           
-          {/* Subtitle "TECHNOLOGIES PVT. LTD." in bold black */}
-          {showSubtitle ? (
-            <text 
-              x="0.5" 
-              y="37" 
-              fontFamily="system-ui, -apple-system, sans-serif" 
-              fontWeight="800" 
-              fontSize="7.2" 
-              fill="#000000" 
-              letterSpacing="0.04em"
-            >
-              TECHNOLOGIES PVT. LTD.
-            </text>
-          ) : (
-            <text 
-              x="0.5" 
-              y="37" 
-              fontFamily="system-ui, -apple-system, sans-serif" 
-              fontWeight="800" 
-              fontSize="6.2" 
-              fill="#64748B" 
-              letterSpacing="0.04em"
-            >
-              TECHNOLOGIES
-            </text>
-          )}
+          {/* Center bottom downward peak (Darkest Blue for depth) */}
+          <polygon points="34,75 56,102 56,53" fill="#2464A8" />
+          <polygon points="78,75 56,102 56,53" fill="#4B95DB" />
         </g>
+        
+        {/* --- TEXT SECTION --- */}
+        <text 
+          x="130" 
+          y="78" 
+          fontFamily="Inter, system-ui, sans-serif" 
+          fontWeight="900" 
+          fontSize="68" 
+          fill="url(#berg-gradient)"
+          letterSpacing="0.01em"
+        >
+          BERG
+        </text>
+        
+        {/* Subtitle respects dark mode (black in light mode, white in dark mode) */}
+        {showSubtitle && (
+          <text 
+            x="135" 
+            y="104" 
+            fontFamily="Inter, system-ui, sans-serif" 
+            fontWeight="700" 
+            fontSize="14" 
+            className="fill-slate-900 dark:fill-white"
+            letterSpacing="0.08em"
+          >
+            TECHNOLOGIES PVT. LTD.
+          </text>
+        )}
       </svg>
     </div>
   );

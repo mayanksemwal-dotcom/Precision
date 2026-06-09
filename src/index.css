@@ -89,7 +89,7 @@ body {
 }
 
 .metric-card {
-  @apply bg-white border border-slate-200 rounded-xl p-6 shadow-sm hover:shadow-md transition-shadow;
+  @apply bg-white border border-slate-200 rounded-xl p-4 shadow-sm hover:shadow-md transition-shadow;
 }
 
 .mono-value {

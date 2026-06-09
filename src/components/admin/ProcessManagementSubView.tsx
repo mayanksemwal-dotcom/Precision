@@ -31,9 +31,17 @@ interface ProcessManagementSubViewProps {
 interface MiniProcess {
   name: string;
   status: 'Active' | 'Inactive';
+  hidden?: boolean;
 }
 
-const DEFAULT_PROCESSES = ['HITL', 'MPQC', 'OQC', 'SOP Training', 'QA Review', 'Team Alignment'];
+const DEFAULT_PROCESSES: MiniProcess[] = [
+  { name: 'HITL', status: 'Active', hidden: false },
+  { name: 'MPQC', status: 'Active', hidden: false },
+  { name: 'OQC', status: 'Active', hidden: false },
+  { name: 'SOP Training', status: 'Active', hidden: false },
+  { name: 'QA Review', status: 'Active', hidden: false },
+  { name: 'Team Alignment', status: 'Active', hidden: false }
+];
 
 export const ProcessManagementSubView = ({ user, adminTheme }: ProcessManagementSubViewProps) => {
   const [processes, setProcesses] = useState<MiniProcess[]>([]);
@@ -142,6 +150,13 @@ export const ProcessManagementSubView = ({ user, adminTheme }: ProcessManagement
     toast.success(`Process "${nextList[index].name}" is now ${nextList[index].status}`);
   };
 
+  const toggleHidden = async (index: number) => {
+    const nextList = [...processes];
+    nextList[index].hidden = !nextList[index].hidden;
+    await saveToConfig(nextList);
+    toast.success(`Process "${nextList[index].name}" is now ${nextList[index].hidden ? 'hidden' : 'visible'} in dropdowns`);
+  };
+
   const deleteProcess = async (index: number) => {
     const name = processes[index].name;
     if (!confirm(`Are you sure you want to delete the process "${name}"? Check if any users are mapped to it.`)) {
@@ -156,11 +171,7 @@ export const ProcessManagementSubView = ({ user, adminTheme }: ProcessManagement
     if (!confirm('This will restore all legacy default processes (HITL, MPQC, OQC, etc.) as active. Continue?')) {
       return;
     }
-    const initial = DEFAULT_PROCESSES.map(name => ({
-      name,
-      status: 'Active' as const
-    }));
-    await saveToConfig(initial);
+    await saveToConfig(DEFAULT_PROCESSES);
     toast.success('Restored default TMS processes successfully');
   };
 
@@ -251,17 +262,30 @@ export const ProcessManagementSubView = ({ user, adminTheme }: ProcessManagement
                         </div>
                       </td>
                       <td className="p-4 text-center">
-                        <button 
-                          onClick={() => toggleStatus(idx)}
-                          className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-wide transition-colors ${
-                            proc.status === 'Active' 
-                              ? 'bg-emerald-500/10 text-emerald-500 hover:bg-emerald-500/20' 
-                              : 'bg-rose-500/10 text-rose-500 hover:bg-rose-500/20'
-                          }`}
-                        >
-                          {proc.status === 'Active' ? <CheckCircle size={10} /> : <XCircle size={10} />}
-                          {proc.status}
-                        </button>
+                        <div className="flex flex-col gap-2 items-center">
+                          <button 
+                            onClick={() => toggleStatus(idx)}
+                            className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-wide transition-colors ${
+                              proc.status === 'Active' 
+                                ? 'bg-emerald-500/10 text-emerald-500 hover:bg-emerald-500/20' 
+                                : 'bg-rose-500/10 text-rose-500 hover:bg-rose-500/20'
+                            }`}
+                          >
+                            {proc.status === 'Active' ? <CheckCircle size={10} /> : <XCircle size={10} />}
+                            {proc.status}
+                          </button>
+                          
+                          <button 
+                            onClick={() => toggleHidden(idx)}
+                            className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-wide transition-colors ${
+                              !proc.hidden
+                                ? 'bg-sky-500/10 text-sky-500 hover:bg-sky-500/20' 
+                                : 'bg-slate-500/10 text-slate-500 hover:bg-slate-500/20'
+                            }`}
+                          >
+                            {proc.hidden ? 'Hidden' : 'Visible'}
+                          </button>
+                        </div>
                       </td>
                       <td className="p-4 text-right pr-6">
                         <div className="flex items-center justify-end gap-1 opacity-0 group-hover:opacity-100 transition-opacity">

@@ -20,6 +20,7 @@ import {
   Clock,
   Award,
   Link2,
+  FileText,
   Sun,
   Moon
 } from 'lucide-react';
@@ -61,6 +62,7 @@ import ScorecardView from './views/ScorecardView';
 import PipView from './views/PipView';
 import ManageHistoricalRecordsView from './views/ManageHistoricalRecordsView';
 import ResourceHubView from './views/ResourceHubView';
+import AttendanceView from './views/AttendanceView';
 
 import { PermissionProvider, usePermission } from './components/PermissionContext';
 import { canActOn } from './lib/hierarchy';
@@ -243,8 +245,9 @@ export default function App() {
               const isCurrentAdmin = !!tokenResult.claims.isAdmin;
               const isCurrentQA = !!tokenResult.claims.isQA;
 
-              if (isCurrentAdmin !== expectedAdmin || isCurrentQA !== expectedQA) {
+              if ((isCurrentAdmin !== expectedAdmin || isCurrentQA !== expectedQA) && !sessionStorage.getItem('claims_sync_attempted')) {
                 console.log('Firebase user custom claims mismatch detected. Synchronizing claims...');
+                sessionStorage.setItem('claims_sync_attempted', 'true');
                 const idToken = await firebaseUser.getIdToken(true);
                 const claimResponse = await fetch('/api/set-claims', {
                   method: 'POST',
@@ -354,11 +357,7 @@ export default function App() {
 
   useEffect(() => {
     if (user) {
-      if (['ADMIN', 'MANAGER'].includes((user.role || '').toUpperCase())) {
-        setActiveTab('config');
-      } else {
-        setActiveTab('tms');
-      }
+      setActiveTab('tms');
       fetchAllData();
     }
   }, [user]);
@@ -463,6 +462,7 @@ function AppContent({
 
   const navItems = [
     { id: 'tms', label: 'Workforce TMS', icon: Clock },
+    { id: 'attendance', label: 'Attendance', icon: FileText },
     { id: 'kpis_scorecard', label: 'KPI Scorecard', icon: Award },
     { id: 'warnings', label: 'Warnings', icon: ShieldAlert },
     { id: 'pips', label: 'PIP Management', icon: Activity },
@@ -510,9 +510,9 @@ function AppContent({
         <div className="px-4 pt-6 pb-4 flex flex-col items-start">
           <div className="w-full flex items-center justify-between mb-6">
             <div className={`flex items-center gap-2.5 ${!sidebarOpen && 'justify-center w-full'}`}>
-              <div className="bg-white p-1 rounded-xl flex items-center justify-center shadow-lg border border-slate-100 flex-shrink-0 overflow-hidden">
+              <div className="p-0 flex items-center justify-center flex-shrink-0">
                 <BergLogo 
-                  className={sidebarOpen ? 'h-9 w-28' : 'h-8 w-12'} 
+                  className={sidebarOpen ? 'h-11 w-32' : 'h-11 w-11 overflow-hidden'} 
                   showSubtitle={false} 
                 />
               </div>
@@ -532,7 +532,7 @@ function AppContent({
               key={item.id}
               id={`nav-${item.id}`}
               onClick={() => setActiveTab(item.id)}
-              className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-lg transition-all duration-200 group text-sm ${
+              className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-lg transition-all duration-200 group text-[13px] ${
                 activeTab === item.id 
                   ? 'bg-[#38BDF8] text-[#0F172A] font-bold shadow-md shadow-sky-500/10' 
                   : 'hover:bg-[#1E293B] hover:text-white'
@@ -666,6 +666,8 @@ function AppContent({
               >
                 {activeTab === 'tms' ? (
                   <TMSView user={effectiveUser!} allUsers={allUsers} />
+                ) : activeTab === 'attendance' ? (
+                  <AttendanceView user={effectiveUser!} allUsers={allUsers} />
                 ) : activeTab === 'kpis_scorecard' ? (
                   <ScorecardView user={effectiveUser!} allUsers={allUsers} onRefreshAllData={fetchAllData} externalTheme={theme} />
                 ) : activeTab === 'warnings' ? (

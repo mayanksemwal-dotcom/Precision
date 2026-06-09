@@ -17,12 +17,40 @@ import {
   ExternalLink,
   RefreshCw
 } from 'lucide-react';
-import { db } from '../../lib/firebase';
+import { db, auth } from '../../lib/firebase';
 import { doc, setDoc, deleteDoc, writeBatch, collection, getDocs, getDoc } from 'firebase/firestore';
 import { UserRole, UserProfile } from '../../types';
 import { toast } from 'sonner';
 import * as XLSX from 'xlsx';
 import { UserPicker } from '../UserPicker';
+
+// Robust CSV Line parser helper that supports double quotes containing commas
+export function parseCSVLine(line: string): string[] {
+  const result: string[] = [];
+  let current = '';
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const char = line[i];
+    if (char === '"') {
+      inQuotes = !inQuotes;
+    } else if (char === ',' && !inQuotes) {
+      let val = current.trim();
+      if (val.startsWith('"') && val.endsWith('"')) {
+        val = val.slice(1, -1);
+      }
+      result.push(val);
+      current = '';
+    } else {
+      current += char;
+    }
+  }
+  let val = current.trim();
+  if (val.startsWith('"') && val.endsWith('"')) {
+    val = val.slice(1, -1);
+  }
+  result.push(val);
+  return result;
+}
 
 interface UserManagementSubViewProps {
   allUsers: any[];
@@ -61,6 +89,75 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
   const [bulkText, setBulkText] = useState('');
   const [isNotesOpen, setIsNotesOpen] = useState<any>(null); // holds user object to edit notes
   const [editingNotes, setEditingNotes] = useState('');
+
+  // CSV Validation reports
+  const [csvErrors, setCsvErrors] = useState<{ lineNum: number; text: string; type: 'error' | 'warning'; message: string }[]>([]);
+
+  useEffect(() => {
+    if (!bulkText) {
+      setCsvErrors([]);
+      return;
+    }
+    const lines = bulkText.split('\n');
+    const errors: { lineNum: number; text: string; type: 'error' | 'warning'; message: string }[] = [];
+    const validRoles = ['ADMIN', 'MANAGER', 'ASSISTANT_MANAGER', 'TEAM_LEAD', 'SME', 'TRAINER', 'QA', 'AGENT'];
+    
+    let index = 0;
+    for (let line of lines) {
+      index++;
+      if (!line.trim()) continue;
+      
+      const fields = parseCSVLine(line);
+      const [empId, name, email, roleStr] = fields.map(s => s?.trim() || '');
+      
+      // Skip header
+      if (email?.toLowerCase() === 'email' && name?.toLowerCase() === 'name') {
+        continue;
+      }
+
+      if (!name && !email) continue; 
+
+      if (!name) {
+        errors.push({
+          lineNum: index,
+          text: line,
+          type: 'error',
+          message: 'Missing Name value'
+        });
+        continue;
+      }
+
+      if (!email) {
+        errors.push({
+          lineNum: index,
+          text: line,
+          type: 'error',
+          message: 'Missing Email address'
+        });
+        continue;
+      }
+
+      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      if (!emailRegex.test(email)) {
+        errors.push({
+          lineNum: index,
+          text: line,
+          type: 'error',
+          message: `Invalid email format: "${email}"`
+        });
+      }
+
+      if (roleStr && !validRoles.includes(roleStr.toUpperCase())) {
+        errors.push({
+          lineNum: index,
+          type: 'warning',
+          text: line,
+          message: `Unknown role: "${roleStr}". Will default to AGENT. Valid roles: ${validRoles.join(', ')}`
+        });
+      }
+    }
+    setCsvErrors(errors);
+  }, [bulkText]);
 
   // Edit form states
   const [isEditUserOpen, setIsEditUserOpen] = useState(false);
@@ -355,11 +452,14 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
 
     try {
       // 1. Provision via custom server Auth creation
+      const currentUser = auth.currentUser;
+      const idToken = currentUser ? await currentUser.getIdToken() : '';
+
       const response = await fetch('/api/create-user', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${sessionStorage.getItem('idToken') || ''}`
+          'Authorization': `Bearer ${idToken}`
         },
         body: JSON.stringify({
           name: newForm.name,
@@ -525,85 +625,81 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
   // Offline parsing for bulk csv copy-paste with support for updating existing users
   const handleBulkImport = async () => {
     if (!bulkText.trim()) {
-      toast.error('Please paste CSV raw string.');
+      toast.error('Please paste or upload CSV data.');
       return;
     }
+
+    const hasErrors = csvErrors.some(err => err.type === 'error');
+    if (hasErrors) {
+      toast.error('Please fix the syntax errors in your CSV before importing.');
+      return;
+    }
+
     const lines = bulkText.split('\n');
-    let commitCount = 0;
+    const usersToCreate = [];
+    
+    // Validate first
+    for (let line of lines) {
+      if (!line.trim()) continue;
+      const fields = parseCSVLine(line);
+      const [empId, name, email, roleStr, dept, processStr, joinDate, notesStr] = fields.map(s => s?.trim() || '');
+      if (!email || !name) continue;
+      
+      const parsedEmail = email.toLowerCase();
+      if (parsedEmail === 'email') continue;
+
+      usersToCreate.push({
+        employeeId: empId,
+        name: name,
+        email: parsedEmail,
+        role: roleStr,
+        department: dept,
+        process: processStr,
+        dateJoined: joinDate,
+        notes: notesStr,
+        password: 'Password360@'
+      });
+    }
+
+    if (usersToCreate.length === 0) {
+      toast.error('No valid users found in CSV');
+      return;
+    }
+
     try {
-      let batch = writeBatch(db);
-      let opCount = 0;
+      const currentUser = auth.currentUser;
+      const idToken = currentUser ? await currentUser.getIdToken() : '';
+      
+      const response = await fetch('/api/bulk-create-users', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${idToken}`
+        },
+        body: JSON.stringify({ users: usersToCreate })
+      });
 
-      for (let line of lines) {
-        if (!line.trim()) continue;
-        const [empId, name, email, roleStr, dept, processStr, joinDate, notesStr] = line.split(',').map(s => s?.trim() || '');
-        if (!email || !name) continue;
-
-        // Skip CSV header line if pasted
-        const parsedEmail = email.toLowerCase();
-        if (parsedEmail === 'email') continue;
-
-        // Find existing user to update instead of blindly generating a local_ uid
-        const existingUser = allUsers.find(u => u.email?.toLowerCase().trim() === parsedEmail);
-        const targetUid = existingUser?.uid || existingUser?.id || ('local_' + btoa(parsedEmail).replace(/=/g, '').slice(0,12));
-
-        const profileDoc = {
-          uid: targetUid,
-          employeeId: empId || existedOrEmpty(existingUser, 'employeeId'),
-          name: name || existedOrEmpty(existingUser, 'name') || existedOrEmpty(existingUser, 'fullName') || '',
-          fullName: name || existedOrEmpty(existingUser, 'fullName') || existedOrEmpty(existingUser, 'name') || '',
-          email: parsedEmail,
-          role: (roleStr as UserRole) || existedOrEmpty(existingUser, 'role') || 'AGENT',
-          department: dept || existedOrEmpty(existingUser, 'department') || 'Operations',
-          process: processStr || existedOrEmpty(existingUser, 'process') || '',
-          dateJoined: joinDate || existedOrEmpty(existingUser, 'dateJoined') || new Date().toISOString().slice(0,10),
-          notes: notesStr || existedOrEmpty(existingUser, 'notes') || '',
-          status: 'Active',
-          isActive: true,
-          ...(!existingUser && { createdAt: new Date().toISOString() })
-        };
-
-        const masterData = {
-          employeeId: empId || existedOrEmpty(existingUser, 'employeeId'),
-          employeeName: name || existedOrEmpty(existingUser, 'fullName') || existedOrEmpty(existingUser, 'name') || '',
-          email: parsedEmail,
-          role: (roleStr as UserRole) || existedOrEmpty(existingUser, 'role') || 'AGENT',
-          department: dept || existedOrEmpty(existingUser, 'department') || 'Operations',
-          process: processStr || existedOrEmpty(existingUser, 'process') || '',
-          teamLeadId: existedOrEmpty(existingUser, 'teamLeadId'),
-          teamLeadName: existedOrEmpty(existingUser, 'teamLeadName'),
-          managerId: existedOrEmpty(existingUser, 'managerId'),
-          managerName: existedOrEmpty(existingUser, 'managerName'),
-          status: 'Active',
-          dateJoined: joinDate || existedOrEmpty(existingUser, 'dateJoined') || new Date().toISOString().slice(0,10),
-          lastUpdated: new Date().toISOString()
-        };
-
-        // Standard Firestore batch limit is 500 operations. We chunk at 400 operations.
-        if (opCount >= 400) {
-          await batch.commit();
-          batch = writeBatch(db);
-          opCount = 0;
-        }
-
-        batch.set(doc(db, 'users', targetUid), profileDoc, { merge: true });
-        batch.set(doc(db, 'employee_master', targetUid), masterData, { merge: true });
-        opCount += 2;
-        commitCount++;
+      if (!response.ok) {
+        const errObj = await response.json();
+        throw new Error(errObj.error || 'Server rejected bulk user creation.');
       }
 
-      if (opCount > 0) {
-        await batch.commit();
+      const resData = await response.json();
+      
+      if (resData.errors && resData.errors.length > 0) {
+        console.error('Bulk upload had some errors:', resData.errors);
+        toast.warning(`Uploaded with ${resData.errors.length} errors. Check console.`);
+      } else {
+        toast.success(`Successfully updated/initialized ${resData.createdUsers?.length || 0} user profiles.`);
       }
 
-      toast.success(`Successfully updated/initialized ${commitCount} user profiles.`);
-      logAdminEvent('CSV Roster Upload', `${commitCount} batch entries`, 'Blank', 'Roster update/creation sync');
+      logAdminEvent('CSV Roster Upload', `${resData.createdUsers?.length || 0} batch entries`, 'Blank', 'Roster update/creation sync');
       setIsBulkOpen(false);
       setBulkText('');
       onRefresh();
     } catch (err: any) {
       console.error(err);
-      toast.error('CSV Import runtime parsing failed.');
+      toast.error(err.message || 'CSV Import processing failed.');
     }
   };
 
@@ -1354,30 +1450,98 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
         <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
           <div className={`max-w-2xl w-full border shadow-2xl rounded-2xl p-6 ${adminTheme === 'dark' ? 'bg-slate-800 border-slate-700' : 'bg-white border-slate-200'}`}>
             <div className="flex justify-between items-center border-b pb-2 mb-4">
-              <h4 className="text-sm font-extrabold uppercase tracking-wider">CSV Copy & Paste Batch Roster</h4>
+              <h4 className="text-sm font-extrabold uppercase tracking-wider">CSV Batch Roster Upload & Sync</h4>
               <button onClick={() => setIsBulkOpen(false)} className="text-slate-400 hover:text-slate-600"><X size={16} /></button>
             </div>
 
             <p className="text-[11px] text-slate-400 mb-3 leading-relaxed">
-              Accepts plain lines separation. Header format template: <br />
+              Standard format schema template (values enclosed in quotes if they contain commas): <br />
               <strong className="font-mono bg-slate-100 dark:bg-slate-900/60 p-1 rounded inline-block mt-1 text-indigo-400 select-all">
                 EmployeeID, Name, Email, Role, Department, Process, DateJoined, Notes
               </strong>
             </p>
 
+            {/* Drag & Drop File Picker */}
+            <div className={`mb-4 p-5 border-2 border-dashed rounded-xl flex flex-col items-center justify-center transition-colors ${adminTheme === 'dark' ? 'border-slate-700 hover:border-indigo-500 bg-slate-900/40' : 'border-slate-200 hover:border-indigo-500 bg-slate-50/60'}`}>
+              <Upload size={24} className="text-indigo-500 mb-2 animate-bounce" />
+              <p className="text-xs font-semibold mb-1 text-slate-700 dark:text-slate-300">Drag and drop your .csv file here, or click to browse</p>
+              <p className="text-[10px] text-slate-400">Quotes-aware CSV text processor</p>
+              <input 
+                type="file" 
+                accept=".csv"
+                id="csv-file-upload-input"
+                className="hidden"
+                onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  if (!file) return;
+                  const reader = new FileReader();
+                  reader.onload = (event) => {
+                    const text = event.target?.result as string;
+                    setBulkText(text);
+                    toast.success(`Loaded file "${file.name}" successfully.`);
+                  };
+                  reader.readAsText(file);
+                }}
+              />
+              <button 
+                type="button" 
+                onClick={() => document.getElementById('csv-file-upload-input')?.click()}
+                className="mt-2 text-[11px] font-bold px-3 py-1 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg transition-all shadow-sm cursor-pointer"
+              >
+                Choose CSV File
+              </button>
+            </div>
+
+            <div className="flex items-center justify-between mb-1.5">
+              <span className="text-[11px] font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wider">CSV Data Preview & Editor:</span>
+              {bulkText && (
+                <button 
+                  onClick={() => setBulkText('')} 
+                  className="text-[10px] font-bold text-red-500 hover:underline cursor-pointer"
+                >
+                  Clear Data
+                </button>
+              )}
+            </div>
+
             <textarea 
-              rows={8}
+              rows={6}
               value={bulkText}
               onChange={e => setBulkText(e.target.value)}
               placeholder="e.g.&#10;BT-901,Akshit Sodhi,akshit@bergtechnologies.co.in,QA,Operations,Vertical Core,2026-01-08,Senior Assessor"
-              className={`w-full text-xs p-3 font-mono border rounded-xl focus:outline-none focus:ring-1 focus:ring-indigo-500 mb-4 ${adminTheme === 'dark' ? 'bg-slate-900 border-slate-700' : 'bg-slate-50'}`}
+              className={`w-full text-xs p-3 font-mono border rounded-xl focus:outline-none focus:ring-1 focus:ring-indigo-500 mb-4 ${adminTheme === 'dark' ? 'bg-slate-900 border-slate-700 text-slate-100' : 'bg-slate-50 text-slate-800'}`}
             />
 
-            <div className="flex justify-between items-center text-xs">
-              <span className="text-[10px] text-slate-400 font-mono">Double-check headers before triggering transaction writes.</span>
+            {/* Diagnostics Analysis output */}
+            {csvErrors.length > 0 && (
+              <div className="mb-4 max-h-36 overflow-y-auto rounded-xl p-3 border border-red-500/10 bg-red-500/5 space-y-1.5 text-[11px]">
+                <h5 className="font-extrabold text-red-500 uppercase tracking-tight flex items-center gap-1">
+                  <X size={12} fill="currentColor" className="text-white bg-red-500 rounded-full p-0.5" /> CSV Analysis & Syntax Diagnostics ({csvErrors.length})
+                </h5>
+                {csvErrors.map((err, i) => (
+                  <div key={i} className={`flex items-start gap-1 p-1 rounded ${err.type === 'error' ? 'text-red-600 dark:text-red-400 font-medium' : 'text-amber-600 dark:text-amber-400'}`}>
+                    <span className="font-mono bg-black/5 dark:bg-white/5 px-1 rounded font-bold">Line {err.lineNum}:</span>
+                    <span className="flex-1">{err.message}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <div className="flex justify-between items-center text-xs border-t pt-4">
+              <span className="text-[10px] text-slate-400 font-mono">Lines without Name/Email are auto-ignored from writes.</span>
               <div className="flex gap-2">
                 <button onClick={() => setIsBulkOpen(false)} className="px-3 py-1.5 font-bold rounded-lg bg-slate-200 text-slate-700 hover:bg-slate-300 cursor-pointer">Cancel</button>
-                <button onClick={handleBulkImport} className="px-3 py-1.5 font-bold rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white cursor-pointer">Trigger Import Batch</button>
+                <button 
+                  onClick={handleBulkImport} 
+                  disabled={csvErrors.some(err => err.type === 'error')}
+                  className={`px-3 py-1.5 font-bold rounded-lg text-white cursor-pointer transition-all ${
+                    csvErrors.some(err => err.type === 'error') 
+                      ? 'bg-slate-400 opacity-60 cursor-not-allowed' 
+                      : 'bg-emerald-600 hover:bg-emerald-700'
+                  }`}
+                >
+                  Trigger Import Batch
+                </button>
               </div>
             </div>
           </div>

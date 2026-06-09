@@ -28,6 +28,10 @@ import { AuditLogsSubView } from '../components/admin/AuditLogsSubView';
 import { DataManagementSubView } from '../components/admin/DataManagementSubView';
 import { BackupRestoreSubView } from '../components/admin/BackupRestoreSubView';
 import { ProcessManagementSubView } from '../components/admin/ProcessManagementSubView';
+import { AttendanceSettingsSubView } from '../components/admin/AttendanceSettingsSubView';
+
+// Subview type definition
+type SubTabType = 'dashboard' | 'users' | 'roles' | 'mapping' | 'process' | 'audits' | 'data' | 'backup' | 'attendancecfg';
 
 interface AdminViewProps {
   activeTab: string;
@@ -55,7 +59,7 @@ export default function AdminView({
   const { canView, canCreate, canEdit, canDelete } = usePermission();
   
   // Tab Routing inside Admin Console
-  const [activeSubTab, setActiveSubTab] = useState<'dashboard' | 'users' | 'roles' | 'mapping' | 'process' | 'audits' | 'data' | 'backup'>('dashboard');
+  const [activeSubTab, setActiveSubTab] = useState<SubTabType>('dashboard');
   
   // Theme Toggle: Sync with global theme if provided, else manage locally
   const [adminTheme, setAdminTheme] = useState<'light' | 'dark'>(externalTheme || 'light');
@@ -94,6 +98,7 @@ export default function AdminView({
     { id: 'mapping', label: 'Team Mapping', icon: RefreshCw, visible: canEdit('Console') },
     { id: 'audits', label: 'Audit Trail', icon: History, visible: canView('Console') },
     { id: 'data', label: 'Data Management', icon: Database, visible: canDelete('Console') },
+    { id: 'attendancecfg', label: 'Attendance Rules', icon: FileText, visible: canEdit('Console') },
     { id: 'backup', label: 'Backup & Restore', icon: CloudLightning, visible: canEdit('Console') && canDelete('Console') }
   ] as const;
 
@@ -200,6 +205,10 @@ export default function AdminView({
             onRefresh={onRefresh || (() => {})} 
             logAdminEvent={logAdminEvent} 
           />
+        )}
+
+        {activeSubTab === 'attendancecfg' && (
+          <AttendanceSettingsSubView />
         )}
       </div>
 

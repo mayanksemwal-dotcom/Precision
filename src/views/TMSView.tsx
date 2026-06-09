@@ -29,7 +29,8 @@ import { Input } from '../components/ui/input';
 import { Label } from '../components/ui/label';
 import { toast } from 'sonner';
 import { usePermission } from '../components/PermissionContext';
-import { auth, db, handleFirestoreError, OperationType } from '../lib/firebase';
+import { db, auth, handleFirestoreError, OperationType } from '../lib/firebase';
+import { syncShiftToAttendance } from '../services/attendanceSyncService';
 import { 
   doc, 
   setDoc, 
@@ -44,7 +45,8 @@ import {
   deleteDoc,
   serverTimestamp,
   getDocs,
-  limit
+  limit,
+  writeBatch
 } from 'firebase/firestore';
 import { UserProfile, UserRole } from '../types';
 import { motion, AnimatePresence } from 'motion/react';
@@ -192,12 +194,25 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
   useEffect(() => {
     if (!user) return;
     const unsub = onSnapshot(doc(db, 'config', 'tmsProcesses'), (snap) => {
-      let activeList: string[] = [];
-      if (snap.exists() && Array.isArray(snap.data()?.list)) {
-        activeList = snap.data()?.list;
-      }
-      if (activeList.length > 0) {
-        setProcesses(activeList);
+      if (snap.exists()) {
+        const data = snap.data();
+        let processList: string[] = [];
+
+        if (Array.isArray(data.processes)) {
+          // Use the structured processes list, filtering out inactive and hidden
+          processList = data.processes
+            .filter((p: any) => p.status === 'Active' && !p.hidden)
+            .map((p: any) => p.name);
+        } else if (Array.isArray(data.list)) {
+          // Fallback to legacy string array
+          processList = data.list;
+        }
+
+        if (processList.length > 0) {
+          setProcesses(processList);
+        } else {
+          setProcesses(DEFAULT_PROCESSES);
+        }
       } else {
         setProcesses(DEFAULT_PROCESSES);
       }
@@ -224,8 +239,34 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
       
       setMyPastShifts(shifts);
 
+      // Find and heal duplicate active shifts
+      const activeShiftsList = shifts.filter(s => s.status === 'ACTIVE' || s.status === 'BREAK');
+      if (activeShiftsList.length > 1) {
+        // Find older duplicates to close
+        const duplicateClosingShifts = activeShiftsList.slice(1);
+        const healBatch = writeBatch(db);
+        const healNowISO = new Date().toISOString();
+        duplicateClosingShifts.forEach(sh => {
+          const updatedActivities = [...(sh.activities || [])];
+          if (updatedActivities.length > 0) {
+            const lastIndex = updatedActivities.length - 1;
+            if (!updatedActivities[lastIndex].endTime) {
+              updatedActivities[lastIndex].endTime = healNowISO;
+            }
+          }
+          healBatch.set(doc(db, 'tmsShifts', sh.id), {
+            ...sh,
+            activities: updatedActivities,
+            status: 'AUTO_CLOSED',
+            clockOutTime: healNowISO,
+            remarks: 'System Auto-Resolved Duplicate Active Shift (User Self-Healing)'
+          });
+        });
+        healBatch.commit().catch(e => console.error('Failed to auto-heal duplicate shifts for active user', e));
+      }
+
       // Find if there's any active shift (status ACTIVE or BREAK)
-      const active = shifts.find(s => s.status === 'ACTIVE' || s.status === 'BREAK');
+      const active = activeShiftsList.length > 0 ? activeShiftsList[0] : null;
       if (active) {
         setCurrentShift(active);
         // Default select previous active process if available
@@ -332,12 +373,18 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
         ? (forceOutCustomReason.trim() || 'Forced logout by supervisor')
         : forceOutReason;
 
-      // Update shift to COMPLETED
-      await updateDoc(shiftRef, {
+      const updatedShift = {
+        ...shift,
         activities: updatedActivities,
         clockOutTime: nowISO,
         status: 'COMPLETED'
-      });
+      };
+
+      // Update shift to COMPLETED
+      await updateDoc(shiftRef, updatedShift as any);
+      
+      // Auto-generate Attendance
+      await syncShiftToAttendance(updatedShift);
 
       // 0. Update User Status to Offline in users collection
       const userRef = doc(db, 'users', forceOutTargetUid);
@@ -757,12 +804,17 @@ export default function TMSView({ user, allUsers }: TMSViewProps) {
         updatedActivities[updatedActivities.length - 1].endTime = nowISO;
       }
 
-      await saveShiftState({
+      const finalizedShift = {
         ...currentShift,
         activities: updatedActivities,
         clockOutTime: nowISO,
         status: 'COMPLETED'
-      });
+      };
+
+      await saveShiftState(finalizedShift as any);
+      
+      // Auto-generate Attendance
+      await syncShiftToAttendance({ id: currentShift.id, ...finalizedShift });
 
       // Update User Status to Offline
       const userRef = doc(db, 'users', user.uid);

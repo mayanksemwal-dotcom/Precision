@@ -56,7 +56,8 @@ const ALL_MASTER_MODULES = [
   'PIP Management',
   'Historical Records',
   'Important Quality Links',
-  'Console'
+  'Console',
+  'Attendance'
 ];
 
 interface RolePermissionSubViewProps {
@@ -74,6 +75,20 @@ export interface RolePermissionDoc {
   can_delete: boolean;
   can_export: boolean;
   can_approve: boolean;
+  view_team: boolean;
+  view_all: boolean;
+  assign: boolean;
+  override: boolean;
+  force_action: boolean;
+  manage_settings: boolean;
+  manage_masters: boolean;
+  audit_access: boolean;
+  email_trigger: boolean;
+  bulk_action: boolean;
+  reopen_records: boolean;
+  escalate: boolean;
+  comment: boolean;
+  view_sensitive_data: boolean;
   tms_permissions?: TMSPermissions;
 }
 
@@ -155,6 +170,20 @@ export const RolePermissionSubView: React.FC<RolePermissionSubViewProps> = ({ ad
             can_delete: !!docItem.can_delete,
             can_export: !!docItem.can_export,
             can_approve: !!docItem.can_approve,
+            view_team: !!docItem.view_team,
+            view_all: !!docItem.view_all,
+            assign: !!docItem.assign,
+            override: !!docItem.override,
+            force_action: !!docItem.force_action,
+            manage_settings: !!docItem.manage_settings,
+            manage_masters: !!docItem.manage_masters,
+            audit_access: !!docItem.audit_access,
+            email_trigger: !!docItem.email_trigger,
+            bulk_action: !!docItem.bulk_action,
+            reopen_records: !!docItem.reopen_records,
+            escalate: !!docItem.escalate,
+            comment: !!docItem.comment,
+            view_sensitive_data: !!docItem.view_sensitive_data,
             tms_permissions: docItem.tms_permissions || undefined
           };
 
@@ -1048,6 +1077,7 @@ export const RolePermissionSubView: React.FC<RolePermissionSubViewProps> = ({ ad
                     items: [
                       { key: 'view_workforce_control', label: 'View Workforce Control' },
                       { key: 'can_force_logout', label: 'Can Force Logout Users' },
+                      { key: 'can_force_out', label: 'Can Force Out' },
                       { key: 'can_edit_tms_records', label: 'Can Edit TMS Records' },
                       { key: 'can_modify_activities', label: 'Can Modify Activities' },
                       { key: 'can_close_sessions', label: 'Can Close Sessions' },

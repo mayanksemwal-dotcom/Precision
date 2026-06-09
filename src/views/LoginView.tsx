@@ -102,8 +102,8 @@ export default function LoginView() {
         <Card className="w-full max-w-md bg-white/10 backdrop-blur-xl border border-white/20 shadow-2xl rounded-3xl overflow-hidden self-center mx-auto text-slate-900">
             <CardHeader className="text-center pt-10 pb-2">
             <div className="flex justify-center mb-4">
-                <div className="bg-white p-2.5 rounded-2xl shadow-inner overflow-hidden flex items-center justify-center">
-                <BergLogo className="h-14 w-48" showSubtitle={false} />
+                <div className="p-0 flex items-center justify-center">
+                <BergLogo className="h-20 w-60" showSubtitle={true} />
                 </div>
             </div>
             <CardTitle className="text-2xl font-black text-white tracking-tight">Login</CardTitle>

@@ -158,6 +158,11 @@ service cloud.firestore {
       allow delete: if isAdmin();
     }
 
+    match /config/attendanceSettings {
+      allow read: if isVerified();
+      allow write: if isAdmin();
+    }
+
     match /config/master {
       allow read: if isVerified();
       allow write, delete: if isAdmin();
@@ -239,6 +244,20 @@ service cloud.firestore {
       allow read: if isVerified() && (isTL() || isAdmin() || isOwner(resource.data.userId));
       allow write: if isVerified() && (isTL() || isAdmin() || isOwner(incoming().userId) || isOwner(existing().userId));
       allow delete: if isAdmin();
+    }
+
+    match /attendanceSummary/{id} {
+      allow get: if isVerified() && (isTL() || isAdmin() || isOwner(resource.data.userId));
+      allow list: if isVerified();
+      allow create: if isVerified(); // Allow creation from system/services
+      allow update: if isVerified() && (isTL() || isAdmin() || isOwner(resource.data.userId));
+      allow delete: if isAdmin();
+    }
+
+    match /attendanceAuditLogs/{id} {
+      allow read: if isVerified() && (isTL() || isAdmin());
+      allow create: if isVerified();
+      allow update, delete: if isAdmin();
     }
 
     match /dashboardSummary/{id} {

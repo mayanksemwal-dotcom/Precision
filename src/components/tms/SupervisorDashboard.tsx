@@ -37,6 +37,7 @@ import {
   Cell 
 } from 'recharts';
 import { db, handleFirestoreError, OperationType } from '../../lib/firebase';
+import { syncShiftToAttendance } from '../../services/attendanceSyncService';
 import { 
   doc, 
   setDoc, 
@@ -46,7 +47,8 @@ import {
   where, 
   getDocs, 
   writeBatch,
-  addDoc
+  addDoc,
+  onSnapshot
 } from 'firebase/firestore';
 import { UserProfile, UserRole } from '../../types';
 import { toast } from 'sonner';
@@ -195,6 +197,15 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
     return allUsers.filter(u => u.status === 'Active' && canActOn(user, u, allUsers));
   }, [allUsers, user, tlFilter]);
 
+  // Keep a ref of the latest mappedUsers and dependencies so the snapshot closure doesn't become stale
+  const mappedUsersRef = React.useRef(mappedUsers);
+  const allUsersRef = React.useRef(allUsers);
+  
+  useEffect(() => {
+    mappedUsersRef.current = mappedUsers;
+    allUsersRef.current = allUsers;
+  }, [mappedUsers, allUsers]);
+
   // List of unique Team Leads who have members in mappedUsers or have a TL role
   const teamLeadsList = useMemo(() => {
     const leads = new Map<string, { name: string; role: string }>();
@@ -298,47 +309,84 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
     };
   };
 
-  // FETCH & AGGREGATE CORE - Minimal reads & cached architecture
-  const loadAndRecomputeData = async (forceRecalculate = false) => {
+  // FETCH & AGGREGATE CORE - Minimal reads & in-memory synced architecture
+  const loadAndRecomputeData = async (forceRecalculate = false, externalSnapshot?: any) => {
+    const currentAllUsers = allUsersRef.current;
+    const currentMappedUsers = mappedUsersRef.current;
+    
+    if (!currentAllUsers || currentAllUsers.length === 0) {
+      console.log('Skipping recomputation as allUsers roster is not yet ready');
+      return;
+    }
     setIsLoadingShifts(true);
     try {
-      const summaryDocRef = doc(db, 'dashboardSummary', `tms_${user.uid}`);
-      let cachedSummary: any = null;
-
-      if (!forceRecalculate) {
-        // Attempt to read cached summary document first to avoid computing
-        const docSnap = await getDoc(summaryDocRef);
-        if (docSnap.exists()) {
-          const data = docSnap.data();
-          const age = new Date().getTime() - new Date(data.lastUpdated).getTime();
-          // Cache validity: 20 seconds
-          if (age < 20000) {
-            cachedSummary = data;
-          }
-        }
+      // Perform optimized fetch of ONLY active shifts
+      let allActiveShifts: TMSShift[] = [];
+      
+      if (externalSnapshot) {
+        allActiveShifts = externalSnapshot.docs.map((d: any) => ({ id: d.id, ...d.data() } as TMSShift));
+      } else {
+        const activeShiftsQuery = query(
+          collection(db, 'tmsShifts'),
+          where('status', 'in', ['ACTIVE', 'BREAK'])
+        );
+        const snapshot = await getDocs(activeShiftsQuery);
+        allActiveShifts = snapshot.docs.map(d => ({ id: d.id, ...d.data() } as TMSShift));
       }
-
-      if (cachedSummary) {
-        setSummaryData(cachedSummary);
-        if (cachedSummary.activeShiftsList) {
-          setActiveShifts(cachedSummary.activeShiftsList);
-        }
-        setLastRefreshed(new Date(cachedSummary.lastUpdated));
-        setIsLoadingShifts(false);
-        if (cachedSummary.activeShiftsList) return;
-      }
-
-      // If missing or expired: Perform optimized fetch of ONLY active shifts
-      const activeShiftsQuery = query(
-        collection(db, 'tmsShifts'),
-        where('status', 'in', ['ACTIVE', 'BREAK'])
-      );
-      const snapshot = await getDocs(activeShiftsQuery);
-      const allActiveShifts = snapshot.docs.map(d => ({ id: d.id, ...d.data() } as TMSShift));
 
       // Filter active shifts matching the team scope
-      const scopeIds = new Set(mappedUsers.map(u => u.uid));
-      const teamActiveShifts = allActiveShifts.filter(sh => scopeIds.has(sh.userId));
+      const scopeIds = new Set(currentMappedUsers.map(u => u.uid));
+      const teamActiveShiftsRaw = allActiveShifts.filter(sh => scopeIds.has(sh.userId));
+
+      // Group active shifts by userId to identify and heal duplicates
+      const shiftsByUser: { [userId: string]: TMSShift[] } = {};
+      teamActiveShiftsRaw.forEach(sh => {
+        if (!shiftsByUser[sh.userId]) {
+          shiftsByUser[sh.userId] = [];
+        }
+        shiftsByUser[sh.userId].push(sh);
+      });
+
+      const teamActiveShifts: TMSShift[] = [];
+      const duplicateCloses: TMSShift[] = [];
+
+      Object.entries(shiftsByUser).forEach(([userId, userShifts]) => {
+        if (userShifts.length > 1) {
+          // Sort descending: most recent shift at index 0
+          userShifts.sort((a, b) => new Date(b.clockInTime).getTime() - new Date(a.clockInTime).getTime());
+          teamActiveShifts.push(userShifts[0]);
+          for (let i = 1; i < userShifts.length; i++) {
+            duplicateCloses.push(userShifts[i]);
+          }
+        } else {
+          teamActiveShifts.push(userShifts[0]);
+        }
+      });
+
+      // Heal the database synchronously by batch-closing older duplicates
+      if (duplicateCloses.length > 0) {
+        console.warn(`[DATA HEAL] Found ${duplicateCloses.length} duplicate active shifts. Closing older ones...`);
+        const healBatch = writeBatch(db);
+        const healNowISO = new Date().toISOString();
+        duplicateCloses.forEach(sh => {
+          const updatedActivities = [...(sh.activities || [])];
+          if (updatedActivities.length > 0) {
+            const lastIndex = updatedActivities.length - 1;
+            if (!updatedActivities[lastIndex].endTime) {
+              updatedActivities[lastIndex].endTime = healNowISO;
+            }
+          }
+          healBatch.set(doc(db, 'tmsShifts', sh.id), {
+            ...sh,
+            activities: updatedActivities,
+            status: 'AUTO_CLOSED',
+            clockOutTime: healNowISO,
+            remarks: 'System Auto-Resolved Duplicate Active Shift (Supervisor Healing)'
+          });
+        });
+        healBatch.commit().catch(err => console.error('Error healing duplicate shifts:', err));
+      }
+
       setActiveShifts(teamActiveShifts);
 
       // Fetch auto-closed sessions of today
@@ -355,7 +403,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
         .filter(sh => scopeIds.has(sh.userId));
 
       // Compute statistics and variables in memory without database scans
-      const totalAssigned = mappedUsers.length;
+      const totalAssigned = currentMappedUsers.length;
       const loggedInCount = teamActiveShifts.length;
       const onBreakCount = teamActiveShifts.filter(s => s.status === 'BREAK').length;
       const activeSessionsCount = teamActiveShifts.filter(s => s.status === 'ACTIVE').length;
@@ -460,7 +508,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
 
       // Team Inconsistencies Scan
       const inconsistencies: any[] = [];
-      mappedUsers.forEach(u => {
+      currentMappedUsers.forEach(u => {
         if (!u.teamLeadId && u.role === 'AGENT') {
           inconsistencies.push({
             userId: u.uid,
@@ -473,7 +521,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
       // Attendance Exceptions (scheduled but no shifts today)
       const clockedAgentIds = new Set(teamActiveShifts.map(s => s.userId));
       const attendanceExceptions: any[] = [];
-      mappedUsers.forEach(u => {
+      currentMappedUsers.forEach(u => {
         if (!clockedAgentIds.has(u.uid) && !teamAutoClosed.some(c => c.userId === u.uid)) {
           attendanceExceptions.push({
             userId: u.uid,
@@ -553,8 +601,6 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
         activeShiftsList: teamActiveShifts
       };
 
-      // Save summary data in Firestore to share/cache
-      await setDoc(summaryDocRef, computedSummary);
       setSummaryData(computedSummary);
       setLastRefreshed(new Date());
 
@@ -574,17 +620,22 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
   }, [allUsers, tlFilter]);
 
   useEffect(() => {
-    const timer = setInterval(() => {
-      setCountdown(prev => {
-        if (prev <= 1) {
-          loadAndRecomputeData(false);
-          return 20;
-        }
-        return prev - 1;
-      });
-    }, 1000);
-    return () => clearInterval(timer);
-  }, []);
+    if (!user) return;
+
+    // Real-time reactive synchronization for active/break shifts
+    const activeShiftsQuery = query(
+      collection(db, 'tmsShifts'),
+      where('status', 'in', ['ACTIVE', 'BREAK'])
+    );
+
+    const unsubscribe = onSnapshot(activeShiftsQuery, (snapshot) => {
+      loadAndRecomputeData(false, snapshot);
+    }, (error) => {
+      console.warn('[REALTIME_SYNC_ERROR]', error);
+    });
+
+    return () => unsubscribe();
+  }, [user.uid]);
 
   // Filter & paginate the workforce controls list
   const filteredWorkforce = useMemo(() => {
@@ -769,6 +820,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
       };
 
       await setDoc(shiftRef, finalShift);
+      await syncShiftToAttendance(finalShift);
 
       // Log in audit trail
       await addDoc(collection(db, 'adminAuditLogs'), {
@@ -1033,18 +1085,109 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
         </div>
 
         <div className="flex items-center gap-3 flex-wrap">
-          <div className="flex items-center gap-1.5 bg-slate-50 dark:bg-slate-800 text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-slate-700 px-3 py-1.5 rounded-xl font-mono text-[11px]">
-            <Clock3 size={13} className="text-indigo-500" />
-            <span>Refreshes in {countdown}s</span>
+          <div className="flex items-center gap-1.5 bg-emerald-50 dark:bg-emerald-950/20 text-emerald-600 dark:text-emerald-400 border border-emerald-100 dark:border-emerald-900/20 px-3 py-1.5 rounded-xl font-semibold text-xs transition-all">
+            <span className="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-pulse shrink-0" />
+            <span>Synced in Real-time</span>
           </div>
           
+          <div className="flex items-center gap-2">
+            <button 
+              onClick={() => {
+                // Clock-In/Out logic for supervisor
+                const myShift = activeShifts.find(s => s.userId === user.uid);
+                if (myShift) {
+                  // Clock Out logic - Perform standard end of work
+                  const myShiftId = myShift.id;
+                  const nowISO = new Date().toISOString();
+                  
+                  const updatedActivities = [...(myShift.activities || [])];
+                  if (updatedActivities.length > 0) {
+                    const lastIndex = updatedActivities.length - 1;
+                    if (!updatedActivities[lastIndex].endTime) {
+                      updatedActivities[lastIndex].endTime = nowISO;
+                    }
+                  }
+                  
+                  const finalShift = {
+                    ...myShift,
+                    activities: updatedActivities,
+                    status: 'COMPLETED',
+                    clockOutTime: nowISO
+                  };
+                  
+                  setDoc(doc(db, 'tmsShifts', myShiftId), finalShift).then(() => {
+                    syncShiftToAttendance(finalShift);
+                    toast.success('Shift completed successfully');
+                    loadAndRecomputeData(true);
+                  });
+                } else {
+                  // Clock In logic - create new shift record
+                  const newShift: Omit<TMSShift, 'id'> = {
+                    userId: user.uid,
+                    userName: user.name,
+                    userEmail: user.email,
+                    clockInTime: new Date().toISOString(),
+                    activities: [{ type: 'productive', name: 'Work Start', startTime: new Date().toISOString() }],
+                    status: 'ACTIVE'
+                  };
+                  addDoc(collection(db, 'tmsShifts'), newShift).then(() => {
+                    toast.success('Clocked in successfully');
+                    // Give Firestore a moment before recomputing
+                    setTimeout(() => loadAndRecomputeData(true), 500);
+                  }).catch(err => {
+                    console.error('Clock-in failed:', err);
+                    toast.error('Failed to clock in: ' + err.message);
+                  });
+                }
+              }}
+              className={`flex items-center gap-1.5 ${activeShifts.find(s => s.userId === user.uid) ? 'bg-amber-600 hover:bg-amber-700' : 'bg-emerald-600 hover:bg-emerald-700'} text-white px-3.5 py-1.5 rounded-xl text-xs font-bold cursor-pointer transition-colors`}
+            >
+              <Clock size={13} />
+              <span>{activeShifts.find(s => s.userId === user.uid) ? 'Clock Out' : 'Clock In'}</span>
+            </button>
+            
+            {activeShifts.find(s => s.userId === user.uid) && (
+              <button
+                onClick={() => {
+                  const myShift = activeShifts.find(s => s.userId === user.uid);
+                  if (!myShift) return;
+                  
+                  const nowISO = new Date().toISOString();
+                  const updatedActivities = [...(myShift.activities || [])];
+                  const lastActivity = updatedActivities[updatedActivities.length - 1];
+                  
+                  if (myShift.status === 'ACTIVE') {
+                    // Start Break
+                    if (lastActivity && !lastActivity.endTime) {
+                      lastActivity.endTime = nowISO;
+                    }
+                    updatedActivities.push({ type: 'break', name: 'Break', startTime: nowISO });
+                    setDoc(doc(db, 'tmsShifts', myShift.id), { ...myShift, activities: updatedActivities, status: 'BREAK' })
+                      .then(() => { toast.success('Break started'); loadAndRecomputeData(true); });
+                  } else if (myShift.status === 'BREAK') {
+                    // End Break
+                    if (lastActivity && !lastActivity.endTime) {
+                      lastActivity.endTime = nowISO;
+                    }
+                    updatedActivities.push({ type: 'productive', name: 'Work Resumed', startTime: nowISO });
+                    setDoc(doc(db, 'tmsShifts', myShift.id), { ...myShift, activities: updatedActivities, status: 'ACTIVE' })
+                      .then(() => { toast.success('Break ended'); loadAndRecomputeData(true); });
+                  }
+                }}
+                className="flex items-center gap-1.5 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 px-3.5 py-1.5 rounded-xl text-xs font-bold cursor-pointer transition-colors"
+              >
+                <Coffee size={13} />
+                <span>{activeShifts.find(s => s.userId === user.uid)?.status === 'BREAK' ? 'End Break' : 'Punch Break'}</span>
+              </button>
+            )}
+          </div>
           <button 
             onClick={() => loadAndRecomputeData(true)}
             disabled={isLoadingShifts}
-            className="flex items-center gap-1.5 bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-1.5 rounded-xl text-xs font-bold cursor-pointer transition-colors disabled:opacity-50"
+            className="flex items-center gap-1.5 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 px-3.5 py-1.5 rounded-xl text-xs font-bold cursor-pointer transition-colors disabled:opacity-50"
           >
             <RefreshCw size={13} className={isLoadingShifts ? 'animate-spin' : ''} />
-            <span>Sync & Audit</span>
+            <span>Sync</span>
           </button>
         </div>
       </div>
@@ -1759,25 +1902,52 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
         {activeTab === 'exceptions' && (
           <div className="space-y-6">
             
-            {/* Actionable Exception Center Cards */}
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+            {/* Operational Intelligence Center Header Banner */}
+            <div className="relative overflow-hidden bg-gradient-to-r from-rose-500/5 via-amber-500/5 to-indigo-500/10 border border-slate-200/80 dark:border-slate-800/80 p-6 rounded-2xl flex flex-col md:flex-row justify-between items-start md:items-center gap-4.5 shadow-xs">
+              <div className="space-y-1">
+                <div className="flex items-center gap-2">
+                  <div className="p-1 px-2.5 bg-rose-500/10 text-rose-600 dark:text-rose-400 rounded-lg text-[10px] font-extrabold uppercase tracking-widest leading-none">Compliancy</div>
+                  <h3 className="text-sm font-black text-slate-800 dark:text-white uppercase tracking-wider">Operational Audit & Compliance Center</h3>
+                </div>
+                <p className="text-xs text-slate-500 dark:text-slate-400 font-sans mt-1">
+                  Active monitoring tracks and displays real-time performance anomalies, outstanding break thresholds, and tool inactivity safely.
+                </p>
+              </div>
+              <div className="flex items-center gap-2 bg-white dark:bg-slate-950 px-4 py-2 rounded-xl border border-slate-200/80 dark:border-slate-800 text-xs font-bold leading-none shadow-xs text-slate-700 dark:text-slate-300 whitespace-nowrap">
+                Roster Health Score: <span className="text-emerald-500 font-extrabold ml-1 leading-none flex items-center gap-1 font-sans">● 100% compliant</span>
+              </div>
+            </div>
+
+            {/* Actionable Exception Center Cards Grid */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
               
               {/* Long Breaks Exception */}
-              <div className="bg-white border border-rose-200 rounded-2xl p-5 shadow-sm space-y-4">
-                <h4 className="text-xs font-extrabold text-rose-700 uppercase tracking-widest flex items-center gap-1.5 leading-none">
-                  <Coffee size={14} className="text-rose-500 animate-pulse" /> Active Long Breaks Exception Limit {' > 45 mins'}
-                </h4>
+              <div className="relative bg-white dark:bg-slate-900 border border-rose-100 dark:border-rose-950 rounded-2xl p-6 shadow-xs hover:shadow-md hover:-translate-y-0.5 transition-all duration-300">
+                <div className="absolute top-0 bottom-0 left-0 w-1 bg-rose-500 rounded-l-2xl" />
+                <div className="flex items-center justify-between border-b border-rose-50/60 dark:border-rose-950/40 pb-3 mb-4">
+                  <h4 className="text-xs font-extrabold text-rose-700 dark:text-rose-400 uppercase tracking-widest flex items-center gap-2 leading-none">
+                    <Coffee size={15} className="text-rose-500 animate-pulse" /> Active Long Breaks Exception {`> 45 mins`}
+                  </h4>
+                  <span className="bg-rose-50 dark:bg-rose-950/40 text-rose-700 dark:text-rose-400 text-[10px] font-black px-2.5 py-1 rounded-full leading-none font-mono">
+                    {summaryData?.exceptionsList?.longBreaks?.length || 0} active
+                  </span>
+                </div>
                 
-                <div className="space-y-3.5 max-h-64 overflow-y-auto pt-1.5">
+                <div className="space-y-3.5 max-h-68 overflow-y-auto">
                   {summaryData?.exceptionsList?.longBreaks?.map((item: any, idx: number) => (
-                    <div key={idx} className="flex justify-between items-center text-xs bg-rose-50/50 p-2.5 rounded-xl border border-rose-100/60 font-sans">
-                      <div>
-                        <div className="font-extrabold text-slate-800 leading-tight">{item.userName}</div>
-                        <div className="text-[10px] text-rose-600 font-bold mt-1 leading-none">Break: {item.breakName} ({item.durationMins} minutes active)</div>
+                    <div key={idx} className="flex justify-between items-center text-xs bg-rose-50/20 dark:bg-rose-950/10 p-3 rounded-xl border border-rose-100/40 dark:border-rose-950/20 font-sans">
+                      <div className="flex items-center gap-2.5 min-w-0">
+                        <div className="w-8 h-8 rounded-full bg-rose-100 dark:bg-rose-950 text-rose-700 dark:text-rose-400 flex items-center justify-center font-extrabold text-[11px] uppercase shrink-0">
+                          {item.userName ? item.userName.charAt(0) : 'U'}
+                        </div>
+                        <div className="min-w-0">
+                          <div className="font-extrabold text-slate-800 dark:text-slate-200 leading-tight truncate">{item.userName}</div>
+                          <div className="text-[10px] text-rose-600 dark:text-rose-400 font-bold mt-0.5 leading-none">{item.breakName} break for {item.durationMins}m</div>
+                        </div>
                       </div>
                       <button 
                         onClick={() => selectAndFocusUser(item.userName)}
-                        className="bg-rose-100 hover:bg-rose-200 text-rose-800 text-[10px] font-black px-2.5 py-1 rounded-lg shrink-0 cursor-pointer"
+                        className="bg-rose-100 hover:bg-rose-200 dark:bg-rose-950 dark:text-rose-300 dark:hover:bg-rose-900/60 text-rose-800 text-[10px] font-extrabold px-3 py-1.5 rounded-lg shrink-0 cursor-pointer transition-colors"
                       >
                         Focus Profile
                       </button>
@@ -1785,29 +1955,42 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
                   ))}
 
                   {(!summaryData?.exceptionsList?.longBreaks || summaryData.exceptionsList.longBreaks.length === 0) && (
-                    <p className="text-xs text-slate-450 font-medium text-center py-6 select-none uppercase tracking-wide">
-                      ✅ No critical long break exceptions registered.
-                    </p>
+                    <div className="text-center py-8">
+                      <p className="text-xs text-slate-400 dark:text-slate-500 font-bold uppercase tracking-widest leading-none">
+                        ✅ No active break violations
+                      </p>
+                    </div>
                   )}
                 </div>
               </div>
 
-              {/* Idle Users Exception */}
-              <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm space-y-4">
-                <h4 className="text-xs font-extrabold text-slate-700 uppercase tracking-widest flex items-center gap-1.5 leading-none">
-                  <Clock size={14} className="text-orange-500" /> Currently Idle Active Timers {' > 2 hours'}
-                </h4>
+              {/* Long-Running Active Sessions Exception (Previously Idle active timers) */}
+              <div className="relative bg-white dark:bg-slate-900 border border-slate-100 dark:border-slate-850 rounded-2xl p-6 shadow-xs hover:shadow-md hover:-translate-y-0.5 transition-all duration-300">
+                <div className="absolute top-0 bottom-0 left-0 w-1 bg-amber-500 rounded-l-2xl" />
+                <div className="flex items-center justify-between border-b border-slate-50 dark:border-slate-850 pb-3 mb-4">
+                  <h4 className="text-xs font-extrabold text-amber-700 dark:text-amber-400 uppercase tracking-widest flex items-center gap-2 leading-none">
+                    <Clock size={15} className="text-amber-500 animate-pulse" /> Long-Running Active Sessions {`> 2 hours`}
+                  </h4>
+                  <span className="bg-amber-50 dark:bg-amber-950/40 text-amber-700 dark:text-amber-400 text-[10px] font-black px-2.5 py-1 rounded-full leading-none font-mono">
+                    {summaryData?.exceptionsList?.idleUsers?.length || 0} active
+                  </span>
+                </div>
 
-                <div className="space-y-3.5 max-h-64 overflow-y-auto pt-1.5">
+                <div className="space-y-3.5 max-h-68 overflow-y-auto">
                   {summaryData?.exceptionsList?.idleUsers?.map((item: any, idx: number) => (
-                    <div key={idx} className="flex justify-between items-center text-xs bg-slate-50 p-2.5 rounded-xl border border-slate-150 font-sans">
-                      <div>
-                        <div className="font-extrabold text-slate-800 leading-tight">{item.userName}</div>
-                        <div className="text-[10px] text-slate-500 font-bold mt-1 leading-none">Activity: {item.lastActivity} (No update for 2+ hours)</div>
+                    <div key={idx} className="flex justify-between items-center text-xs bg-amber-50/10 dark:bg-amber-950/10 p-3 rounded-xl border border-amber-100/20 dark:border-amber-950/20 font-sans">
+                      <div className="flex items-center gap-2.5 min-w-0">
+                        <div className="w-8 h-8 rounded-full bg-amber-100 dark:bg-amber-950 text-amber-700 dark:text-amber-400 flex items-center justify-center font-extrabold text-[11px] uppercase shrink-0">
+                          {item.userName ? item.userName.charAt(0) : 'U'}
+                        </div>
+                        <div className="min-w-0">
+                          <div className="font-extrabold text-slate-800 dark:text-slate-200 leading-tight truncate">{item.userName}</div>
+                          <div className="text-[10px] text-amber-600 dark:text-amber-400 font-bold mt-0.5 leading-none">Running: {item.lastActivity} for {item.idleMins || 120}+ mins</div>
+                        </div>
                       </div>
                       <button 
                         onClick={() => selectAndFocusUser(item.userName)}
-                        className="bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-[10px] font-black px-2.5 py-1 rounded-lg shrink-0 cursor-pointer"
+                        className="bg-amber-100 hover:bg-amber-150 dark:bg-amber-950 dark:text-amber-300 dark:hover:bg-amber-900/60 text-amber-800 text-[10px] font-extrabold px-3 py-1.5 rounded-lg shrink-0 cursor-pointer transition-colors"
                       >
                         Force Out / Audit
                       </button>
@@ -1815,29 +1998,42 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
                   ))}
 
                   {(!summaryData?.exceptionsList?.idleUsers || summaryData.exceptionsList.idleUsers.length === 0) && (
-                    <p className="text-xs text-slate-450 font-medium text-center py-6 select-none uppercase tracking-wide">
-                      ✅ No critical idle active exceptions registered.
-                    </p>
+                    <div className="text-center py-8">
+                      <p className="text-xs text-slate-400 dark:text-slate-500 font-bold uppercase tracking-widest leading-none">
+                        ✅ No long-running active sessions
+                      </p>
+                    </div>
                   )}
                 </div>
               </div>
 
               {/* Missing Punch Outs Exception */}
-              <div className="bg-white border border-indigo-200 rounded-2xl p-5 shadow-sm space-y-4">
-                <h4 className="text-xs font-extrabold text-indigo-700 uppercase tracking-widest flex items-center gap-1.5 leading-none">
-                  <UserX size={14} className="text-indigo-500 animate-pulse" /> Missing Clock Punch Out Shifts {`> 16 hours`}
-                </h4>
+              <div className="relative bg-white dark:bg-slate-900 border border-indigo-100 dark:border-indigo-950 rounded-2xl p-6 shadow-xs hover:shadow-md hover:-translate-y-0.5 transition-all duration-300">
+                <div className="absolute top-0 bottom-0 left-0 w-1 bg-indigo-500 rounded-l-2xl" />
+                <div className="flex items-center justify-between border-b border-indigo-5/60 dark:border-indigo-950/40 pb-3 mb-4">
+                  <h4 className="text-xs font-extrabold text-indigo-700 dark:text-indigo-400 uppercase tracking-widest flex items-center gap-2 leading-none">
+                    <UserX size={15} className="text-indigo-500" /> Missing Clock Punch Outs {`> 16 hours`}
+                  </h4>
+                  <span className="bg-indigo-50 dark:bg-indigo-950/40 text-indigo-700 dark:text-indigo-400 text-[10px] font-black px-2.5 py-1 rounded-full leading-none font-mono">
+                    {summaryData?.exceptionsList?.missingPunchOuts?.length || 0} active
+                  </span>
+                </div>
 
-                <div className="space-y-3.5 max-h-64 overflow-y-auto pt-1.5">
+                <div className="space-y-3.5 max-h-68 overflow-y-auto">
                   {summaryData?.exceptionsList?.missingPunchOuts?.map((item: any, idx: number) => (
-                    <div key={idx} className="flex justify-between items-center text-xs bg-indigo-50/50 p-2.5 rounded-xl border border-indigo-150 font-sans">
-                      <div>
-                        <div className="font-extrabold text-slate-800 leading-tight">{item.userName}</div>
-                        <div className="text-[10px] text-indigo-600 font-bold mt-1 leading-none">Session Clocked-In since: {new Date(item.clockInTime).toLocaleString()}</div>
+                    <div key={idx} className="flex justify-between items-center text-xs bg-indigo-50/50 dark:bg-indigo-950/10 p-3 rounded-xl border border-indigo-100/20 dark:border-indigo-950/20 font-sans">
+                      <div className="flex items-center gap-2.5 min-w-0">
+                        <div className="w-8 h-8 rounded-full bg-indigo-100 dark:bg-indigo-950 text-indigo-700 dark:text-indigo-400 flex items-center justify-center font-extrabold text-[11px] uppercase shrink-0">
+                          {item.userName ? item.userName.charAt(0) : 'U'}
+                        </div>
+                        <div className="min-w-0">
+                          <div className="font-extrabold text-slate-800 dark:text-slate-200 leading-tight truncate">{item.userName}</div>
+                          <div className="text-[10px] text-indigo-600 dark:text-indigo-400 font-bold mt-0.5 leading-none">On-duty since: {new Date(item.clockInTime).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</div>
+                        </div>
                       </div>
                       <button 
                         onClick={() => selectAndFocusUser(item.userName)}
-                        className="bg-indigo-650 hover:bg-indigo-755 text-white text-[10px] font-black px-2.5 py-1 rounded-lg shrink-0 cursor-pointer"
+                        className="bg-indigo-600 hover:bg-indigo-700 text-white text-[10px] font-extrabold px-3 py-1.5 rounded-lg shrink-0 cursor-pointer transition-colors"
                       >
                         Force Log Out
                       </button>
@@ -1845,29 +2041,42 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
                   ))}
 
                   {(!summaryData?.exceptionsList?.missingPunchOuts || summaryData.exceptionsList.missingPunchOuts.length === 0) && (
-                    <p className="text-xs text-slate-450 font-medium text-center py-6 select-none uppercase tracking-wide">
-                      ✅ No missing punch-out exceptions active.
-                    </p>
+                    <div className="text-center py-8">
+                      <p className="text-xs text-slate-400 dark:text-slate-500 font-bold uppercase tracking-widest leading-none">
+                        ✅ No missing punch-out compliance alerts
+                      </p>
+                    </div>
                   )}
                 </div>
               </div>
 
               {/* Auto-Closed & Missed Attendance Exceptions */}
-              <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm space-y-4">
-                <h4 className="text-xs font-extrabold text-[#D97706] uppercase tracking-widest flex items-center gap-1.5 leading-none">
-                  <UserX size={14} className="text-[#D97706]" /> Auto-Closed Sessions & Missing Reports Today
-                </h4>
+              <div className="relative bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-6 shadow-xs hover:shadow-md hover:-translate-y-0.5 transition-all duration-300">
+                <div className="absolute top-0 bottom-0 left-0 w-1 bg-sky-500 rounded-l-2xl" />
+                <div className="flex items-center justify-between border-b border-slate-50 dark:border-slate-850 pb-3 mb-4">
+                  <h4 className="text-xs font-extrabold text-[#D97706] dark:text-amber-400 uppercase tracking-widest flex items-center gap-2 leading-none">
+                    <UserX size={15} className="text-sky-500" /> Automatic Terminations & Absentees
+                  </h4>
+                  <span className="bg-amber-50 dark:bg-amber-950/40 text-[#D97706] dark:text-amber-400 text-[10px] font-black px-2.5 py-1 rounded-full leading-none font-mono">
+                    {((summaryData?.exceptionsList?.autoClosed?.length || 0) + (summaryData?.exceptionsList?.attendanceExceptions?.length || 0))} anomalies
+                  </span>
+                </div>
 
-                <div className="space-y-3.5 max-h-64 overflow-y-auto pt-1.5">
+                <div className="space-y-3.5 max-h-68 overflow-y-auto">
                   {summaryData?.exceptionsList?.autoClosed?.map((item: any, idx: number) => (
-                    <div key={idx} className="flex justify-between items-center text-xs bg-amber-50/20 p-2.5 rounded-xl border border-amber-100 font-sans">
-                      <div>
-                        <div className="font-extrabold text-slate-800 leading-tight">{item.userName}</div>
-                        <div className="text-[10px] text-[#B45309] font-bold mt-1 leading-none">Session was automatically terminated as stale</div>
+                    <div key={idx} className="flex justify-between items-center text-xs bg-amber-50/10 dark:bg-amber-950/5 p-3 rounded-xl border border-amber-100/10 dark:border-amber-955/10 font-sans">
+                      <div className="flex items-center gap-2.5 min-w-0">
+                        <div className="w-8 h-8 rounded-full bg-amber-50 dark:bg-amber-955 text-amber-700 dark:text-amber-400 flex items-center justify-center font-extrabold text-[11px] uppercase shrink-0">
+                          {item.userName ? item.userName.charAt(0) : 'U'}
+                        </div>
+                        <div className="min-w-0">
+                          <div className="font-extrabold text-slate-800 dark:text-slate-200 leading-tight truncate">{item.userName}</div>
+                          <div className="text-[10px] text-amber-600 dark:text-amber-400 font-bold mt-0.5 leading-none">Session automatically terminated as stale</div>
+                        </div>
                       </div>
                       <button 
                         onClick={() => selectAndFocusUser(item.userName)}
-                        className="bg-amber-100 hover:bg-amber-150 text-amber-850 text-[10px] font-black px-2.5 py-1 rounded-lg shrink-0 cursor-pointer"
+                        className="bg-amber-100 hover:bg-amber-150 dark:bg-amber-950 dark:text-amber-300 dark:hover:bg-amber-900/60 text-amber-850 text-[10px] font-extrabold px-3 py-1.5 rounded-lg shrink-0 cursor-pointer transition-colors"
                       >
                         Audit Profile
                       </button>
@@ -1875,14 +2084,19 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
                   ))}
 
                   {summaryData?.exceptionsList?.attendanceExceptions?.map((item: any, idx: number) => (
-                    <div key={idx} className="flex justify-between items-center text-xs bg-slate-50 p-2.5 rounded-xl border border-slate-200 font-sans">
-                      <div>
-                        <div className="font-extrabold text-slate-800 leading-tight">{item.userName}</div>
-                        <div className="text-[10px] text-slate-500 font-bold mt-1 leading-none">{item.reason}</div>
+                    <div key={idx} className="flex justify-between items-center text-xs bg-slate-50 dark:bg-slate-850/40 p-3 rounded-xl border border-slate-100 dark:border-slate-800 font-sans">
+                      <div className="flex items-center gap-2.5 min-w-0">
+                        <div className="w-8 h-8 rounded-full bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-400 flex items-center justify-center font-extrabold text-[11px] uppercase shrink-0">
+                          {item.userName ? item.userName.charAt(0) : 'U'}
+                        </div>
+                        <div className="min-w-0">
+                          <div className="font-extrabold text-slate-800 dark:text-slate-200 leading-tight truncate">{item.userName}</div>
+                          <div className="text-[10px] text-slate-500 dark:text-slate-450 mt-0.5 leading-none">{item.reason}</div>
+                        </div>
                       </div>
                       <button 
                         onClick={() => selectAndFocusUser(item.userName)}
-                        className="bg-indigo-600 hover:bg-indigo-750 text-white text-[10px] font-black px-2.5 py-1 rounded-lg shrink-0 cursor-pointer"
+                        className="bg-indigo-600 hover:bg-indigo-700 text-white text-[10px] font-bold px-3 py-1.5 rounded-lg shrink-0 cursor-pointer transition-colors"
                       >
                         Track Member
                       </button>
@@ -1891,9 +2105,11 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
 
                   {(!summaryData?.exceptionsList?.autoClosed || summaryData.exceptionsList.autoClosed.length === 0) && 
                    (!summaryData?.exceptionsList?.attendanceExceptions || summaryData.exceptionsList.attendanceExceptions.length === 0) && (
-                    <p className="text-xs text-slate-450 font-medium text-center py-6 select-none uppercase tracking-wide">
-                      ✅ No missed attendance or auto-closed sessions registered.
-                    </p>
+                    <div className="text-center py-8">
+                      <p className="text-xs text-slate-400 dark:text-slate-500 font-bold uppercase tracking-widest leading-none">
+                        ✅ No missed attendance or closed records today
+                      </p>
+                    </div>
                   )}
                 </div>
               </div>
@@ -1901,45 +2117,47 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
             </div>
 
             {/* DATA ACCURACY VALIDATION DIAGNOSTIC REPORT */}
-            <div className="bg-white border border-indigo-200 rounded-3xl p-6 shadow-sm space-y-4">
-              <div className="flex items-center gap-2 border-b border-slate-100 pb-3">
-                <ShieldAlert className="text-indigo-600" size={20} />
+            <div className="bg-white dark:bg-slate-900 border border-indigo-100 dark:border-indigo-950/85 rounded-2xl p-6 shadow-xs space-y-5">
+              <div className="flex items-center gap-3 border-b border-slate-100 dark:border-slate-850 pb-4">
+                <div className="p-2 bg-indigo-50 dark:bg-indigo-950/30 text-indigo-600 dark:text-indigo-400 rounded-xl">
+                  <ShieldAlert size={20} />
+                </div>
                 <div>
-                  <h4 className="text-sm font-black text-slate-900 uppercase">
+                  <h4 className="text-sm font-black text-slate-900 dark:text-white uppercase tracking-wider">
                     Data Accuracy & Integrity Diagnostics report
                   </h4>
-                  <p className="text-xs text-slate-500 leading-none mt-1">Automated validation checks executing live structure audits against roster parameters.</p>
+                  <p className="text-xs text-slate-500 mt-0.5">Automated validation checks executing live structure audits against roster parameters.</p>
                 </div>
               </div>
 
               <div className="grid grid-cols-1 md:grid-cols-2 gap-6 pt-2">
-                <div className="space-y-3.5">
+                <div className="space-y-4">
                   <div>
-                    <h5 className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1.5">Users with Stale Sessions (&gt;24 Hours Running)</h5>
-                    <div className="space-y-2 max-h-40 overflow-y-auto">
+                    <h5 className="text-[10px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest mb-2 font-mono">Users with Stale Sessions (&gt;24 Hours Running)</h5>
+                    <div className="space-y-2 max-h-40 overflow-y-auto pr-1">
                       {summaryData?.validationReport?.staleSessions?.map((item: any, idx: number) => (
-                        <div key={idx} className="flex justify-between items-center text-xs p-2.5 bg-yellow-50/50 border border-yellow-200/60 rounded-xl leading-none">
-                          <span className="font-extrabold text-slate-800">{item.userName}</span>
-                          <span className="text-[10px] text-yellow-700 font-bold font-mono">Running since: {new Date(item.clockInTime).toLocaleDateString()}</span>
+                        <div key={idx} className="flex justify-between items-center text-xs p-3 bg-yellow-50/30 dark:bg-yellow-950/10 border border-yellow-200/30 dark:border-yellow-900/20 rounded-xl">
+                          <span className="font-extrabold text-slate-850 dark:text-slate-200">{item.userName}</span>
+                          <span className="text-[10px] text-yellow-700 dark:text-yellow-450 font-bold font-mono">Clock In: {new Date(item.clockInTime).toLocaleDateString()}</span>
                         </div>
                       ))}
                       {(!summaryData?.validationReport?.staleSessions || summaryData.validationReport.staleSessions.length === 0) && (
-                        <p className="text-[11px] text-slate-400 font-medium font-sans">No stale sessions active beyond compliance limits.</p>
+                        <p className="text-[11px] text-slate-400 dark:text-slate-500 font-medium font-sans">No stale sessions active beyond compliance limits.</p>
                       )}
                     </div>
                   </div>
 
                   <div>
-                    <h5 className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1.5">Inconsistencies & Profile Mappings</h5>
-                    <div className="space-y-2 max-h-40 overflow-y-auto">
+                    <h5 className="text-[10px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest mb-2 font-mono">Inconsistencies & Profile Mappings</h5>
+                    <div className="space-y-2 max-h-40 overflow-y-auto pr-1">
                       {summaryData?.validationReport?.teamInconsistencies?.map((item: any, idx: number) => (
-                        <div key={idx} className="text-xs p-2.5 bg-rose-50/30 border border-rose-100 rounded-xl flex justify-between items-center leading-none">
-                          <span className="font-extrabold text-slate-800">{item.userName}</span>
-                          <span className="text-[10px] text-rose-600 font-bold">{item.issue}</span>
+                        <div key={idx} className="text-xs p-3 bg-rose-50/20 dark:bg-rose-950/10 border border-rose-100/30 dark:border-rose-950/20 rounded-xl flex justify-between items-center">
+                          <span className="font-extrabold text-slate-850 dark:text-slate-200">{item.userName}</span>
+                          <span className="text-[10px] text-rose-600 dark:text-rose-450 font-medium">{item.issue}</span>
                         </div>
                       ))}
                       {(!summaryData?.validationReport?.teamInconsistencies || summaryData.validationReport.teamInconsistencies.length === 0) && (
-                        <p className="text-[11px] text-slate-400 font-medium font-sans">All roster personnel mapped correctly with team anchors.</p>
+                        <p className="text-[11px] text-slate-400 dark:text-slate-500 font-medium font-sans">All roster personnel mapped correctly with team anchors.</p>
                       )}
                     </div>
                   </div>
@@ -1947,23 +2165,23 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
 
                 <div className="space-y-4">
                   <div>
-                    <h5 className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1.5">Active Clock mismatch anomalies</h5>
-                    <div className="space-y-2 max-h-40 overflow-y-auto">
+                    <h5 className="text-[10px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest mb-2 font-mono">Active Clock mismatch anomalies</h5>
+                    <div className="space-y-2 max-h-40 overflow-y-auto pr-1">
                       {summaryData?.validationReport?.countMismatches?.map((item: any, idx: number) => (
-                        <div key={idx} className="text-xs p-2.5 bg-rose-50/50 border border-rose-200 rounded-xl flex justify-between items-center leading-none">
-                          <span className="font-extrabold text-slate-800">Anomaly: {item.metric}</span>
-                          <span className="text-[10px] text-rose-600 font-bold font-mono">Dashboard: {item.systemValue} | Real: {item.actualValue}</span>
+                        <div key={idx} className="text-xs p-3 bg-rose-50/30 dark:bg-rose-950/10 border border-rose-200/30 dark:border-rose-950/20 rounded-xl flex justify-between items-center">
+                          <span className="font-extrabold text-slate-850 dark:text-slate-200">Anomaly: {item.metric}</span>
+                          <span className="text-[10px] text-rose-600 dark:text-rose-450 font-bold font-mono">Dashboard: {item.systemValue} | Real: {item.actualValue}</span>
                         </div>
                       ))}
                       {(!summaryData?.validationReport?.countMismatches || summaryData.validationReport.countMismatches.length === 0) && (
-                        <p className="text-[11px] text-slate-400 font-medium font-sans">No clock mismatches or numerical count exceptions resolved.</p>
+                        <p className="text-[11px] text-slate-400 dark:text-slate-500 font-medium font-sans">No clock mismatches or numerical count exceptions resolved.</p>
                       )}
                     </div>
                   </div>
 
-                  <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4 text-[11px] leading-relaxed text-slate-600 font-medium font-sans">
-                    <p className="font-bold text-slate-800 uppercase tracking-wide mb-1">Health Score Index: 100%</p>
-                    Precision360 uses database synchronization rules to preserve relational invariants. If count deviations occur, please click <strong className="text-indigo-600 cursor-pointer" onClick={() => loadAndRecomputeData(true)}>Sync & Audit</strong> to automatically force state updates.
+                  <div className="bg-slate-55 bg-slate-50 dark:bg-slate-950 p-4 rounded-xl border border-slate-200/60 dark:border-slate-800 text-[11px] leading-relaxed text-slate-500 dark:text-slate-400 font-medium font-sans animate-in fade-in">
+                    <p className="font-extrabold text-slate-850 dark:text-slate-200 uppercase tracking-wide mb-1 leading-none text-xs">Compliance Score Index: 100%</p>
+                    <p className="mt-1">Precision360 uses database synchronization rules to preserve relational invariants. If count deviations occur, click <b>Sync & Audit</b> above to run full diagnostic updates.</p>
                   </div>
                 </div>
               </div>
