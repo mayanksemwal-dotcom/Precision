@@ -97,7 +97,10 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
   const [processFilter, setProcessFilter] = useState('all');
   const [shiftFilter, setShiftFilter] = useState('all'); // all, active, break, offline
   const [tlFilter, setTlFilter] = useState('all');
-  const [managerFilter, setManagerFilter] = useState('all');
+  const [managerFilter, setManagerFilter] = useState(() => {
+    const isOnlyManager = (user.role || '').toString().toUpperCase() === 'MANAGER';
+    return isOnlyManager ? user.uid : 'all';
+  });
   const [sortKey, setSortKey] = useState<'name' | 'productive' | 'status'>('name');
   const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('asc');
   
@@ -669,16 +672,34 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
       // TL filter
       if (tlFilter !== 'all' && u.teamLeadId !== tlFilter) return false;
 
-      // Manager filter
+      // Manager filter (robust nested traversal across all possible schema fields)
       if (managerFilter !== 'all') {
-        const checkHierarchy = (userToCheck: UserProfile, visited: Set<string>): boolean => {
-          if (userToCheck.uid === managerFilter) return true;
-          if (visited.has(userToCheck.uid)) return false;
-          visited.add(userToCheck.uid);
-          const parentId = userToCheck.managerId || userToCheck.mappedManagerId || userToCheck.teamLeadId;
-          if (!parentId) return false;
-          const parent = allUsers.find(u => u.uid === parentId);
-          return parent ? checkHierarchy(parent, visited) : false;
+        const checkHierarchy = (uToCheck: UserProfile, visited: Set<string>): boolean => {
+          if (!uToCheck) return false;
+          if (uToCheck.uid === managerFilter) return true;
+          if (uToCheck.managerId === managerFilter) return true;
+          if (uToCheck.mappedManagerId === managerFilter) return true;
+          if ((uToCheck as any).mappedManagerUid === managerFilter) return true;
+          if (visited.has(uToCheck.uid)) return false;
+          visited.add(uToCheck.uid);
+          
+          if (uToCheck.teamLeadId) {
+            const tl = allUsers.find(usr => usr.uid === uToCheck.teamLeadId);
+            if (tl && checkHierarchy(tl, visited)) return true;
+          }
+          if (uToCheck.managerId) {
+            const mgr = allUsers.find(usr => usr.uid === uToCheck.managerId);
+            if (mgr && checkHierarchy(mgr, visited)) return true;
+          }
+          if (uToCheck.mappedManagerId) {
+            const mgr = allUsers.find(usr => usr.uid === uToCheck.mappedManagerId);
+            if (mgr && checkHierarchy(mgr, visited)) return true;
+          }
+          if ((uToCheck as any).mappedManagerUid) {
+            const mgr = allUsers.find(usr => usr.uid === (uToCheck as any).mappedManagerUid);
+            if (mgr && checkHierarchy(mgr, visited)) return true;
+          }
+          return false;
         };
         if (!checkHierarchy(u, new Set())) return false;
       }
@@ -1068,6 +1089,62 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
     }
   };
 
+  // Dynamic live statistics to keep KPI tiles and distribution sync'd with selected filters
+  const liveStats = useMemo(() => {
+    const total = filteredWorkforce.length;
+    const activeShiftList = filteredWorkforce.map(u => activeShifts.find(s => s.userId === u.uid)).filter(Boolean) as TMSShift[];
+    const loggedIn = activeShiftList.length;
+    const onBreak = activeShiftList.filter(s => s.status === 'BREAK').length;
+    const active = activeShiftList.filter(s => s.status === 'ACTIVE').length;
+    const offline = Math.max(0, total - loggedIn);
+    const attendancePercent = total > 0 ? Math.round((loggedIn / total) * 100) : 0;
+    
+    return {
+      total,
+      loggedIn,
+      onBreak,
+      active,
+      offline,
+      attendancePercent
+    };
+  }, [filteredWorkforce, activeShifts]);
+
+  const liveDistribution = useMemo(() => {
+    const total = filteredWorkforce.length || 1;
+    const activeShiftList = filteredWorkforce.map(u => activeShifts.find(s => s.userId === u.uid)).filter(Boolean) as TMSShift[];
+    
+    const active = activeShiftList.filter(s => s.status === 'ACTIVE').length;
+    
+    let lunch = 0;
+    let meeting = 0;
+    let otherBreak = 0;
+    
+    activeShiftList.forEach(sh => {
+      if (sh.status === 'BREAK') {
+        const shActs = sh.activities || [];
+        const lastActivity = shActs.length > 0 ? shActs[shActs.length - 1]?.name || '' : '';
+        if (lastActivity.toLowerCase().includes('lunch')) {
+          lunch++;
+        } else if (lastActivity.toLowerCase().includes('meeting') || lastActivity.toLowerCase().includes('coaching') || lastActivity.toLowerCase().includes('alignment')) {
+          meeting++;
+        } else {
+          otherBreak++;
+        }
+      }
+    });
+
+    const loggedIn = activeShiftList.length;
+    const offline = Math.max(0, filteredWorkforce.length - loggedIn);
+    
+    return {
+      active,
+      break: otherBreak,
+      lunch,
+      meeting,
+      offline
+    };
+  }, [filteredWorkforce, activeShifts]);
+
   // Helper navigate directly to exception user inside table
   const selectAndFocusUser = (targetName: string) => {
     setSearchTerm(targetName);
@@ -1199,42 +1276,42 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
         </div>
       </div>
 
-      {/* CORE STATS KPI TILES (TOP SUMMARY CARDS) */}
-      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3.5">
-        <div className="bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 p-4.5 rounded-2xl shadow-sm text-center">
-          <span className="text-[10px] font-extrabold uppercase tracking-widest text-slate-400 dark:text-slate-500 leading-none">Total Assigned</span>
-          <h3 className="text-2xl font-black text-slate-900 dark:text-white mt-1">{summaryData?.totalAssigned ?? mappedUsers.length}</h3>
-          <p className="text-[10px] text-slate-500 dark:text-slate-400 font-bold mt-0.5 leading-none">Roster Mapped</p>
+      {/* CORE STATS KPI TILES (TOP SUMMARY CARDS - REACTIVE TO ACTIVE FILTERS) */}
+      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-2.5">
+        <div className="bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 p-2.5 rounded-xl shadow-xs text-center">
+          <span className="text-[9px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-500 leading-none">Total Assigned</span>
+          <h3 className="text-xl font-black text-slate-900 dark:text-white mt-0.5">{liveStats.total}</h3>
+          <p className="text-[8px] text-slate-500 dark:text-slate-400 font-bold mt-0.5 leading-none">Roster Mapped</p>
         </div>
 
-        <div className="bg-white dark:bg-slate-900 border border-emerald-200 dark:border-emerald-900/30 p-4.5 rounded-2xl shadow-sm shadow-emerald-50/50 dark:shadow-none text-center">
-          <span className="text-[10px] font-extrabold uppercase tracking-widest text-emerald-600 dark:text-emerald-400 leading-none">Logged In Now</span>
-          <h3 className="text-2xl font-black text-emerald-600 dark:text-emerald-400 mt-1">{summaryData?.loggedInCount ?? 0}</h3>
-          <p className="text-[10px] text-emerald-500 dark:text-emerald-500/80 font-bold mt-0.5 leading-none">On-Duty Shifts</p>
+        <div className="bg-white dark:bg-slate-900 border border-emerald-250 dark:border-emerald-950/30 p-2.5 rounded-xl shadow-xs text-center">
+          <span className="text-[9px] font-black uppercase tracking-widest text-emerald-600 dark:text-emerald-400 leading-none">Logged In Now</span>
+          <h3 className="text-xl font-black text-emerald-600 dark:text-emerald-400 mt-0.5">{liveStats.loggedIn}</h3>
+          <p className="text-[8px] text-emerald-500 dark:text-emerald-500/85 font-bold mt-0.5 leading-none">On-Duty Shifts</p>
         </div>
 
-        <div className="bg-white dark:bg-slate-900 border border-amber-200 dark:border-amber-900/30 p-4.5 rounded-2xl shadow-sm shadow-amber-50/50 dark:shadow-none text-center">
-          <span className="text-[10px] font-extrabold uppercase tracking-widest text-amber-600 dark:text-amber-400 leading-none">On Break</span>
-          <h3 className="text-2xl font-black text-amber-500 dark:text-amber-400 mt-1">{summaryData?.onBreakCount ?? 0}</h3>
-          <p className="text-[10px] text-amber-500 dark:text-amber-500/80 font-bold mt-0.5 leading-none">Rest Periods</p>
+        <div className="bg-white dark:bg-slate-900 border border-amber-250 dark:border-amber-950/30 p-2.5 rounded-xl shadow-xs text-center">
+          <span className="text-[9px] font-black uppercase tracking-widest text-amber-600 dark:text-amber-400 leading-none">On Break</span>
+          <h3 className="text-xl font-black text-amber-500 dark:text-amber-400 mt-0.5">{liveStats.onBreak}</h3>
+          <p className="text-[8px] text-amber-500 dark:text-amber-500/85 font-bold mt-0.5 leading-none">Rest Periods</p>
         </div>
 
-        <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4.5 rounded-2xl shadow-sm text-center">
-          <span className="text-[10px] font-extrabold uppercase tracking-widest text-slate-400 dark:text-slate-500 leading-none">Offline</span>
-          <h3 className="text-2xl font-black text-slate-600 dark:text-slate-300 mt-1">{summaryData?.offlineCount ?? 0}</h3>
-          <p className="text-[10px] text-slate-400 dark:text-slate-500 font-bold mt-0.5 leading-none">Off-Duty staff</p>
+        <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-2.5 rounded-xl shadow-xs text-center">
+          <span className="text-[9px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-500 leading-none">Offline</span>
+          <h3 className="text-xl font-black text-slate-500 dark:text-slate-300 mt-0.5">{liveStats.offline}</h3>
+          <p className="text-[8px] text-slate-400 dark:text-slate-500 font-bold mt-0.5 leading-none">Off-Duty staff</p>
         </div>
 
-        <div className="bg-white dark:bg-slate-900 border border-sky-200 dark:border-sky-900/30 p-4.5 rounded-2xl shadow-sm shadow-sky-50/50 dark:shadow-none text-center">
-          <span className="text-[10px] font-extrabold uppercase tracking-widest text-sky-600 dark:text-sky-400 leading-none">Attendance %</span>
-          <h3 className="text-2xl font-black text-sky-600 dark:text-sky-400 mt-1">{summaryData?.attendancePercent ?? 0}%</h3>
-          <p className="text-[10px] text-sky-500 dark:text-sky-500/80 font-bold mt-0.5 leading-none">Team Rate</p>
+        <div className="bg-white dark:bg-slate-900 border border-sky-250 dark:border-sky-950/30 p-2.5 rounded-xl shadow-xs text-center">
+          <span className="text-[9px] font-black uppercase tracking-widest text-sky-600 dark:text-sky-400 leading-none">Attendance %</span>
+          <h3 className="text-xl font-black text-sky-600 dark:text-sky-400 mt-0.5">{liveStats.attendancePercent}%</h3>
+          <p className="text-[8px] text-sky-500 dark:text-sky-500/85 font-bold mt-0.5 leading-none">Team Rate</p>
         </div>
 
-        <div className="bg-white dark:bg-slate-900 border border-indigo-200 dark:border-indigo-900/30 p-4.5 rounded-2xl shadow-sm shadow-indigo-50/50 dark:shadow-none text-center">
-          <span className="text-[10px] font-extrabold uppercase tracking-widest text-indigo-600 dark:text-indigo-400 leading-none">Active Work</span>
-          <h3 className="text-2xl font-black text-indigo-600 dark:text-indigo-400 mt-1">{summaryData?.activeCount ?? 0}</h3>
-          <p className="text-[10px] text-indigo-500 dark:text-indigo-500/80 font-bold mt-0.5 leading-none">Productive Timers</p>
+        <div className="bg-white dark:bg-slate-900 border border-indigo-250 dark:border-indigo-950/30 p-2.5 rounded-xl shadow-xs text-center">
+          <span className="text-[9px] font-black uppercase tracking-widest text-indigo-600 dark:text-indigo-400 leading-none">Active Work</span>
+          <h3 className="text-xl font-black text-indigo-600 dark:text-indigo-400 mt-0.5">{liveStats.active}</h3>
+          <p className="text-[8px] text-indigo-500 dark:text-indigo-500/85 font-bold mt-0.5 leading-none">Productive Timers</p>
         </div>
       </div>
 
@@ -1285,50 +1362,50 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData }
                 <div>
                   <div className="flex justify-between text-xs font-bold text-slate-600 dark:text-slate-400 mb-1 leading-none">
                     <span>Active Workflow</span>
-                    <span className="text-indigo-600 dark:text-indigo-400">{summaryData?.distribution?.active ?? 0}</span>
+                    <span className="text-indigo-600 dark:text-indigo-400">{liveDistribution.active}</span>
                   </div>
-                  <div className="w-full bg-slate-100 dark:bg-slate-800 h-2.5 rounded-full overflow-hidden">
-                    <div className="bg-indigo-600 dark:bg-indigo-500 h-full rounded-full" style={{ width: `${(summaryData?.distribution?.active / (summaryData?.totalAssigned || 1)) * 100}%` }} />
+                  <div className="w-full bg-slate-100 dark:bg-slate-800 h-2 rounded-full overflow-hidden">
+                    <div className="bg-indigo-600 dark:bg-indigo-500 h-full rounded-full" style={{ width: `${(liveDistribution.active / (liveStats.total || 1)) * 100}%` }} />
                   </div>
                 </div>
 
                 <div>
                   <div className="flex justify-between text-xs font-bold text-slate-600 dark:text-slate-400 mb-1 leading-none">
                     <span>Break & Tea</span>
-                    <span className="text-amber-500">{summaryData?.distribution?.break ?? 0}</span>
+                    <span className="text-amber-500">{liveDistribution.break}</span>
                   </div>
-                  <div className="w-full bg-slate-100 dark:bg-slate-800 h-2.5 rounded-full overflow-hidden">
-                    <div className="bg-amber-500 h-full rounded-full" style={{ width: `${(summaryData?.distribution?.break / (summaryData?.totalAssigned || 1)) * 100}%` }} />
+                  <div className="w-full bg-slate-100 dark:bg-slate-800 h-2 rounded-full overflow-hidden">
+                    <div className="bg-amber-500 h-full rounded-full" style={{ width: `${(liveDistribution.break / (liveStats.total || 1)) * 100}%` }} />
                   </div>
                 </div>
 
                 <div>
-                  <div className="flex justify-between text-xs font-bold text-slate-600 mb-1 leading-none">
+                  <div className="flex justify-between text-xs font-bold text-slate-600 dark:text-slate-400 mb-1 leading-none">
                     <span>Lunch Interval</span>
-                    <span className="text-[#D97706]">{summaryData?.distribution?.lunch ?? 0}</span>
+                    <span className="text-[#D97706]">{liveDistribution.lunch}</span>
                   </div>
-                  <div className="w-full bg-slate-100 h-2.5 rounded-full overflow-hidden">
-                    <div className="bg-[#D97706] h-full rounded-full" style={{ width: `${(summaryData?.distribution?.lunch / (summaryData?.totalAssigned || 1)) * 100}%` }} />
+                  <div className="w-full bg-slate-100 dark:bg-slate-800 h-2 rounded-full overflow-hidden">
+                    <div className="bg-[#D97706] h-full rounded-full" style={{ width: `${(liveDistribution.lunch / (liveStats.total || 1)) * 100}%` }} />
                   </div>
                 </div>
 
                 <div>
-                  <div className="flex justify-between text-xs font-bold text-slate-600 mb-1 leading-none">
+                  <div className="flex justify-between text-xs font-bold text-slate-600 dark:text-slate-400 mb-1 leading-none">
                     <span>Meeting / Coaching</span>
-                    <span className="text-purple-650">{summaryData?.distribution?.meeting ?? 0}</span>
+                    <span className="text-purple-650">{liveDistribution.meeting}</span>
                   </div>
-                  <div className="w-full bg-slate-100 h-2.5 rounded-full overflow-hidden">
-                    <div className="bg-purple-600 h-full rounded-full" style={{ width: `${(summaryData?.distribution?.meeting / (summaryData?.totalAssigned || 1)) * 100}%` }} />
+                  <div className="w-full bg-slate-100 dark:bg-slate-800 h-2 rounded-full overflow-hidden">
+                    <div className="bg-purple-600 h-full rounded-full" style={{ width: `${(liveDistribution.meeting / (liveStats.total || 1)) * 100}%` }} />
                   </div>
                 </div>
 
                 <div>
-                  <div className="flex justify-between text-xs font-bold text-slate-600 mb-1 leading-none">
+                  <div className="flex justify-between text-xs font-bold text-slate-600 dark:text-slate-400 mb-1 leading-none">
                     <span>Offline / Off-Duty</span>
-                    <span className="text-slate-400">{summaryData?.distribution?.offline ?? 0}</span>
+                    <span className="text-slate-400">{liveDistribution.offline}</span>
                   </div>
-                  <div className="w-full bg-slate-100 h-2.5 rounded-full overflow-hidden">
-                    <div className="bg-slate-300 h-full rounded-full" style={{ width: `${(summaryData?.distribution?.offline / (summaryData?.totalAssigned || 1)) * 100}%` }} />
+                  <div className="w-full bg-slate-100 dark:bg-slate-800 h-2 rounded-full overflow-hidden">
+                    <div className="bg-slate-300 dark:bg-slate-700 h-full rounded-full" style={{ width: `${(liveDistribution.offline / (liveStats.total || 1)) * 100}%` }} />
                   </div>
                 </div>
               </div>

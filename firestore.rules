@@ -310,5 +310,15 @@ service cloud.firestore {
     match /admin_backups/{id} {
       allow read, write: if isAdmin();
     }
+
+    match /mail/{id} {
+      allow create: if isVerified();
+      allow read: if isVerified() && (isAdmin() || isTL() || isQA());
+    }
+
+    match /emails/{id} {
+      allow create: if isVerified();
+      allow read: if isVerified() && (isAdmin() || isTL() || isQA());
+    }
   }
 }

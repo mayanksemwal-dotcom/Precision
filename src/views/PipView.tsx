@@ -285,6 +285,78 @@ Berg Technologies Corp HS Division
           }
         });
 
+        // Write real email documents for Firestore Trigger Email extension
+        const realEmailDoc = {
+          to: targetAgent.email || '',
+          cc: reportingLineCC,
+          message: {
+            subject: emailSubject,
+            text: emailBody,
+            html: `
+              <div style="font-family: Arial, sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto; border: 1px solid #e2e8f0; border-radius: 8px; padding: 20px;">
+                <h2 style="color: #4f46e5; margin-top: 0;">Performance Improvement Plan (PIP) Initiated</h2>
+                <p>Dear <strong>${targetAgent.name}</strong>,</p>
+                <p>Please be advised that a Performance Improvement Plan (PIP) has been initiated for you by your Team Lead/Manager, <strong>${performerName}</strong>, on ${new Date().toLocaleDateString()}.</p>
+                
+                <h3 style="border-bottom: 2px solid #e2e8f0; padding-bottom: 5px; color: #1e3a8a;">Prospects & Plan Details</h3>
+                <table style="width: 100%; border-collapse: collapse; margin-bottom: 20px;">
+                  <tr>
+                    <td style="padding: 8px; font-weight: bold; width: 180px; background-color: #f8fafc; border: 1px solid #e2e8f0;">Title:</td>
+                    <td style="padding: 8px; border: 1px solid #e2e8f0;">${newPipForm.title}</td>
+                  </tr>
+                  <tr>
+                    <td style="padding: 8px; font-weight: bold; background-color: #f8fafc; border: 1px solid #e2e8f0;">Gaps Identified:</td>
+                    <td style="padding: 8px; border: 1px solid #e2e8f0;">${newPipForm.description}</td>
+                  </tr>
+                  <tr>
+                    <td style="padding: 8px; font-weight: bold; background-color: #f8fafc; border: 1px solid #e2e8f0;">Coaching Support Plan:</td>
+                    <td style="padding: 8px; border: 1px solid #e2e8f0;">${newPipForm.coachingSupportPlan || 'N/A'}</td>
+                  </tr>
+                  <tr>
+                    <td style="padding: 8px; font-weight: bold; background-color: #f8fafc; border: 1px solid #e2e8f0;">Observation Period:</td>
+                    <td style="padding: 8px; border: 1px solid #e2e8f0;">${newPipForm.startDate} to ${newPipForm.endDate} (${calculatedDurationDays} Calendar Days)</td>
+                  </tr>
+                </table>
+
+                <h3 style="border-bottom: 2px solid #e2e8f0; padding-bottom: 5px; color: #1e3a8a;">Observation Key Performance Standards</h3>
+                <table style="width: 100%; border-collapse: collapse; margin-bottom: 20px;">
+                  <tr>
+                    <td style="padding: 8px; font-weight: bold; width: 180px; background-color: #f8fafc; border: 1px solid #e2e8f0;">Target QA Quality Score:</td>
+                    <td style="padding: 8px; border: 1px solid #e2e8f0; font-weight: bold; color: #4f46e5;">${newPipForm.qualityTarget}%</td>
+                  </tr>
+                  <tr>
+                    <td style="padding: 8px; font-weight: bold; background-color: #f8fafc; border: 1px solid #e2e8f0;">Target Attendance Standard:</td>
+                    <td style="padding: 8px; border: 1px solid #e2e8f0; font-weight: bold; color: #4f46e5;">${newPipForm.attendanceTarget}%</td>
+                  </tr>
+                  <tr>
+                    <td style="padding: 8px; font-weight: bold; background-color: #f8fafc; border: 1px solid #e2e8f0;">Target Productivity Cases:</td>
+                    <td style="padding: 8px; border: 1px solid #e2e8f0; font-weight: bold; color: #4f46e5;">${newPipForm.productivityTarget} cases</td>
+                  </tr>
+                </table>
+
+                <div style="background-color: #e0e7ff; border-left: 4px solid #4f46e5; padding: 15px; margin-bottom: 20px; border-radius: 4px;">
+                  <h4 style="margin: 0 0 5px 0; color: #3730a3;">Review Required</h4>
+                  <p style="margin: 0; font-size: 14px;">Please review and officially acknowledge this plan in your Coaching & Excellence Bureau portal.</p>
+                </div>
+
+                <p style="font-size: 12px; color: #64748b; margin-top: 30px; border-top: 1px solid #e2e8f0; padding-top: 10px;">
+                  This is a system generated email CC'd to: ${reportingLineCC.join(', ')}
+                </p>
+              </div>
+            `
+          },
+          createdAt: nowISO,
+          status: 'pending'
+        };
+
+        try {
+          await addDoc(collection(db, 'mail'), realEmailDoc);
+          await addDoc(collection(db, 'emails'), realEmailDoc);
+          console.log("Successfully wrote PIP email to Firestore queues");
+        } catch (mailErr) {
+          console.error("Failed to write to mail collections: ", mailErr);
+        }
+
         toast.success(`Automated notification email dispatched to ${targetAgent.email} and reporting leads!`);
       } else {
         // Audit Log: Email Skipped

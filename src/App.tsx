@@ -84,7 +84,11 @@ export default function App() {
 
   const [theme, setTheme] = useState<'light' | 'dark'>(() => {
     if (typeof window !== 'undefined') {
-      return (localStorage.getItem('theme') as 'light' | 'dark') || 'light';
+      const stored = localStorage.getItem('theme');
+      if (stored === 'light' || stored === 'dark') {
+        return stored;
+      }
+      return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
     }
     return 'light';
   });
@@ -97,6 +101,30 @@ export default function App() {
     }
     localStorage.setItem('theme', theme);
   }, [theme]);
+
+  // Handle live changes to the browser system theme preference
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
+    const handleBrowserThemeChange = (e: MediaQueryListEvent) => {
+      // Only transition theme if the user hasn't explicitly set their own manual preference
+      if (!localStorage.getItem('theme')) {
+        setTheme(e.matches ? 'dark' : 'light');
+      }
+    };
+    if (mediaQuery.addEventListener) {
+      mediaQuery.addEventListener('change', handleBrowserThemeChange);
+    } else {
+      mediaQuery.addListener(handleBrowserThemeChange);
+    }
+    return () => {
+      if (mediaQuery.removeEventListener) {
+        mediaQuery.removeEventListener('change', handleBrowserThemeChange);
+      } else {
+        mediaQuery.removeListener(handleBrowserThemeChange);
+      }
+    };
+  }, []);
 
   // Removed direct userPermissions state since we'll use context
 
@@ -507,12 +535,12 @@ function AppContent({
         animate={{ width: sidebarOpen ? 290 : 80 }}
         className="bg-[#0F172A] dark:bg-slate-900 border-r border-[#1E293B] dark:border-slate-800 flex flex-col z-30 text-[#CBD5E1]"
       >
-        <div className="px-4 pt-6 pb-4 flex flex-col items-start">
+        <div className="px-4 pt-6 pb-4 flex flex-col items-start animate-fade-in">
           <div className="w-full flex items-center justify-between mb-6">
-            <div className={`flex items-center gap-2.5 ${!sidebarOpen && 'justify-center w-full'}`}>
+            <div className={`flex items-center gap-3.5 ${!sidebarOpen && 'justify-center w-full'}`}>
               <div className="p-0 flex items-center justify-center flex-shrink-0">
                 <BergLogo 
-                  className={sidebarOpen ? 'h-11 w-32' : 'h-11 w-11 overflow-hidden'} 
+                  className={sidebarOpen ? 'h-11 w-auto px-2' : 'h-11 w-11'} 
                   showSubtitle={false} 
                 />
               </div>

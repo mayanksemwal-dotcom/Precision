@@ -10,6 +10,20 @@ const configPath = path.join(process.cwd(), 'firebase-applet-config.json');
 const firebaseConfig = JSON.parse(fs.readFileSync(configPath, 'utf8'));
 const DB_ID = firebaseConfig.firestoreDatabaseId;
 
+// Synchronize uploaded original attached logo with public/berg_logo.png on startup
+try {
+  const sourceLogo = path.join(process.cwd(), 'src/assets/images/berg_logo_1780903600604.png');
+  const targetLogo = path.join(process.cwd(), 'public/berg_logo.png');
+  if (fs.existsSync(sourceLogo)) {
+    fs.copyFileSync(sourceLogo, targetLogo);
+    console.log('[LOGO SYNC] Replicated original attached PNG to public/berg_logo.png');
+  } else {
+    console.warn('[LOGO SYNC] Source original logo file not found in assets, skipping sync.');
+  }
+} catch (logoErr) {
+  console.error('[LOGO SYNC] Error copying original logo:', logoErr);
+}
+
 if (admin.apps.length === 0) {
   admin.initializeApp({
     projectId: firebaseConfig.projectId,

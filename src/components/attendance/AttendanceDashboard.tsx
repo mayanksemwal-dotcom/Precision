@@ -436,14 +436,14 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
 
   return (
     <div className="flex flex-col h-full bg-white dark:bg-slate-900 overflow-hidden relative">
-      <div className="shrink-0 p-5 border-b border-slate-100 dark:border-slate-800 flex flex-col md:flex-row md:items-center justify-between gap-4">
+      <div className="shrink-0 p-3 border-b border-slate-100 dark:border-slate-800 flex flex-col md:flex-row md:items-center justify-between gap-3">
         <div>
-          <h2 className="text-xl font-black text-slate-800 dark:text-slate-100 tracking-tight flex items-center gap-2">
-            <Calendar className="text-indigo-500" /> Attendance Register
+          <h2 className="text-base font-black text-slate-800 dark:text-slate-100 tracking-tight flex items-center gap-1.5">
+            <Calendar className="text-indigo-500" size={16} /> Attendance Register
           </h2>
         </div>
-        <div className="flex items-center gap-3">
-          <select value={dateRange} onChange={(e) => setDateRange(e.target.value as any)} className="bg-slate-50 dark:bg-slate-800 border-none text-xs font-bold rounded-xl px-3 py-2 text-slate-600 dark:text-slate-300">
+        <div className="flex items-center gap-2">
+          <select value={dateRange} onChange={(e) => setDateRange(e.target.value as any)} className="bg-slate-50 dark:bg-slate-800 border-none text-[11px] font-bold rounded-lg px-2.5 py-1.5 text-slate-600 dark:text-slate-300">
             <option value="today">Today</option>
             <option value="yesterday">Yesterday</option>
             <option value="week">Last 7 Days</option>
@@ -453,15 +453,15 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
             <option value="custom">Custom Range</option>
           </select>
           {dateRange === 'custom' && (
-            <div className="flex items-center gap-2">
-              <input type="date" value={customStartDate} onChange={e => setCustomStartDate(e.target.value)} className="bg-slate-50 dark:bg-slate-800 border-none rounded-xl px-3 py-2 text-xs font-bold text-slate-600 dark:text-slate-300" />
-              <span className="text-slate-400">to</span>
-              <input type="date" value={customEndDate} onChange={e => setCustomEndDate(e.target.value)} className="bg-slate-50 dark:bg-slate-800 border-none rounded-xl px-3 py-2 text-xs font-bold text-slate-600 dark:text-slate-300" />
+            <div className="flex items-center gap-1">
+              <input type="date" value={customStartDate} onChange={e => setCustomStartDate(e.target.value)} className="bg-slate-50 dark:bg-slate-800 border-none rounded-lg px-2 py-1 text-[11px] font-bold text-slate-600 dark:text-slate-300" />
+              <span className="text-slate-400 text-xs">to</span>
+              <input type="date" value={customEndDate} onChange={e => setCustomEndDate(e.target.value)} className="bg-slate-50 dark:bg-slate-800 border-none rounded-lg px-2 py-1 text-[11px] font-bold text-slate-600 dark:text-slate-300" />
             </div>
           )}
           {canExportAttendance && (
-            <button onClick={() => setExportFormatModal(true)} className="flex items-center gap-2 px-3 py-2 bg-emerald-50 text-emerald-600 hover:bg-emerald-100 dark:bg-emerald-500/10 dark:text-emerald-400 rounded-xl font-bold text-xs transition-colors">
-              <Download size={14} /> Export
+            <button onClick={() => setExportFormatModal(true)} className="flex items-center gap-1.5 px-2.5 py-1.5 bg-emerald-50 text-emerald-600 hover:bg-emerald-100 dark:bg-emerald-500/10 dark:text-emerald-400 rounded-lg font-bold text-[11px] transition-colors">
+              <Download size={12} /> Export
             </button>
           )}
           <button onClick={() => {
@@ -470,31 +470,37 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
             } else {
               toast.error('Only Admins or Managers can perform a full sync.');
             }
-          }} disabled={syncing} className="flex items-center gap-2 px-3 py-2 bg-indigo-500 text-white hover:bg-indigo-600 rounded-xl font-bold text-xs transition-colors">
-            <RefreshCw size={14} className={syncing ? 'animate-spin' : ''} /> {syncing ? 'Syncing...' : 'Sync From TMS'}
+          }} disabled={syncing} className="flex items-center gap-1.5 px-2.5 py-1.5 bg-indigo-500 text-white hover:bg-indigo-600 rounded-lg font-bold text-[11px] transition-colors">
+            <RefreshCw size={12} className={syncing ? 'animate-spin' : ''} /> {syncing ? 'Syncing...' : 'Sync From TMS'}
           </button>
         </div>
       </div>
 
       {/* Summary Cards */}
-      <div className="p-5 grid grid-cols-2 md:grid-cols-5 gap-4">
+      <div className="p-3 grid grid-cols-2 md:grid-cols-5 gap-2.5">
         {[
-          { label: 'Present', val: summary.present, color: 'text-emerald-600' },
-          { label: 'Half Day', val: summary.halfDay, color: 'text-amber-600' },
-          { label: 'Absent', val: summary.absent, color: 'text-rose-600' },
-          { label: 'Attendance %', val: `${summary.attendancePct}%`, color: 'text-indigo-600' },
-          { label: 'Manual Overrides', val: summary.manualOverrides, color: 'text-slate-600' }
+          { label: 'Present', val: summary.present, color: 'text-emerald-650 dark:text-emerald-400' },
+          { label: 'Half Day', val: summary.halfDay, color: 'text-amber-650 dark:text-amber-400' },
+          { label: 'Absent', val: summary.absent, color: 'text-rose-650 dark:text-rose-400' },
+          { label: 'Attendance %', val: `${summary.attendancePct}%`, color: 'text-indigo-650 dark:text-indigo-400' },
+          { label: 'Manual Overrides', val: summary.manualOverrides, color: 'text-slate-655 text-slate-500 dark:text-slate-400' }
         ].map((c, i) => (
-          <div key={i} className="bg-white dark:bg-slate-800 p-4 rounded-2xl border border-slate-100 dark:border-slate-800 shadow-sm">
-            <div className="text-xs font-medium text-slate-500 uppercase">{c.label}</div>
-            <div className={`text-3xl font-black ${c.color}`}>{c.val}</div>
+          <div key={i} className="bg-white dark:bg-slate-800 p-2 border border-slate-100 dark:border-slate-800 rounded-xl shadow-xs text-center flex flex-col justify-center">
+            <div className="text-[9px] font-black tracking-widest text-slate-400 dark:text-slate-500 uppercase leading-none">{c.label}</div>
+            <div className={`text-lg font-black ${c.color} mt-1.5`}>{c.val}</div>
           </div>
         ))}
       </div>
 
       {/* Advanced Filters */}
-      <div className="px-5 pb-5 flex flex-wrap gap-3">
-        <input type="text" placeholder="Search Employee..." value={searchTerm} onChange={e => setSearchTerm(e.target.value)} className="bg-slate-50 dark:bg-slate-800 border-none rounded-xl px-4 py-2 text-xs font-bold" />
+      <div className="px-3 pb-2 flex flex-wrap gap-2 text-xs">
+        <input 
+          type="text" 
+          placeholder="Search Employee..." 
+          value={searchTerm} 
+          onChange={e => setSearchTerm(e.target.value)} 
+          className="bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl px-3 py-1 cursor-text outline-none text-xs font-bold text-slate-700 dark:text-slate-100 placeholder-slate-400 w-44" 
+        />
         <MultiSelectDropdown 
           options={['Present', 'Half Day', 'Absent']}
           selectedValues={selectedStatuses}
@@ -525,61 +531,61 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
         )}
       </div>
 
-      <div className="flex-1 overflow-auto p-5">
+      <div className="flex-1 overflow-auto p-3">
         {loading ? (
-          <div className="flex items-center justify-center p-12 text-sm text-slate-400">Loading Attendance...</div>
+          <div className="flex items-center justify-center p-12 text-xs text-slate-405 text-slate-400">Loading Attendance...</div>
         ) : (
-          <div className="space-y-4">
-            <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl overflow-hidden shadow-sm">
-              <table className="w-full text-left border-collapse">
+          <div className="space-y-3">
+            <div className="bg-white dark:bg-slate-900 border border-slate-150 dark:border-slate-800 rounded-xl overflow-hidden shadow-xs">
+              <table className="w-full text-left text-xs border-collapse">
                 <thead>
-                  <tr className="bg-slate-50 dark:bg-slate-800/50 border-b border-slate-200 dark:border-slate-800 text-sm font-black tracking-wider text-slate-500">
-                    <th className="p-3">Employee</th>
-                    <th className="p-3">Date</th>
-                    <th className="p-3">Session Times</th>
-                    <th className="p-3">Productive Mins</th>
-                    <th className="p-3">Status</th>
-                    {canModifyAttendance && <th className="p-3 text-right">Actions</th>}
+                  <tr className="bg-slate-50 dark:bg-slate-800/40 border-b border-slate-150 dark:border-slate-850 dark:border-slate-800 text-[10px] font-black tracking-wider text-slate-500 uppercase select-none">
+                    <th className="py-1.5 px-3 pl-4">Employee</th>
+                    <th className="py-1.5 px-3">Date</th>
+                    <th className="py-1.5 px-3">Session Times</th>
+                    <th className="py-1.5 px-3">Productive Mins</th>
+                    <th className="py-1.5 px-3">Status</th>
+                    {canModifyAttendance && <th className="py-1.5 px-3 text-right pr-4">Actions</th>}
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
                   {paginatedRecords.map(r => (
                     <tr key={r.id} className="hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors">
-                      <td className="p-3">
-                        <div className="font-bold text-slate-800 dark:text-slate-200 text-sm">{r.employeeName}</div>
-                        <div className="text-xs text-slate-400">{r.employeeEmail}</div>
-                        {r.isOvernight && <span className="mt-1 inline-flex items-center gap-1 bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-300 text-[9px] px-1.5 py-0.5 rounded font-bold uppercase"><Clock size={10} /> Overnight</span>}
+                      <td className="py-1.5 px-3 pl-4">
+                        <div className="font-extrabold text-slate-800 dark:text-slate-200 text-xs leading-none">{r.employeeName}</div>
+                        <div className="text-[10px] text-slate-400 mt-0.5 leading-none">{r.employeeEmail}</div>
+                        {r.isOvernight && <span className="mt-1 inline-flex items-center gap-0.5 bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-300 text-[8px] px-1 py-0.2 rounded font-bold uppercase"><Clock size={9} /> Overnight</span>}
                       </td>
-                      <td className="p-3 text-sm font-bold text-slate-600 dark:text-slate-300">
+                      <td className="py-1.5 px-3 text-xs font-bold text-slate-600 dark:text-slate-300">
                         {r.attendanceDate}
                       </td>
-                      <td className="p-3 text-sm text-slate-500 font-mono">
+                      <td className="py-1.5 px-3 text-xs text-slate-500 font-mono">
                         {new Date(r.sessionStart).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}  &rarr;  
                         {new Date(r.sessionEnd).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                       </td>
-                      <td className="p-3">
-                        <div className="font-mono text-sm font-black text-slate-700 dark:text-slate-300">
-                          {r.productiveMinutes}
+                      <td className="py-1.5 px-3">
+                        <div className="font-mono text-xs font-black text-slate-700 dark:text-slate-300">
+                          {r.productiveMinutes}m
                         </div>
-                        <div className="text-xs text-slate-400">Break: {r.totalBreakMinutes}m</div>
+                        <div className="text-[10px] text-slate-400">Break: {r.totalBreakMinutes}m</div>
                       </td>
-                      <td className="p-3">
-                        <span className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-black uppercase ${
-                          r.attendanceStatus === 'Present' ? 'bg-emerald-100 text-emerald-800' :
-                          r.attendanceStatus === 'Half Day' ? 'bg-amber-100 text-amber-800' :
-                          'bg-rose-100 text-rose-800'
+                      <td className="py-1.5 px-3">
+                        <span className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[10px] font-black uppercase ${
+                          r.attendanceStatus === 'Present' ? 'bg-emerald-100 dark:bg-emerald-950/40 text-emerald-800 dark:text-emerald-400' :
+                          r.attendanceStatus === 'Half Day' ? 'bg-amber-100 dark:bg-amber-950/40 text-amber-800 dark:text-amber-400' :
+                          'bg-rose-100 dark:bg-rose-950/40 text-rose-800 dark:text-rose-400'
                         }`}>
-                          {r.attendanceStatus === 'Present' ? <CheckCircle size={12} /> : 
-                           r.attendanceStatus === 'Half Day' ? <ClockAlert size={12} /> : <XCircle size={12} />}
+                          {r.attendanceStatus === 'Present' ? <CheckCircle size={10} /> : 
+                           r.attendanceStatus === 'Half Day' ? <ClockAlert size={10} /> : <XCircle size={10} />}
                           {r.attendanceStatus}
                         </span>
-                        {r.lastModifiedBy && <div className="text-[9px] text-slate-400 mt-1">Edited manually</div>}
+                        {r.lastModifiedBy && <div className="text-[9px] text-slate-400 mt-0.5 leading-none">Edited manually</div>}
                       </td>
                       {canModifyAttendance && (
-                        <td className="p-4 text-right">
+                        <td className="py-1.5 px-3 text-right pr-4">
                           <button 
                             onClick={() => openEditModal(r)}
-                            className="text-xs font-bold text-indigo-500 hover:text-indigo-600 px-2 py-1 bg-indigo-50 hover:bg-indigo-100 rounded-lg transition-colors"
+                            className="text-[10px] font-bold text-indigo-500 hover:text-indigo-650 px-2 py-0.5 bg-indigo-50 hover:bg-indigo-100 dark:bg-indigo-950/40 rounded transition-colors"
                           >
                             Modify
                           </button>
@@ -589,7 +595,7 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
                   ))}
                   {paginatedRecords.length === 0 && (
                     <tr>
-                      <td colSpan={canModifyAttendance ? 6 : 5} className="p-8 text-center text-slate-400 text-sm">
+                      <td colSpan={canModifyAttendance ? 6 : 5} className="py-6 text-center text-slate-400 text-xs">
                         No matching records found.
                       </td>
                     </tr>
@@ -598,10 +604,10 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
               </table>
             </div>
             {totalPages > 1 && (
-              <div className="flex justify-center gap-2 mt-4">
-                <button disabled={currentPage === 1} onClick={() => setCurrentPage(p => p - 1)} className="px-3 py-1 bg-slate-100 rounded-lg text-xs font-bold disabled:opacity-50">Prev</button>
-                <span className="px-3 py-1 text-xs font-bold flex items-center">Page {currentPage} of {totalPages}</span>
-                <button disabled={currentPage === totalPages} onClick={() => setCurrentPage(p => p + 1)} className="px-3 py-1 bg-slate-100 rounded-lg text-xs font-bold disabled:opacity-50">Next</button>
+              <div className="flex justify-center gap-1.5 mt-2.5">
+                <button disabled={currentPage === 1} onClick={() => setCurrentPage(p => p - 1)} className="px-2 py-0.5 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors rounded text-[10px] font-bold disabled:opacity-40">Prev</button>
+                <span className="px-2 py-0.5 text-[10px] text-slate-500 dark:text-slate-400 font-bold flex items-center">Page {currentPage} of {totalPages}</span>
+                <button disabled={currentPage === totalPages} onClick={() => setCurrentPage(p => p + 1)} className="px-2 py-0.5 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors rounded text-[10px] font-bold disabled:opacity-40">Next</button>
               </div>
             )}
           </div>

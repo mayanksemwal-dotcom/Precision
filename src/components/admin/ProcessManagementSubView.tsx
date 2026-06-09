@@ -68,17 +68,11 @@ export const ProcessManagementSubView = ({ user, adminTheme }: ProcessManagement
           }));
         } else {
           // Only use defaults if document has no data whatsoever
-          loaded = DEFAULT_PROCESSES.map(name => ({
-            name,
-            status: 'Active' as const
-          }));
+          loaded = DEFAULT_PROCESSES;
         }
         setProcesses(loaded);
       } else {
-        const initial = DEFAULT_PROCESSES.map(name => ({
-          name,
-          status: 'Active' as const
-        }));
+        const initial = DEFAULT_PROCESSES;
         setProcesses(initial);
       }
       setLoading(false);

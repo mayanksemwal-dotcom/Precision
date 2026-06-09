@@ -267,6 +267,20 @@ export const PermissionProvider: React.FC<PermissionProviderProps> = ({ children
           can_delete: !!data.can_delete,
           can_export: !!data.can_export,
           can_approve: !!data.can_approve,
+          view_team: !!data.view_team,
+          view_all: !!data.view_all,
+          assign: !!data.assign,
+          override: !!data.override,
+          force_action: !!data.force_action,
+          manage_settings: !!data.manage_settings,
+          manage_masters: !!data.manage_masters,
+          audit_access: !!data.audit_access,
+          email_trigger: !!data.email_trigger,
+          bulk_action: !!data.bulk_action,
+          reopen_records: !!data.reopen_records,
+          escalate: !!data.escalate,
+          comment: !!data.comment,
+          view_sensitive_data: !!data.view_sensitive_data,
           tms_permissions: data.tms_permissions || undefined
         };
       });

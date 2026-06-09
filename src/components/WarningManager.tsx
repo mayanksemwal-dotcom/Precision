@@ -185,6 +185,16 @@ CC Checklist:
 - HR Operations (hr@bergtechnologies.co.in)
       `;
 
+      const ccList = ['hr@bergtechnologies.co.in'];
+      if (fullAgent.teamLeadId) {
+        const tlObj = allUsers.find(u => u.uid === fullAgent.teamLeadId);
+        if (tlObj && tlObj.email) ccList.push(tlObj.email);
+      }
+      if (fullAgent.mappedManagerId) {
+        const mgrObj = allUsers.find(u => u.uid === fullAgent.mappedManagerId);
+        if (mgrObj && mgrObj.email) ccList.push(mgrObj.email);
+      }
+
       if (sendEmailNotification) {
         // Log "Email Sent" in audit logs
         await addDoc(collection(db, 'adminAuditLogs'), {
@@ -194,15 +204,76 @@ CC Checklist:
           affectedUser: `${name} (${email})`,
           previousValue: 'None',
           newValue: 'Email Triggered = Yes',
-          remarks: `Subject: Disciplinary Warning Issued - To: ${email} | CC: hr@bergtechnologies.co.in`,
+          remarks: `Subject: Disciplinary Warning Issued - To: ${email} | CC: ${ccList.join(', ')}`,
           emailDetails: {
             to: email,
             sender: auth.currentUser?.email,
-            subject: 'Automated Disciplinary Warning Notification',
+            subject: `[DISCIPLINARY ACTION] Disciplinary Warning Issued - ${name} (${level})`,
             body: emailText,
             timestamp: nowISO
           }
         });
+
+        // Write real email documents for Firestore Trigger Email extension
+        const realEmailDoc = {
+          to: email,
+          cc: ccList,
+          message: {
+            subject: `[DISCIPLINARY ACTION] Disciplinary Warning Issued - ${name} (${level})`,
+            text: emailText,
+            html: `
+              <div style="font-family: Arial, sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto; border: 1px solid #e2e8f0; border-radius: 8px; padding: 20px;">
+                <h2 style="color: #b91c1c; margin-top: 0;">Automated Disciplinary Warning Notification</h2>
+                <p>Dear <strong>${name.toUpperCase()}</strong> (ID: ${employeeId}),</p>
+                <p>This is an automated notification regarding a disciplinary action issued against you under the Staircase Policy.</p>
+                
+                <h3 style="border-bottom: 2px solid #e2e8f0; padding-bottom: 5px; color: #1e3a8a;">Details of Warning Ticket</h3>
+                <table style="width: 100%; border-collapse: collapse; margin-bottom: 20px;">
+                  <tr>
+                    <td style="padding: 8px; font-weight: bold; width: 150px; background-color: #f8fafc; border: 1px solid #e2e8f0;">Level of Warning:</td>
+                    <td style="padding: 8px; border: 1px solid #e2e8f0; color: #b91c1c; font-weight: bold;">${level} Notice</td>
+                  </tr>
+                  <tr>
+                    <td style="padding: 8px; font-weight: bold; background-color: #f8fafc; border: 1px solid #e2e8f0;">Severity Level:</td>
+                    <td style="padding: 8px; border: 1px solid #e2e8f0;">${severity}</td>
+                  </tr>
+                  <tr>
+                    <td style="padding: 8px; font-weight: bold; background-color: #f8fafc; border: 1px solid #e2e8f0;">Reason / Remarks:</td>
+                    <td style="padding: 8px; border: 1px solid #e2e8f0;">${remarks}</td>
+                  </tr>
+                  <tr>
+                    <td style="padding: 8px; font-weight: bold; background-color: #f8fafc; border: 1px solid #e2e8f0;">Issued By:</td>
+                    <td style="padding: 8px; border: 1px solid #e2e8f0;">${performerName}</td>
+                  </tr>
+                  <tr>
+                    <td style="padding: 8px; font-weight: bold; background-color: #f8fafc; border: 1px solid #e2e8f0;">Date & Time Issued:</td>
+                    <td style="padding: 8px; border: 1px solid #e2e8f0;">${new Date(nowISO).toLocaleString()}</td>
+                  </tr>
+                </table>
+
+                <div style="background-color: #fef2f2; border-left: 4px solid #ef4444; padding: 15px; margin-bottom: 20px; border-radius: 4px;">
+                  <h4 style="margin: 0 0 5px 0; color: #991b1b;">Acknowledgment Required</h4>
+                  <p style="margin: 0; font-size: 14px;">You are strictly required to log in to the Precision360 compliance dashboard immediately to review and formally acknowledge/accept this warning ticket.</p>
+                </div>
+
+                <p style="font-size: 12px; color: #64748b; margin-top: 30px; border-top: 1px solid #e2e8f0; padding-top: 10px;">
+                  This is a system generated email CC'd to: ${ccList.join(', ')}
+                </p>
+              </div>
+            `
+          },
+          createdAt: nowISO,
+          status: 'pending'
+        };
+
+        try {
+          await addDoc(collection(db, 'mail'), realEmailDoc);
+          await addDoc(collection(db, 'emails'), realEmailDoc);
+          console.log("Successfully wrote warning email to Firestore queues");
+        } catch (mailErr) {
+          console.error("Failed to write warning email to mail collections: ", mailErr);
+        }
+
         toast.success(`Warning issued and notification email dispatched to ${name} and HR successfully!`);
       } else {
         // Log "Email Skipped" in audit logs
