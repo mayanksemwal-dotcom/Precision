@@ -569,27 +569,10 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
       return;
     }
 
-    if (currentShift) {
-      toast.error('Action Blocked: You already have an active shift running.');
+    const isCurrentlyActive = currentShift && (currentShift.status === 'ACTIVE' || currentShift.status === 'BREAK');
+    if (isCurrentlyActive) {
+      toast.error('Action Blocked: You already have an active shift running. Please Clock Out of your current session first.');
       return;
-    }
-
-    // Restriction: Only one clock-in allowed per calendar day IST (unless the user is an admin for testing)
-    const roleUpper = (user.role || '').toUpperCase();
-    if (roleUpper !== 'ADMIN') {
-      // Calculate today in IST
-      const istDate = new Date(new Date().getTime() + (5.5 * 60 * 60 * 1000));
-      const todayIST = istDate.toISOString().split('T')[0];
-      
-      const hasTodayShift = myPastShifts.some(s => {
-        const sIST = new Date(new Date(s.clockInTime).getTime() + (5.5 * 60 * 60 * 1000));
-        return sIST.toISOString().split('T')[0] === todayIST;
-      });
-
-      if (hasTodayShift) {
-        toast.error('Policy Restriction: You have already completed a shift today. Multiple clock-ins in a single cycle are restricted.');
-        return;
-      }
     }
 
     setIsProcessingPunch(true);

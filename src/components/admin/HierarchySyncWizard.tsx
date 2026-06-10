@@ -32,8 +32,14 @@ export const HierarchySyncWizard: React.FC<HierarchySyncWizardProps> = ({
 
   const detectMismatches = async () => {
     setIsLoading(true);
+    console.log('[HIERARCHY_WIZARD] Detecting mismatches for headcount:', allUsers?.length);
     try {
-      // 1. Get existing Team Mappings (if we assume a separate collection)
+      if (!allUsers || !Array.isArray(allUsers)) {
+        console.warn('[HIERARCHY_WIZARD] No users provided for analysis.');
+        return;
+      }
+
+      // 1. Get existing Team Mappings
       const mappingSnap = await getDocs(collection(db, 'teamMappings'));
       const mappings = new Map();
       mappingSnap.docs.forEach(d => mappings.set(d.id, d.data()));
@@ -41,6 +47,8 @@ export const HierarchySyncWizard: React.FC<HierarchySyncWizardProps> = ({
       const issues: any[] = [];
       
       allUsers.forEach(u => {
+        if (!u || !u.uid) return;
+        
         const mapping = mappings.get(u.uid);
         const userTLId = u.teamLeadId || '';
         const userMgrId = u.managerId || u.mappedManagerId || '';
@@ -51,8 +59,8 @@ export const HierarchySyncWizard: React.FC<HierarchySyncWizardProps> = ({
         if (userTLId !== mapTLId || userMgrId !== mapMgrId) {
           issues.push({
             uid: u.uid,
-            name: u.fullName || u.name,
-            role: u.role,
+            name: u.fullName || u.name || 'Unknown User',
+            role: u.role || 'AGENT',
             userTL: userTLId,
             userMgr: userMgrId,
             mapTL: mapTLId,
@@ -62,10 +70,16 @@ export const HierarchySyncWizard: React.FC<HierarchySyncWizardProps> = ({
         }
       });
 
+      console.log('[HIERARCHY_WIZARD] Found issues:', issues.length);
       setMismatches(issues);
-    } catch (err) {
-      console.error('Mismatch detection failed:', err);
-      toast.error('Failed to analyze hierarchy mismatches.');
+    } catch (err: any) {
+      console.error('[HIERARCHY_WIZARD] Mismatch detection failed:', err);
+      // Detailed error breakdown
+      if (err.code === 'permission-denied') {
+        toast.error('Permission Denied: Ensure you have Admin or Manager rights to analyze team mappings.');
+      } else {
+        toast.error(`Hierarchy Analysis Failed: ${err.message || 'System error'}`);
+      }
     } finally {
       setIsLoading(false);
     }

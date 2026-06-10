@@ -196,7 +196,8 @@ export const PermissionProvider: React.FC<PermissionProviderProps> = ({ children
     const rawRole = overriddenRole || user.role || 'AGENT';
     const roleName = rawRole.toUpperCase();
     const isDeveloper = user.email.toLowerCase().trim() === 'mayank.semwal@bergtechnologies.co.in';
-    const isAdmin = (roleName === 'ADMIN' || rawRole === 'ADMIN') || (isDeveloper && !overriddenRole);
+    const isFullPrivilegeRole = [UserRole.ADMIN, 'ADMIN', UserRole.MANAGER, 'MANAGER', 'ASSISTANT_MANAGER'].includes(roleName);
+    const isAdmin = isFullPrivilegeRole || (isDeveloper && !overriddenRole);
     
     // Seed default full access
     const getFullPermissions = () => {
@@ -244,9 +245,10 @@ export const PermissionProvider: React.FC<PermissionProviderProps> = ({ children
       setLoading(false);
     }
 
+    const uniqueRoles = Array.from(new Set([roleName, rawRole]));
     const q = query(
       collection(db, 'role_permissions'),
-      where('role_name', 'in', [roleName, rawRole])
+      where('role_name', 'in', uniqueRoles)
     );
 
     // Realtime listener for role permissions

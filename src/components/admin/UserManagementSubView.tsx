@@ -196,11 +196,11 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
 
   // Compute normalizedUsers
   const normalizedUsers = useMemo(() => {
-    return allUsers.map(u => ({
+    return allUsers.filter(Boolean).map(u => ({
       ...u,
-      uid: u.uid || u.id || u.employeeId,
-      name: u.fullName || u.name || u.employeeName || '',
-      fullName: u.fullName || u.name || u.employeeName || '',
+      uid: u.uid || u.id || u.employeeId || Math.random().toString(36).substring(7),
+      name: u.fullName || u.name || u.employeeName || 'Unknown User',
+      fullName: u.fullName || u.name || u.employeeName || 'Unknown User',
       mappedManagerName: u.mappedManagerName || u.managerName || u.Manager || '',
       teamLeadName: u.teamLeadName || '',
     }));
@@ -1029,10 +1029,10 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
                       <td className="p-4 text-slate-400 dark:text-slate-500 font-semibold">{user.email}</td>
                       <td className="p-4">
                         <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
-                          ['ADMIN'].includes(user.role.toUpperCase()) ? 'bg-red-500/10 text-red-500' :
-                          ['MANAGER', 'ASSISTANT_MANAGER'].includes(user.role.toUpperCase()) ? 'bg-indigo-500/10 text-indigo-500' :
-                          ['TEAM_LEAD', 'STL', 'QTL', 'OPS_TL', 'TEAM LEAD'].includes(user.role.toUpperCase()) ? 'bg-amber-500/10 text-amber-500' :
-                          user.role.toUpperCase() === 'QA' ? 'bg-blue-500/10 text-blue-500' : 'bg-emerald-500/10 text-emerald-500'
+                          ['ADMIN'].includes((user.role || '').toUpperCase()) ? 'bg-red-500/10 text-red-500' :
+                          ['MANAGER', 'ASSISTANT_MANAGER'].includes((user.role || '').toUpperCase()) ? 'bg-indigo-500/10 text-indigo-500' :
+                          ['TEAM_LEAD', 'STL', 'QTL', 'OPS_TL', 'TEAM LEAD'].includes((user.role || '').toUpperCase()) ? 'bg-amber-500/10 text-amber-500' :
+                          (user.role || '').toUpperCase() === 'QA' ? 'bg-blue-500/10 text-blue-500' : 'bg-emerald-500/10 text-emerald-500'
                         }`}>
                           {user.role}
                         </span>

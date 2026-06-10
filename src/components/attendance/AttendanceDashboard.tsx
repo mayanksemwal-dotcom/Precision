@@ -165,8 +165,8 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
   // Authorization for edits
   const canModifyAttendance = canEdit('Attendance');
   const canExportAttendance = canExport('Attendance');
-  const isTopAdmin = ['ADMIN', 'MIS'].includes(user.role.toUpperCase());
-  const isStrictAdminOrManager = ['ADMIN', 'MANAGER', 'MIS'].includes(user.role.toUpperCase());
+  const isTopAdmin = ['ADMIN', 'MANAGER', 'MIS'].includes(user.role.toUpperCase());
+  const isStrictAdminOrManager = ['ADMIN', 'MANAGER', 'MIS', 'ASSISTANT_MANAGER'].includes(user.role.toUpperCase());
   const isTLRole = ['QTL', 'STL', 'OPS_TL', 'TRAINER_TL', 'TEAM_LEAD'].includes(user.role.toUpperCase());
 
   // Dynamic Process filter: If IC, only show processes user has worked in
@@ -329,9 +329,21 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
       const shiftsRef = collection(db, 'tmsShifts');
       const lastWeek = new Date();
       lastWeek.setDate(lastWeek.getDate() - 14); // Sync last 14 days
-      const qShifts = query(shiftsRef, where('status', '==', 'COMPLETED'), where('clockInTime', '>=', lastWeek.toISOString()));
+      
+      // Use single field filter to avoid composite index requirement
+      const qShifts = query(shiftsRef, where('clockInTime', '>=', lastWeek.toISOString()));
       const shiftsSnap = await getDocs(qShifts);
       
+      // Filter COMPLETED in memory
+      const completedShifts = shiftsSnap.docs
+        .map(d => ({ ...d.data(), id: d.id }))
+        .filter((s: any) => s.status === 'COMPLETED');
+
+      if (completedShifts.length === 0) {
+        toast.info('No completed shifts found to sync in the requested period.');
+        return;
+      }
+
       // Fetch existing attendances to prevent duplicate logic
       const attSnap = await getDocs(query(collection(db, 'attendanceSummary'), where('attendanceDate', '>=', lastWeek.toISOString().split('T')[0])));
       const existingShiftIds = new Set(attSnap.docs.map(d => d.data().shiftId));
@@ -340,8 +352,7 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
       let newCount = 0;
       let batchCount = 0;
 
-      for (const docSnap of shiftsSnap.docs) {
-        const shift = docSnap.data();
+      for (const shift of completedShifts as any[]) {
         if (existingShiftIds.has(shift.id)) continue; 
 
         // Calculate

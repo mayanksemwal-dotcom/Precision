@@ -27,17 +27,19 @@ service cloud.firestore {
     
     function isRole(role) { return isVerified() && getUserRole().upper() == role; }
     function isAdmin() {
-      return isSignedIn() && (
-        (getUserRole().upper() == 'ADMIN') ||
-        ('email' in request.auth.token && request.auth.token.email != null && request.auth.token.email.lower() == 'mayank.semwal@bergtechnologies.co.in')
-      );
+      let isAdminEmail = request.auth.token.email != null && request.auth.token.email.lower() == 'mayank.semwal@bergtechnologies.co.in';
+      return isSignedIn() && (isAdminEmail || getUserRole().upper() == 'ADMIN');
     }
 
-    function isManager() { return isRole('MANAGER') || isAdmin(); }
+    function isManager() { 
+      let role = getUserRole().upper();
+      return isAdmin() || role == 'MANAGER' || role == 'ASSISTANT_MANAGER' || role == 'EXECUTIVE';
+    }
     function isQA() { return isRole('QA') || isManager(); }
     function isTL() { 
       let role = getUserRole().upper();
-      return role in ['TEAM_LEAD', 'STL', 'OPS_TL', 'QTL', 'TRAINER_TL', 'TRAINER', 'MIS', 'SME', 'MANAGER', 'ADMIN'] || isManager(); 
+      let tlRoles = ['TEAM_LEAD', 'STL', 'OPS_TL', 'QTL', 'TRAINER_TL', 'TRAINER', 'MIS', 'SME', 'MANAGER', 'ASSISTANT_MANAGER', 'ADMIN', 'TEAM LEAD', 'TRAINER TL', 'OPS TL'];
+      return isAdmin() || role in tlRoles || isManager(); 
     }
     function isAgent() { return isRole('AGENT') || isTL() || isQA(); }
     
@@ -52,7 +54,7 @@ service cloud.firestore {
       return data.keys().hasAll(['uid', 'email', 'role']) &&
              data.uid is string &&
              data.email is string &&
-             data.role in ['ADMIN', 'MANAGER', 'QA', 'TEAM_LEAD', 'AGENT'];
+             data.role in ['ADMIN', 'MANAGER', 'ASSISTANT_MANAGER', 'QA', 'TEAM_LEAD', 'STL', 'OPS_TL', 'SME', 'QTL', 'TRAINER_TL', 'TRAINER', 'MIS', 'AGENT', 'TEAM LEAD', 'TRAINER TL', 'OPS TL'];
     }
 
     function isValidAudit(data) {
@@ -85,10 +87,11 @@ service cloud.firestore {
     // -------------------------------------------------------------------------
 
     match /users/{userId} {
-      allow read: if isVerified();
-      allow create: if isSignedIn() && isOwner(userId);
-      allow update: if isSignedIn() && (isOwner(userId) || isAdmin() || isManager());
-      allow delete: if isVerified() && isAdmin();
+      allow get: if isVerified();
+      allow list: if isVerified();
+      allow create: if isVerified() && (isOwner(userId) || isAdmin() || isManager());
+      allow update: if isVerified() && (isOwner(userId) || isAdmin() || isManager());
+      allow delete: if isAdmin();
     }
 
     match /tasks/{taskId} {
@@ -248,16 +251,22 @@ service cloud.firestore {
     }
 
     match /tmsShifts/{shiftId} {
-      allow read: if isVerified() && (isTL() || isAdmin() || isOwner(resource.data.userId));
-      allow write: if isVerified() && (isTL() || isAdmin() || isOwner(incoming().userId) || isOwner(existing().userId));
+      allow read: if isVerified() && (isTL() || isAdmin() || (resource != null && isOwner(resource.data.userId)));
+      allow write: if isVerified() && (isTL() || isAdmin() || isOwner(incoming().userId) || (resource != null && isOwner(resource.data.userId)));
       allow delete: if isAdmin();
     }
 
     match /attendanceSummary/{id} {
-      allow get: if isVerified() && (isTL() || isAdmin() || isOwner(resource.data.userId));
+      allow get: if isVerified() && (isTL() || isAdmin() || (resource != null && isOwner(resource.data.userId)));
       allow list: if isVerified();
-      allow create: if isVerified(); // Allow creation from system/services
-      allow update: if isVerified() && (isTL() || isAdmin() || isOwner(resource.data.userId));
+      allow create: if isVerified(); 
+      allow update: if isVerified() && (isTL() || isAdmin() || (resource != null && isOwner(resource.data.userId)));
+      allow delete: if isAdmin();
+    }
+
+    match /teamMappings/{id} {
+      allow read: if isVerified();
+      allow create, update: if isAdmin() || isManager() || isTL();
       allow delete: if isAdmin();
     }
 
@@ -305,7 +314,7 @@ service cloud.firestore {
 
     match /employee_master/{id} {
       allow read: if isVerified();
-      allow write: if isAdmin();
+      allow create, update: if isAdmin() || isManager() || isTL();
       allow delete: if isAdmin();
     }
 
