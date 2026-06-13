@@ -8,6 +8,7 @@ import { auth, db, handleFirestoreError, OperationType } from '../lib/firebase';
 import { doc, setDoc, addDoc, collection, getDoc } from 'firebase/firestore';
 import { WarningTicket, UserProfile, UserRole } from '../types';
 import { UserPicker } from './UserPicker';
+import { sendEmailViaGmailApi } from '../lib/gmailService';
 
 interface WarningManagerProps {
   agentName?: string;
@@ -253,7 +254,7 @@ CC Checklist:
           }
         });
 
-        // Write real email documents for Firestore Trigger Email extension
+        // Write email queue documents for Custom Email Delivery Service background worker
         const realEmailDoc = {
           to: finalTo,
           cc: finalCc,
@@ -314,7 +315,27 @@ CC Checklist:
           console.error("Failed to write warning email to mail collections: ", mailErr);
         }
 
-        toast.success(`Warning issued and notification email dispatched to ${name} and HR successfully!`);
+        // Direct Gmail REST API sending logic
+        try {
+          const mailConfig = {
+            to: finalTo,
+            cc: finalCc,
+            subject: `[DISCIPLINARY ACTION] Disciplinary Warning Issued - ${name} (${level})`,
+            bodyText: emailText,
+            bodyHtml: realEmailDoc.message.html,
+            fromEmail: fromEmail || 'compliance@bergtechnologies.co.in'
+          };
+          const gmailResult = await sendEmailViaGmailApi(mailConfig);
+          if (gmailResult.success) {
+            toast.success(`Warning issued and notification email dispatched directly through your Gmail (Sent folder updated)!`);
+          } else {
+            console.warn('Could not dispatch via Gmail direct API:', gmailResult.error);
+            toast.success(`Warning issued and notification email queued in Firestore!`);
+          }
+        } catch (gmailErr: any) {
+          console.error('Failed to trigger Gmail API wrapper:', gmailErr);
+          toast.success(`Warning issued & notification queued in Firestore successfully.`);
+        }
       } else {
         // Log "Email Skipped" in audit logs
         await addDoc(collection(db, 'adminAuditLogs'), {

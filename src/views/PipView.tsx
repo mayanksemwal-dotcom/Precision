@@ -51,6 +51,7 @@ import { doc, setDoc, updateDoc, collection, addDoc, onSnapshot, query, where, o
 import { toast } from 'sonner';
 import { usePermission } from '../components/PermissionContext';
 import { canActOn } from '../lib/hierarchy';
+import { sendEmailViaGmailApi } from '../lib/gmailService';
 
 interface PipViewProps {
   user: UserProfile;
@@ -324,7 +325,7 @@ Berg Technologies Corp HS Division
           }
         });
 
-        // Write real email documents for Firestore Trigger Email extension
+        // Write email queue documents for Custom Email Delivery Service background worker
         const realEmailDoc = {
           to: finalTo,
           cc: reportingLineCC,
@@ -397,7 +398,27 @@ Berg Technologies Corp HS Division
           console.error("Failed to write to mail collections: ", mailErr);
         }
 
-        toast.success(`Automated notification email dispatched to ${targetAgent.email} and reporting leads!`);
+        // Direct Gmail REST API sending logic
+        try {
+          const mailConfig = {
+            to: finalTo,
+            cc: reportingLineCC,
+            subject: emailSubject,
+            bodyText: emailBody,
+            bodyHtml: realEmailDoc.message.html,
+            fromEmail: fromEmail || 'compliance@bergtechnologies.co.in'
+          };
+          const gmailResult = await sendEmailViaGmailApi(mailConfig);
+          if (gmailResult.success) {
+            toast.success(`Automated notification email dispatched directly through your Gmail (Sent folder updated)!`);
+          } else {
+            console.warn('Could not dispatch via Gmail direct API:', gmailResult.error);
+            toast.success(`Automated notification email queued in Firestore!`);
+          }
+        } catch (gmailErr: any) {
+          console.error('Failed to trigger Gmail API wrapper:', gmailErr);
+          toast.success(`Automated notification email queued in Firestore!`);
+        }
       } else {
         // Audit Log: Email Skipped
         await addDoc(collection(db, 'adminAuditLogs'), {

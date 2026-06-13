@@ -65,16 +65,59 @@ export function canActOn(actor: UserProfile, target: UserProfile, allUsers: User
 
   if (!isRoleAuthorized) return false;
 
+  const actorIdLower = (actor.uid || '').toLowerCase().trim();
+  const actorEmailLower = (actor.email || '').toLowerCase().trim();
+  const actorNameLower = (actor.name || '').toLowerCase().trim();
+  const actorFullNameLower = (actor.fullName || actor.employeeName || '').toLowerCase().trim();
+
   // 3. Verify reporting structure (Authoritative Source: Team Mapping fields)
   const isDirectReport = 
-    target.teamLeadId === actor.uid || 
-    target.mappedManagerId === actor.uid ||
-    target.managerId === actor.uid;
+    (target.teamLeadId && target.teamLeadId.toLowerCase().trim() === actorIdLower) ||
+    (target.teamLeadEmail && target.teamLeadEmail.toLowerCase().trim() === actorEmailLower) ||
+    (target.teamLeadId && target.teamLeadId.toLowerCase().trim() === actorEmailLower) ||
+    (target.teamLeadName && actorNameLower && target.teamLeadName.toLowerCase().trim() === actorNameLower) ||
+    (target.teamLeadName && actorFullNameLower && target.teamLeadName.toLowerCase().trim() === actorFullNameLower) ||
+    (target.mappedTL && target.mappedTL.toLowerCase().trim() === actorIdLower) ||
+    
+    // Manager mappings
+    (target.mappedManagerId && target.mappedManagerId.toLowerCase().trim() === actorIdLower) ||
+    (target.managerId && target.managerId.toLowerCase().trim() === actorIdLower) ||
+    (target.managerEmail && target.managerEmail.toLowerCase().trim() === actorEmailLower) ||
+    (target.mappedManagerEmail && target.mappedManagerEmail.toLowerCase().trim() === actorEmailLower) ||
+    (target.managerName && actorNameLower && target.managerName.toLowerCase().trim() === actorNameLower) ||
+    (target.managerName && actorFullNameLower && target.managerName.toLowerCase().trim() === actorFullNameLower) ||
+    (target.mappedManagerName && actorNameLower && target.mappedManagerName.toLowerCase().trim() === actorNameLower) ||
+    (target.mappedManagerName && actorFullNameLower && target.mappedManagerName.toLowerCase().trim() === actorFullNameLower);
   
   // indirect report check (e.g. Manager -> TL -> Agent)
   const isIndirectReport = allUsers.some(tl => {
-    const tlIsSubordinate = tl.mappedManagerId === actor.uid || tl.managerId === actor.uid;
-    const targetReportsToTL = target.teamLeadId === tl.uid;
+    const tlActorIdLower = (tl.mappedManagerId || tl.managerId || '').toLowerCase().trim();
+    const tlActorEmailLower = (tl.mappedManagerEmail || tl.managerEmail || '').toLowerCase().trim();
+    const tlActorNameLower = (tl.mappedManagerName || tl.managerName || '').toLowerCase().trim();
+
+    const tlIsSubordinate = 
+      tlActorIdLower === actorIdLower ||
+      tlActorEmailLower === actorEmailLower ||
+      (tlActorNameLower && actorNameLower && tlActorNameLower === actorNameLower) ||
+      (tlActorNameLower && actorFullNameLower && tlActorNameLower === actorFullNameLower);
+
+    const targetTLIdLower = (target.teamLeadId || '').toLowerCase().trim();
+    const targetTLEmailLower = (target.teamLeadEmail || '').toLowerCase().trim();
+    const targetTLNameLower = (target.teamLeadName || '').toLowerCase().trim();
+
+    const tlIdLower = (tl.uid || '').toLowerCase().trim();
+    const tlEmailLower = (tl.email || '').toLowerCase().trim();
+    const tlNameLower = (tl.name || '').toLowerCase().trim();
+    const tlFullNameLower = (tl.fullName || tl.employeeName || '').toLowerCase().trim();
+
+    const targetReportsToTL = 
+      (targetTLIdLower && targetTLIdLower === tlIdLower) ||
+      (targetTLEmailLower && targetTLEmailLower === tlEmailLower) ||
+      (targetTLIdLower && targetTLIdLower === tlEmailLower) ||
+      (targetTLNameLower && tlNameLower && targetTLNameLower === tlNameLower) ||
+      (targetTLNameLower && tlFullNameLower && targetTLNameLower === tlFullNameLower) ||
+      (target.mappedTL && target.mappedTL.toLowerCase().trim() === tlIdLower);
+
     return tlIsSubordinate && targetReportsToTL;
   });
 

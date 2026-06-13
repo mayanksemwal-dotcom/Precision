@@ -31,9 +31,10 @@ import { BackupRestoreSubView } from '../components/admin/BackupRestoreSubView';
 import { ProcessManagementSubView } from '../components/admin/ProcessManagementSubView';
 import { AttendanceSettingsSubView } from '../components/admin/AttendanceSettingsSubView';
 import { HierarchySyncWizard } from '../components/admin/HierarchySyncWizard';
+import { EmailDashboardSubView } from '../components/admin/EmailDashboardSubView';
 
 // Subview type definition
-type SubTabType = 'dashboard' | 'users' | 'roles' | 'mapping' | 'process' | 'audits' | 'data' | 'backup' | 'attendancecfg' | 'hierarchy';
+type SubTabType = 'dashboard' | 'users' | 'roles' | 'mapping' | 'process' | 'audits' | 'data' | 'backup' | 'attendancecfg' | 'hierarchy' | 'emailcfg';
 
 interface AdminViewProps {
   activeTab: string;
@@ -101,6 +102,7 @@ export default function AdminView({
     { id: 'audits', label: 'Audit Trail', icon: History, visible: canView('Console') },
     { id: 'data', label: 'Data Management', icon: Database, visible: canDelete('Console') },
     { id: 'attendancecfg', label: 'Attendance Rules', icon: FileText, visible: canEdit('Console') },
+    { id: 'emailcfg', label: 'Email Portal', icon: FileText, visible: canEdit('Console') },
     { id: 'hierarchy', label: 'Hierarchy Repair', icon: Shield, visible: requesterUser.role === 'ADMIN' },
     { id: 'backup', label: 'Backup & Restore', icon: CloudLightning, visible: canEdit('Console') && canDelete('Console') }
   ] as const;
@@ -208,6 +210,10 @@ export default function AdminView({
             onRefresh={onRefresh || (() => {})} 
             logAdminEvent={logAdminEvent} 
           />
+        )}
+
+        {activeSubTab === 'emailcfg' && (
+          <EmailDashboardSubView adminTheme={adminTheme} />
         )}
 
         {activeSubTab === 'attendancecfg' && (

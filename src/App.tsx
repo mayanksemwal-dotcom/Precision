@@ -186,43 +186,25 @@ export default function App() {
               
               if (!querySnap.empty) {
                 const matchedDoc = querySnap.docs[0];
-                const matchedData = matchedDoc.data() as any;
-                console.log('Pre-provisioned user found. Linking to Auth uid...', matchedDoc.id);
+                console.log('Pre-provisioned user found. Triggering server-side profile linking and migration...', matchedDoc.id);
                 
-                userProfile = {
-                  ...matchedData,
-                  uid: firebaseUser.uid,
-                  email: (firebaseUser.email || '').toLowerCase().trim(),
-                  name: matchedData.name || matchedData.fullName || getCleanName(),
-                  fullName: matchedData.fullName || matchedData.name || getCleanName(),
-                  role: (matchedData.role || UserRole.AGENT).toUpperCase(),
-                  status: matchedData.status || 'Active',
-                  department: matchedData.department || 'Operations',
-                  Manager: matchedData.Manager || '',
-                  createdAt: matchedData.createdAt || now.toISOString(),
-                  lastLoginAt: now.toISOString(),
-                };
-                
-                await setDoc(userDocRef, userProfile);
-                if (matchedDoc.id !== firebaseUser.uid) {
-                  await deleteDoc(doc(db, 'users', matchedDoc.id));
-                  // Synchronize employee_master record if exists
-                  try {
-                    const oldMasterRef = doc(db, 'employee_master', matchedDoc.id);
-                    const oldMasterSnap = await getDoc(oldMasterRef);
-                    if (oldMasterSnap.exists()) {
-                      const oldMasterData = oldMasterSnap.data();
-                      await setDoc(doc(db, 'employee_master', firebaseUser.uid), {
-                        ...oldMasterData,
-                        lastUpdated: new Date().toISOString()
-                      }, { merge: true });
-                      await deleteDoc(oldMasterRef);
-                      console.log(`Migrated employee_master record for ${firebaseUser.email} from ${matchedDoc.id} to ${firebaseUser.uid}`);
-                    }
-                  } catch (err) {
-                    console.error('Error during employee_master migration in App.tsx:', err);
-                  }
+                const idToken = await firebaseUser.getIdToken(true);
+                const response = await fetch('/api/link-user-profile', {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${idToken}`
+                  },
+                  body: JSON.stringify({ oldDocId: matchedDoc.id })
+                });
+
+                if (!response.ok) {
+                  throw new Error(`Profile migration failed: ${await response.text()}`);
                 }
+
+                const resData = await response.json();
+                userProfile = resData.user;
+                console.log('Successfully completed server-side profile linking and migration.');
               } else {
                 console.log('No pre-provisioned profile, creating clean profile...');
                 const isEmail = firebaseUser.providerData.some(p => p.providerId === 'password');
@@ -282,7 +264,8 @@ export default function App() {
                   headers: {
                     'Content-Type': 'application/json',
                     'Authorization': `Bearer ${idToken}`,
-                  }
+                  },
+                  body: JSON.stringify({ role: userProfile.role })
                 });
                 const cType = claimResponse.headers.get('content-type');
                 if (claimResponse.ok && cType && cType.includes('application/json')) {
@@ -333,21 +316,17 @@ export default function App() {
 
       // Create database query promises
       let warningsQuery: any;
-      const { canEdit: checkEdit } = await getDoc(doc(db, 'role_permissions', user.role)).then(d => d.data() as any || {});
-      const hasManagementPrivilege = (role: string, module: string) => {
-          // This is a bit tricky inside the parent App component where we don't have the context yet easily
-          // But we can check the role_permissions document directly or use a helper.
-          // Since we want to remove hardcoded role names, we'll assume if they can EDIT, they are management.
-          return true; // Fallback for now, will refine
-      };
-
-      // Using a simpler check for now: if user is not an AGENT, they see more. 
-      // But we want to avoid hardcoded 'AGENT' too.
-      // Let's use a check for the 'canEdit' permission of the Warnings module.
+      const warningsDocId = `${user.role.toUpperCase()}_Warnings`;
+      const permissionsDoc = await getDoc(doc(db, 'role_permissions', warningsDocId));
+      let canSeeAllWarnings = false;
       
-      const permissionsDoc = await getDoc(doc(db, 'role_permissions', user.role));
-      const perms = permissionsDoc.data();
-      const canSeeAllWarnings = perms?.modules?.['Warnings']?.canEdit || perms?.modules?.['Warnings']?.canDelete || perms?.modules?.['Warnings']?.canApprove;
+      if (permissionsDoc.exists()) {
+        const perms = permissionsDoc.data();
+        canSeeAllWarnings = !!perms.can_view || !!perms.can_edit || !!perms.can_delete || !!perms.can_approve;
+      } else {
+        // Fallback standard roles
+        canSeeAllWarnings = ['ADMIN', 'MANAGER', 'ASSISTANT_MANAGER', 'QA', 'TEAM_LEAD', 'STL', 'OPS_TL'].includes(user.role.toUpperCase());
+      }
 
       if (canSeeAllWarnings) {
         warningsQuery = query(collection(db, 'disciplinaryLogs'), orderBy('createdAt', 'desc'), limit(25));
@@ -403,6 +382,8 @@ export default function App() {
     const unsubscribe = onSnapshot(masterQuery, (snapshot) => {
       const usersList = snapshot.docs.map(doc => {
         const data = doc.data() as any;
+        const normalizedTLId = data.teamLeadUid || data.teamLeadId || '';
+        const normalizedManagerId = data.mappedManagerUid || data.mappedManagerId || data.managerId || '';
         return {
           uid: doc.id,
           ...data,
@@ -410,7 +391,12 @@ export default function App() {
           name: data.fullName || data.name || data.employeeName || '',
           fullName: data.fullName || data.name || data.employeeName || '',
           role: (data.role || UserRole.AGENT).toUpperCase(),
-          status: data.status || 'Active'
+          status: data.status || 'Active',
+          teamLeadId: normalizedTLId,
+          teamLeadUid: normalizedTLId,
+          managerId: normalizedManagerId,
+          mappedManagerId: normalizedManagerId,
+          mappedManagerUid: normalizedManagerId
         } as UserProfile;
       });
       setAllUsers(usersList);

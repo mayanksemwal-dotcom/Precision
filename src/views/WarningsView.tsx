@@ -369,7 +369,7 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
                     const targetUser = allUsers.find(u => u.uid === ticket.agentId);
                     const agentDisplayName = targetUser?.fullName || targetUser?.name || ticket.agentName || 'Corporate Agent';
                     const agentDisplayEmail = targetUser?.email || ticket.agentEmail || 'agent@workforce.co';
-                    const agentDisplayEmpId = targetUser?.uid ? `EMP-2026-${targetUser.uid.substring(0, 4).toUpperCase()}` : (ticket.employeeId || 'EMP-360');
+                    const agentDisplayEmpId = targetUser?.employeeId || ticket.employeeId || (targetUser?.uid ? `EMP-2026-${targetUser.uid.substring(0, 4).toUpperCase()}` : 'N/A');
 
                     return (
                       <TableRow key={ticket.id} className="hover:bg-slate-50/50 dark:hover:bg-slate-800/50 border-slate-100 dark:border-slate-800 group transition-colors">

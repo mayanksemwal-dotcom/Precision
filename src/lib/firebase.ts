@@ -26,6 +26,8 @@ export const db = (firebaseConfig as any).firestoreDatabaseId
   : getFirestore(app);
 
 const googleProvider = new GoogleAuthProvider();
+googleProvider.addScope('https://www.googleapis.com/auth/gmail.send');
+googleProvider.addScope('https://www.googleapis.com/auth/gmail.readonly');
 
 const workspaceProvider = new GoogleAuthProvider();
 workspaceProvider.addScope('https://www.googleapis.com/auth/spreadsheets');
@@ -41,7 +43,13 @@ export const getGoogleAccessToken = () => cachedAccessToken;
 export const setGoogleAccessToken = (token: string | null) => { cachedAccessToken = token; };
 
 export const loginWithGoogle = async () => {
-  return await signInWithPopup(auth, googleProvider);
+  const result = await signInWithPopup(auth, googleProvider);
+  const credential = GoogleAuthProvider.credentialFromResult(result);
+  if (credential?.accessToken) {
+    cachedAccessToken = credential.accessToken;
+    console.log('Successfully cached Google OAuth access token during google sign-in.');
+  }
+  return result;
 };
 
 export const authorizeWorkspaceGoogle = async () => {

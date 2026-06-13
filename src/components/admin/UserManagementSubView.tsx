@@ -24,8 +24,16 @@ import { toast } from 'sonner';
 import * as XLSX from 'xlsx';
 import { UserPicker } from '../UserPicker';
 
-// Robust CSV Line parser helper that supports double quotes containing commas
+// Robust CSV Line parser helper that supports dynamic separators and double quotes containing commas/delimiters
 export function parseCSVLine(line: string): string[] {
+  // Auto-detect delimiter for this specific line
+  let delimiter = ',';
+  if (line.includes('\t')) {
+    delimiter = '\t';
+  } else if (!line.includes(',') && line.includes(';')) {
+    delimiter = ';';
+  }
+
   const result: string[] = [];
   let current = '';
   let inQuotes = false;
@@ -33,7 +41,7 @@ export function parseCSVLine(line: string): string[] {
     const char = line[i];
     if (char === '"') {
       inQuotes = !inQuotes;
-    } else if (char === ',' && !inQuotes) {
+    } else if (char === delimiter && !inQuotes) {
       let val = current.trim();
       if (val.startsWith('"') && val.endsWith('"')) {
         val = val.slice(1, -1);
@@ -50,6 +58,238 @@ export function parseCSVLine(line: string): string[] {
   }
   result.push(val);
   return result;
+}
+
+// Full bulk text parser supporting flexible header matching, smart heuristics and format diagnostics
+export function parseBulkCSVText(text: string): { 
+  users: any[]; 
+  errors: { lineNum: number; text: string; type: 'error' | 'warning'; message: string }[];
+} {
+  const users: any[] = [];
+  const errors: { lineNum: number; text: string; type: 'error' | 'warning'; message: string }[] = [];
+  const validRoles = ['ADMIN', 'MANAGER', 'ASSISTANT_MANAGER', 'TEAM_LEAD', 'SME', 'TRAINER', 'QA', 'AGENT'];
+
+  if (!text || !text.trim()) {
+    return { users, errors };
+  }
+
+  const lines = text.split(/\r?\n/);
+  if (lines.length === 0) {
+    return { users, errors };
+  }
+
+  // Detect delimiter based on sample lines
+  let commaCount = 0;
+  let tabCount = 0;
+  let semiCount = 0;
+  const sampleLines = lines.slice(0, 5).filter(l => l.trim());
+  for (const line of sampleLines) {
+    commaCount += (line.match(/,/g) || []).length;
+    tabCount += (line.match(/\t/g) || []).length;
+    semiCount += (line.match(/;/g) || []).length;
+  }
+
+  let delimiter = ',';
+  if (tabCount > commaCount && tabCount > semiCount) {
+    delimiter = '\t';
+  } else if (semiCount > commaCount && semiCount > tabCount) {
+    delimiter = ';';
+  }
+
+  const parseLineFields = (line: string): string[] => {
+    const result: string[] = [];
+    let current = '';
+    let inQuotes = false;
+    for (let i = 0; i < line.length; i++) {
+      const char = line[i];
+      if (char === '"') {
+        inQuotes = !inQuotes;
+      } else if (char === delimiter && !inQuotes) {
+        let val = current.trim();
+        if (val.startsWith('"') && val.endsWith('"')) {
+          val = val.slice(1, -1);
+        }
+        result.push(val);
+        current = '';
+      } else {
+        current += char;
+      }
+    }
+    let val = current.trim();
+    if (val.startsWith('"') && val.endsWith('"')) {
+      val = val.slice(1, -1);
+    }
+    result.push(val);
+    return result;
+  };
+
+  const parsedLines = lines.map(line => {
+    let trimmed = line.trim();
+    if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
+      const normalFields = parseLineFields(trimmed);
+      if (normalFields.length === 1 && normalFields[0].includes(delimiter)) {
+        trimmed = trimmed.slice(1, -1).trim();
+      }
+    }
+    return trimmed;
+  });
+
+  const firstLineFields = parseLineFields(parsedLines[0] || '');
+  const hasEmailHeader = firstLineFields.some(f => f.toLowerCase().includes('email') || f.toLowerCase().includes('mail'));
+  const hasNameHeader = firstLineFields.some(f => f.toLowerCase().includes('name'));
+
+  let emailIdx = -1;
+  let nameIdx = -1;
+  let empIdIdx = -1;
+  let roleIdx = -1;
+  let deptIdx = -1;
+  let processIdx = -1;
+  let dateJoinedIdx = -1;
+  let notesIdx = -1;
+  let teamLeadIdx = -1;
+  let managerIdx = -1;
+
+  let startIndex = 0;
+
+  if (hasEmailHeader || hasNameHeader) {
+    startIndex = 1;
+    firstLineFields.forEach((field, idx) => {
+      const lower = field.toLowerCase().trim();
+      if (lower.includes('email') || lower.includes('mail')) {
+        emailIdx = idx;
+      } else if ((lower.includes('team lead') || lower.includes('teamlead') || lower.includes('lead') || lower.includes('tl')) && !lower.includes('manager')) {
+        teamLeadIdx = idx;
+      } else if (lower.includes('manager') || lower.includes('mgr')) {
+        managerIdx = idx;
+      } else if (lower.includes('name')) {
+        nameIdx = idx;
+      } else if (lower.includes('id') || lower.includes('empid') || lower.includes('number') || lower.includes('uid')) {
+        empIdIdx = idx;
+      } else if (lower.includes('role') || lower.includes('designation') || lower.includes('type')) {
+        roleIdx = idx;
+      } else if (lower.includes('dept') || lower.includes('department') || lower.includes('division')) {
+        deptIdx = idx;
+      } else if (lower.includes('process') || lower.includes('project') || lower.includes('queue')) {
+        processIdx = idx;
+      } else if (lower.includes('date') || lower.includes('join') || lower.includes('hired') || lower.includes('doj') || lower.includes('d.o.j') || lower.includes('joining')) {
+        dateJoinedIdx = idx;
+      } else if (lower.includes('note') || lower.includes('comment') || lower.includes('desc')) {
+        notesIdx = idx;
+      }
+    });
+  }
+
+  // Fallbacks if not detected or header is completely missing
+  if (emailIdx === -1) emailIdx = 2;
+  if (nameIdx === -1) nameIdx = 1;
+  if (empIdIdx === -1) empIdIdx = 0;
+  if (roleIdx === -1) roleIdx = 3;
+  if (deptIdx === -1) deptIdx = 4;
+  if (processIdx === -1) processIdx = 5;
+  if (dateJoinedIdx === -1) dateJoinedIdx = 6;
+  if (notesIdx === -1) notesIdx = 7;
+  if (teamLeadIdx === -1) teamLeadIdx = 8;
+  if (managerIdx === -1) managerIdx = 9;
+
+  for (let i = startIndex; i < parsedLines.length; i++) {
+    const line = parsedLines[i];
+    if (!line.trim()) continue;
+
+    const fields = parseLineFields(line);
+    const lineNum = i + 1;
+
+    const getField = (idx: number, def: string = ''): string => {
+      if (idx >= 0 && idx < fields.length) {
+        return fields[idx].trim();
+      }
+      return def;
+    };
+
+    let email = getField(emailIdx);
+    let name = getField(nameIdx);
+    const empId = getField(empIdIdx);
+    const roleStr = getField(roleIdx);
+    const dept = getField(deptIdx);
+    const processStr = getField(processIdx);
+    const joinDate = getField(dateJoinedIdx);
+    const notesStr = getField(notesIdx);
+    const teamLeadRaw = getField(teamLeadIdx);
+    const mngrRaw = getField(managerIdx);
+
+    // Heuristics: if email column contains no @, try to find one in the row
+    if (!email || !email.includes('@')) {
+      const emailRegex = /[^\s@]+@[^\s@]+\.[^\s@]+/;
+      const idx = fields.findIndex(f => emailRegex.test(f));
+      if (idx !== -1) {
+        email = fields[idx].trim();
+        if (!name) {
+          const nameFieldIdx = fields.findIndex((f, fIdx) => fIdx !== idx && f.trim().length > 1 && isNaN(Number(f)));
+          if (nameFieldIdx !== -1) {
+            name = fields[nameFieldIdx].trim();
+          }
+        }
+      }
+    }
+
+    if (!email && !name) continue;
+    if (email.toLowerCase() === 'email' && name.toLowerCase() === 'name') continue;
+
+    if (!name) {
+      errors.push({
+        lineNum,
+        text: line,
+        type: 'error',
+        message: 'Name is missing'
+      });
+      continue;
+    }
+
+    if (!email) {
+      errors.push({
+        lineNum,
+        text: line,
+        type: 'error',
+        message: 'Email address is missing'
+      });
+      continue;
+    }
+
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      errors.push({
+        lineNum,
+        text: line,
+        type: 'error',
+        message: `Invalid email address format: "${email}"`
+      });
+      continue;
+    }
+
+    users.push({
+      employeeId: empId,
+      name: name,
+      email: email.toLowerCase(),
+      role: roleStr,
+      department: dept,
+      process: processStr,
+      dateJoined: joinDate,
+      notes: notesStr,
+      teamLeadRawText: teamLeadRaw,
+      managerRawText: mngrRaw,
+      password: 'Password360@'
+    });
+
+    if (roleStr && !validRoles.includes(roleStr.toUpperCase())) {
+      errors.push({
+        lineNum,
+        text: line,
+        type: 'warning',
+        message: `Unknown Role: "${roleStr}". Defaults to AGENT.`
+      });
+    }
+  }
+
+  return { users, errors };
 }
 
 interface UserManagementSubViewProps {
@@ -98,64 +338,7 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
       setCsvErrors([]);
       return;
     }
-    const lines = bulkText.split('\n');
-    const errors: { lineNum: number; text: string; type: 'error' | 'warning'; message: string }[] = [];
-    const validRoles = ['ADMIN', 'MANAGER', 'ASSISTANT_MANAGER', 'TEAM_LEAD', 'SME', 'TRAINER', 'QA', 'AGENT'];
-    
-    let index = 0;
-    for (let line of lines) {
-      index++;
-      if (!line.trim()) continue;
-      
-      const fields = parseCSVLine(line);
-      const [empId, name, email, roleStr] = fields.map(s => s?.trim() || '');
-      
-      // Skip header
-      if (email?.toLowerCase() === 'email' && name?.toLowerCase() === 'name') {
-        continue;
-      }
-
-      if (!name && !email) continue; 
-
-      if (!name) {
-        errors.push({
-          lineNum: index,
-          text: line,
-          type: 'error',
-          message: 'Missing Name value'
-        });
-        continue;
-      }
-
-      if (!email) {
-        errors.push({
-          lineNum: index,
-          text: line,
-          type: 'error',
-          message: 'Missing Email address'
-        });
-        continue;
-      }
-
-      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-      if (!emailRegex.test(email)) {
-        errors.push({
-          lineNum: index,
-          text: line,
-          type: 'error',
-          message: `Invalid email format: "${email}"`
-        });
-      }
-
-      if (roleStr && !validRoles.includes(roleStr.toUpperCase())) {
-        errors.push({
-          lineNum: index,
-          type: 'warning',
-          text: line,
-          message: `Unknown role: "${roleStr}". Will default to AGENT. Valid roles: ${validRoles.join(', ')}`
-        });
-      }
-    }
+    const { errors } = parseBulkCSVText(bulkText);
     setCsvErrors(errors);
   }, [bulkText]);
 
@@ -451,9 +634,9 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
     }
 
     try {
-      // 1. Provision via custom server Auth creation
+      // 1. Create or retrieve the User in Firebase Authentication via server API
       const currentUser = auth.currentUser;
-      const idToken = currentUser ? await currentUser.getIdToken() : '';
+      const idToken = currentUser ? await currentUser.getIdToken(true) : '';
 
       const response = await fetch('/api/create-user', {
         method: 'POST',
@@ -475,9 +658,16 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
       }
 
       const resData = await response.json();
-      const generatedUid = resData.user.uid;
+      let generatedUid = resData.user.uid;
 
-      // 2. Client write for advanced attributes (Employee ID, etc.)
+      // Prevent duplicate profiles! Check if there is an existing user in allUsers with this exact email,
+      // and if so, reuse their UID so we merge and overwrite their settings in-place.
+      const existingUser = allUsers.find((u: any) => (u.email || '').toLowerCase().trim() === newForm.email.toLowerCase().trim());
+      if (existingUser && existingUser.uid) {
+        generatedUid = existingUser.uid;
+      }
+
+      // 2. Perform client-side database writes which have 100% working permissions
       const finalProfile = {
         uid: generatedUid,
         email: newForm.email.toLowerCase().trim(),
@@ -517,7 +707,7 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
       };
       await setDoc(doc(db, 'employee_master', generatedUid), masterDoc);
 
-      // 4. Sync Team Mapping (Ongoing Auto-Sync)
+      // 4. Sync Team Mapping
       const mappingDoc = {
         userId: generatedUid,
         userName: newForm.name,
@@ -655,36 +845,12 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
       return;
     }
 
-    const hasErrors = csvErrors.some(err => err.type === 'error');
+    const { users: usersToCreate, errors } = parseBulkCSVText(bulkText);
+
+    const hasErrors = errors.some(err => err.type === 'error');
     if (hasErrors) {
       toast.error('Please fix the syntax errors in your CSV before importing.');
       return;
-    }
-
-    const lines = bulkText.split('\n');
-    const usersToCreate = [];
-    
-    // Validate first
-    for (let line of lines) {
-      if (!line.trim()) continue;
-      const fields = parseCSVLine(line);
-      const [empId, name, email, roleStr, dept, processStr, joinDate, notesStr] = fields.map(s => s?.trim() || '');
-      if (!email || !name) continue;
-      
-      const parsedEmail = email.toLowerCase();
-      if (parsedEmail === 'email') continue;
-
-      usersToCreate.push({
-        employeeId: empId,
-        name: name,
-        email: parsedEmail,
-        role: roleStr,
-        department: dept,
-        process: processStr,
-        dateJoined: joinDate,
-        notes: notesStr,
-        password: 'Password360@'
-      });
     }
 
     if (usersToCreate.length === 0) {
@@ -694,7 +860,7 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
 
     try {
       const currentUser = auth.currentUser;
-      const idToken = currentUser ? await currentUser.getIdToken() : '';
+      const idToken = currentUser ? await currentUser.getIdToken(true) : '';
       
       const response = await fetch('/api/bulk-create-users', {
         method: 'POST',
@@ -706,20 +872,156 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
       });
 
       if (!response.ok) {
-        const errObj = await response.json();
-        throw new Error(errObj.error || 'Server rejected bulk user creation.');
+        let errMsg = 'Server rejected bulk user creation.';
+        try {
+          const errObj = await response.json();
+          errMsg = errObj.error || errMsg;
+        } catch (jsonErr) {}
+        throw new Error(errMsg);
       }
 
       const resData = await response.json();
+      
+      // Perform batch writes natively in the browser which has full authorized credentials!
+      const totalUsers = resData.createdUsers || [];
+      const batchChunksSize = 50; // 50 users = 150 operations, well within Firestore limits of 500
+
+      // Helper function to resolve Team Lead or Manager by raw text (Name, Email, or EmployeeID)
+      const resolveUserRef = (rawText: string) => {
+        if (!rawText) return null;
+        const searchStr = rawText.trim().toLowerCase();
+        if (!searchStr) return null;
+
+        // 1. Search in newly created/updated users list
+        const foundNew = totalUsers.find((t: any) => {
+          const tEmail = (t.email || '').toLowerCase().trim();
+          const tName = (t.profile?.name || t.profile?.fullName || '').toLowerCase().trim();
+          const tEmpId = (t.profile?.employeeId || '').toLowerCase().trim();
+          return tEmail === searchStr || tName === searchStr || tEmpId === searchStr;
+        });
+        if (foundNew) {
+          return {
+            uid: foundNew.uid,
+            name: foundNew.profile?.name || foundNew.profile?.fullName || foundNew.email.split('@')[0]
+          };
+        }
+
+        // 2. Search in allUsers (the master user list that we sync from Firestore)
+        const foundExisting = allUsers.find((u: any) => {
+          const uEmail = (u.email || '').toLowerCase().trim();
+          const uName = (u.name || u.fullName || '').toLowerCase().trim();
+          const uEmpId = (u.employeeId || '').toLowerCase().trim();
+          return uEmail === searchStr || uName === searchStr || uEmpId === searchStr;
+        });
+        if (foundExisting) {
+          return {
+            uid: foundExisting.uid,
+            name: foundExisting.name || foundExisting.fullName || foundExisting.email.split('@')[0]
+          };
+        }
+
+        // 3. Fallback to partial name match in allUsers if exact match was not found
+        const partialExisting = allUsers.find((u: any) => {
+          const uName = (u.name || u.fullName || '').toLowerCase().trim();
+          return uName.includes(searchStr) || searchStr.includes(uName);
+        });
+        if (partialExisting) {
+          return {
+            uid: partialExisting.uid,
+            name: partialExisting.name || partialExisting.fullName || partialExisting.email.split('@')[0]
+          };
+        }
+
+        return null;
+      };
+
+      for (let i = 0; i < totalUsers.length; i += batchChunksSize) {
+        const chunk = totalUsers.slice(i, i + batchChunksSize);
+        const batch = writeBatch(db);
+
+        chunk.forEach((item: any) => {
+          let { uid, email } = item;
+          if (!uid) return;
+          
+          const emailLower = (email || '').toLowerCase().trim();
+          
+          // Match the original fully-parsed row from the client data
+          const orig = usersToCreate.find((u: any) => (u.email || '').toLowerCase().trim() === emailLower) || {};
+          
+          // CRITICAL: Prevent duplicate profiles! If there is an existing user in allUsers with this exact email,
+          // prioritize using their existing UID so we don't spawn a duplicate document in Firestore under a local ID.
+          const existingUser = allUsers.find((u: any) => (u.email || '').toLowerCase().trim() === emailLower);
+          if (existingUser && existingUser.uid) {
+            uid = existingUser.uid;
+          }
+
+          const resolvedTL = resolveUserRef(orig.teamLeadRawText);
+          const resolvedMgr = resolveUserRef(orig.managerRawText);
+          
+          const finalProfile = {
+            uid: uid,
+            email: email,
+            role: orig.role || existingUser?.role || 'AGENT',
+            fullName: orig.name || existingUser?.fullName || existingUser?.name || '',
+            name: orig.name || existingUser?.name || existingUser?.fullName || '',
+            employeeId: orig.employeeId || existingUser?.employeeId || '',
+            department: orig.department || existingUser?.department || 'Operations',
+            process: orig.process || existingUser?.process || '',
+            dateJoined: orig.dateJoined || existingUser?.dateJoined || '',
+            notes: orig.notes || existingUser?.notes || '',
+            createdAt: existingUser?.createdAt || new Date().toISOString(),
+            status: existingUser?.status || 'Active',
+            isActive: existingUser ? (existingUser.isActive !== undefined ? existingUser.isActive : (existingUser.status?.toLowerCase() === 'active')) : true,
+            teamLeadId: resolvedTL?.uid || existingUser?.teamLeadId || '',
+            teamLeadName: resolvedTL?.name || orig.teamLeadRawText || existingUser?.teamLeadName || '',
+            mappedManagerId: resolvedMgr?.uid || existingUser?.mappedManagerId || '',
+            mappedManagerName: resolvedMgr?.name || orig.managerRawText || existingUser?.mappedManagerName || ''
+          };
+
+          const masterDoc = {
+            employeeId: orig.employeeId || existingUser?.employeeId || '',
+            employeeName: orig.name || existingUser?.fullName || existingUser?.name || '',
+            email: email,
+            role: orig.role || existingUser?.role || 'AGENT',
+            department: orig.department || existingUser?.department || 'Operations',
+            process: orig.process || existingUser?.process || '',
+            teamLeadId: resolvedTL?.uid || existingUser?.teamLeadId || '',
+            teamLeadName: resolvedTL?.name || orig.teamLeadRawText || existingUser?.teamLeadName || '',
+            managerId: resolvedMgr?.uid || existingUser?.mappedManagerId || '',
+            managerName: resolvedMgr?.name || orig.managerRawText || existingUser?.mappedManagerName || '',
+            status: existingUser?.status || 'Active',
+            dateJoined: orig.dateJoined || existingUser?.dateJoined || '',
+            lastUpdated: new Date().toISOString()
+          };
+
+          const mappingDoc = {
+            userId: uid,
+            userName: orig.name || existingUser?.fullName || existingUser?.name || '',
+            teamLeadId: resolvedTL?.uid || existingUser?.teamLeadId || '',
+            teamLeadName: resolvedTL?.name || orig.teamLeadRawText || existingUser?.teamLeadName || '',
+            managerId: resolvedMgr?.uid || existingUser?.mappedManagerId || '',
+            managerName: resolvedMgr?.name || orig.managerRawText || existingUser?.mappedManagerName || '',
+            process: orig.process || existingUser?.process || '',
+            lastUpdated: new Date().toISOString()
+          };
+
+          batch.set(doc(db, 'users', uid), finalProfile, { merge: true });
+          batch.set(doc(db, 'employee_master', uid), masterDoc, { merge: true });
+          batch.set(doc(db, 'teamMappings', uid), mappingDoc, { merge: true });
+        });
+
+        await batch.commit();
+        console.log(`[CLIENT ROSTER BATCH] Committed user profiles block: ${i} to ${Math.min(i + batchChunksSize, totalUsers.length)}`);
+      }
       
       if (resData.errors && resData.errors.length > 0) {
         console.error('Bulk upload had some errors:', resData.errors);
         toast.warning(`Uploaded with ${resData.errors.length} errors. Check console.`);
       } else {
-        toast.success(`Successfully updated/initialized ${resData.createdUsers?.length || 0} user profiles.`);
+        toast.success(`Successfully updated/initialized ${totalUsers.length} user profiles.`);
       }
 
-      logAdminEvent('CSV Roster Upload', `${resData.createdUsers?.length || 0} batch entries`, 'Blank', 'Roster update/creation sync');
+      logAdminEvent('CSV Roster Upload', `${totalUsers.length} batch entries`, 'Blank', 'Roster update/creation sync');
       setIsBulkOpen(false);
       setBulkText('');
       onRefresh();
@@ -1483,7 +1785,7 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
             <p className="text-[11px] text-slate-400 mb-3 leading-relaxed">
               Standard format schema template (values enclosed in quotes if they contain commas): <br />
               <strong className="font-mono bg-slate-100 dark:bg-slate-900/60 p-1 rounded inline-block mt-1 text-indigo-400 select-all">
-                EmployeeID, Name, Email, Role, Department, Process, DateJoined, Notes
+                EmployeeID, Name, Email, Role, Department, Process, DateJoined, Notes, TeamLead, Manager
               </strong>
             </p>
 
@@ -1534,7 +1836,7 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
               rows={6}
               value={bulkText}
               onChange={e => setBulkText(e.target.value)}
-              placeholder="e.g.&#10;BT-901,Akshit Sodhi,akshit@bergtechnologies.co.in,QA,Operations,Vertical Core,2026-01-08,Senior Assessor"
+              placeholder="e.g.&#10;BT-901,Akshit Sodhi,akshit@bergtechnologies.co.in,QA,Operations,Vertical Core,2026-01-08,Senior Assessor,Mayank Semwal,John Doe"
               className={`w-full text-xs p-3 font-mono border rounded-xl focus:outline-none focus:ring-1 focus:ring-indigo-500 mb-4 ${adminTheme === 'dark' ? 'bg-slate-900 border-slate-700 text-slate-100' : 'bg-slate-50 text-slate-800'}`}
             />
 

@@ -188,10 +188,10 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
     const isManagerOrAdmin = ['ADMIN', 'MANAGER'].includes(roleNormalized);
     const isTeamLeadOrSupervisor = ['TEAM_LEAD', 'STL', 'QTL', 'OPS_TL', 'TRAINER_TL'].includes(roleNormalized);
     
-    // Status normalization
+    // Status normalization (only filter out deactivated/inactive accounts, so offline agents show up in roster)
     const isActive = (u: UserProfile) => {
       const s = (u.status || '').toLowerCase();
-      return s === 'active' || s === 'online' || s === 'break' || s === '';
+      return s !== 'inactive';
     };
 
     if (isManagerOrAdmin) {
@@ -608,6 +608,31 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
         if (shiftFilter === 'active' && (!liveShift || liveShift.status !== 'ACTIVE')) return false;
         if (shiftFilter === 'break' && (!liveShift || liveShift.status !== 'BREAK')) return false;
         if (shiftFilter === 'offline' && liveShift) return false;
+        if (shiftFilter === 'lunch') {
+          if (!liveShift || liveShift.status !== 'BREAK') return false;
+          const shActs = liveShift.activities || [];
+          const lastActivity = shActs.length > 0 ? shActs[shActs.length - 1]?.name || '' : '';
+          if (!lastActivity.toLowerCase().includes('lunch')) return false;
+        }
+        if (shiftFilter === 'meeting') {
+          if (!liveShift || liveShift.status !== 'BREAK') return false;
+          const shActs = liveShift.activities || [];
+          const lastActivity = shActs.length > 0 ? shActs[shActs.length - 1]?.name || '' : '';
+          const isMeet = lastActivity.toLowerCase().includes('meeting') || 
+                         lastActivity.toLowerCase().includes('coaching') || 
+                         lastActivity.toLowerCase().includes('alignment');
+          if (!isMeet) return false;
+        }
+        if (shiftFilter === 'break_tea') {
+          if (!liveShift || liveShift.status !== 'BREAK') return false;
+          const shActs = liveShift.activities || [];
+          const lastActivity = shActs.length > 0 ? shActs[shActs.length - 1]?.name || '' : '';
+          const isLunchOrMeet = lastActivity.toLowerCase().includes('lunch') || 
+                                lastActivity.toLowerCase().includes('meeting') || 
+                                lastActivity.toLowerCase().includes('coaching') || 
+                                lastActivity.toLowerCase().includes('alignment');
+          if (isLunchOrMeet) return false;
+        }
       }
 
       // Process filters
@@ -1047,6 +1072,14 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
     toast.info(`Focused view onto matching profile: ${targetName}`);
   };
 
+  // Helper navigate to workforce controls using a custom state distribution filter
+  const handleDistributionClick = (filterVal: string, filterLabel: string) => {
+    setShiftFilter(filterVal);
+    setActiveTab('controls');
+    setCurrentPage(1);
+    toast.info(`Filtering user management view for matching state: ${filterLabel}`);
+  };
+
   return (
     <div className="space-y-6">
       
@@ -1224,41 +1257,87 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
         </div>
       </div>
 
+      {/* ONBOARDING USER GUIDE BAR */}
+      <div className="bg-indigo-50/40 dark:bg-slate-900/60 border border-indigo-100/40 dark:border-slate-800 rounded-xl p-3 flex flex-col md:flex-row items-start md:items-center justify-between gap-3 text-xs">
+        <div className="flex items-center gap-2">
+          <span className="flex h-2 w-2 relative">
+            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-indigo-400 opacity-75"></span>
+            <span className="relative inline-flex rounded-full h-2 w-2 bg-indigo-500"></span>
+          </span>
+          <span className="font-semibold text-slate-600 dark:text-slate-300">
+            💡 <strong className="text-indigo-600 dark:text-indigo-400">First-Time User Tip:</strong> Toggle dashboards by clicking any menu option below.
+          </span>
+        </div>
+        <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] font-bold text-slate-500">
+          <span>📊 <strong>Monitoring</strong>: Real-time Distribution</span>
+          <span>⚙️ <strong>Controls</strong>: Agent Shift Operations</span>
+          <span>⚠️ <strong>Audit</strong>: Late & Break Exceptions</span>
+        </div>
+      </div>
+
       {/* DASHBOARD TABS */}
-      <div className="flex gap-2 border-b border-slate-200 dark:border-slate-800 pb-1 overflow-x-auto scrollbar-none">
+      <div className="flex gap-3 border-b border-slate-200 dark:border-slate-800 pb-2 overflow-x-auto scrollbar-none">
         <button 
           onClick={() => setActiveTab('monitoring')}
-          className={`flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-black transition-all cursor-pointer ${activeTab === 'monitoring' ? 'bg-indigo-50 dark:bg-indigo-900/20 text-indigo-600 dark:text-indigo-400 border border-indigo-100 dark:border-indigo-800' : 'text-slate-500 dark:text-slate-400 hover:text-slate-800 dark:hover:text-slate-200'}`}
+          className={`flex flex-col items-start gap-1 px-5 py-3 rounded-xl text-left transition-all cursor-pointer border shadow-sm select-none ${
+            activeTab === 'monitoring' 
+              ? 'bg-indigo-600 border-indigo-600 text-white dark:bg-indigo-600 dark:border-indigo-600' 
+              : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50 hover:border-slate-300 dark:bg-slate-900 dark:border-slate-800 dark:text-slate-300 dark:hover:bg-slate-850'
+          }`}
         >
-          <Activity size={14} />
-          Workforce Monitoring
+          <div className="flex items-center gap-1.5 font-black text-xs">
+            <Activity size={14} className={activeTab === 'monitoring' ? 'text-white' : 'text-indigo-600'} />
+            Workforce Monitoring
+          </div>
+          <span className={`text-[10px] font-medium ${activeTab === 'monitoring' ? 'text-indigo-100' : 'text-slate-500 dark:text-slate-400'}`}>Live dashboard & statistics</span>
         </button>
         <button 
           onClick={() => setActiveTab('controls')}
-          className={`flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-black transition-all cursor-pointer ${activeTab === 'controls' ? 'bg-indigo-50 dark:bg-indigo-900/20 text-indigo-600 dark:text-indigo-400 border border-indigo-100 dark:border-indigo-800' : 'text-slate-500 dark:text-slate-400 hover:text-slate-800 dark:hover:text-slate-200'}`}
+          className={`flex flex-col items-start gap-1 px-5 py-3 rounded-xl text-left transition-all cursor-pointer border shadow-sm select-none ${
+            activeTab === 'controls' 
+              ? 'bg-indigo-600 border-indigo-600 text-white dark:bg-indigo-600 dark:border-indigo-600' 
+              : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50 hover:border-slate-300 dark:bg-slate-900 dark:border-slate-800 dark:text-slate-300 dark:hover:bg-slate-850'
+          }`}
         >
-          <Users size={14} />
-          Workforce Controls
+          <div className="flex items-center gap-1.5 font-black text-xs">
+            <Users size={14} className={activeTab === 'controls' ? 'text-white' : 'text-indigo-600'} />
+            Workforce Controls
+          </div>
+          <span className={`text-[10px] font-medium ${activeTab === 'controls' ? 'text-indigo-100' : 'text-slate-500 dark:text-slate-400'}`}>Clock out, edit shift logs & filters</span>
         </button>
         <button 
           onClick={() => setActiveTab('exceptions')}
-          className={`flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-black transition-all cursor-pointer ${activeTab === 'exceptions' ? 'bg-rose-50 dark:bg-rose-900/20 text-rose-600 dark:text-rose-400 border border-rose-100 dark:border-rose-800' : 'text-slate-500 dark:text-slate-400 hover:text-slate-800 dark:hover:text-slate-200'}`}
+          className={`flex flex-col items-start gap-1 px-5 py-3 rounded-xl text-left transition-all cursor-pointer border shadow-sm select-none ${
+            activeTab === 'exceptions' 
+              ? 'bg-rose-600 border-rose-600 text-white dark:bg-rose-600 dark:border-rose-600' 
+              : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50 hover:border-slate-300 dark:bg-slate-900 dark:border-slate-800 dark:text-slate-300 dark:hover:bg-slate-850'
+          }`}
         >
-          <AlertTriangle size={14} className="text-rose-500 animate-bounce-slow" />
-          Audit & Exceptions
-          {summaryData?.exceptionCounts && (Object.values(summaryData.exceptionCounts).reduce((a: any, b: any) => a + b, 0) as number) > 0 && (
-            <span className="bg-rose-600 text-white font-mono text-[9px] font-black rounded-full h-4.5 px-1.5 flex items-center justify-center animate-pulse">
-              {(Object.values(summaryData.exceptionCounts).reduce((a: any, b: any) => a + b, 0) as number)}
-            </span>
-          )}
+          <div className="flex items-center gap-1.5 font-black text-xs">
+            <AlertTriangle size={14} className={`${activeTab === 'exceptions' ? 'text-white' : 'text-rose-500'} ${activeTab !== 'exceptions' ? 'animate-bounce-slow' : ''}`} />
+            Audit & Exceptions
+            {summaryData?.exceptionCounts && (Object.values(summaryData.exceptionCounts).reduce((a: any, b: any) => a + b, 0) as number) > 0 && (
+              <span className={`font-mono text-[9px] font-black rounded-full h-4 px-1.5 flex items-center justify-center animate-pulse ${activeTab === 'exceptions' ? 'bg-white text-rose-600' : 'bg-rose-600 text-white'}`}>
+                {(Object.values(summaryData.exceptionCounts).reduce((a: any, b: any) => a + b, 0) as number)}
+              </span>
+            )}
+          </div>
+          <span className={`text-[10px] font-medium ${activeTab === 'exceptions' ? 'text-rose-100' : 'text-slate-500 dark:text-slate-400'}`}>Tardiness, unexcused breaks, anomalies</span>
         </button>
         {user.role === 'ADMIN' && (
           <button 
             onClick={() => setActiveTab('hierarchy')}
-            className={`flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-black transition-all cursor-pointer ${activeTab === 'hierarchy' ? 'bg-indigo-50 dark:bg-indigo-900/20 text-indigo-600 dark:text-indigo-400 border border-indigo-100 dark:border-indigo-800' : 'text-slate-500 dark:text-slate-400 hover:text-slate-800 dark:hover:text-slate-200'}`}
+            className={`flex flex-col items-start gap-1 px-5 py-3 rounded-xl text-left transition-all cursor-pointer border shadow-sm select-none ${
+              activeTab === 'hierarchy' 
+                ? 'bg-indigo-600 border-indigo-600 text-white dark:bg-indigo-600 dark:border-indigo-600' 
+                : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50 hover:border-slate-300 dark:bg-slate-900 dark:border-slate-800 dark:text-slate-300 dark:hover:bg-slate-850'
+            }`}
           >
-            <Shield size={14} />
-            Diagnostics
+            <div className="flex items-center gap-1.5 font-black text-xs">
+              <Shield size={14} className={activeTab === 'hierarchy' ? 'text-white' : 'text-indigo-650'} />
+              Diagnostics
+            </div>
+            <span className={`text-[10px] font-medium ${activeTab === 'hierarchy' ? 'text-indigo-100' : 'text-slate-500 dark:text-slate-400'}`}>Check database sync state</span>
           </button>
         )}
       </div>
@@ -1425,60 +1504,88 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
             
             {/* Live Distribution Board */}
             <div className="lg:col-span-4 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-5 shadow-sm space-y-4">
-              <h4 className="text-xs font-extrabold text-slate-800 dark:text-slate-200 uppercase tracking-widest flex items-center gap-1.5">
-                <Sparkles size={14} className="text-amber-500" /> Live Workforce Distribution
-              </h4>
+              <div>
+                <h4 className="text-xs font-extrabold text-slate-800 dark:text-slate-200 uppercase tracking-widest flex items-center gap-1.5">
+                  <Sparkles size={14} className="text-amber-500" /> Live Workforce Distribution
+                </h4>
+                <p className="text-[10px] text-slate-500 dark:text-slate-400 mt-1">💡 Click any category below to immediately filter matching agents inside Workforce Controls.</p>
+              </div>
               
-              <div className="space-y-3 pt-2">
-                <div>
+              <div className="space-y-1.5 pt-1">
+                <button
+                  type="button"
+                  onClick={() => handleDistributionClick('active', '🟢 Active Workflow')}
+                  className="group cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-800/40 p-2 rounded-xl transition-all border border-transparent hover:border-slate-100 dark:hover:border-slate-800/60 focus:outline-none w-full text-left"
+                >
                   <div className="flex justify-between text-xs font-bold text-slate-600 dark:text-slate-400 mb-1 leading-none">
-                    <span>Active Workflow</span>
-                    <span className="text-indigo-600 dark:text-indigo-400">{liveDistribution.active}</span>
+                    <span className="group-hover:text-indigo-600 dark:group-hover:text-indigo-400 font-black transition-colors">🟢 Active Workflow</span>
+                    <span className="text-indigo-600 dark:text-indigo-400 bg-indigo-50 dark:bg-indigo-950/40 px-1.5 py-0.5 rounded-md font-extrabold text-[10px]">{liveDistribution.active}</span>
                   </div>
                   <div className="w-full bg-slate-100 dark:bg-slate-800 h-2 rounded-full overflow-hidden">
-                    <div className="bg-indigo-600 dark:bg-indigo-500 h-full rounded-full" style={{ width: `${(liveDistribution.active / (liveStats.total || 1)) * 100}%` }} />
+                    <div className="bg-indigo-600 dark:bg-indigo-500 h-full rounded-full transition-all duration-300" style={{ width: `${(liveDistribution.active / (liveStats.total || 1)) * 100}%` }} />
                   </div>
-                </div>
+                  <span className="text-[9px] text-slate-400 group-hover:text-indigo-500 font-bold hidden group-block mt-1 leading-none transition-colors">Click to filter controls view &rarr;</span>
+                </button>
 
-                <div>
+                <button
+                  type="button"
+                  onClick={() => handleDistributionClick('break_tea', '☕ Tea / Short Break')}
+                  className="group cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-800/40 p-2 rounded-xl transition-all border border-transparent hover:border-slate-100 dark:hover:border-slate-800/60 focus:outline-none w-full text-left"
+                >
                   <div className="flex justify-between text-xs font-bold text-slate-600 dark:text-slate-400 mb-1 leading-none">
-                    <span>Break & Tea</span>
-                    <span className="text-amber-500">{liveDistribution.break}</span>
+                    <span className="group-hover:text-amber-500 font-black transition-colors">☕ Break & Tea</span>
+                    <span className="text-amber-500 bg-amber-50 dark:bg-amber-955/20 px-1.5 py-0.5 rounded-md font-extrabold text-[10px]">{liveDistribution.break}</span>
                   </div>
                   <div className="w-full bg-slate-100 dark:bg-slate-800 h-2 rounded-full overflow-hidden">
-                    <div className="bg-amber-500 h-full rounded-full" style={{ width: `${(liveDistribution.break / (liveStats.total || 1)) * 100}%` }} />
+                    <div className="bg-amber-500 h-full rounded-full transition-all duration-300" style={{ width: `${(liveDistribution.break / (liveStats.total || 1)) * 100}%` }} />
                   </div>
-                </div>
+                  <span className="text-[9px] text-slate-400 group-hover:text-amber-500 font-bold hidden group-block mt-1 leading-none transition-colors">Click to filter controls view &rarr;</span>
+                </button>
 
-                <div>
+                <button
+                  type="button"
+                  onClick={() => handleDistributionClick('lunch', '🍱 Lunch Interval')}
+                  className="group cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-800/40 p-2 rounded-xl transition-all border border-transparent hover:border-slate-100 dark:hover:border-slate-800/60 focus:outline-none w-full text-left"
+                >
                   <div className="flex justify-between text-xs font-bold text-slate-600 dark:text-slate-400 mb-1 leading-none">
-                    <span>Lunch Interval</span>
-                    <span className="text-[#D97706]">{liveDistribution.lunch}</span>
+                    <span className="group-hover:text-orange-600 dark:group-hover:text-orange-400 font-black transition-colors">🍱 Lunch Interval</span>
+                    <span className="text-[#D97706] bg-amber-50 dark:bg-amber-955/20 px-1.5 py-0.5 rounded-md font-extrabold text-[10px]">{liveDistribution.lunch}</span>
                   </div>
                   <div className="w-full bg-slate-100 dark:bg-slate-800 h-2 rounded-full overflow-hidden">
-                    <div className="bg-[#D97706] h-full rounded-full" style={{ width: `${(liveDistribution.lunch / (liveStats.total || 1)) * 100}%` }} />
+                    <div className="bg-[#D97706] h-full rounded-full transition-all duration-300" style={{ width: `${(liveDistribution.lunch / (liveStats.total || 1)) * 100}%` }} />
                   </div>
-                </div>
+                  <span className="text-[9px] text-slate-400 group-hover:text-orange-550 font-bold hidden group-block mt-1 leading-none transition-colors">Click to filter controls view &rarr;</span>
+                </button>
 
-                <div>
+                <button
+                  type="button"
+                  onClick={() => handleDistributionClick('meeting', '🤝 Meeting / Coaching')}
+                  className="group cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-800/40 p-2 rounded-xl transition-all border border-transparent hover:border-slate-100 dark:hover:border-slate-800/60 focus:outline-none w-full text-left"
+                >
                   <div className="flex justify-between text-xs font-bold text-slate-600 dark:text-slate-400 mb-1 leading-none">
-                    <span>Meeting / Coaching</span>
-                    <span className="text-purple-650">{liveDistribution.meeting}</span>
+                    <span className="group-hover:text-purple-600 dark:group-hover:text-purple-400 font-black transition-colors">🤝 Meeting / Coaching</span>
+                    <span className="text-purple-600 dark:text-purple-400 bg-purple-50 dark:bg-purple-950/20 px-1.5 py-0.5 rounded-md font-extrabold text-[10px]">{liveDistribution.meeting}</span>
                   </div>
                   <div className="w-full bg-slate-100 dark:bg-slate-800 h-2 rounded-full overflow-hidden">
-                    <div className="bg-purple-600 h-full rounded-full" style={{ width: `${(liveDistribution.meeting / (liveStats.total || 1)) * 100}%` }} />
+                    <div className="bg-purple-600 h-full rounded-full transition-all duration-300" style={{ width: `${(liveDistribution.meeting / (liveStats.total || 1)) * 100}%` }} />
                   </div>
-                </div>
+                  <span className="text-[9px] text-slate-400 group-hover:text-purple-500 font-bold hidden group-block mt-1 leading-none transition-colors">Click to filter controls view &rarr;</span>
+                </button>
 
-                <div>
+                <button
+                  type="button"
+                  onClick={() => handleDistributionClick('offline', '⚪ Offline Staff')}
+                  className="group cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-800/40 p-2 rounded-xl transition-all border border-transparent hover:border-slate-100 dark:hover:border-slate-800/60 focus:outline-none w-full text-left"
+                >
                   <div className="flex justify-between text-xs font-bold text-slate-600 dark:text-slate-400 mb-1 leading-none">
-                    <span>Offline / Off-Duty</span>
-                    <span className="text-slate-400">{liveDistribution.offline}</span>
+                    <span className="group-hover:text-slate-600 dark:group-hover:text-slate-300 font-black transition-colors">⚪ Offline / Off-Duty</span>
+                    <span className="text-slate-400 bg-slate-50 dark:bg-slate-900/50 px-1.5 py-0.5 rounded-md font-extrabold text-[10px]">{liveDistribution.offline}</span>
                   </div>
                   <div className="w-full bg-slate-100 dark:bg-slate-800 h-2 rounded-full overflow-hidden">
-                    <div className="bg-slate-300 dark:bg-slate-700 h-full rounded-full" style={{ width: `${(liveDistribution.offline / (liveStats.total || 1)) * 100}%` }} />
+                    <div className="bg-slate-300 dark:bg-slate-700 h-full rounded-full transition-all duration-300" style={{ width: `${(liveDistribution.offline / (liveStats.total || 1)) * 100}%` }} />
                   </div>
-                </div>
+                  <span className="text-[9px] text-slate-400 group-hover:text-slate-500 font-bold hidden group-block mt-1 leading-none transition-colors">Click to filter controls view &rarr;</span>
+                </button>
               </div>
             </div>
 
@@ -1566,7 +1673,10 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
                     <span className="truncate">
                       {shiftFilter === 'all' && "🟢 Status: All"}
                       {shiftFilter === 'active' && "🟢 Active Workflow"}
-                      {shiftFilter === 'break' && "🟠 Rest Breaks"}
+                      {shiftFilter === 'lunch' && "🍱 Lunch Interval"}
+                      {shiftFilter === 'meeting' && "🤝 Meeting / Coaching"}
+                      {shiftFilter === 'break_tea' && "☕ Tea / Short Break"}
+                      {shiftFilter === 'break' && "🟠 All Rest Breaks"}
                       {shiftFilter === 'offline' && "⚪ Offline Staff"}
                     </span>
                     <span className="text-slate-400 text-[10px]">▼</span>
@@ -1577,7 +1687,10 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
                       {[
                         { val: 'all', label: '🟢 Status: All' },
                         { val: 'active', label: '🟢 Active Workflow' },
-                        { val: 'break', label: '🟠 Rest Breaks' },
+                        { val: 'break_tea', label: '☕ Tea / Short Break' },
+                        { val: 'lunch', label: '🍱 Lunch Interval' },
+                        { val: 'meeting', label: '🤝 Meeting / Coaching' },
+                        { val: 'break', label: '🟠 All Rest Breaks' },
                         { val: 'offline', label: '⚪ Offline Staff' }
                       ].map(opt => (
                         <button
