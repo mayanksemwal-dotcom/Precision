@@ -225,7 +225,8 @@ export const EmailDashboardSubView: React.FC<EmailDashboardSubViewProps> = ({ ad
 
     try {
       await addDoc(collection(db, 'emails'), testEmailDoc);
-      toast.success('Test email queue document registered in Firestore! The background trigger is processing it.');
+      await addDoc(collection(db, 'mail'), testEmailDoc);
+      toast.success('Test email queue document registered in Firestore (emails & mail)! The background extension/trigger is processing it.');
       // Clear fields
       setTestTo('');
       setTestCc('');

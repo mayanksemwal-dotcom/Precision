@@ -159,6 +159,14 @@ async function start() {
     res.json({ status: 'ok', time: new Date(), dbId: DB_ID });
   });
 
+  // Server time synchronization endpoint
+  app.get('/api/time', (req, res) => {
+    res.json({ 
+      serverTime: new Date().toISOString(), 
+      serverTimeMs: Date.now() 
+    });
+  });
+
   // API Route: Set Custom User Claims
   app.post('/api/set-claims', async (req, res) => {
     console.log('[DEBUG API] /api/set-claims matched');

@@ -53,6 +53,7 @@ import { UserProfile, UserRole } from '../types';
 import { motion, AnimatePresence } from 'motion/react';
 import * as XLSX from 'xlsx';
 import { canActOn } from '../lib/hierarchy';
+import { getLiveTime, getLiveTimeISO } from '../lib/timeSync';
 // No Sheets imports
 
 interface TMSViewProps {
@@ -206,6 +207,7 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
 
   // Configured processes in the app
   const [processes, setProcesses] = useState<string[]>([]);
+  const [presentThreshold, setPresentThreshold] = useState<number>(480);
   const [recentProcesses, setRecentProcesses] = useState<string[]>(
     JSON.parse(localStorage.getItem('tms_recent_processes') || '[]')
   );
@@ -286,16 +288,34 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
   }, [exportFormat, reportType]);
   
   // System timer ticker
-  const [currentTime, setCurrentTime] = useState(new Date());
+  const [currentTime, setCurrentTime] = useState(getLiveTime());
   const [elapsedActive, setElapsedActive] = useState('00:00:00');
   const [elapsedBreak, setElapsedBreak] = useState('00:00:00');
   const [elapsedShift, setElapsedShift] = useState('00:00:00');
 
   // Trigger real-time ticking clock
   useEffect(() => {
-    const timer = setInterval(() => setCurrentTime(new Date()), 1000);
+    const timer = setInterval(() => setCurrentTime(getLiveTime()), 1000);
     return () => clearInterval(timer);
   }, []);
+
+  // Fetch Attendance present threshold in Real-time from config/attendanceSettings document
+  useEffect(() => {
+    if (!user) return;
+    const unsub = onSnapshot(doc(db, 'config', 'attendanceSettings'), (snap) => {
+      if (snap.exists()) {
+        const data = snap.data();
+        if (typeof data.presentThreshold === 'number') {
+          setPresentThreshold(data.presentThreshold);
+        } else if (data.presentThreshold) {
+          setPresentThreshold(Number(data.presentThreshold));
+        }
+      }
+    }, (err) => {
+      console.warn('Failed to subscribe config/attendanceSettings in TMSView', err);
+    });
+    return () => unsub();
+  }, [user]);
 
   // Fetch Processes Config in Real-time from config/tmsProcesses document
   useEffect(() => {
@@ -352,7 +372,7 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
         // Find older duplicates to close
         const duplicateClosingShifts = activeShiftsList.slice(1);
         const healBatch = writeBatch(db);
-        const healNowISO = new Date().toISOString();
+        const healNowISO = getLiveTimeISO();
         duplicateClosingShifts.forEach(sh => {
           const updatedActivities = [...(sh.activities || [])];
           if (updatedActivities.length > 0) {
@@ -579,22 +599,38 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
     await setDoc(doc(db, 'config', 'tmsProcesses'), { list: updatedList }, { merge: true });
   };
 
+  const isSupervisorRole = (role: string | UserRole): boolean => {
+    const norm = (role || '').toString().toUpperCase().trim();
+    return [
+      'ADMIN',
+      'MANAGER',
+      'STL',
+      'OPS_TL',
+      'QTL',
+      'TEAM_LEAD',
+      'TRAINER_TL'
+    ].includes(norm);
+  };
+
   // Handle ticking timers for currently active shift
   useEffect(() => {
     if (!currentShift) return;
 
     const tick = () => {
-      const now = new Date().getTime();
+      const now = getLiveTime().getTime();
       const inTime = new Date(currentShift.clockInTime).getTime();
       
       // Calculate accumulated stats of earlier completed shifts of today
       const nowLocalDateString = new Date().toDateString();
-      const completedShiftsToday = myPastShifts.filter(s => {
-        const isCompleted = s.status !== 'ACTIVE' && s.status !== 'BREAK';
-        if (!isCompleted || s.id === currentShift.id) return false;
-        const shiftOutDate = s.clockOutTime ? new Date(s.clockOutTime) : new Date(s.clockInTime);
-        return shiftOutDate.toDateString() === nowLocalDateString;
-      });
+      const isSupervisor = isSupervisorRole(user.role);
+      const completedShiftsToday = isSupervisor
+        ? myPastShifts.filter(s => {
+            const isCompleted = s.status !== 'ACTIVE' && s.status !== 'BREAK';
+            if (!isCompleted || s.id === currentShift.id) return false;
+            const shiftOutDate = s.clockOutTime ? new Date(s.clockOutTime) : new Date(s.clockInTime);
+            return shiftOutDate.toDateString() === nowLocalDateString;
+          })
+        : [];
 
       let completedShiftMs = 0;
       let completedActiveMs = 0;
@@ -668,12 +704,15 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
     }
 
     const nowLocalDateString = new Date().toDateString();
-    const completedShiftsToday = myPastShifts.filter(s => {
-      const isCompleted = s.status !== 'ACTIVE' && s.status !== 'BREAK';
-      if (!isCompleted) return false;
-      const shiftOutDate = s.clockOutTime ? new Date(s.clockOutTime) : new Date(s.clockInTime);
-      return shiftOutDate.toDateString() === nowLocalDateString;
-    });
+    const isSupervisor = isSupervisorRole(user.role);
+    const completedShiftsToday = isSupervisor
+      ? myPastShifts.filter(s => {
+          const isCompleted = s.status !== 'ACTIVE' && s.status !== 'BREAK';
+          if (!isCompleted) return false;
+          const shiftOutDate = s.clockOutTime ? new Date(s.clockOutTime) : new Date(s.clockInTime);
+          return shiftOutDate.toDateString() === nowLocalDateString;
+        })
+      : [];
 
     if (completedShiftsToday.length > 0) {
       let totalShiftMs = 0;
@@ -780,7 +819,7 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
 
     setIsProcessingPunch(true);
     try {
-      const nowISO = new Date().toISOString();
+      const nowISO = getLiveTimeISO();
       const newShift: TMSShift = {
         id: `shift-${user.uid || 'anon'}-${Date.now()}`,
         userId: user.uid || '',
@@ -836,7 +875,7 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
     }
 
     try {
-      const nowISO = new Date().toISOString();
+      const nowISO = getLiveTimeISO();
       const updatedActivities = [...currentShift.activities];
       
       // Terminate last activity
@@ -894,7 +933,7 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
     }
 
     try {
-      const nowISO = new Date().toISOString();
+      const nowISO = getLiveTimeISO();
       const updatedActivities = [...currentShift.activities];
       
       // Terminate last active segment
@@ -956,7 +995,7 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
     }
 
     try {
-      const nowISO = new Date().toISOString();
+      const nowISO = getLiveTimeISO();
       const updatedActivities = [...currentShift.activities];
       
       // Terminate break segment
@@ -997,7 +1036,7 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
   const performClockOut = async () => {
     if (!currentShift) return;
     try {
-      const nowISO = new Date().toISOString();
+      const nowISO = getLiveTimeISO();
       const updatedActivities = [...currentShift.activities];
       
       // Terminate last activity
@@ -1035,7 +1074,7 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
   const computeShiftStats = (shift: TMSShift) => {
     const endMs = shift.clockOutTime 
       ? new Date(shift.clockOutTime).getTime() 
-      : new Date().getTime();
+      : getLiveTime().getTime();
     const startMs = new Date(shift.clockInTime).getTime();
     
     // Total elapsed duration
@@ -1061,11 +1100,11 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
       }
     });
 
-    // Utilization calculated as: (Productive / Shift duration) * 100
-    // If shift is extremely short, treat as 100% or 0%
-    const utilization = totalShiftMs > 60000 
-      ? Number(((activeMs / totalShiftMs) * 100).toFixed(1)) 
-      : 100;
+    // Utilization % = (Productive Minutes / Present Threshold Minutes) * 100
+    // Starts from 0% at Clock-In and capped at 100%
+    const thresholdMins = presentThreshold || 480;
+    const productiveMins = activeMs / 60000;
+    const utilization = Number(Math.min(100, Math.max(0, (productiveMins / thresholdMins) * 100)).toFixed(1));
 
     return {
       totalShiftStr: formatMs(totalShiftMs),
@@ -1424,7 +1463,7 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
             if (act.endTime) {
               durationMin = (new Date(act.endTime).getTime() - new Date(act.startTime).getTime()) / (1000 * 60);
             } else {
-              durationMin = (new Date().getTime() - new Date(act.startTime).getTime()) / (1000 * 60);
+              durationMin = (getLiveTime().getTime() - new Date(act.startTime).getTime()) / (1000 * 60);
               if (durationMin < 0) durationMin = 0;
             }
 
@@ -2097,7 +2136,7 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
           if (act.endTime) {
             durationMin = (new Date(act.endTime).getTime() - new Date(act.startTime).getTime()) / (1000 * 60);
           } else {
-            durationMin = (new Date().getTime() - new Date(act.startTime).getTime()) / (1000 * 60);
+            durationMin = (getLiveTime().getTime() - new Date(act.startTime).getTime()) / (1000 * 60);
             if (durationMin < 0) durationMin = 0;
           }
 

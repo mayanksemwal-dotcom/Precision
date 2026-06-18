@@ -339,7 +339,7 @@ export const PermissionProvider: React.FC<PermissionProviderProps> = ({ children
 
     // First check if db module contains custom rule
     const tmsMod = permissions['Workforce TMS'];
-    if (tmsMod && tmsMod.tms_permissions) {
+    if (tmsMod && tmsMod.tms_permissions && tmsMod.tms_permissions[permKey] !== undefined) {
       return !!tmsMod.tms_permissions[permKey];
     }
 

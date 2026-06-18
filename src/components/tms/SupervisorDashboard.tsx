@@ -7,6 +7,7 @@ import {
   ShieldAlert, 
   ChevronLeft, 
   ChevronRight, 
+  ChevronDown,
   RefreshCw, 
   Calendar, 
   Briefcase, 
@@ -57,6 +58,7 @@ import { usePermission } from '../PermissionContext';
 import { MultiSelectDropdown } from '../ui/multi-select';
 import * as XLSX from 'xlsx';
 import { getManagerOfManager } from '../../views/TMSView';
+import { getLiveTime, getLiveTimeISO } from '../../lib/timeSync';
 
 interface SupervisorDashboardProps {
   user: UserProfile;
@@ -97,6 +99,25 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
   const [isLoadingShifts, setIsLoadingShifts] = useState(false);
   const [lastRefreshed, setLastRefreshed] = useState<Date>(new Date());
   const [countdown, setCountdown] = useState(20); // 20 seconds quick refresh cycle
+  const [presentThreshold, setPresentThreshold] = useState<number>(480);
+  const [expandedUserId, setExpandedUserId] = useState<string | null>(null);
+
+  // Subscribe to attendance config
+  useEffect(() => {
+    const unsub = onSnapshot(doc(db, 'config', 'attendanceSettings'), (snap) => {
+      if (snap.exists()) {
+        const data = snap.data();
+        if (typeof data.presentThreshold === 'number') {
+          setPresentThreshold(data.presentThreshold);
+        } else if (data.presentThreshold) {
+          setPresentThreshold(Number(data.presentThreshold));
+        }
+      }
+    }, (err) => {
+      console.warn('Failed to subscribe config/attendanceSettings in SupervisorDashboard', err);
+    });
+    return () => unsub();
+  }, []);
 
   // Filters state for control table
   const [searchTerm, setSearchTerm] = useState('');
@@ -152,7 +173,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
 
     const interval = setInterval(() => {
       const startMs = new Date(myShift.clockInTime).getTime();
-      const now = new Date().getTime();
+      const now = getLiveTime().getTime();
       const totalShiftMs = Math.max(0, now - startMs);
 
       setElapsedShift(formatMs(totalShiftMs));
@@ -349,42 +370,12 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
 
   // List of unique Managers
   const managersList = useMemo(() => {
-    return allUsers.filter(u => u.role === UserRole.MANAGER || u.role === UserRole.ADMIN);
+    return allUsers.filter(u => {
+      const roleUpper = (u.role || '').toString().toUpperCase().trim();
+      return roleUpper === 'MANAGER' || roleUpper === 'ADMIN';
+    });
   }, [allUsers]);
 
-  // Auto-select Team Leads matching the selected processes
-  useEffect(() => {
-    if (selectedProcesses.length > 0) {
-      const matchingTLNames = new Set<string>();
-      allUsers.forEach(u => {
-        const uProc = (u.process || '').trim();
-        if (selectedProcesses.includes(uProc)) {
-          // If the user themselves is a Team Lead, add them
-          const isTL = ['TEAM_LEAD', 'STL', 'OPS_TL', 'QTL', 'TRAINER_TL', 'TEAM LEAD', 'OPS TL', 'TRAINER TL'].includes((u.role || '').toUpperCase());
-          if (isTL) {
-            const tlName = u.fullName || u.name;
-            if (tlName) matchingTLNames.add(tlName);
-          }
-          // Also add their team lead if they are an agent
-          if (u.teamLeadName) {
-            matchingTLNames.add(u.teamLeadName);
-          }
-        }
-      });
-      
-      const newTLs = Array.from(matchingTLNames);
-      // Only update if they differ to avoid infinite rendering loop
-      const sortedNew = [...newTLs].sort();
-      const sortedCurr = [...selectedTLs].sort();
-      if (JSON.stringify(sortedNew) !== JSON.stringify(sortedCurr)) {
-        setSelectedTLs(newTLs);
-      }
-    } else {
-      if (selectedTLs.length > 0) {
-        setSelectedTLs([]);
-      }
-    }
-  }, [selectedProcesses, allUsers]);
 
   // Read summary metrics or trigger recalculation when necessary
   const [summaryData, setSummaryData] = useState<any>(null);
@@ -427,9 +418,23 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
       }
     });
 
-    const utilization = totalShiftMs > 60000 
-      ? Number(((activeMs / totalShiftMs) * 100).toFixed(1)) 
-      : 100;
+    const activeMins = activeMs / 60000;
+    const threshold = presentThreshold > 0 ? presentThreshold : 480;
+    const rawUtil = (activeMins / threshold) * 100;
+    const utilization = Number(Math.min(100, Math.max(0, rawUtil)).toFixed(1));
+
+    const remainingMins = Math.max(0, threshold - activeMins);
+
+    // Projected end-of-shift utilization based on standard 9 hours (540 mins)
+    let projectedUtilization = utilization;
+    if (!shift.clockOutTime) {
+      const elapsedMins = totalShiftMs / 60000;
+      if (elapsedMins > 0) {
+        const rate = activeMins / elapsedMins;
+        const projectedActiveMins = 540 * rate;
+        projectedUtilization = Number(Math.min(100, Math.max(0, (projectedActiveMins / threshold) * 100)).toFixed(1));
+      }
+    }
 
     return {
       totalShiftStr: formatMs(totalShiftMs),
@@ -438,7 +443,11 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
       utilization,
       totalShiftMs,
       activeMs,
-      breakMs
+      breakMs,
+      activeMins,
+      threshold,
+      remainingMins,
+      projectedUtilization
     };
   };
 
@@ -780,10 +789,25 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
       if (selectedManagers.length > 0) {
         const checkHierarchy = (uToCheck: UserProfile, visited: Set<string>): boolean => {
           if (!uToCheck) return false;
-          if (selectedManagers.includes(uToCheck.uid)) return true;
-          if (selectedManagers.includes(uToCheck.managerId || '')) return true;
-          if (selectedManagers.includes(uToCheck.mappedManagerId || '')) return true;
-          if (selectedManagers.includes((uToCheck as any).mappedManagerUid || '')) return true;
+          
+          // Match direct manager name, email or IDs from user fields
+          const possibleManagerMatch = 
+            selectedManagers.includes(uToCheck.uid) ||
+            selectedManagers.includes(uToCheck.managerId || '') ||
+            selectedManagers.includes(uToCheck.mappedManagerId || '') ||
+            selectedManagers.includes((uToCheck as any).mappedManagerUid || '') ||
+            selectedManagers.includes(uToCheck.managerName || '') ||
+            selectedManagers.includes(uToCheck.mappedManagerName || '') ||
+            selectedManagers.includes(uToCheck.Manager || '') ||
+            selectedManagers.includes(uToCheck.fullName || '') ||
+            selectedManagers.includes(uToCheck.name || '') ||
+            selectedManagers.includes(uToCheck.employeeName || '') ||
+            (uToCheck.managerEmail && selectedManagers.some(m => m.toLowerCase() === uToCheck.managerEmail!.toLowerCase())) ||
+            (uToCheck.mappedManagerEmail && selectedManagers.some(m => m.toLowerCase() === uToCheck.mappedManagerEmail!.toLowerCase())) ||
+            (uToCheck.email && selectedManagers.some(m => m.toLowerCase() === uToCheck.email.toLowerCase()));
+
+          if (possibleManagerMatch) return true;
+
           if (visited.has(uToCheck.uid)) return false;
           visited.add(uToCheck.uid);
           
@@ -996,12 +1020,15 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
         ];
 
         const summaryRows = teamShifts.map(sh => {
-          const u = allUsers.find(user => user.uid === sh.userId || user.email === sh.userEmail);
+          const u = allUsers.find(user => 
+            user.uid === sh.userId || 
+            (user.email && sh.userEmail && user.email.toLowerCase().trim() === sh.userEmail.toLowerCase().trim())
+          );
           const stats = calculateShiftStatsObj(sh);
           const dateStr = new Date(sh.clockInTime).toLocaleDateString('en-IN');
           
           return [
-            u?.employeeId || 'N/A',
+            u?.employeeId || (u as any).empID || 'N/A',
             u?.fullName || u?.name || sh.userName,
             u?.email || sh.userEmail,
             u?.role || 'N/A',
@@ -1032,8 +1059,11 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
         const chronoRows: any[] = [];
         teamShifts.forEach(sh => {
           const dateStr = new Date(sh.clockInTime).toLocaleDateString('en-IN');
-          const u = allUsers.find(user => user.uid === sh.userId || user.email === sh.userEmail);
-          const empId = u?.employeeId || 'N/A';
+          const u = allUsers.find(user => 
+            user.uid === sh.userId || 
+            (user.email && sh.userEmail && user.email.toLowerCase().trim() === sh.userEmail.toLowerCase().trim())
+          );
+          const empId = u?.employeeId || (u as any).empID || 'N/A';
           const mom = u ? getManagerOfManager(u, allUsers) : 'N/A';
 
           (sh.activities || []).forEach((act, idx) => {
@@ -1062,6 +1092,36 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
         const ws = XLSX.utils.aoa_to_sheet([chronoHeaders, ...chronoRows]);
         XLSX.utils.book_append_sheet(workbook, ws, "Chronological Activity Log");
       }
+
+      // 3. Workforce Roster State (Always included for completeness)
+      const rosterHeaders = [
+        'Emp ID', 'Employee Name', 'Email', 'Role', 'Department', 'Process / Segment', 'Team Lead', 'Manager Name', 'Manager of Manager', 'Current Session Status', 'Last Activity Time'
+      ];
+
+      const rosterRows = mappedUsers.map(u => {
+        const live = activeShifts.find(s => s.userId === u.uid);
+        const liveStatus = live ? (live.status === 'BREAK' ? 'On Break' : 'Active Work') : 'Offline';
+        const lastActiveStr = live && live.activities && live.activities.length > 0
+          ? new Date(live.activities[live.activities.length - 1].startTime).toLocaleTimeString('en-IN')
+          : 'N/A';
+        
+        return [
+          u.employeeId || (u as any).empID || 'N/A',
+          u.fullName || u.name || 'N/A',
+          u.email,
+          u.role || 'N/A',
+          u.department || 'Operations',
+          u.process || 'N/A',
+          u.teamLeadName || 'Unassigned',
+          u.mappedManagerName || u.managerName || 'Unassigned',
+          getManagerOfManager(u, allUsers),
+          liveStatus,
+          lastActiveStr
+        ];
+      });
+
+      const wsRoster = XLSX.utils.aoa_to_sheet([rosterHeaders, ...rosterRows]);
+      XLSX.utils.book_append_sheet(workbook, wsRoster, "Workforce Roster State");
 
       if (exportFormat === 'excel') {
         XLSX.writeFile(workbook, `TMS_Enhanced_Report_${user.name.split(' ').join('_')}.xlsx`);
@@ -1159,15 +1219,26 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
     const offline = Math.max(0, total - loggedIn);
     const attendancePercent = total > 0 ? Math.round((loggedIn / total) * 100) : 0;
     
+    // Calculate team average utilization for all logged-in users under current scope
+    let totalUtil = 0;
+    activeShiftList.forEach(sh => {
+      const stats = calculateShiftStatsObj(sh);
+      totalUtil += stats.utilization;
+    });
+    const teamAvgUtilization = activeShiftList.length > 0 
+      ? Number((totalUtil / activeShiftList.length).toFixed(1)) 
+      : 0;
+    
     return {
       total,
       loggedIn,
       onBreak,
       active,
       offline,
-      attendancePercent
+      attendancePercent,
+      teamAvgUtilization
     };
-  }, [filteredWorkforce, activeShifts]);
+  }, [filteredWorkforce, activeShifts, presentThreshold]);
 
   const liveDistribution = useMemo(() => {
     const total = filteredWorkforce.length || 1;
@@ -1264,7 +1335,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
                 if (myShift) {
                   // Clock Out logic - Perform standard end of work
                   const myShiftId = myShift.id;
-                  const nowISO = new Date().toISOString();
+                  const nowISO = getLiveTimeISO();
                   
                   const updatedActivities = [...(myShift.activities || [])];
                   if (updatedActivities.length > 0) {
@@ -1294,8 +1365,8 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
                     userEmail: user.email,
                     mappedTL: (user as any).teamLeadEmail || (user as any).mappedTL || 'N/A',
                     mappedManager: (user as any).mappedManagerEmail || (user as any).mappedManager || 'N/A',
-                    clockInTime: new Date().toISOString(),
-                    activities: [{ type: 'productive', name: 'Work Start', startTime: new Date().toISOString() }],
+                    clockInTime: getLiveTimeISO(),
+                    activities: [{ type: 'productive', name: 'Work Start', startTime: getLiveTimeISO() }],
                     status: 'ACTIVE'
                   };
                   addDoc(collection(db, 'tmsShifts'), newShift).then((docRef) => {
@@ -1327,7 +1398,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
                   const myShift = activeShifts.find(s => s.userId === user.uid);
                   if (!myShift) return;
                   
-                  const nowISO = new Date().toISOString();
+                  const nowISO = getLiveTimeISO();
                   const updatedActivities = [...(myShift.activities || [])];
                   const lastActivity = updatedActivities[updatedActivities.length - 1];
                   
@@ -1360,7 +1431,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
       </div>
 
       {/* CORE STATS KPI TILES (TOP SUMMARY CARDS - REACTIVE TO ACTIVE FILTERS) */}
-      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-2.5">
+      <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-7 gap-2.5">
         <div className="bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 p-2.5 rounded-xl shadow-xs text-center">
           <span className="text-[9px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-500 leading-none">Total Assigned</span>
           <h3 className="text-xl font-black text-slate-900 dark:text-white mt-0.5">{liveStats.total}</h3>
@@ -1391,10 +1462,16 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
           <p className="text-[8px] text-sky-500 dark:text-sky-500/85 font-bold mt-0.5 leading-none">Team Rate</p>
         </div>
 
+        <div className="bg-white dark:bg-slate-900 border border-teal-250 dark:border-teal-950/30 p-2.5 rounded-xl shadow-xs text-center">
+          <span className="text-[9px] font-black uppercase tracking-widest text-teal-600 dark:text-teal-400 leading-none">Team Avg Util</span>
+          <h3 className="text-xl font-black text-teal-600 dark:text-teal-400 mt-0.5">{liveStats.teamAvgUtilization}%</h3>
+          <p className="text-[8px] text-teal-550 dark:text-teal-500 font-bold mt-0.5 leading-none">Target: {presentThreshold}m</p>
+        </div>
+
         <div className="bg-white dark:bg-slate-900 border border-indigo-250 dark:border-indigo-950/30 p-2.5 rounded-xl shadow-xs text-center">
           <span className="text-[9px] font-black uppercase tracking-widest text-indigo-600 dark:text-indigo-400 leading-none">Active Work</span>
           <h3 className="text-xl font-black text-indigo-600 dark:text-indigo-400 mt-0.5">{liveStats.active}</h3>
-          <p className="text-[8px] text-indigo-500 dark:text-indigo-500/85 font-bold mt-0.5 leading-none">Productive Timers</p>
+          <p className="text-[8px] text-indigo-500 dark:text-indigo-505/85 font-bold mt-0.5 leading-none">Productive Timers</p>
         </div>
       </div>
 
@@ -1889,7 +1966,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
                   <div className="relative">
                     <label className="block text-[10px] uppercase font-bold text-slate-400 mb-1">Manager Filter</label>
                     <MultiSelectDropdown
-                      options={managersList.map(m => m.name)}
+                      options={managersList.map(m => m.fullName || m.name || m.employeeName).filter(Boolean) as string[]}
                       selectedValues={selectedManagers}
                       onToggle={(val) => {
                         setSelectedManagers(prev => 
@@ -1933,6 +2010,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
                     <th className="p-4">Current Activity</th>
                     <th className="p-4">Log In Time</th>
                     <th className="p-4 cursor-pointer" onClick={() => { setSortKey('productive'); setSortOrder(prev => prev === 'asc' ? 'desc' : 'asc'); }}>Productive Duration</th>
+                    <th className="p-4 text-center">Utilization</th>
                     <th className="p-4">Operational Status</th>
                     <th className="p-4 text-center">Action</th>
                   </tr>
@@ -1945,74 +2023,189 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
                     const lastAct = liveActs.length > 0 ? liveActs[liveActs.length - 1] : null;
 
                     return (
-                      <tr key={u.uid} className="hover:bg-slate-50 transition-colors">
-                        <td className="p-4 pl-6">
-                          <div className="font-extrabold text-slate-900 leading-none">{u.name}</div>
-                          <div className="text-[10px] font-mono text-slate-400 mt-1 leading-none">{u.email}</div>
-                        </td>
-                        <td className="p-4">
-                          <span className="bg-slate-150/60 font-semibold px-2 py-0.5 rounded text-slate-700">{u.process || 'General'}</span>
-                        </td>
-                        <td className="p-4 font-semibold text-slate-800">
-                          {live ? (
-                            <div className="flex flex-col gap-0.5">
-                              <span>{lastAct?.name || 'In transition'}</span>
-                              {live.status === 'BREAK' && lastAct && (
-                                <span className="text-[10px] font-bold text-amber-600 dark:text-amber-400 animate-pulse flex items-center gap-1 font-mono">
-                                  <Clock3 size={11} className="inline text-amber-500" />
-                                  <span>Break time: {formatMs(Math.max(0, new Date().getTime() - new Date(lastAct.startTime).getTime()))}</span>
-                                </span>
-                              )}
+                      <React.Fragment key={u.uid}>
+                        <tr className="hover:bg-slate-50 transition-colors">
+                          <td className="p-4 pl-6">
+                            <div className="flex items-center gap-2">
+                              <button 
+                                onClick={() => setExpandedUserId(prev => prev === u.uid ? null : u.uid)}
+                                className="text-slate-400 hover:text-indigo-600 transition-colors p-0.5 rounded cursor-pointer"
+                                title="Click to toggle details breakdown"
+                              >
+                                {expandedUserId === u.uid ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                              </button>
+                              <div className="flex flex-col">
+                                <div 
+                                  className="font-extrabold text-slate-900 leading-none cursor-pointer hover:text-indigo-600"
+                                  onClick={() => setExpandedUserId(prev => prev === u.uid ? null : u.uid)}
+                                >
+                                  {u.name}
+                                </div>
+                                <div className="text-[10px] font-mono text-slate-400 mt-1 leading-none">{u.email}</div>
+                              </div>
                             </div>
-                          ) : <span className="text-slate-400">-</span>}
-                        </td>
-                        <td className="p-4 text-slate-500 font-mono text-[10px]">
-                          {live ? new Date(live.clockInTime).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }) : <span className="text-slate-400">Not Clocked</span>}
-                        </td>
-                        <td className="p-4 font-bold text-teal-600 font-mono">
-                          {stats ? stats.activeStr : <span className="text-slate-400 font-normal font-sans text-xs">Offline</span>}
-                        </td>
-                        <td className="p-4">
-                          {live ? (
-                            <div className="flex flex-col gap-1">
-                              <span className={`w-fit px-2.5 py-0.5 rounded-full text-[9px] font-black uppercase ${live.status === 'BREAK' ? 'bg-amber-150 text-amber-800' : 'bg-emerald-150 text-emerald-800'}`}>
-                                {live.status}
-                              </span>
-                              {live.status === 'BREAK' && lastAct && (
-                                <span className="text-[9px] font-medium font-mono text-amber-600 dark:text-amber-450 leading-none">
-                                  Duration: {formatMs(Math.max(0, new Date().getTime() - new Date(lastAct.startTime).getTime()))}
+                          </td>
+                          <td className="p-4">
+                            <span className="bg-slate-150/60 font-semibold px-2 py-0.5 rounded text-slate-700">{u.process || 'General'}</span>
+                          </td>
+                          <td className="p-4 font-semibold text-slate-800">
+                            {live ? (
+                              <div className="flex flex-col gap-0.5">
+                                <span>{lastAct?.name || 'In transition'}</span>
+                                {live.status === 'BREAK' && lastAct && (
+                                  <span className="text-[10px] font-bold text-amber-600 dark:text-amber-400 animate-pulse flex items-center gap-1 font-mono">
+                                    <Clock3 size={11} className="inline text-amber-500" />
+                                    <span>Break time: {formatMs(Math.max(0, new Date().getTime() - new Date(lastAct.startTime).getTime()))}</span>
+                                  </span>
+                                )}
+                              </div>
+                            ) : <span className="text-slate-400">-</span>}
+                          </td>
+                          <td className="p-4 text-slate-500 font-mono text-[10px]">
+                            {live ? new Date(live.clockInTime).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }) : <span className="text-slate-400">Not Clocked</span>}
+                          </td>
+                          <td className="p-4 font-bold text-teal-600 font-mono">
+                            {stats ? stats.activeStr : <span className="text-slate-400 font-normal font-sans text-xs">Offline</span>}
+                          </td>
+                          <td className="p-4 text-center relative group/util">
+                            {stats ? (
+                              <>
+                                <div 
+                                  className="flex flex-col items-center gap-1 cursor-pointer justify-center select-none"
+                                  onClick={() => setExpandedUserId(prev => prev === u.uid ? null : u.uid)}
+                                >
+                                  <span className={`font-mono font-bold text-xs ${
+                                    stats.utilization >= 100 ? 'text-emerald-600 dark:text-emerald-400' :
+                                    stats.utilization >= 50 ? 'text-indigo-600 dark:text-indigo-400' :
+                                    'text-rose-500'
+                                  }`}>
+                                    {stats.utilization}%
+                                  </span>
+                                  <span className={`text-[8px] font-black px-1.5 py-px rounded uppercase tracking-wider ${
+                                    stats.utilization >= 100 ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/30' :
+                                    stats.utilization >= 50 ? 'bg-indigo-50 text-indigo-700 dark:bg-indigo-950/30' :
+                                    'bg-rose-50 text-rose-700 dark:bg-rose-950/30'
+                                  }`}>
+                                    {stats.utilization >= 100 ? 'Achieved' :
+                                     stats.utilization >= 50 ? 'On Track' :
+                                     'Below Target'}
+                                  </span>
+                                </div>
+
+                                {/* Hover Micro-Card Tooltip */}
+                                <div className="absolute bottom-full mb-1 left-1/2 -translate-x-1/2 hidden group-hover/util:block z-30 w-52 p-3 bg-white dark:bg-slate-905 border border-slate-200 dark:border-slate-800 rounded-xl shadow-xl animate-in fade-in zoom-in-95 duration-100 text-left">
+                                  <div className="space-y-1 text-[11px] font-semibold text-slate-600 dark:text-slate-350">
+                                    <div className="flex justify-between border-b border-slate-100 dark:border-slate-800 pb-1 font-black text-slate-800 dark:text-slate-100">
+                                      <span>Shift Metric</span>
+                                      <span className={stats.utilization >= 100 ? 'text-emerald-650' : stats.utilization >= 50 ? 'text-indigo-650' : 'text-rose-500'}>{stats.utilization}%</span>
+                                    </div>
+                                    <div className="flex justify-between pt-1">
+                                      <span>Productive Time:</span>
+                                      <span className="font-mono text-slate-900 dark:text-slate-205">{stats.activeMins.toFixed(1)}m</span>
+                                    </div>
+                                    <div className="flex justify-between">
+                                      <span>Present Threshold:</span>
+                                      <span className="font-mono text-slate-500">{stats.threshold}m</span>
+                                    </div>
+                                    <div className="flex justify-between">
+                                      <span>Remaining Minutes:</span>
+                                      <span className="font-mono text-slate-900 dark:text-slate-205">{stats.remainingMins.toFixed(1)}m</span>
+                                    </div>
+                                    <div className="flex justify-between border-t border-slate-100 dark:border-slate-800 pt-1 mt-1 font-bold">
+                                      <span className="text-slate-700 dark:text-slate-300">Projected Total:</span>
+                                      <span className="font-mono text-indigo-600 dark:text-indigo-400">{stats.projectedUtilization}%</span>
+                                    </div>
+                                  </div>
+                                </div>
+                              </>
+                            ) : (
+                              <span className="text-slate-400 font-normal">-</span>
+                            )}
+                          </td>
+                          <td className="p-4">
+                            {live ? (
+                              <div className="flex flex-col gap-1">
+                                <span className={`w-fit px-2.5 py-0.5 rounded-full text-[9px] font-black uppercase ${live.status === 'BREAK' ? 'bg-amber-150 text-amber-800' : 'bg-emerald-150 text-emerald-800'}`}>
+                                  {live.status}
                                 </span>
-                              )}
-                            </div>
-                          ) : (
-                            <span className="bg-slate-150 text-slate-450 px-2.5 py-0.5 rounded-full text-[9px] font-black uppercase select-none">Offline</span>
-                          )}
-                        </td>
-                        <td className="p-4 text-center space-x-1.5 shrink-0 flex items-center justify-center">
-                          {live && canModifyTarget(u.uid) ? (
-                            <button
-                              onClick={() => {
-                                setLogoutShiftId(live.id);
-                                setLogoutTargetUid(u.uid);
-                                setLogoutTargetName(u.name);
-                                setLogoutReason('Left without logging out');
-                                setShowForceLogoutConfirm(true);
-                              }}
-                              className="bg-rose-50 hover:bg-rose-100 border border-rose-200 text-rose-600 text-[10px] font-extrabold px-2.5 py-1 rounded-lg shrink-0 cursor-pointer"
-                            >
-                              Force Out
-                            </button>
-                          ) : (
-                            <span className="text-slate-400 font-medium text-xs select-none">No Action</span>
-                          )}
-                        </td>
-                      </tr>
+                                {live.status === 'BREAK' && lastAct && (
+                                  <span className="text-[9px] font-medium font-mono text-amber-600 dark:text-amber-450 leading-none">
+                                    Duration: {formatMs(Math.max(0, getLiveTime().getTime() - new Date(lastAct.startTime).getTime()))}
+                                  </span>
+                                )}
+                              </div>
+                            ) : (
+                              <span className="bg-slate-150 text-slate-450 px-2.5 py-0.5 rounded-full text-[9px] font-black uppercase select-none">Offline</span>
+                            )}
+                          </td>
+                          <td className="p-4 text-center space-x-1.5 shrink-0 flex items-center justify-center">
+                            {live && canModifyTarget(u.uid) ? (
+                              <button
+                                onClick={() => {
+                                  setLogoutShiftId(live.id);
+                                  setLogoutTargetUid(u.uid);
+                                  setLogoutTargetName(u.name);
+                                  setLogoutReason('Left without logging out');
+                                  setShowForceLogoutConfirm(true);
+                                }}
+                                className="bg-rose-50 hover:bg-rose-100 border border-rose-200 text-rose-600 text-[10px] font-extrabold px-2.5 py-1 rounded-lg shrink-0 cursor-pointer"
+                              >
+                                Force Out
+                              </button>
+                            ) : (
+                              <span className="text-slate-400 font-medium text-xs select-none">No Action</span>
+                            )}
+                          </td>
+                        </tr>
+                        {expandedUserId === u.uid && stats && (
+                          <tr className="bg-slate-50/70 dark:bg-slate-900/40 border-b border-indigo-50/60 dark:border-slate-800">
+                            <td colSpan={8} className="p-4 pl-12">
+                              <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+                                <div>
+                                  <span className="text-[10px] text-slate-400 dark:text-slate-500 block uppercase font-bold tracking-wider mb-1">Productive Minutes</span>
+                                  <span className="font-mono font-black text-xs text-slate-800 dark:text-slate-200">
+                                    {stats.activeMins.toFixed(1)}m <span className="text-[10px] text-slate-400 font-normal">({stats.activeStr})</span>
+                                  </span>
+                                </div>
+                                <div>
+                                  <span className="text-[10px] text-slate-400 dark:text-slate-500 block uppercase font-bold tracking-wider mb-1">Present Threshold</span>
+                                  <span className="font-mono font-bold text-xs text-slate-700 dark:text-slate-300">
+                                    {stats.threshold} minutes
+                                  </span>
+                                </div>
+                                <div>
+                                  <span className="text-[10px] text-slate-400 dark:text-slate-500 block uppercase font-bold tracking-wider mb-1">Utilization %</span>
+                                  <span className={`font-mono font-black text-xs ${
+                                    stats.utilization >= 100 ? 'text-emerald-600' :
+                                    stats.utilization >= 50 ? 'text-indigo-600' :
+                                    'text-rose-500'
+                                  }`}>
+                                    {stats.utilization}%
+                                  </span>
+                                </div>
+                                <div>
+                                  <span className="text-[10px] text-slate-400 dark:text-slate-500 block uppercase font-bold tracking-wider mb-1">Remaining Time</span>
+                                  <span className="font-mono font-bold text-xs text-slate-705 dark:text-slate-300">
+                                    {stats.remainingMins.toFixed(1)} mins
+                                  </span>
+                                </div>
+                                <div>
+                                  <span className="text-[10px] text-slate-400 dark:text-slate-500 block uppercase font-bold tracking-wider mb-1">Projected End-of-Shift</span>
+                                  <span className="font-mono font-black text-xs text-indigo-600 dark:text-indigo-455">
+                                    {stats.projectedUtilization}%
+                                  </span>
+                                </div>
+                              </div>
+                            </td>
+                          </tr>
+                        )}
+                      </React.Fragment>
                     );
                   })}
 
                   {paginatedWorkforce.length === 0 && (
                     <tr>
-                      <td colSpan={7} className="p-16 text-center text-slate-400 font-medium font-sans">
+                      <td colSpan={8} className="p-16 text-center text-slate-400 font-medium font-sans">
                         <UserX size={44} className="mx-auto text-slate-200 mb-2" />
                         No supervised workforce accounts found matching currently selected criteria.
                       </td>
