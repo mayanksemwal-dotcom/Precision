@@ -82,6 +82,108 @@ export interface TMSShift {
   status: 'ACTIVE' | 'BREAK' | 'COMPLETED';
 }
 
+export function getManagerOfManager(u: UserProfile, allUsers: UserProfile[]): string {
+  if (!u) return 'N/A';
+  
+  // Find direct supervisor
+  let directSupervisor: UserProfile | undefined = undefined;
+  
+  if (u.teamLeadId) {
+    directSupervisor = allUsers.find(x => x.uid === u.teamLeadId);
+  }
+  if (!directSupervisor && u.teamLeadEmail) {
+    directSupervisor = allUsers.find(x => x.email?.toLowerCase().trim() === u.teamLeadEmail?.toLowerCase().trim());
+  }
+  if (!directSupervisor && u.mappedTL) {
+    directSupervisor = allUsers.find(x => x.uid === u.mappedTL);
+  }
+  if (!directSupervisor && u.managerId) {
+    directSupervisor = allUsers.find(x => x.uid === u.managerId);
+  }
+  if (!directSupervisor && u.mappedManagerId) {
+    directSupervisor = allUsers.find(x => x.uid === u.mappedManagerId);
+  }
+  if (!directSupervisor && u.managerEmail) {
+    directSupervisor = allUsers.find(x => x.email?.toLowerCase().trim() === u.managerEmail?.toLowerCase().trim());
+  }
+  if (!directSupervisor && u.mappedManagerEmail) {
+    directSupervisor = allUsers.find(x => x.email?.toLowerCase().trim() === u.mappedManagerEmail?.toLowerCase().trim());
+  }
+  
+  if (!directSupervisor && u.teamLeadName) {
+    const tlName = u.teamLeadName.toLowerCase().trim();
+    directSupervisor = allUsers.find(x => 
+      (x.fullName || x.name || x.employeeName || '').toLowerCase().trim() === tlName
+    );
+  }
+  if (!directSupervisor && u.managerName) {
+    const mName = u.managerName.toLowerCase().trim();
+    directSupervisor = allUsers.find(x => 
+      (x.fullName || x.name || x.employeeName || '').toLowerCase().trim() === mName
+    );
+  }
+  if (!directSupervisor && u.mappedManagerName) {
+    const mmName = u.mappedManagerName.toLowerCase().trim();
+    directSupervisor = allUsers.find(x => 
+      (x.fullName || x.name || x.employeeName || '').toLowerCase().trim() === mmName
+    );
+  }
+  
+  if (!directSupervisor) {
+    return 'N/A';
+  }
+  
+  // Find manager of manager
+  let managerOfManager: UserProfile | undefined = undefined;
+  
+  if (directSupervisor.managerId) {
+    managerOfManager = allUsers.find(x => x.uid === directSupervisor.managerId);
+  }
+  if (!managerOfManager && directSupervisor.mappedManagerId) {
+    managerOfManager = allUsers.find(x => x.uid === directSupervisor.mappedManagerId);
+  }
+  if (!managerOfManager && directSupervisor.managerEmail) {
+    managerOfManager = allUsers.find(x => x.email?.toLowerCase().trim() === directSupervisor.managerEmail?.toLowerCase().trim());
+  }
+  if (!managerOfManager && directSupervisor.mappedManagerEmail) {
+    managerOfManager = allUsers.find(x => x.email?.toLowerCase().trim() === directSupervisor.mappedManagerEmail?.toLowerCase().trim());
+  }
+  if (!managerOfManager && directSupervisor.managerName) {
+    const mName = directSupervisor.managerName.toLowerCase().trim();
+    managerOfManager = allUsers.find(x => 
+      (x.fullName || x.name || x.employeeName || '').toLowerCase().trim() === mName
+    );
+  }
+  if (!managerOfManager && directSupervisor.mappedManagerName) {
+    const mmName = directSupervisor.mappedManagerName.toLowerCase().trim();
+    managerOfManager = allUsers.find(x => 
+      (x.fullName || x.name || x.employeeName || '').toLowerCase().trim() === mmName
+    );
+  }
+  if (!managerOfManager && directSupervisor.teamLeadId) {
+    managerOfManager = allUsers.find(x => x.uid === directSupervisor.teamLeadId);
+  }
+  if (!managerOfManager && directSupervisor.teamLeadEmail) {
+    managerOfManager = allUsers.find(x => x.email?.toLowerCase().trim() === directSupervisor.teamLeadEmail?.toLowerCase().trim());
+  }
+  if (!managerOfManager && directSupervisor.teamLeadName) {
+    const tlName = directSupervisor.teamLeadName.toLowerCase().trim();
+    managerOfManager = allUsers.find(x => 
+      (x.fullName || x.name || x.employeeName || '').toLowerCase().trim() === tlName
+    );
+  }
+  
+  if (managerOfManager) {
+    return managerOfManager.fullName || managerOfManager.name || managerOfManager.employeeName || managerOfManager.email;
+  }
+  
+  if (directSupervisor.managerName) return directSupervisor.managerName;
+  if (directSupervisor.mappedManagerName) return directSupervisor.mappedManagerName;
+  if (directSupervisor.teamLeadName) return directSupervisor.teamLeadName;
+  
+  return 'N/A';
+}
+
 const DEFAULT_PROCESSES = ['HITL', 'MPQC', 'OQC', 'SOP Training', 'QA Review', 'Team Alignment'];
 const BREAK_OPTIONS = [
   'Lunch Break', 
@@ -343,7 +445,7 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
 
   useEffect(() => {
     if (!user || !canViewReports) return;
-    const qAllShifts = query(collection(db, 'tmsShifts'), orderBy('clockInTime', 'desc'));
+    const qAllShifts = query(collection(db, 'tmsShifts'), orderBy('clockInTime', 'desc'), limit(1000));
     const unsubscribe = onSnapshot(qAllShifts, (snap) => {
       const shifts = snap.docs.map(doc => ({ id: doc.id, ...doc.data() } as TMSShift));
       setAllShifts(shifts);
@@ -481,23 +583,67 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
   useEffect(() => {
     if (!currentShift) return;
 
-    const interval = setInterval(() => {
+    const tick = () => {
       const now = new Date().getTime();
       const inTime = new Date(currentShift.clockInTime).getTime();
       
+      // Calculate accumulated stats of earlier completed shifts of today
+      const nowLocalDateString = new Date().toDateString();
+      const completedShiftsToday = myPastShifts.filter(s => {
+        const isCompleted = s.status !== 'ACTIVE' && s.status !== 'BREAK';
+        if (!isCompleted || s.id === currentShift.id) return false;
+        const shiftOutDate = s.clockOutTime ? new Date(s.clockOutTime) : new Date(s.clockInTime);
+        return shiftOutDate.toDateString() === nowLocalDateString;
+      });
+
+      let completedShiftMs = 0;
+      let completedActiveMs = 0;
+      let completedBreakMs = 0;
+
+      completedShiftsToday.forEach(s => {
+        const outTime = s.clockOutTime ? new Date(s.clockOutTime).getTime() : new Date(s.clockInTime).getTime();
+        const inTimePrev = new Date(s.clockInTime).getTime();
+        const diff = Math.max(0, outTime - inTimePrev);
+        completedShiftMs += diff;
+
+        (s.activities || []).forEach(act => {
+          const start = new Date(act.startTime).getTime();
+          const end = act.endTime ? new Date(act.endTime).getTime() : (s.clockOutTime ? new Date(s.clockOutTime).getTime() : start);
+          const duration = Math.max(0, end - start);
+          const actName = (act.name || '').toLowerCase();
+          const isProductive = act.type === 'productive' || 
+                               actName.includes('meeting') || 
+                               actName.includes('coaching') || 
+                               actName.includes('training') || 
+                               actName.includes('alignment');
+          if (isProductive) {
+            completedActiveMs += duration;
+          } else {
+            completedBreakMs += duration;
+          }
+        });
+      });
+
       // 1. Shift duration
-      const totalShiftMs = now - inTime;
+      const currentShiftMs = Math.max(0, now - inTime);
+      const totalShiftMs = currentShiftMs + completedShiftMs;
       setElapsedShift(formatMs(totalShiftMs));
 
       // 2. Compute Productive & Break times
-      let activeMs = 0;
-      let breakMs = 0;
+      let activeMs = completedActiveMs;
+      let breakMs = completedBreakMs;
 
       currentShift.activities.forEach(act => {
         const start = new Date(act.startTime).getTime();
         const end = act.endTime ? new Date(act.endTime).getTime() : now;
-        const duration = end - start;
-        if (act.type === 'productive') {
+        const duration = Math.max(0, end - start);
+        const actName = (act.name || '').toLowerCase();
+        const isProductive = act.type === 'productive' || 
+                             actName.includes('meeting') || 
+                             actName.includes('coaching') || 
+                             actName.includes('training') || 
+                             actName.includes('alignment');
+        if (isProductive) {
           activeMs += duration;
         } else {
           breakMs += duration;
@@ -506,10 +652,67 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
 
       setElapsedActive(formatMs(activeMs));
       setElapsedBreak(formatMs(breakMs));
-    }, 1000);
+    };
 
+    // Run tick immediately to avoid 1-second display delay
+    tick();
+
+    const interval = setInterval(tick, 1000);
     return () => clearInterval(interval);
-  }, [currentShift]);
+  }, [currentShift, myPastShifts]);
+
+  // Handle clocked-out user shift durations display and next date reset
+  useEffect(() => {
+    if (currentShift) {
+      return;
+    }
+
+    const nowLocalDateString = new Date().toDateString();
+    const completedShiftsToday = myPastShifts.filter(s => {
+      const isCompleted = s.status !== 'ACTIVE' && s.status !== 'BREAK';
+      if (!isCompleted) return false;
+      const shiftOutDate = s.clockOutTime ? new Date(s.clockOutTime) : new Date(s.clockInTime);
+      return shiftOutDate.toDateString() === nowLocalDateString;
+    });
+
+    if (completedShiftsToday.length > 0) {
+      let totalShiftMs = 0;
+      let activeMs = 0;
+      let breakMs = 0;
+
+      completedShiftsToday.forEach(s => {
+        const outTime = s.clockOutTime ? new Date(s.clockOutTime).getTime() : new Date(s.clockInTime).getTime();
+        const inTimePrev = new Date(s.clockInTime).getTime();
+        const diff = Math.max(0, outTime - inTimePrev);
+        totalShiftMs += diff;
+
+        (s.activities || []).forEach(act => {
+          const start = new Date(act.startTime).getTime();
+          const end = act.endTime ? new Date(act.endTime).getTime() : (s.clockOutTime ? new Date(s.clockOutTime).getTime() : start);
+          const duration = Math.max(0, end - start);
+          const actName = (act.name || '').toLowerCase();
+          const isProductive = act.type === 'productive' || 
+                               actName.includes('meeting') || 
+                               actName.includes('coaching') || 
+                               actName.includes('training') || 
+                               actName.includes('alignment');
+          if (isProductive) {
+            activeMs += duration;
+          } else {
+            breakMs += duration;
+          }
+        });
+      });
+
+      setElapsedShift(formatMs(totalShiftMs));
+      setElapsedActive(formatMs(activeMs));
+      setElapsedBreak(formatMs(breakMs));
+    } else {
+      setElapsedShift('00:00:00');
+      setElapsedActive('00:00:00');
+      setElapsedBreak('00:00:00');
+    }
+  }, [currentShift, myPastShifts]);
 
   // Helper: Format Milliseconds to HH:MM:SS
   const formatMs = (ms: number): string => {
@@ -845,7 +1048,13 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
       const aStart = new Date(act.startTime).getTime();
       const aEnd = act.endTime ? new Date(act.endTime).getTime() : endMs;
       const duration = Math.max(0, aEnd - aStart);
-      if (act.type === 'productive') {
+      const actName = (act.name || '').toLowerCase();
+      const isProductive = act.type === 'productive' || 
+                           actName.includes('meeting') || 
+                           actName.includes('coaching') || 
+                           actName.includes('training') || 
+                           actName.includes('alignment');
+      if (isProductive) {
         activeMs += duration;
       } else {
         breakMs += duration;
@@ -1088,9 +1297,11 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
       const includeChrono = selectedReportType === 'chronological' || selectedReportType === 'both';
 
       const summaryHeaders = [
+        'Emp ID',
         'Agent Name',
         'Agent Email',
         'Role',
+        'Manager of Manager',
         isTodayOnly ? 'Live Status' : 'Period Status',
         'Process/Break',
         'Shift Count in Period',
@@ -1162,9 +1373,11 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
         }
 
         return [
+          u.employeeId || 'N/A',
           u.name,
           u.email,
           u.role,
+          getManagerOfManager(u, allUsers),
           currentStatus,
           currentProcess,
           rangeShifts.length,
@@ -1178,8 +1391,10 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
       }) : [];
 
       const chronoHeaders = [
+        'Emp ID',
         'Agent Name',
         'Agent Email',
+        'Manager of Manager',
         'Date (IST)',
         'Action Sequence',
         'Duration Type',
@@ -1195,6 +1410,9 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
 
         sortedShifts.forEach(sh => {
           const dateStr = new Date(sh.clockInTime).toLocaleDateString('en-US', { timeZone: 'Asia/Kolkata' });
+          const uProfile = allUsers.find(x => x.uid === sh.userId || x.email === sh.userEmail);
+          const empId = uProfile?.employeeId || 'N/A';
+          const mom = uProfile ? getManagerOfManager(uProfile, allUsers) : 'N/A';
           
           sh.activities.forEach((act, idx) => {
             const startTimeIST = new Date(act.startTime).toLocaleString('en-US', { timeZone: 'Asia/Kolkata' });
@@ -1211,8 +1429,10 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
             }
 
             chronoRows.push([
+              empId,
               sh.userName || 'N/A',
               sh.userEmail || 'N/A',
+              mom,
               dateStr,
               idx + 1,
               act.type === 'productive' ? 'Productive Work' : 'Break',
@@ -1734,20 +1954,29 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
     );
   }
 
-  // Filtering admin shift records
-  const filteredAllShifts = allShifts.filter(s => {
-    const search = (adminSearch || '').toLowerCase();
-    return (s.userName || '').toLowerCase().includes(search) ||
-           (s.userEmail || '').toLowerCase().includes(search) ||
-           (s.activities || []).some(act => (act.name || '').toLowerCase().includes(search));
-  });
+  // Filtering admin shift records - memoized to prevent constant recalculation during clock ticks
+  const filteredAllShifts = React.useMemo(() => {
+    const search = (adminSearch || '').toLowerCase().trim();
+    if (!search) return allShifts;
+    return allShifts.filter(s => {
+      return (s.userName || '').toLowerCase().includes(search) ||
+             (s.userEmail || '').toLowerCase().includes(search) ||
+             (s.activities || []).some(act => (act.name || '').toLowerCase().includes(search));
+    });
+  }, [allShifts, adminSearch]);
 
   const itemsPerPage = 30;
-  const totalPages = Math.ceil(filteredAllShifts.length / itemsPerPage) || 1;
-  const paginatedShifts = filteredAllShifts.slice(
-    (currentPage - 1) * itemsPerPage,
-    currentPage * itemsPerPage
-  );
+
+  const totalPages = React.useMemo(() => {
+    return Math.ceil(filteredAllShifts.length / itemsPerPage) || 1;
+  }, [filteredAllShifts.length]);
+
+  const paginatedShifts = React.useMemo(() => {
+    return filteredAllShifts.slice(
+      (currentPage - 1) * itemsPerPage,
+      currentPage * itemsPerPage
+    );
+  }, [filteredAllShifts, currentPage]);
 
   const handleExportAllShifts = () => {
     setExportType('organization');
@@ -1782,8 +2011,10 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
     const includeChrono = selectedReportType === 'chronological' || selectedReportType === 'both';
 
     const summaryHeaders = [
+      'Emp ID',
       'Name',
       'Email ID',
+      'Manager of Manager',
       'Shift Status',
       'Process Name',
       'Last Activity',
@@ -1811,9 +2042,15 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
       const lastAct = sh.activities.length > 0 ? sh.activities[sh.activities.length - 1] : null;
       const lastActivity = lastAct ? lastAct.name : 'N/A';
 
+      const uProfile = allUsers.find(x => x.uid === sh.userId || x.email === sh.userEmail);
+      const empId = uProfile?.employeeId || 'N/A';
+      const mom = uProfile ? getManagerOfManager(uProfile, allUsers) : 'N/A';
+
       return [
+        empId,
         sh.userName,
         sh.userEmail,
+        mom,
         sh.status,
         processName,
         lastActivity,
@@ -1827,8 +2064,10 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
     }) : [];
 
     const chronoHeaders = [
+      'Emp ID',
       'Agent Name',
       'Agent Email',
+      'Manager of Manager',
       'Date (IST)',
       'Action Sequence',
       'Duration Type',
@@ -1844,6 +2083,9 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
 
       sortedShifts.forEach(sh => {
         const dateStr = new Date(sh.clockInTime).toLocaleDateString('en-US', { timeZone: 'Asia/Kolkata' });
+        const uProfile = allUsers.find(x => x.uid === sh.userId || x.email === sh.userEmail);
+        const empId = uProfile?.employeeId || 'N/A';
+        const mom = uProfile ? getManagerOfManager(uProfile, allUsers) : 'N/A';
         
         sh.activities.forEach((act, idx) => {
           const startTimeIST = new Date(act.startTime).toLocaleString('en-US', { timeZone: 'Asia/Kolkata' });
@@ -1860,8 +2102,10 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
           }
 
           chronoRows.push([
+            empId,
             sh.userName || 'N/A',
             sh.userEmail || 'N/A',
+            mom,
             dateStr,
             idx + 1,
             act.type === 'productive' ? 'Productive Work' : 'Break',
@@ -2047,26 +2291,26 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
             <CardContent className="pt-6 space-y-6">
               
               {/* Ticking Clock Status inside Punch station */}
-              {currentShift ? (
-                <div className="grid grid-cols-3 gap-3 p-4 bg-slate-50 rounded-xl border border-slate-200">
-                  <div className="text-center border-r border-slate-200">
-                    <p className="text-[9px] font-black uppercase text-slate-400 tracking-wider">Shift Elapsed</p>
-                    <p className="font-mono text-sm font-black text-slate-800 mt-1">{elapsedShift}</p>
-                  </div>
-                  <div className="text-center border-r border-slate-200">
-                    <p className="text-[9px] font-black uppercase text-slate-400 tracking-wider text-teal-600">Active Work</p>
-                    <p className="font-mono text-sm font-black text-teal-700 mt-1">{elapsedActive}</p>
-                  </div>
-                  <div className="text-center">
-                    <p className="text-[9px] font-black uppercase text-slate-400 tracking-wider text-amber-600">Total Breaks</p>
-                    <p className="font-mono text-sm font-black text-amber-700 mt-1">{elapsedBreak}</p>
-                  </div>
+              <div className="grid grid-cols-3 gap-3 p-4 bg-slate-50 rounded-xl border border-slate-200">
+                <div className="text-center border-r border-slate-200">
+                  <p className="text-[9px] font-black uppercase text-slate-400 tracking-wider">Shift Elapsed</p>
+                  <p className="font-mono text-sm font-black text-slate-800 mt-1">{elapsedShift}</p>
                 </div>
-              ) : (
-                <div className="flex flex-col items-center justify-center p-8 bg-slate-50 border border-slate-200 border-dashed rounded-xl">
-                  <Clock className="text-slate-300 mb-2" size={32} />
+                <div className="text-center border-r border-slate-200">
+                  <p className="text-[9px] font-black uppercase text-slate-400 tracking-wider text-teal-600">Active Work</p>
+                  <p className="font-mono text-sm font-black text-teal-700 mt-1">{elapsedActive}</p>
+                </div>
+                <div className="text-center">
+                  <p className="text-[9px] font-black uppercase text-slate-400 tracking-wider text-amber-600">Total Breaks</p>
+                  <p className="font-mono text-sm font-black text-amber-700 mt-1">{elapsedBreak}</p>
+                </div>
+              </div>
+
+              {!currentShift && (
+                <div className="flex flex-col items-center justify-center p-6 bg-slate-50 border border-slate-200 border-dashed rounded-xl">
+                  <Clock className="text-slate-350 mb-1.5" size={24} />
                   <p className="text-xs font-bold text-slate-500">You are currently clocked out.</p>
-                  <p className="text-[10px] text-slate-400 mt-1">Please select a process and clock in to begin.</p>
+                  <p className="text-[10px] text-slate-400 mt-0.5">Please select a process and clock in to begin.</p>
                 </div>
               )}
 

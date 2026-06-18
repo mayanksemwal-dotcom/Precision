@@ -15,7 +15,15 @@ export function MultiSelectDropdown({
   const [isOpen, setIsOpen] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
   
-  const filteredOptions = options.filter(o => o.toLowerCase().includes(searchTerm.toLowerCase()));
+  const uniqueOptions = React.useMemo(() => {
+    return Array.from(new Set((options || []).map(o => (o || '').trim()))).filter(Boolean);
+  }, [options]);
+
+  const uniqueSelectedValues = React.useMemo(() => {
+    return Array.from(new Set((selectedValues || []).map(v => (v || '').trim()))).filter(Boolean);
+  }, [selectedValues]);
+
+  const filteredOptions = uniqueOptions.filter(o => o.toLowerCase().includes(searchTerm.toLowerCase()));
 
   return (
     <div className="relative">
@@ -24,8 +32,8 @@ export function MultiSelectDropdown({
         onClick={() => setIsOpen(!isOpen)}
       >
         <div className="flex flex-wrap gap-1 items-center flex-1">
-          {selectedValues.length === 0 && <span className="text-slate-500 dark:text-slate-400 font-bold text-xs">{placeholder}</span>}
-          {selectedValues.map(val => (
+          {uniqueSelectedValues.length === 0 && <span className="text-slate-500 dark:text-slate-400 font-bold text-xs">{placeholder}</span>}
+          {uniqueSelectedValues.map(val => (
             <span key={val} className="px-1.5 py-0.5 bg-slate-50 dark:bg-slate-700 text-slate-850 dark:text-slate-100 rounded-lg text-[10px] font-bold border border-slate-200 dark:border-slate-600 flex items-center gap-1" onClick={(e) => { e.stopPropagation(); onToggle(val); }}>
               <span className="max-w-[150px] truncate">{val}</span> <X size={10} className="hover:text-red-500 cursor-pointer flex-shrink-0" />
             </span>
@@ -52,7 +60,7 @@ export function MultiSelectDropdown({
               <div className="p-3 text-center text-xs text-slate-400 dark:text-slate-500 font-medium">No results found.</div>
             ) : (
               filteredOptions.map(opt => {
-                const isSelected = selectedValues.includes(opt);
+                const isSelected = uniqueSelectedValues.includes(opt);
                 return (
                   <div 
                     key={opt}

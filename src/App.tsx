@@ -487,8 +487,10 @@ function AppContent({
 
   const effectiveRole = viewAsRole || (user?.role || UserRole.AGENT);
   
-  // Dynamically filter navigation items using centralized PermissionService
-  const filteredNav = navItems.filter(item => canView(item.label));
+  // Dynamically filter navigation items using centralized PermissionService with memoization for snappy performance
+  const filteredNav = React.useMemo(() => {
+    return navItems.filter(item => canView(item.label));
+  }, [canView, permissionsLoading]);
 
   const effectiveUser = user ? { ...user, role: effectiveRole } : null;
 
@@ -541,7 +543,17 @@ function AppContent({
         </div>
 
         <nav className="flex-1 px-4 space-y-1.5 overflow-y-auto">
-          {filteredNav.map((item) => (
+          {permissionsLoading && (
+            <div className="space-y-2.5 mt-3 select-none">
+              {[1, 2, 3, 4, 5].map((idx) => (
+                <div key={idx} className="w-full h-10 bg-slate-800/40 rounded-lg animate-pulse flex items-center px-4 gap-3 border border-slate-800/20">
+                  <div className="w-4 h-4 bg-slate-700/50 rounded-md shrink-0 animate-pulse" />
+                  {sidebarOpen && <div className="h-3.5 w-24 bg-slate-700/40 rounded animate-pulse" />}
+                </div>
+              ))}
+            </div>
+          )}
+          {!permissionsLoading && filteredNav.map((item) => (
             <button
               key={item.id}
               id={`nav-${item.id}`}
@@ -672,10 +684,10 @@ function AppContent({
             ) : (
               <motion.div
                 key={`${activeTab}-${effectiveRole}`}
-                initial={{ opacity: 0, y: 10 }}
+                initial={{ opacity: 0, y: 4 }}
                 animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -10 }}
-                transition={{ duration: 0.2 }}
+                exit={{ opacity: 0 }}
+                transition={{ duration: 0.12, ease: "easeOut" }}
                 className="max-w-7xl mx-auto h-full"
               >
                 {activeTab === 'tms' ? (

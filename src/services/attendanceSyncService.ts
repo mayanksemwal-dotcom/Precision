@@ -27,7 +27,13 @@ export async function syncShiftToAttendance(shift: any) {
       const aStart = new Date(act.startTime).getTime();
       const aEnd = act.endTime ? new Date(act.endTime).getTime() : endMs;
       const dur = Math.max(0, aEnd - aStart);
-      if (act.type === 'productive') prodMs += dur;
+      const actName = (act.name || '').toLowerCase();
+      const isProductive = act.type === 'productive' || 
+                           actName.includes('meeting') || 
+                           actName.includes('coaching') || 
+                           actName.includes('training') || 
+                           actName.includes('alignment');
+      if (isProductive) prodMs += dur;
       else breakMs += dur;
     });
 

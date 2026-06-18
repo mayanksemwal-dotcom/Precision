@@ -63,10 +63,12 @@ export function startEmailWorker(db: admin.firestore.Firestore) {
   const hasCreds = !!(config.user && config.pass);
   
   if (!hasCreds) {
-    console.warn('[EMAIL WORKER] WARNING: SMTP credentials NOT configured. Email delivery will mark entries as failed with configuration detail.');
-  } else {
-    console.log(`[EMAIL WORKER] SMTP Transport Active: ${config.host}:${config.port} (${config.user})`);
+    console.log('[EMAIL WORKER] WARNING: SMTP_USER and SMTP_PASS are not configured on the container server.');
+    console.log('[EMAIL WORKER] Skipping local background listener subscription. Email delivery is delegated entirely to the Trigger Email from Firestore extension running on your Firebase project.');
+    return;
   }
+
+  console.log(`[EMAIL WORKER] SMTP Transport Active: ${config.host}:${config.port} (${config.user})`);
 
   // Subscribe to documents in the 'emails' collection that have status 'pending'
   db.collection('emails')

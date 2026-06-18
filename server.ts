@@ -633,6 +633,154 @@ async function start() {
     }
   });
 
+  // Automated 7 AM attendance synchronization routine
+  async function autoSyncAttendance() {
+    console.log('[AUTO SYNC] Starting scheduled attendance synchronization...');
+    try {
+      // 1. Fetch completed shifts from the last 7 days from Firestore
+      const shiftsRef = db.collection('tmsShifts');
+      const cutoffDate = new Date();
+      cutoffDate.setDate(cutoffDate.getDate() - 7); // Sync last 7 days is fast and safe
+      
+      const shiftsSnapshot = await shiftsRef
+        .where('clockInTime', '>=', cutoffDate.toISOString())
+        .get();
+        
+      const completedShifts = shiftsSnapshot.docs
+        .map(doc => ({ id: doc.id, ...doc.data() } as any))
+        .filter(s => s.status === 'COMPLETED');
+        
+      if (completedShifts.length === 0) {
+        console.log('[AUTO SYNC] No completed shifts found to sync.');
+        return;
+      }
+      
+      // 2. Fetch config/attendanceSettings
+      const confSnap = await db.collection('config').doc('attendanceSettings').get();
+      let config = { presentThreshold: 480, halfDayThreshold: 240, countBreakTime: false };
+      if (confSnap.exists) {
+        const c = confSnap.data() || {};
+        config = {
+          presentThreshold: c.presentThreshold ?? 480,
+          halfDayThreshold: c.halfDayThreshold ?? 240,
+          countBreakTime: c.countBreakTime ?? false
+        };
+      }
+      
+      console.log('[AUTO SYNC] Configuration:', config);
+      
+      // 3. Process each completed shift
+      let writeCount = 0;
+      const CHUNK_SIZE = 450;
+      let batch = db.batch();
+      
+      for (const shift of completedShifts) {
+        const startMs = new Date(shift.clockInTime).getTime();
+        const endMs = shift.clockOutTime ? new Date(shift.clockOutTime).getTime() : startMs;
+        
+        let prodMs = 0;
+        let breakMs = 0;
+        
+        (shift.activities || []).forEach((act: any) => {
+          const aStart = new Date(act.startTime).getTime();
+          const aEnd = act.endTime ? new Date(act.endTime).getTime() : endMs;
+          const dur = Math.max(0, aEnd - aStart);
+          
+          const actName = (act.name || '').toLowerCase();
+          const isProductive = act.type === 'productive' || 
+                               actName.includes('meeting') || 
+                               actName.includes('coaching') || 
+                               actName.includes('alignment');
+                               
+          if (isProductive) {
+            prodMs += dur;
+          } else {
+            breakMs += dur;
+          }
+        });
+        
+        let totalMins = Math.floor(prodMs / 60000);
+        if (config.countBreakTime) {
+          totalMins += Math.floor(breakMs / 60000);
+        }
+        
+        let attendanceStatus: 'Present' | 'Half Day' | 'Absent' = 'Absent';
+        if (totalMins >= config.presentThreshold) attendanceStatus = 'Present';
+        else if (totalMins >= config.halfDayThreshold) attendanceStatus = 'Half Day';
+        
+        const dateStr = shift.clockInTime.split('T')[0];
+        const isOvernight = shift.clockOutTime ? (shift.clockInTime.split('T')[0] !== shift.clockOutTime.split('T')[0]) : false;
+        
+        const summary = {
+          id: shift.id,
+          shiftId: shift.id,
+          userId: shift.userId,
+          employeeName: shift.userName || shift.userEmail,
+          employeeEmail: shift.userEmail,
+          employeeId: shift.employeeId || '',
+          process: shift.process || 'N/A',
+          mappedTL: shift.mappedTL || 'N/A',
+          mappedManager: shift.mappedManager || 'N/A',
+          attendanceDate: dateStr,
+          attendanceStatus,
+          productiveMinutes: totalMins,
+          totalBreakMinutes: Math.floor(breakMs / 60000),
+          sessionStart: shift.clockInTime,
+          sessionEnd: shift.clockOutTime || shift.clockInTime,
+          generatedBySystem: true,
+          isOvernight,
+          autoSyncedAt: new Date().toISOString()
+        };
+        
+        const attDocRef = db.collection('attendanceSummary').doc(shift.id);
+        batch.set(attDocRef, summary, { merge: true });
+        writeCount++;
+        
+        if (writeCount % CHUNK_SIZE === 0) {
+          await batch.commit();
+          batch = db.batch();
+        }
+      }
+      
+      if (writeCount % CHUNK_SIZE !== 0) {
+        await batch.commit();
+      }
+      
+      console.log(`[AUTO SYNC] Successfully auto-synchronized ${writeCount} attendance records.`);
+    } catch (err) {
+      console.error('[AUTO SYNC] Error in scheduled synchronizer:', err);
+    }
+  }
+
+  // Schedule auto attendance sync job every 7 AM Kolkata time
+  let lastLoggedHour = -1;
+  let lastSyncedDateStr = '';
+
+  setInterval(() => {
+    try {
+      const kolkataTimeStr = new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" });
+      const kolkataDate = new Date(kolkataTimeStr);
+      const hours = kolkataDate.getHours();
+      const minutes = kolkataDate.getMinutes();
+      const dateStr = kolkataDate.toISOString().split('T')[0];
+
+      // Exact matching at 7:00 AM once a day
+      if (hours === 7 && minutes === 0 && lastSyncedDateStr !== dateStr) {
+        lastSyncedDateStr = dateStr;
+        console.log(`[AUTO SYNC SCHEDULE] Triggered automated 7 AM attendance sync for date ${dateStr} IST.`);
+        autoSyncAttendance();
+      }
+      
+      // Heartbeat diagnostic status logging
+      if (hours % 4 === 0 && lastLoggedHour !== hours) {
+        lastLoggedHour = hours;
+        console.log(`[SCHEDULER HEARTBEAT] Active. Kolkata time is ${kolkataDate.toLocaleTimeString()}.`);
+      }
+    } catch (err) {
+      console.error('[SCHEDULER CRON ERROR] Error in tick interval:', err);
+    }
+  }, 60000);
+
   // Catch-all for undefined /api routes
   app.all('/api/*', (req, res) => {
     console.warn(`[API 404] No route matched: ${req.method} ${req.url}`);

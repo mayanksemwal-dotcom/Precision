@@ -196,9 +196,15 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
     getDocs(q).then(snap => setAuditLogs(snap.docs.map(d => d.data())));
   };
 
+  const allUsersRef = React.useRef(allUsers);
+  useEffect(() => {
+    allUsersRef.current = allUsers;
+  }, [allUsers]);
+
   useEffect(() => {
     loadData();
-  }, [dateRange, allUsers]);
+  }, [dateRange]);
+
   const loadData = async () => {
     setLoading(true);
     try {
@@ -262,7 +268,7 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
            const rTL = (r.mappedTL || '').toLowerCase();
            const rMgr = (r.mappedManager || '').toLowerCase();
 
-           const employeeProfile = allUsers.find(u => u.uid === r.userId || u.email.toLowerCase() === r.employeeEmail.toLowerCase());
+           const employeeProfile = allUsersRef.current.find(u => u.uid === r.userId || u.email.toLowerCase() === r.employeeEmail.toLowerCase());
            
            // STERN RULE: TLs cannot see Managers or Admins
            if (employeeProfile) {
@@ -365,7 +371,13 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
           const aStart = new Date(act.startTime).getTime();
           const aEnd = act.endTime ? new Date(act.endTime).getTime() : endMs;
           const dur = Math.max(0, aEnd - aStart);
-          if (act.type === 'productive') prodMs += dur;
+          const actName = (act.name || '').toLowerCase();
+          const isProductive = act.type === 'productive' || 
+                               actName.includes('meeting') || 
+                               actName.includes('coaching') || 
+                               actName.includes('training') || 
+                               actName.includes('alignment');
+          if (isProductive) prodMs += dur;
           else breakMs += dur;
         });
 

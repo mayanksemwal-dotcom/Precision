@@ -54,7 +54,9 @@ import { UserProfile, UserRole } from '../../types';
 import { toast } from 'sonner';
 import { canActOn } from '../../lib/hierarchy';
 import { usePermission } from '../PermissionContext';
+import { MultiSelectDropdown } from '../ui/multi-select';
 import * as XLSX from 'xlsx';
+import { getManagerOfManager } from '../../views/TMSView';
 
 interface SupervisorDashboardProps {
   user: UserProfile;
@@ -98,12 +100,12 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
 
   // Filters state for control table
   const [searchTerm, setSearchTerm] = useState('');
-  const [processFilter, setProcessFilter] = useState('all');
+  const [selectedProcesses, setSelectedProcesses] = useState<string[]>([]);
   const [shiftFilter, setShiftFilter] = useState('all'); // all, active, break, offline
-  const [tlFilter, setTlFilter] = useState('all');
-  const [managerFilter, setManagerFilter] = useState(() => {
+  const [selectedTLs, setSelectedTLs] = useState<string[]>([]);
+  const [selectedManagers, setSelectedManagers] = useState<string[]>(() => {
     const isOnlyManager = (user.role || '').toString().toUpperCase() === 'MANAGER';
-    return isOnlyManager ? user.uid : 'all';
+    return isOnlyManager ? [user.fullName || user.name] : [];
   });
   const [sortKey, setSortKey] = useState<'name' | 'productive' | 'status'>('name');
   const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('asc');
@@ -133,6 +135,54 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
   const [exportCustomStart, setExportCustomStart] = useState('');
   const [exportCustomEnd, setExportCustomEnd] = useState('');
   const [exportReportType, setExportReportType] = useState<'summary' | 'chrono' | 'both'>('both');
+
+  // Supervisor personal shift timers
+  const [elapsedActive, setElapsedActive] = useState('00:00:00');
+  const [elapsedBreak, setElapsedBreak] = useState('00:00:00');
+  const [elapsedShift, setElapsedShift] = useState('00:00:00');
+
+  useEffect(() => {
+    const myShift = activeShifts.find(s => s.userId === user.uid);
+    if (!myShift) {
+      setElapsedActive('00:00:00');
+      setElapsedBreak('00:00:00');
+      setElapsedShift('00:00:00');
+      return;
+    }
+
+    const interval = setInterval(() => {
+      const startMs = new Date(myShift.clockInTime).getTime();
+      const now = new Date().getTime();
+      const totalShiftMs = Math.max(0, now - startMs);
+
+      setElapsedShift(formatMs(totalShiftMs));
+
+      let activeMs = 0;
+      let breakMs = 0;
+
+      (myShift.activities || []).forEach(act => {
+        const start = new Date(act.startTime).getTime();
+        const end = act.endTime ? new Date(act.endTime).getTime() : now;
+        const duration = end - start;
+        const actName = (act.name || '').toLowerCase();
+        const isProductive = act.type === 'productive' || 
+                             actName.includes('meeting') || 
+                             actName.includes('coaching') || 
+                             actName.includes('training') || 
+                             actName.includes('alignment');
+        if (isProductive) {
+          activeMs += duration;
+        } else {
+          breakMs += duration;
+        }
+      });
+
+      setElapsedActive(formatMs(activeMs));
+      setElapsedBreak(formatMs(breakMs));
+    }, 1000);
+
+    return () => clearInterval(interval);
+  }, [activeShifts, user.uid]);
   const [exportFormat, setExportFormat] = useState<'excel' | 'csv'>('excel');
 
   // Searchable Dropdowns States & Refs
@@ -178,6 +228,22 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
     if (user.uid === targetUid) return false;
     const target = allUsers.find(u => u.uid === targetUid);
     if (!target) return false;
+
+    // Check if the current user has TL profile or is manager/admin
+    const roleNormalized = (user.role || '').toUpperCase();
+    const isTL = ['TEAM_LEAD', 'STL', 'QTL', 'OPS_TL', 'TRAINER_TL'].includes(roleNormalized);
+    const isManagerOrAdmin = ['ADMIN', 'MANAGER'].includes(roleNormalized);
+
+    // Allow TLs to force-out users of other team members
+    if (isTL || isManagerOrAdmin) {
+      const targetRole = (target.role || '').toUpperCase();
+      const isTargetHigher = ['ADMIN', 'MANAGER'].includes(targetRole);
+      if (isTargetHigher && !isManagerOrAdmin) {
+        return false;
+      }
+      return true;
+    }
+
     return canActOn(user, target, allUsers);
   };
 
@@ -195,26 +261,34 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
     };
 
     if (isManagerOrAdmin) {
-      if (tlFilter !== 'all') {
-        return allUsers.filter(u => isActive(u) && (u.teamLeadId === tlFilter || u.uid === tlFilter));
+      if (selectedTLs.length > 0) {
+        return allUsers.filter(u => isActive(u) && (
+          selectedTLs.includes(u.teamLeadName || '') || 
+          selectedTLs.includes(u.teamLeadId || '') || 
+          selectedTLs.includes(u.name) || 
+          selectedTLs.includes(u.fullName || '') || 
+          selectedTLs.includes(u.uid)
+        ));
       }
       return allUsers.filter(u => isActive(u));
     } else if (isTeamLeadOrSupervisor) {
-      // If a specific Team Lead is selected, show resources belonging to that Team Lead, plus that Team Lead itself
-      if (tlFilter !== 'all') {
-        const tlLower = tlFilter.toLowerCase();
+      // If specific Team Leads are selected, show resources belonging to those Team Leads, plus themselves
+      if (selectedTLs.length > 0) {
         return allUsers.filter(u => isActive(u) && (
-          u.teamLeadId === tlFilter || 
-          u.uid === tlFilter || 
-          (u.teamLeadEmail && u.teamLeadEmail.toLowerCase() === tlLower) ||
-          (u.email && u.email.toLowerCase() === tlLower)
+          selectedTLs.includes(u.teamLeadName || '') || 
+          selectedTLs.includes(u.teamLeadId || '') || 
+          selectedTLs.includes(u.uid) ||
+          selectedTLs.includes(u.name) ||
+          selectedTLs.includes(u.fullName || '') ||
+          (u.teamLeadEmail && selectedTLs.some(st => u.teamLeadEmail.toLowerCase() === st.toLowerCase())) ||
+          (u.email && selectedTLs.some(st => u.email.toLowerCase() === st.toLowerCase()))
         ));
       }
-      // By default (tlFilter === 'all'), fallback to their own mapped resources, plus themselves so they see their own status & attendance
+      // By default, fallback to their own mapped resources, plus themselves so they see their own status & attendance
       return allUsers.filter(u => isActive(u) && (u.uid === user.uid || canActOn(user, u, allUsers)));
     }
     return allUsers.filter(u => isActive(u) && (u.uid === user.uid || canActOn(user, u, allUsers)));
-  }, [allUsers, user, tlFilter]);
+  }, [allUsers, user, selectedTLs]);
 
   // Keep a ref of the latest mappedUsers and dependencies so the snapshot closure doesn't become stale
   const mappedUsersRef = React.useRef(mappedUsers);
@@ -278,6 +352,40 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
     return allUsers.filter(u => u.role === UserRole.MANAGER || u.role === UserRole.ADMIN);
   }, [allUsers]);
 
+  // Auto-select Team Leads matching the selected processes
+  useEffect(() => {
+    if (selectedProcesses.length > 0) {
+      const matchingTLNames = new Set<string>();
+      allUsers.forEach(u => {
+        const uProc = (u.process || '').trim();
+        if (selectedProcesses.includes(uProc)) {
+          // If the user themselves is a Team Lead, add them
+          const isTL = ['TEAM_LEAD', 'STL', 'OPS_TL', 'QTL', 'TRAINER_TL', 'TEAM LEAD', 'OPS TL', 'TRAINER TL'].includes((u.role || '').toUpperCase());
+          if (isTL) {
+            const tlName = u.fullName || u.name;
+            if (tlName) matchingTLNames.add(tlName);
+          }
+          // Also add their team lead if they are an agent
+          if (u.teamLeadName) {
+            matchingTLNames.add(u.teamLeadName);
+          }
+        }
+      });
+      
+      const newTLs = Array.from(matchingTLNames);
+      // Only update if they differ to avoid infinite rendering loop
+      const sortedNew = [...newTLs].sort();
+      const sortedCurr = [...selectedTLs].sort();
+      if (JSON.stringify(sortedNew) !== JSON.stringify(sortedCurr)) {
+        setSelectedTLs(newTLs);
+      }
+    } else {
+      if (selectedTLs.length > 0) {
+        setSelectedTLs([]);
+      }
+    }
+  }, [selectedProcesses, allUsers]);
+
   // Read summary metrics or trigger recalculation when necessary
   const [summaryData, setSummaryData] = useState<any>(null);
 
@@ -306,7 +414,13 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
       const aStart = new Date(act.startTime).getTime();
       const aEnd = act.endTime ? new Date(act.endTime).getTime() : endMs;
       const duration = Math.max(0, aEnd - aStart);
-      if (act.type === 'productive') {
+      const actName = (act.name || '').toLowerCase();
+      const isProductive = act.type === 'productive' || 
+                           actName.includes('meeting') || 
+                           actName.includes('coaching') || 
+                           actName.includes('training') || 
+                           actName.includes('alignment');
+      if (isProductive) {
         activeMs += duration;
       } else {
         breakMs += duration;
@@ -438,7 +552,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
           const lastActivity = shActs.length > 0 ? shActs[shActs.length - 1]?.name || '' : '';
           if (lastActivity.toLowerCase().includes('lunch')) {
             lunchCount++;
-          } else if (lastActivity.toLowerCase().includes('meeting') || lastActivity.toLowerCase().includes('coaching') || lastActivity.toLowerCase().includes('alignment')) {
+          } else if (lastActivity.toLowerCase().includes('meeting') || lastActivity.toLowerCase().includes('coaching') || lastActivity.toLowerCase().includes('training') || lastActivity.toLowerCase().includes('alignment')) {
             meetingCount++;
           } else {
             otherBreakCount++;
@@ -565,10 +679,10 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
     }
   };
 
-  // Run on mount, and schedule recurring pull when allUsers or tlFilter changes
+  // Run on mount, and schedule recurring pull when allUsers or selectedTLs changes
   useEffect(() => {
     loadAndRecomputeData(true);
-  }, [allUsers, tlFilter]);
+  }, [allUsers, selectedTLs]);
 
   useEffect(() => {
     if (!user) return;
@@ -620,6 +734,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
           const lastActivity = shActs.length > 0 ? shActs[shActs.length - 1]?.name || '' : '';
           const isMeet = lastActivity.toLowerCase().includes('meeting') || 
                          lastActivity.toLowerCase().includes('coaching') || 
+                         lastActivity.toLowerCase().includes('training') || 
                          lastActivity.toLowerCase().includes('alignment');
           if (!isMeet) return false;
         }
@@ -630,30 +745,45 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
           const isLunchOrMeet = lastActivity.toLowerCase().includes('lunch') || 
                                 lastActivity.toLowerCase().includes('meeting') || 
                                 lastActivity.toLowerCase().includes('coaching') || 
+                                lastActivity.toLowerCase().includes('training') || 
                                 lastActivity.toLowerCase().includes('alignment');
           if (isLunchOrMeet) return false;
         }
       }
 
       // Process filters
-      if (processFilter !== 'all') {
-        if (!liveShift) return false;
-        const liveShiftActs = liveShift.activities || [];
-        const currentProc = liveShiftActs.length > 0 ? liveShiftActs[liveShiftActs.length - 1]?.name || '' : '';
-        if (currentProc !== processFilter) return false;
+      if (selectedProcesses.length > 0) {
+        const uProc = (u.process || '').trim();
+        const matchesUserProc = selectedProcesses.includes(uProc);
+        
+        let matchesLiveProc = false;
+        if (liveShift) {
+          const liveShiftActs = liveShift.activities || [];
+          const currentProc = liveShiftActs.length > 0 ? liveShiftActs[liveShiftActs.length - 1]?.name || '' : '';
+          matchesLiveProc = selectedProcesses.includes(currentProc);
+        }
+        
+        if (!matchesUserProc && !matchesLiveProc) {
+          return false;
+        }
       }
 
       // TL filter
-      if (tlFilter !== 'all' && u.teamLeadId !== tlFilter) return false;
+      if (selectedTLs.length > 0) {
+        const matchesTL = selectedTLs.includes(u.teamLeadId || '') || 
+                         selectedTLs.includes(u.teamLeadName || '') ||
+                         (u.teamLeadEmail && selectedTLs.some(st => u.teamLeadEmail.toLowerCase() === st.toLowerCase()));
+        if (!matchesTL) return false;
+      }
 
       // Manager filter (robust nested traversal across all possible schema fields)
-      if (managerFilter !== 'all') {
+      if (selectedManagers.length > 0) {
         const checkHierarchy = (uToCheck: UserProfile, visited: Set<string>): boolean => {
           if (!uToCheck) return false;
-          if (uToCheck.uid === managerFilter) return true;
-          if (uToCheck.managerId === managerFilter) return true;
-          if (uToCheck.mappedManagerId === managerFilter) return true;
-          if ((uToCheck as any).mappedManagerUid === managerFilter) return true;
+          if (selectedManagers.includes(uToCheck.uid)) return true;
+          if (selectedManagers.includes(uToCheck.managerId || '')) return true;
+          if (selectedManagers.includes(uToCheck.mappedManagerId || '')) return true;
+          if (selectedManagers.includes((uToCheck as any).mappedManagerUid || '')) return true;
           if (visited.has(uToCheck.uid)) return false;
           visited.add(uToCheck.uid);
           
@@ -680,7 +810,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
 
       return true;
     });
-  }, [mappedUsers, activeShifts, searchTerm, processFilter, shiftFilter, tlFilter, managerFilter]);
+  }, [mappedUsers, activeShifts, searchTerm, selectedProcesses, shiftFilter, selectedTLs, selectedManagers]);
 
   // Sorting
   const sortedWorkforce = useMemo(() => {
@@ -717,12 +847,15 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
 
   const uniqueActiveProcesses = useMemo(() => {
     const list = new Set<string>();
+    // 1. Add processes from currently active/live shifts' current active activity
     activeShifts.forEach(sh => {
       const shActs = sh.activities || [];
       const act = shActs.length > 0 ? shActs[shActs.length - 1] : null;
-      if (act && act.type === 'productive') list.add(act.name);
+      if (act) {
+        list.add(act.name.trim());
+      }
     });
-    return Array.from(list);
+    return Array.from(list).filter(Boolean);
   }, [activeShifts]);
 
   // Chart Allocations Data
@@ -857,22 +990,24 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
       // 1. Utilization Summary
       if (exportReportType === 'summary' || exportReportType === 'both') {
         const summaryHeaders = [
-          'Employee Name', 'Email', 'Role', 'Team Lead', 'Manager',
+          'Emp ID', 'Employee Name', 'Email', 'Role', 'Team Lead', 'Manager', 'Manager of Manager',
           'Date', 'Clock In', 'Clock Out', 'Shift Status',
           'Prod Minutes', 'Break Minutes', 'Total Minutes', 'Utilization %'
         ];
 
         const summaryRows = teamShifts.map(sh => {
-          const u = allUsers.find(user => user.uid === sh.userId);
+          const u = allUsers.find(user => user.uid === sh.userId || user.email === sh.userEmail);
           const stats = calculateShiftStatsObj(sh);
           const dateStr = new Date(sh.clockInTime).toLocaleDateString('en-IN');
           
           return [
-            u?.name || sh.userName,
+            u?.employeeId || 'N/A',
+            u?.fullName || u?.name || sh.userName,
             u?.email || sh.userEmail,
             u?.role || 'N/A',
             u?.teamLeadName || 'Unassigned',
-            u?.mappedManagerName || 'Unassigned',
+            u?.mappedManagerName || u?.managerName || 'Unassigned',
+            u ? getManagerOfManager(u, allUsers) : 'N/A',
             dateStr,
             new Date(sh.clockInTime).toLocaleTimeString('en-IN'),
             sh.clockOutTime ? new Date(sh.clockOutTime).toLocaleTimeString('en-IN') : 'N/A',
@@ -891,12 +1026,16 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
       // 2. Chronological Log
       if (exportReportType === 'chrono' || exportReportType === 'both') {
         const chronoHeaders = [
-          'Employee Name', 'Email', 'Date', 'Sequence', 'Type', 'Activity', 'Start Time', 'End Time', 'Duration (Min)'
+          'Emp ID', 'Employee Name', 'Email', 'Manager of Manager', 'Date', 'Sequence', 'Type', 'Activity', 'Start Time', 'End Time', 'Duration (Min)'
         ];
 
         const chronoRows: any[] = [];
         teamShifts.forEach(sh => {
           const dateStr = new Date(sh.clockInTime).toLocaleDateString('en-IN');
+          const u = allUsers.find(user => user.uid === sh.userId || user.email === sh.userEmail);
+          const empId = u?.employeeId || 'N/A';
+          const mom = u ? getManagerOfManager(u, allUsers) : 'N/A';
+
           (sh.activities || []).forEach((act, idx) => {
             const startStr = new Date(act.startTime).toLocaleTimeString('en-IN');
             const endStr = act.endTime ? new Date(act.endTime).toLocaleTimeString('en-IN') : 'Ongoing';
@@ -905,8 +1044,10 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
               : (new Date().getTime() - new Date(act.startTime).getTime()) / 60000;
 
             chronoRows.push([
+              empId,
               sh.userName,
               sh.userEmail,
+              mom,
               dateStr,
               idx + 1,
               act.type,
@@ -1044,7 +1185,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
         const lastActivity = shActs.length > 0 ? shActs[shActs.length - 1]?.name || '' : '';
         if (lastActivity.toLowerCase().includes('lunch')) {
           lunch++;
-        } else if (lastActivity.toLowerCase().includes('meeting') || lastActivity.toLowerCase().includes('coaching') || lastActivity.toLowerCase().includes('alignment')) {
+        } else if (lastActivity.toLowerCase().includes('meeting') || lastActivity.toLowerCase().includes('coaching') || lastActivity.toLowerCase().includes('training') || lastActivity.toLowerCase().includes('alignment')) {
           meeting++;
         } else {
           otherBreak++;
@@ -1096,10 +1237,24 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
         </div>
 
         <div className="flex items-center gap-3 flex-wrap">
-          <div className="flex items-center gap-1.5 bg-emerald-50 dark:bg-emerald-950/20 text-emerald-600 dark:text-emerald-400 border border-emerald-100 dark:border-emerald-900/20 px-3 py-1.5 rounded-xl font-semibold text-xs transition-all">
-            <span className="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-pulse shrink-0" />
-            <span>Synced in Real-time</span>
-          </div>
+          {activeShifts.find(s => s.userId === user.uid) && (
+            <div className="flex items-center gap-3 border border-indigo-100 dark:border-indigo-950/40 bg-indigo-50/40 dark:bg-indigo-950/20 px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all flex-wrap">
+              <div className="flex items-center gap-1">
+                <span className="text-[10px] text-slate-400 dark:text-slate-500 uppercase font-black font-sans">Shift:</span>
+                <span className="font-mono text-indigo-600 dark:text-indigo-400 font-extrabold">{elapsedShift}</span>
+              </div>
+              <div className="h-3 w-px bg-slate-200 dark:bg-slate-800" />
+              <div className="flex items-center gap-1">
+                <span className="text-[10px] text-slate-400 dark:text-slate-500 uppercase font-black font-sans">Active:</span>
+                <span className="font-mono text-emerald-600 dark:text-emerald-400 font-extrabold">{elapsedActive}</span>
+              </div>
+              <div className="h-3 w-px bg-slate-200 dark:bg-slate-800" />
+              <div className="flex items-center gap-1">
+                <span className="text-[10px] text-slate-400 dark:text-slate-500 uppercase font-black font-sans">Break:</span>
+                <span className="font-mono text-amber-600 dark:text-amber-500 font-extrabold">{elapsedBreak}</span>
+              </div>
+            </div>
+          )}
           
           <div className="flex items-center gap-2">
             <button 
@@ -1201,20 +1356,6 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
               </button>
             )}
           </div>
-          <button 
-            onClick={() => {
-              toast.promise(loadAndRecomputeData(true), {
-                loading: 'Synchronizing roster data...',
-                success: 'Roster synchronization complete.',
-                error: 'Failed to synchronize roster.'
-              });
-            }}
-            disabled={isLoadingShifts}
-            className="flex items-center gap-1.5 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 px-3.5 py-1.5 rounded-xl text-xs font-bold cursor-pointer transition-colors disabled:opacity-50"
-          >
-            <RefreshCw size={13} className={isLoadingShifts ? 'animate-spin' : ''} />
-            <span>Sync Roster</span>
-          </button>
         </div>
       </div>
 
@@ -1714,281 +1855,50 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
                   )}
                 </div>
 
-                <div className="relative" ref={processDropdownRef}>
+                <div className="relative">
                   <label className="block text-[10px] uppercase font-bold text-slate-400 mb-1">Process Filter</label>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setIsProcessDropdownOpen(!isProcessDropdownOpen);
-                      setProcessSearchQuery('');
+                  <MultiSelectDropdown
+                    options={uniqueActiveProcesses}
+                    selectedValues={selectedProcesses}
+                    onToggle={(val) => {
+                      setSelectedProcesses(prev => 
+                        prev.includes(val) ? prev.filter(p => p !== val) : [...prev, val]
+                      );
+                      setCurrentPage(1);
                     }}
-                    className="w-full bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg p-2 font-bold text-left text-slate-700 dark:text-slate-200 cursor-pointer flex justify-between items-center text-xs shadow-xs focus:ring-1 focus:ring-indigo-500"
-                  >
-                    <span className="truncate">
-                      {processFilter === 'all' ? "🚀 Process: All" : `🚀 ${processFilter}`}
-                    </span>
-                    <span className="text-slate-400 text-[10px]">▼</span>
-                  </button>
-
-                  {isProcessDropdownOpen && (
-                    <div className="absolute left-0 right-0 mt-1 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg shadow-lg z-50 max-h-64 flex flex-col overflow-hidden animate-in fade-in slide-in-from-top-1 duration-100">
-                      <div className="p-1 px-2 border-b border-slate-100 dark:border-slate-850 flex items-center gap-1.5 bg-slate-50 dark:bg-slate-950">
-                        <Search size={12} className="text-slate-400 shrink-0" />
-                        <input
-                          type="text"
-                          value={processSearchQuery}
-                          onChange={(e) => setProcessSearchQuery(e.target.value)}
-                          placeholder="Search processes..."
-                          className="w-full bg-transparent text-xs py-1.5 font-medium text-slate-700 dark:text-slate-200 focus:outline-none placeholder-slate-400"
-                          autoFocus
-                        />
-                        {processSearchQuery && (
-                          <button 
-                            type="button" 
-                            onClick={() => setProcessSearchQuery('')} 
-                            className="text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 text-xs font-bold px-1"
-                          >
-                            ×
-                          </button>
-                        )}
-                      </div>
-                      <div className="overflow-y-auto max-h-48 p-1 space-y-0.5">
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setProcessFilter('all');
-                            setCurrentPage(1);
-                            setIsProcessDropdownOpen(false);
-                          }}
-                          className={`w-full text-left text-xs px-2.5 py-1.5 rounded-md font-bold transition-all ${
-                            processFilter === 'all' 
-                              ? 'bg-indigo-50 dark:bg-indigo-950/40 text-indigo-600 dark:text-indigo-400' 
-                              : 'text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-850'
-                          }`}
-                        >
-                          🚀 Process: All
-                        </button>
-                        {uniqueActiveProcesses
-                          .filter(proc => proc.toLowerCase().includes(processSearchQuery.toLowerCase()))
-                          .map(proc => (
-                            <button
-                              key={proc}
-                              type="button"
-                              onClick={() => {
-                                setProcessFilter(proc);
-                                setCurrentPage(1);
-                                setIsProcessDropdownOpen(false);
-                              }}
-                              className={`w-full text-left text-xs px-2.5 py-1.5 rounded-md font-bold transition-all flex items-center gap-1.5 overflow-hidden text-ellipsis ${
-                                processFilter === proc 
-                                  ? 'bg-indigo-50 dark:bg-indigo-950/40 text-indigo-600 dark:text-indigo-400 border-l-2 border-indigo-500' 
-                                  : 'text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-850'
-                              }`}
-                            >
-                              <span className="truncate">{proc}</span>
-                            </button>
-                          ))}
-                        {uniqueActiveProcesses.filter(proc => proc.toLowerCase().includes(processSearchQuery.toLowerCase())).length === 0 && (
-                          <div className="text-center text-slate-400 dark:text-slate-500 text-[11px] py-4">
-                            No matching processes
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  )}
+                    placeholder="🚀 Process: All"
+                  />
                 </div>
 
-                <div className="relative" ref={tlDropdownRef}>
+                <div className="relative">
                   <label className="block text-[10px] uppercase font-bold text-slate-400 mb-1">Team Lead Mapped</label>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setIsTlDropdownOpen(!isTlDropdownOpen);
-                      setTlSearchQuery('');
+                  <MultiSelectDropdown
+                    options={teamLeadsList.map(tl => tl.name)}
+                    selectedValues={selectedTLs}
+                    onToggle={(val) => {
+                      setSelectedTLs(prev => 
+                        prev.includes(val) ? prev.filter(p => p !== val) : [...prev, val]
+                      );
+                      setCurrentPage(1);
                     }}
-                    className="w-full bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg p-2 font-bold text-left text-slate-700 dark:text-slate-200 cursor-pointer flex justify-between items-center text-xs shadow-xs focus:ring-1 focus:ring-indigo-500"
-                  >
-                    <span className="truncate">
-                      {tlFilter === 'all' ? (
-                        "🗺️ Team Lead: All"
-                      ) : (
-                        `👤 ${teamLeadsList.find(tl => tl.id === tlFilter)?.name || tlFilter} ${
-                          teamLeadsList.find(tl => tl.id === tlFilter)?.roleDisplay 
-                            ? `(${teamLeadsList.find(tl => tl.id === tlFilter)?.roleDisplay})` 
-                            : ''
-                        }`
-                      )}
-                    </span>
-                    <span className="text-slate-400 text-[10px]">▼</span>
-                  </button>
-
-                  {isTlDropdownOpen && (
-                    <div className="absolute left-0 right-0 mt-1 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg shadow-lg z-50 max-h-64 flex flex-col overflow-hidden animate-in fade-in slide-in-from-top-1 duration-100">
-                      <div className="p-1 px-2 border-b border-slate-100 dark:border-slate-850 flex items-center gap-1.5 bg-slate-50 dark:bg-slate-950">
-                        <Search size={12} className="text-slate-400 shrink-0" />
-                        <input
-                          type="text"
-                          value={tlSearchQuery}
-                          onChange={(e) => setTlSearchQuery(e.target.value)}
-                          placeholder="Search supervisors..."
-                          className="w-full bg-transparent text-xs py-1.5 font-medium text-slate-700 dark:text-slate-200 focus:outline-none placeholder-slate-400"
-                          autoFocus
-                        />
-                        {tlSearchQuery && (
-                          <button 
-                            type="button" 
-                            onClick={() => setTlSearchQuery('')} 
-                            className="text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 text-xs font-bold px-1"
-                          >
-                            ×
-                          </button>
-                        )}
-                      </div>
-                      <div className="overflow-y-auto max-h-48 p-1 space-y-0.5">
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setTlFilter('all');
-                            setCurrentPage(1);
-                            setIsTlDropdownOpen(false);
-                          }}
-                          className={`w-full text-left text-xs px-2.5 py-1.5 rounded-md font-bold transition-all flex items-center gap-1.5 ${
-                            tlFilter === 'all' 
-                              ? 'bg-indigo-50 dark:bg-indigo-950/40 text-indigo-600 dark:text-indigo-400' 
-                              : 'text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-850'
-                          }`}
-                        >
-                          🗺️ Team Lead: All
-                        </button>
-                        {teamLeadsList
-                          .filter(tl => 
-                            tl.name.toLowerCase().includes(tlSearchQuery.toLowerCase()) || 
-                            (tl.roleDisplay && tl.roleDisplay.toLowerCase().includes(tlSearchQuery.toLowerCase()))
-                          )
-                          .map(tl => (
-                            <button
-                              key={tl.id}
-                              type="button"
-                              onClick={() => {
-                                setTlFilter(tl.id);
-                                setCurrentPage(1);
-                                setIsTlDropdownOpen(false);
-                              }}
-                              className={`w-full text-left text-xs px-2.5 py-1.5 rounded-md font-bold transition-all flex items-center gap-1.5 overflow-hidden text-ellipsis ${
-                                tlFilter === tl.id 
-                                  ? 'bg-indigo-50 dark:bg-indigo-950/40 text-indigo-600 dark:text-indigo-400 border-l-2 border-indigo-500' 
-                                  : 'text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-850'
-                              }`}
-                            >
-                              <span className="shrink-0">👤</span>
-                              <span className="truncate">{tl.name}</span>
-                              {tl.roleDisplay && (
-                                <span className="text-[10px] opacity-60 font-mono shrink-0 ml-auto bg-slate-100 dark:bg-slate-800 px-1 py-0.5 rounded">
-                                  {tl.roleDisplay}
-                                </span>
-                              )}
-                            </button>
-                          ))}
-                        {teamLeadsList.filter(tl => 
-                          tl.name.toLowerCase().includes(tlSearchQuery.toLowerCase()) || 
-                          (tl.roleDisplay && tl.roleDisplay.toLowerCase().includes(tlSearchQuery.toLowerCase()))
-                        ).length === 0 && (
-                          <div className="text-center text-slate-400 dark:text-slate-500 text-[11px] py-4">
-                            No matching supervisors
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  )}
+                    placeholder="🗺️ Team Leads: All"
+                  />
                 </div>
 
                 {['ADMIN', 'MANAGER'].includes((user.role || '').toUpperCase()) ? (
-                  <div className="relative" ref={managerDropdownRef}>
+                  <div className="relative">
                     <label className="block text-[10px] uppercase font-bold text-slate-400 mb-1">Manager Filter</label>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setIsManagerDropdownOpen(!isManagerDropdownOpen);
-                        setManagerSearchQuery('');
+                    <MultiSelectDropdown
+                      options={managersList.map(m => m.name)}
+                      selectedValues={selectedManagers}
+                      onToggle={(val) => {
+                        setSelectedManagers(prev => 
+                          prev.includes(val) ? prev.filter(p => p !== val) : [...prev, val]
+                        );
+                        setCurrentPage(1);
                       }}
-                      className="w-full bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg p-2 font-bold text-left text-slate-700 dark:text-slate-200 cursor-pointer flex justify-between items-center text-xs shadow-xs focus:ring-1 focus:ring-indigo-500"
-                    >
-                      <span className="truncate">
-                        {managerFilter === 'all' ? (
-                          "🏢 Manager: All"
-                        ) : (
-                          `🏢 ${managersList.find(m => m.uid === managerFilter)?.name || managerFilter}`
-                        )}
-                      </span>
-                      <span className="text-slate-400 text-[10px]">▼</span>
-                    </button>
-
-                    {isManagerDropdownOpen && (
-                      <div className="absolute left-0 right-0 mt-1 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg shadow-lg z-50 max-h-64 flex flex-col overflow-hidden animate-in fade-in slide-in-from-top-1 duration-100">
-                        <div className="p-1 px-2 border-b border-slate-100 dark:border-slate-850 flex items-center gap-1.5 bg-slate-50 dark:bg-slate-950">
-                          <Search size={12} className="text-slate-400 shrink-0" />
-                          <input
-                            type="text"
-                            value={managerSearchQuery}
-                            onChange={(e) => setManagerSearchQuery(e.target.value)}
-                            placeholder="Search managers..."
-                            className="w-full bg-transparent text-xs py-1.5 font-medium text-slate-700 dark:text-slate-200 focus:outline-none placeholder-slate-400"
-                            autoFocus
-                          />
-                          {managerSearchQuery && (
-                            <button 
-                              type="button" 
-                              onClick={() => setManagerSearchQuery('')} 
-                              className="text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 text-xs font-bold px-1"
-                            >
-                              ×
-                            </button>
-                          )}
-                        </div>
-                        <div className="overflow-y-auto max-h-48 p-1 space-y-0.5">
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setManagerFilter('all');
-                              setCurrentPage(1);
-                              setIsManagerDropdownOpen(false);
-                            }}
-                            className={`w-full text-left text-xs px-2.5 py-1.5 rounded-md font-bold transition-all ${
-                              managerFilter === 'all' 
-                                ? 'bg-indigo-50 dark:bg-indigo-950/40 text-indigo-600 dark:text-indigo-400' 
-                                : 'text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-850'
-                            }`}
-                          >
-                            🏢 Manager: All
-                          </button>
-                          {managersList
-                            .filter(m => m.name.toLowerCase().includes(managerSearchQuery.toLowerCase()))
-                            .map(m => (
-                              <button
-                                key={m.uid}
-                                type="button"
-                                onClick={() => {
-                                  setManagerFilter(m.uid);
-                                  setCurrentPage(1);
-                                  setIsManagerDropdownOpen(false);
-                                }}
-                                className={`w-full text-left text-xs px-2.5 py-1.5 rounded-md font-bold transition-all flex items-center gap-1.5 overflow-hidden text-ellipsis ${
-                                  managerFilter === m.uid 
-                                    ? 'bg-indigo-50 dark:bg-indigo-950/40 text-indigo-600 dark:text-indigo-400 border-l-2 border-indigo-500' 
-                                    : 'text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-850'
-                                }`}
-                              >
-                                <span className="truncate">{m.name}</span>
-                              </button>
-                            ))}
-                          {managersList.filter(m => m.name.toLowerCase().includes(managerSearchQuery.toLowerCase())).length === 0 && (
-                            <div className="text-center text-slate-400 dark:text-slate-500 text-[11px] py-4">
-                              No matching managers
-                            </div>
-                          )}
-                        </div>
-                      </div>
-                    )}
+                      placeholder="🏢 Managers: All"
+                    />
                   </div>
                 ) : <div className="hidden"></div>}
 
@@ -1996,10 +1906,13 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
                   <button 
                     onClick={() => {
                       setSearchTerm('');
-                      setProcessFilter('all');
+                      setSelectedProcesses([]);
                       setShiftFilter('all');
-                      setTlFilter('all');
-                      setManagerFilter('all');
+                      setSelectedTLs([]);
+                      setSelectedManagers(() => {
+                        const isOnlyManager = (user.role || '').toString().toUpperCase() === 'MANAGER';
+                        return isOnlyManager ? [user.fullName || user.name] : [];
+                      });
                       setCurrentPage(1);
                     }}
                     className="bg-slate-200 hover:bg-slate-300 text-slate-700 py-2.5 rounded-lg font-bold transition-all cursor-pointer"

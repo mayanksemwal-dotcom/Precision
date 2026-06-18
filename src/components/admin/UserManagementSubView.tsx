@@ -18,7 +18,7 @@ import {
   RefreshCw
 } from 'lucide-react';
 import { db, auth } from '../../lib/firebase';
-import { doc, setDoc, deleteDoc, writeBatch, collection, getDocs, getDoc } from 'firebase/firestore';
+import { doc, setDoc, deleteDoc, writeBatch, collection, getDocs, getDoc, onSnapshot } from 'firebase/firestore';
 import { UserRole, UserProfile } from '../../types';
 import { toast } from 'sonner';
 import * as XLSX from 'xlsx';
@@ -431,6 +431,19 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
   }, [normalizedUsers, searchTerm, roleFilter, statusFilter, deptFilter, procFilter, sortBy, sortOrder]);
 
   const [registeredProcesses, setRegisteredProcesses] = useState<string[]>([]);
+  const [dynamicRoles, setDynamicRoles] = useState<string[]>([]);
+
+  useEffect(() => {
+    const unsubscribe = onSnapshot(collection(db, 'roles'), (snapshot) => {
+      const list = snapshot.docs.map(doc => doc.id.toUpperCase().trim());
+      const baselineRoles = Object.keys(UserRole);
+      const combined = Array.from(new Set([...baselineRoles, ...list]));
+      setDynamicRoles(combined);
+    }, (error) => {
+      console.error('Error listening to dynamic roles:', error);
+    });
+    return () => unsubscribe();
+  }, []);
 
   useEffect(() => {
     const fetchRegisteredProcesses = async () => {
@@ -1219,7 +1232,7 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
               className={adminTheme === 'dark' ? 'w-full bg-slate-800 text-xs px-2 py-1.5 rounded-lg border border-slate-700' : 'w-full bg-white text-xs px-2 py-1.5 rounded-lg border border-slate-200'}
             >
               <option value="">All Roles</option>
-              {Object.keys(UserRole).map(role => (
+              {dynamicRoles.map(role => (
                 <option key={role} value={role}>{role}</option>
               ))}
             </select>
@@ -1534,7 +1547,7 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
                   onChange={e => setNewForm({...newForm, role: e.target.value as UserRole})} 
                   className={adminTheme === 'dark' ? 'w-full bg-slate-900 p-2 border border-slate-705 rounded-lg text-slate-350' : 'w-full bg-white border border-slate-200 p-2 rounded-lg text-slate-650'}
                 >
-                  {Object.keys(UserRole).map(role => (
+                  {dynamicRoles.map(role => (
                     <option key={role} value={role}>{role}</option>
                   ))}
                 </select>
@@ -1679,7 +1692,7 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
                   onChange={e => setEditForm({...editForm, role: e.target.value as UserRole})} 
                   className={adminTheme === 'dark' ? 'w-full bg-slate-900 p-2 border border-slate-700 rounded-lg text-slate-350' : 'w-full bg-white border border-slate-200 p-2 rounded-lg text-slate-650'}
                 >
-                  {Object.keys(UserRole).map(role => (
+                  {dynamicRoles.map(role => (
                     <option key={role} value={role}>{role}</option>
                   ))}
                 </select>

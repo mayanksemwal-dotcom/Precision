@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { db, auth } from '../../lib/firebase';
 import { collection, onSnapshot, query, orderBy, limit, addDoc } from 'firebase/firestore';
 import { 
@@ -35,25 +35,98 @@ export const EmailDashboardSubView: React.FC<EmailDashboardSubViewProps> = ({ ad
   // Active email item for a modal/preview drawer
   const [selectedEmail, setSelectedEmail] = useState<any | null>(null);
 
-  // Fetch email queue from Firestore emails collection
+  // Fetch email queue from both Firestore emails and mail collections
   useEffect(() => {
     setLoading(true);
-    const q = query(collection(db, 'emails'), orderBy('createdAt', 'desc'), limit(50));
+    const qEmails = query(collection(db, 'emails'), orderBy('createdAt', 'desc'), limit(50));
+    const qMail = query(collection(db, 'mail'), orderBy('createdAt', 'desc'), limit(50));
     
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const emailList: any[] = [];
-      snapshot.forEach((doc) => {
-        emailList.push({ id: doc.id, ...doc.data() });
+    let emailsList: any[] = [];
+    let mailList: any[] = [];
+    let isMounted = true;
+    
+    const updateMergedList = (eList: any[], mList: any[]) => {
+      if (!isMounted) return;
+      const seen = new Set<string>();
+      const merged: any[] = [];
+      
+      const all = [
+        ...eList.map(item => ({ ...item, sourceCollection: item.sourceCollection || 'emails' })), 
+        ...mList.map(item => ({ ...item, sourceCollection: item.sourceCollection || 'mail' }))
+      ];
+                    
+      // Sort in-place by chronological creation time
+      all.sort((a, b) => {
+        const dateA = new Date(a.createdAt || 0).getTime();
+        const dateB = new Date(b.createdAt || 0).getTime();
+        return dateB - dateA;
       });
-      setEmails(emailList);
+      
+      all.forEach(item => {
+        const toStr = String(item.to || item.message?.to || '').toLowerCase().trim();
+        const subjStr = String(item.subject || item.message?.subject || '').toLowerCase().trim();
+        const ms = new Date(item.createdAt || 0).getTime();
+        // Bucket within 5 seconds for deduplicating same dispatch logged to both collections
+        const hash = `${toStr}_${subjStr}_${Math.round(ms / 5000)}`;
+        
+        if (!seen.has(hash)) {
+          seen.add(hash);
+          
+          // Match and see if there's a corresponding document that has a richer 'delivery' state
+          const richerInstance = all.find(other => {
+            if (other.id === item.id) return false;
+            const otherToStr = String(other.to || other.message?.to || '').toLowerCase().trim();
+            const otherSubjStr = String(other.subject || other.message?.subject || '').toLowerCase().trim();
+            const otherMs = new Date(other.createdAt || 0).getTime();
+            return otherToStr === toStr && otherSubjStr === subjStr && Math.abs(otherMs - ms) < 10000 && other.delivery;
+          });
+
+          if (richerInstance) {
+            merged.push({ 
+              ...richerInstance, 
+              sourceCollection: item.sourceCollection !== richerInstance.sourceCollection 
+                ? `${item.sourceCollection}/${richerInstance.sourceCollection}` 
+                : item.sourceCollection 
+            });
+          } else {
+            merged.push(item);
+          }
+        }
+      });
+      
+      setEmails(merged.slice(0, 50));
       setLoading(false);
+    };
+
+    const unsubscribeEmails = onSnapshot(qEmails, (snapshot) => {
+      emailsList = [];
+      snapshot.forEach((doc) => {
+        emailsList.push({ id: doc.id, ...doc.data(), sourceCollection: 'emails' });
+      });
+      updateMergedList(emailsList, mailList);
     }, (error) => {
-      console.error('Error listening to emails collection:', error);
-      toast.error('Failed to load email queue. Check permission configuration.');
-      setLoading(false);
+      console.warn('Silent fallback on emails collection permission:', error);
+      // If we failed to read emails, we can still load mail
+      updateMergedList(emailsList, mailList);
     });
 
-    return () => unsubscribe();
+    const unsubscribeMail = onSnapshot(qMail, (snapshot) => {
+      mailList = [];
+      snapshot.forEach((doc) => {
+        mailList.push({ id: doc.id, ...doc.data(), sourceCollection: 'mail' });
+      });
+      updateMergedList(emailsList, mailList);
+    }, (error) => {
+      console.warn('Silent fallback on mail collection permission:', error);
+      // If we failed to read mail, we can still load emails
+      updateMergedList(emailsList, mailList);
+    });
+
+    return () => {
+      isMounted = false;
+      unsubscribeEmails();
+      unsubscribeMail();
+    };
   }, []);
 
   // Fetch SMTP status from our custom server /api/smtp-status endpoint
@@ -88,13 +161,25 @@ export const EmailDashboardSubView: React.FC<EmailDashboardSubViewProps> = ({ ad
     fetchSmtpStatus();
   }, []);
 
-  // Statistics calculation
-  const stats = {
-    pending: emails.filter(e => e.status === 'pending' || e.status === 'processing').length,
-    sent: emails.filter(e => e.status === 'sent').length,
-    failed: emails.filter(e => e.status === 'failed').length,
-    total: emails.length
-  };
+  // Statistics calculation supporting both local custom worker 'status' and Firebase Trigger Email 'delivery.state'
+  const stats = useMemo(() => {
+    let pending = 0;
+    let sent = 0;
+    let failed = 0;
+    
+    emails.forEach(e => {
+      const state = (e.delivery?.state || e.status || 'pending').toLowerCase();
+      if (state === 'success' || state === 'sent') {
+        sent++;
+      } else if (state === 'error' || state === 'failed') {
+        failed++;
+      } else {
+        pending++;
+      }
+    });
+    
+    return { pending, sent, failed, total: emails.length };
+  }, [emails]);
 
   // Trigger test email write
   const handleSendTestEmail = async (e: React.FormEvent) => {
@@ -113,27 +198,29 @@ export const EmailDashboardSubView: React.FC<EmailDashboardSubViewProps> = ({ ad
       createdAt: nowISO,
       status: 'pending',
       retryCount: 0,
-      subject: testSubject.trim() || 'Precision360 Custom Email Delivery System - Test Email',
-      text: testBody.trim() || 'This email confirms the custom Email Delivery Service is live, operational, and connected to your background process queue!',
-      html: `
-        <div style="font-family: sans-serif; padding: 25px; max-width: 600px; border: 1px solid #e2e8f0; border-radius: 12px; background-color: #ffffff; color: #1e293b;">
-          <h2 style="color: #6366f1; margin-top: 0; font-size: 20px; font-weight: 700;">Precision360 Notification System</h2>
-          <p style="font-size: 14px; line-height: 1.5; color: #334155;">Congratulations, your background custom Email Delivery Service is successfully configured and active!</p>
-          <div style="margin: 20px 0; padding: 15px; background-color: #f8fafc; border-radius: 8px; border-left: 4px solid #6366f1;">
-            <p style="margin: 0; font-size: 13px; font-weight: 600; color: #475569;">System Metadata:</p>
-            <ul style="margin: 8px 0 0 0; padding-left: 20px; font-family: monospace; font-size: 12px; color: #64748b; line-height: 1.4;">
-              <li>Queue ID: TEST_${Math.random().toString(36).substring(2, 10).toUpperCase()}</li>
-              <li>Timestamp: ${nowISO}</li>
-              <li>Trigger Type: Manual Test Dispatch</li>
-              <li>SMTP Target: ${smtpStatus?.host || 'smtp.gmail.com'}</li>
-            </ul>
+      message: {
+        subject: testSubject.trim() || 'Precision360 Custom Email Delivery System - Test Email',
+        text: testBody.trim() || 'This email confirms the custom Email Delivery Service is live, operational, and connected to your background process queue!',
+        html: `
+          <div style="font-family: sans-serif; padding: 25px; max-width: 600px; border: 1px solid #e2e8f0; border-radius: 12px; background-color: #ffffff; color: #1e293b;">
+            <h2 style="color: #6366f1; margin-top: 0; font-size: 20px; font-weight: 700;">Precision360 Notification System</h2>
+            <p style="font-size: 14px; line-height: 1.5; color: #334155;">Congratulations, your background custom Email Delivery Service is successfully configured and active!</p>
+            <div style="margin: 20px 0; padding: 15px; background-color: #f8fafc; border-radius: 8px; border-left: 4px solid #6366f1;">
+              <p style="margin: 0; font-size: 13px; font-weight: 600; color: #475569;">System Metadata:</p>
+              <ul style="margin: 8px 0 0 0; padding-left: 20px; font-family: monospace; font-size: 12px; color: #64748b; line-height: 1.4;">
+                <li>Queue ID: TEST_${Math.random().toString(36).substring(2, 10).toUpperCase()}</li>
+                <li>Timestamp: ${nowISO}</li>
+                <li>Trigger Type: Manual Test Dispatch</li>
+                <li>SMTP Target: ${smtpStatus?.host || 'smtp.gmail.com'}</li>
+              </ul>
+            </div>
+            <p style="font-size: 14px; line-height: 1.5; color: #334155;">This dispatch confirms system resilience and cross-module dispatch capabilities (Warnings, PIP, Attendance, IT Helpdesk, and Notifications).</p>
+            <p style="font-size: 12px; color: #94a3b8; margin-top: 25px; border-top: 1px solid #f1f5f9; padding-top: 15px;">
+              This is an automated system generated test email for diagnostics. Please do not reply directly.
+            </p>
           </div>
-          <p style="font-size: 14px; line-height: 1.5; color: #334155;">This dispatch confirms system resilience and cross-module dispatch capabilities (Warnings, PIP, Attendance, IT Helpdesk, and Notifications).</p>
-          <p style="font-size: 12px; color: #94a3b8; margin-top: 25px; border-top: 1px solid #f1f5f9; padding-top: 15px;">
-            This is an automated system generated test email for diagnostics. Please do not reply directly.
-          </p>
-        </div>
-      `
+        `
+      }
     };
 
     try {
@@ -152,8 +239,10 @@ export const EmailDashboardSubView: React.FC<EmailDashboardSubViewProps> = ({ ad
     }
   };
 
-  const getStatusBadge = (status: string) => {
-    switch (status) {
+  const getStatusBadge = (status: string, delivery?: any) => {
+    const rawVal = (delivery?.state || status || 'pending').toLowerCase();
+    switch (rawVal) {
+      case 'success':
       case 'sent':
         return (
           <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-emerald-100 text-emerald-850 dark:bg-emerald-950/40 dark:text-emerald-400">
@@ -166,6 +255,7 @@ export const EmailDashboardSubView: React.FC<EmailDashboardSubViewProps> = ({ ad
             <RefreshCw size={12} className="animate-spin" /> Processing
           </span>
         );
+      case 'error':
       case 'failed':
         return (
           <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-red-101 text-red-800 dark:bg-red-950/40 dark:text-red-400">
@@ -459,7 +549,7 @@ export const EmailDashboardSubView: React.FC<EmailDashboardSubViewProps> = ({ ad
                     </div>
 
                     <div className="flex items-center gap-2 shrink-0 self-end md:self-center">
-                      {getStatusBadge(email.status)}
+                      {getStatusBadge(email.status, email.delivery)}
                       <button 
                         onClick={() => setSelectedEmail(email)}
                         className="p-1.5 hover:bg-slate-500/10 rounded-lg text-slate-400 hover:text-indigo-500 transition-colors cursor-pointer"
@@ -512,7 +602,7 @@ export const EmailDashboardSubView: React.FC<EmailDashboardSubViewProps> = ({ ad
                 </div>
                 <div>
                   <label className="block text-[10px] uppercase font-bold text-slate-400">Queue Status</label>
-                  <div className="mt-1">{getStatusBadge(selectedEmail.status)}</div>
+                  <div className="mt-1">{getStatusBadge(selectedEmail.status, selectedEmail.delivery)}</div>
                 </div>
               </div>
 
