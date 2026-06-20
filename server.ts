@@ -141,12 +141,9 @@ async function checkUserPrivilege(decodedToken: any): Promise<boolean> {
 }
 
 async function start() {
-  // Start custom email queue background processing worker
-  try {
-    startEmailWorker(db);
-  } catch (workerErr) {
-    console.error('[EMAIL WORKER FAILED TO START]', workerErr);
-  }
+  // Custom email queue background processing worker is disabled here to prevent local sandbox processing
+  // and prioritize the native production project Firebase Cloud Function deployment.
+  console.log('[SERVER] Sandbox-side background email worker is disabled in favor of native Firebase Cloud Functions.');
 
   // --- API ROUTES ---
   app.use('/api', (req, res, next) => {

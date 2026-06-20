@@ -80,7 +80,87 @@ export interface TMSShift {
   clockInTime: string; // ISO
   clockOutTime?: string; // ISO
   activities: ShiftActivity[];
-  status: 'ACTIVE' | 'BREAK' | 'COMPLETED';
+  status: 'ACTIVE' | 'BREAK' | 'COMPLETED' | 'AUTO_CLOSED';
+}
+
+export function getShiftProductiveMs(shift: TMSShift, referenceTime: number): number {
+  let activeMs = 0;
+  const endMs = shift.clockOutTime 
+    ? new Date(shift.clockOutTime).getTime() 
+    : referenceTime;
+
+  (shift.activities || []).forEach(act => {
+    const actStart = new Date(act.startTime).getTime();
+    const actEnd = act.endTime ? new Date(act.endTime).getTime() : endMs;
+    const duration = Math.max(0, actEnd - actStart);
+    const actName = (act.name || '').toLowerCase();
+    const isProductive = act.type === 'productive' || 
+                         actName.includes('meeting') || 
+                         actName.includes('coaching') || 
+                         actName.includes('training') || 
+                         actName.includes('alignment');
+    if (isProductive) {
+      activeMs += duration;
+    }
+  });
+  return activeMs;
+}
+
+export function truncateShiftToProductiveTime(shift: TMSShift, limitMs: number = 10 * 60 * 60 * 1000): { activities: ShiftActivity[]; clockOutTime: string } {
+  let accumulatedProductive = 0;
+  const updatedActivities: ShiftActivity[] = [];
+  let exactEndISO = shift.clockOutTime || new Date().toISOString();
+
+  for (const act of shift.activities) {
+    const actStart = new Date(act.startTime).getTime();
+    const actEnd = act.endTime ? new Date(act.endTime).getTime() : new Date().getTime();
+    const duration = Math.max(0, actEnd - actStart);
+
+    const actName = (act.name || '').toLowerCase();
+    const isProductive = act.type === 'productive' || 
+                         actName.includes('meeting') || 
+                         actName.includes('coaching') || 
+                         actName.includes('training') || 
+                         actName.includes('alignment');
+
+    if (isProductive) {
+      if (accumulatedProductive + duration >= limitMs) {
+        const remainingNeeded = limitMs - accumulatedProductive;
+        const exactEndMs = actStart + remainingNeeded;
+        exactEndISO = new Date(exactEndMs).toISOString();
+        
+        updatedActivities.push({
+          ...act,
+          endTime: exactEndISO
+        });
+        accumulatedProductive = limitMs;
+        break; // stop here
+      } else {
+        updatedActivities.push(act);
+        accumulatedProductive += duration;
+      }
+    } else {
+      // Preserve breaks up to the point we hit limit (if any)
+      const breakStart = new Date(act.startTime).getTime();
+      if (accumulatedProductive >= limitMs || breakStart >= new Date(exactEndISO).getTime()) {
+        break;
+      }
+      updatedActivities.push(act);
+    }
+  }
+
+  // Ensure last activity has endTime set
+  if (updatedActivities.length > 0) {
+    const lastIndex = updatedActivities.length - 1;
+    if (!updatedActivities[lastIndex].endTime) {
+      updatedActivities[lastIndex].endTime = exactEndISO;
+    }
+  }
+
+  return {
+    activities: updatedActivities,
+    clockOutTime: exactEndISO
+  };
 }
 
 export function getManagerOfManager(u: UserProfile, allUsers: UserProfile[]): string {
@@ -395,13 +475,40 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
       // Find if there's any active shift (status ACTIVE or BREAK)
       const active = activeShiftsList.length > 0 ? activeShiftsList[0] : null;
       if (active) {
-        setCurrentShift(active);
-        // Default select previous active process if available
-        const lastProductive = [...active.activities]
-          .reverse()
-          .find(act => act.type === 'productive');
-        if (lastProductive && !selectedProcessInput) {
-          setSelectedProcessInput(lastProductive.name);
+        const referenceTime = getLiveTime().getTime();
+        const activeProductiveMs = getShiftProductiveMs(active, referenceTime);
+        const TEN_HOURS_MS = 10 * 60 * 60 * 1000;
+        if (activeProductiveMs >= TEN_HOURS_MS) {
+          const { activities: updatedActivities, clockOutTime } = truncateShiftToProductiveTime(active, TEN_HOURS_MS);
+          const finalizedShift = {
+            ...active,
+            activities: updatedActivities,
+            clockOutTime,
+            status: 'AUTO_CLOSED' as const,
+            remarks: 'Auto-clocked out after 10 hours productive time'
+          };
+
+          saveShiftState(finalizedShift)
+            .then(() => syncShiftToAttendance({ id: active.id, ...finalizedShift }))
+            .then(() => {
+              const userRef = doc(db, 'users', user.uid);
+              return updateDoc(userRef, {
+                status: 'OFFLINE',
+                lastLogoutAt: clockOutTime
+              });
+            })
+            .catch(err => console.error('Error auto-clocking out shift:', err));
+
+          setCurrentShift(null);
+        } else {
+          setCurrentShift(active);
+          // Default select previous active process if available
+          const lastProductive = [...active.activities]
+            .reverse()
+            .find(act => act.type === 'productive');
+          if (lastProductive && !selectedProcessInput) {
+            setSelectedProcessInput(lastProductive.name);
+          }
         }
       } else {
         setCurrentShift(null);

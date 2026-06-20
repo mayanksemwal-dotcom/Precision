@@ -57,7 +57,7 @@ import { canActOn } from '../../lib/hierarchy';
 import { usePermission } from '../PermissionContext';
 import { MultiSelectDropdown } from '../ui/multi-select';
 import * as XLSX from 'xlsx';
-import { getManagerOfManager } from '../../views/TMSView';
+import { getManagerOfManager, getShiftProductiveMs, truncateShiftToProductiveTime } from '../../views/TMSView';
 import { getLiveTime, getLiveTimeISO } from '../../lib/timeSync';
 
 interface SupervisorDashboardProps {
@@ -489,25 +489,37 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
 
       const teamActiveShifts: TMSShift[] = [];
       const duplicateCloses: TMSShift[] = [];
+      const autoClockOuts: TMSShift[] = [];
 
       Object.entries(shiftsByUser).forEach(([userId, userShifts]) => {
+        let primaryShift: TMSShift;
         if (userShifts.length > 1) {
-          // Sort descending: most recent shift at index 0
           userShifts.sort((a, b) => new Date(b.clockInTime).getTime() - new Date(a.clockInTime).getTime());
-          teamActiveShifts.push(userShifts[0]);
+          primaryShift = userShifts[0];
           for (let i = 1; i < userShifts.length; i++) {
             duplicateCloses.push(userShifts[i]);
           }
         } else {
-          teamActiveShifts.push(userShifts[0]);
+          primaryShift = userShifts[0];
+        }
+
+        const referenceTime = new Date().getTime();
+        const activeProductiveMs = getShiftProductiveMs(primaryShift as any, referenceTime);
+        const TEN_HOURS_MS = 10 * 60 * 60 * 1000;
+
+        if (activeProductiveMs >= TEN_HOURS_MS) {
+          autoClockOuts.push(primaryShift);
+        } else {
+          teamActiveShifts.push(primaryShift);
         }
       });
 
-      // Heal the database synchronously by batch-closing older duplicates
-      if (duplicateCloses.length > 0) {
-        console.warn(`[DATA HEAL] Found ${duplicateCloses.length} duplicate active shifts. Closing older ones...`);
+      // Heal the database synchronously by batch-closing older duplicates / 10h productive limit exceeders
+      if (duplicateCloses.length > 0 || autoClockOuts.length > 0) {
+        console.warn(`[DATA HEAL] Found duplicate shifts (${duplicateCloses.length}) and/or expired 10h productive shifts (${autoClockOuts.length}). Updating in Firestore...`);
         const healBatch = writeBatch(db);
         const healNowISO = new Date().toISOString();
+        
         duplicateCloses.forEach(sh => {
           const updatedActivities = [...(sh.activities || [])];
           if (updatedActivities.length > 0) {
@@ -524,7 +536,26 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
             remarks: 'System Auto-Resolved Duplicate Active Shift (Supervisor Healing)'
           });
         });
-        healBatch.commit().catch(err => console.error('Error healing duplicate shifts:', err));
+
+        autoClockOuts.forEach(sh => {
+          const TEN_HOURS_MS = 10 * 60 * 60 * 1000;
+          const { activities: updatedActivities, clockOutTime } = truncateShiftToProductiveTime(sh as any, TEN_HOURS_MS);
+          healBatch.set(doc(db, 'tmsShifts', sh.id), {
+            ...sh,
+            activities: updatedActivities,
+            status: 'AUTO_CLOSED',
+            clockOutTime,
+            remarks: 'Auto-clocked out after 10 hours productive time'
+          });
+
+          const userRef = doc(db, 'users', sh.userId);
+          healBatch.update(userRef, {
+            status: 'OFFLINE',
+            lastLogoutAt: clockOutTime
+          });
+        });
+
+        await healBatch.commit().catch(err => console.error('Error healing active shifts:', err));
       }
 
       setActiveShifts(teamActiveShifts);
@@ -540,7 +571,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
       const autoClosedSnapshot = await getDocs(autoClosedQuery);
       const teamAutoClosed = autoClosedSnapshot.docs
         .map(d => ({ id: d.id, ...d.data() } as any))
-        .filter(sh => scopeIds.has(sh.userId));
+        .filter(sh => scopeIds.has(sh.userId) && (sh.remarks?.includes('10 hours') || sh.remarks?.includes('10H') || sh.remarks?.includes('10-Hour')));
 
       // Compute statistics and variables in memory without database scans
       const totalAssigned = currentMappedUsers.length;
@@ -2104,6 +2135,10 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
                                       <span className="font-mono text-slate-900 dark:text-slate-205">{stats.activeMins.toFixed(1)}m</span>
                                     </div>
                                     <div className="flex justify-between">
+                                      <span>Total Break Time:</span>
+                                      <span className="font-mono text-amber-600 dark:text-amber-450">{(stats.breakMs / 60000).toFixed(1)}m <span className="text-[9px] text-slate-400 font-normal">({stats.breakStr})</span></span>
+                                    </div>
+                                    <div className="flex justify-between">
                                       <span>Present Threshold:</span>
                                       <span className="font-mono text-slate-500">{stats.threshold}m</span>
                                     </div>
@@ -2157,14 +2192,20 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
                             )}
                           </td>
                         </tr>
-                        {expandedUserId === u.uid && stats && (
+                         {expandedUserId === u.uid && stats && (
                           <tr className="bg-slate-50/70 dark:bg-slate-900/40 border-b border-indigo-50/60 dark:border-slate-800">
                             <td colSpan={8} className="p-4 pl-12">
-                              <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+                              <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 gap-4">
                                 <div>
                                   <span className="text-[10px] text-slate-400 dark:text-slate-500 block uppercase font-bold tracking-wider mb-1">Productive Minutes</span>
                                   <span className="font-mono font-black text-xs text-slate-800 dark:text-slate-200">
                                     {stats.activeMins.toFixed(1)}m <span className="text-[10px] text-slate-400 font-normal">({stats.activeStr})</span>
+                                  </span>
+                                </div>
+                                <div>
+                                  <span className="text-[10px] text-slate-400 dark:text-slate-500 block uppercase font-bold tracking-wider mb-1">Total Break Time</span>
+                                  <span className="font-mono font-black text-xs text-amber-600 dark:text-amber-400">
+                                    {(stats.breakMs / 60000).toFixed(1)}m <span className="text-[10px] text-slate-400 font-normal">({stats.breakStr})</span>
                                   </span>
                                 </div>
                                 <div>
@@ -2330,7 +2371,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
                         </div>
                         <div className="min-w-0">
                           <div className="font-extrabold text-slate-800 dark:text-slate-200 leading-tight truncate">{item.userName}</div>
-                          <div className="text-[10px] text-amber-600 dark:text-amber-400 font-bold mt-0.5 leading-none">Session automatically terminated as stale</div>
+                          <div className="text-[10px] text-amber-600 dark:text-amber-400 font-bold mt-0.5 leading-none">Auto-clocked out after 10 hours productive time</div>
                         </div>
                       </div>
                       <button 

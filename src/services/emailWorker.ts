@@ -85,7 +85,8 @@ export function startEmailWorker(db: admin.firestore.Firestore) {
           // De-duplicate / lease check: instantly transition to 'processing' to lock the document
           try {
             await docRef.update({
-              status: 'processing'
+              status: 'processing',
+              processedAt: admin.firestore.FieldValue.serverTimestamp() // Requirement
             });
           } catch (lockErr) {
             console.error(`[Firebase Function processQueuedEmails - Email Failed] Failed to secure document lock for ${doc.id}:`, lockErr);
