@@ -23,7 +23,11 @@ import {
   Clock3,
   UserX,
   Sparkles,
-  LogOut
+  LogOut,
+  Smartphone,
+  Monitor,
+  Laptop,
+  Tablet
 } from 'lucide-react';
 import { 
   BarChart, 
@@ -57,7 +61,7 @@ import { canActOn } from '../../lib/hierarchy';
 import { usePermission } from '../PermissionContext';
 import { MultiSelectDropdown } from '../ui/multi-select';
 import * as XLSX from 'xlsx';
-import { getManagerOfManager, getShiftProductiveMs, truncateShiftToProductiveTime } from '../../views/TMSView';
+import { getManagerOfManager, getShiftProductiveMs, truncateShiftToProductiveTime, getDeviceType } from '../../views/TMSView';
 import { getLiveTime, getLiveTimeISO } from '../../lib/timeSync';
 
 interface SupervisorDashboardProps {
@@ -85,6 +89,23 @@ interface TMSShift {
   clockOutTime?: string;
   activities: ShiftActivity[];
   status: 'ACTIVE' | 'BREAK' | 'COMPLETED' | 'AUTO_CLOSED';
+  clockInDevice?: string;
+  clockOutDevice?: string;
+  deviceType?: string;
+  browser?: string;
+  os?: string;
+  loginTimestamp?: string;
+  remarks?: string;
+
+  // Diagnostics fields
+  userAgent?: string;
+  platform?: string;
+  maxTouchPoints?: number;
+  screenWidth?: number;
+  screenHeight?: number;
+  detectedDeviceType?: string;
+  detectedBrowser?: string;
+  detectedOS?: string;
 }
 
 export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, externalTheme }: SupervisorDashboardProps) {
@@ -133,7 +154,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
   
   // Pagination
   const [currentPage, setCurrentPage] = useState(1);
-  const itemsPerPage = 30;
+  const [itemsPerPage, setItemsPerPage] = useState(25);
 
   // Modals / Actions states
   const [isExporting, setIsExporting] = useState(false);
@@ -143,6 +164,8 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
 
   // Force Logout Confirm States
   const [showForceLogoutConfirm, setShowForceLogoutConfirm] = useState(false);
+  const [selectedInvestigateLogs, setSelectedInvestigateLogs] = useState<any[]>([]);
+  const [showInvestigateModal, setShowInvestigateModal] = useState(false);
   const [logoutShiftId, setLogoutShiftId] = useState<string | null>(null);
   const [logoutTargetName, setLogoutTargetName] = useState('');
   const [logoutTargetUid, setLogoutTargetUid] = useState('');
@@ -315,6 +338,10 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
   const mappedUsersRef = React.useRef(mappedUsers);
   const allUsersRef = React.useRef(allUsers);
   
+  // Performance optimization: cache today's shift query results during massive real-time ticks
+  const lastTodayShiftsFetchTimeRef = React.useRef<number>(0);
+  const cachedTodayShiftsRef = React.useRef<any[]>([]);
+
   useEffect(() => {
     mappedUsersRef.current = mappedUsers;
     allUsersRef.current = allUsers;
@@ -560,18 +587,43 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
 
       setActiveShifts(teamActiveShifts);
 
-      // Fetch auto-closed sessions of today
-      const startOfToday = new Date();
-      startOfToday.setHours(0,0,0,0);
-      const autoClosedQuery = query(
-        collection(db, 'tmsShifts'),
-        where('status', '==', 'AUTO_CLOSED'),
-        where('clockInTime', '>=', startOfToday.toISOString())
-      );
-      const autoClosedSnapshot = await getDocs(autoClosedQuery);
-      const teamAutoClosed = autoClosedSnapshot.docs
-        .map(d => ({ id: d.id, ...d.data() } as any))
-        .filter(sh => scopeIds.has(sh.userId) && (sh.remarks?.includes('10 hours') || sh.remarks?.includes('10H') || sh.remarks?.includes('10-Hour')));
+      // Timezone-safe daily shifts retrieval with aggressive performance caching (20s) to fix lag issues
+      let todayShifts: any[] = [];
+      const currentTimestampMs = Date.now();
+      const CACHE_EXPIRY_MS = 20000;
+      
+      const isCacheValid = cachedTodayShiftsRef.current.length > 0 && 
+                           (currentTimestampMs - lastTodayShiftsFetchTimeRef.current < CACHE_EXPIRY_MS) && 
+                           !forceRecalculate;
+
+      if (isCacheValid) {
+        todayShifts = cachedTodayShiftsRef.current;
+      } else {
+        // Go back 30 hours to safely cover any possible timezone skew (UTC offset overlap)
+        const startOfTodayQuery = new Date(currentTimestampMs - 30 * 60 * 60 * 1000);
+        const todayShiftsQuery = query(
+          collection(db, 'tmsShifts'),
+          where('clockInTime', '>=', startOfTodayQuery.toISOString())
+        );
+        const todayShiftsSnapshot = await getDocs(todayShiftsQuery);
+        
+        // Filter in memory for supervisor's current calendar day (same local date) OR within last 24 hours
+        const nowLocalDateStr = new Date().toDateString();
+        todayShifts = todayShiftsSnapshot.docs
+          .map(d => ({ id: d.id, ...d.data() } as any))
+          .filter(sh => {
+            if (!scopeIds.has(sh.userId)) return false;
+            const shiftLocalDateStr = new Date(sh.clockInTime).toDateString();
+            const isTodayLocal = shiftLocalDateStr === nowLocalDateStr;
+            const within24h = (currentTimestampMs - new Date(sh.clockInTime).getTime()) < 24 * 60 * 60 * 1000;
+            return isTodayLocal || within24h;
+          });
+          
+        cachedTodayShiftsRef.current = todayShifts;
+        lastTodayShiftsFetchTimeRef.current = currentTimestampMs;
+      }
+
+      const teamAutoClosed = todayShifts.filter(sh => sh.status === 'AUTO_CLOSED' && (sh.remarks?.includes('10 hours') || sh.remarks?.includes('10H') || sh.remarks?.includes('10-Hour')));
 
       // Compute statistics and variables in memory without database scans
       const totalAssigned = currentMappedUsers.length;
@@ -602,37 +654,73 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
 
       // Audit and Validation diagnostics calculations
       const nowMs = new Date().getTime();
-      const stales: any[] = [];
-      const longBreaks: any[] = [];
-      const idles: any[] = [];
-      
-      const staleBatch = writeBatch(db);
-      let staleFound = false;
+      const bioBreaks: any[] = [];
+      const lunchBreaks: any[] = [];
+      const shortBreaks: any[] = [];
+      const mobilePunchesList: any[] = [];
 
+      // 1. Calculate segmented break exceptions from teamActiveShifts
       teamActiveShifts.forEach(sh => {
-        const stats = calculateShiftStatsObj(sh);
         const clockInMs = new Date(sh.clockInTime).getTime();
         const shActs = sh.activities || [];
         const lastActObj = shActs.length > 0 ? shActs[shActs.length - 1] : null;
         const lastActTime = lastActObj ? new Date(lastActObj.startTime).getTime() : clockInMs;
-        
 
-        // 2. Long break (>45 minutes on break)
         if (sh.status === 'BREAK' && lastActObj && !lastActObj.endTime) {
           const breakDurationMins = (nowMs - lastActTime) / (60 * 1000);
-          if (breakDurationMins > 45) {
-            longBreaks.push({
-              userId: sh.userId,
-              userName: sh.userName,
-              email: sh.userEmail,
-              breakName: lastActObj.name,
-              startTime: lastActObj.startTime,
-              durationMins: Math.round(breakDurationMins),
-              shiftId: sh.id
-            });
+          const breakNameLower = (lastActObj.name || '').toLowerCase();
+          const durationMins = Math.round(breakDurationMins);
+
+          const exceptionItem = {
+            userId: sh.userId,
+            userName: sh.userName,
+            email: sh.userEmail,
+            breakName: lastActObj.name,
+            startTime: lastActObj.startTime,
+            durationMins,
+            shiftId: sh.id
+          };
+
+          if (breakNameLower.includes('bio')) {
+            if (breakDurationMins > 5) {
+              bioBreaks.push(exceptionItem);
+            }
+          } else if (breakNameLower.includes('lunch') || breakNameLower.includes('dinner') || breakNameLower.includes('meal')) {
+            if (breakDurationMins > 45) {
+              lunchBreaks.push(exceptionItem);
+            }
+          } else {
+            if (breakDurationMins > 20) {
+              shortBreaks.push(exceptionItem);
+            }
           }
         }
+      });
 
+      // 2. Scan today's shifts for used mobile punches
+      todayShifts.forEach(sh => {
+        const hasMobile = sh.hasMobilePunches === true || 
+                          sh.clockInDevice === 'mobile' || 
+                          sh.clockOutDevice === 'mobile' || 
+                          (sh.activities || []).some((act: any) => act.device === 'mobile');
+        if (hasMobile) {
+          const mobilePunchesCount = (sh.clockInDevice === 'mobile' ? 1 : 0) + 
+                                     (sh.clockOutDevice === 'mobile' ? 1 : 0) + 
+                                     (sh.activities || []).filter((act: any) => act.device === 'mobile').length;
+          
+          mobilePunchesList.push({
+            userId: sh.userId,
+            userName: sh.userName,
+            email: sh.userEmail,
+            shiftId: sh.id,
+            clockInTime: sh.clockInTime,
+            status: sh.status,
+            mobilePunchesCount,
+            activities: sh.activities || [],
+            clockInDevice: sh.clockInDevice,
+            clockOutDevice: sh.clockOutDevice
+          });
+        }
       });
 
       // Team Inconsistencies Scan
@@ -692,11 +780,19 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
         },
         exceptionCounts: {
           autoClosed: teamAutoClosed.length,
-          attendanceExceptions: attendanceExceptions.length
+          attendanceExceptions: attendanceExceptions.length,
+          bioBreaks: bioBreaks.length,
+          lunchBreaks: lunchBreaks.length,
+          shortBreaks: shortBreaks.length,
+          mobilePunches: mobilePunchesList.length
         },
         exceptionsList: {
           autoClosed: teamAutoClosed,
-          attendanceExceptions
+          attendanceExceptions,
+          bioBreaks,
+          lunchBreaks,
+          shortBreaks,
+          mobilePunches: mobilePunchesList
         },
         validationReport: {
           activeAfterClockOut: [], // Profiles mark as active somewhere but clocked out
@@ -895,10 +991,18 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
 
   // Paginated Results
   const totalPages = Math.ceil(sortedWorkforce.length / itemsPerPage);
+
+  // Automatically clamp current page when total pages shrinks
+  useEffect(() => {
+    if (currentPage > totalPages) {
+      setCurrentPage(Math.max(1, totalPages));
+    }
+  }, [totalPages, currentPage]);
+
   const paginatedWorkforce = useMemo(() => {
     const start = (currentPage - 1) * itemsPerPage;
     return sortedWorkforce.slice(start, start + itemsPerPage);
-  }, [sortedWorkforce, currentPage]);
+  }, [sortedWorkforce, currentPage, itemsPerPage]);
 
   const uniqueActiveProcesses = useMemo(() => {
     const list = new Set<string>();
@@ -1045,7 +1149,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
       // 1. Utilization Summary
       if (exportReportType === 'summary' || exportReportType === 'both') {
         const summaryHeaders = [
-          'Emp ID', 'Employee Name', 'Email', 'Role', 'Team Lead', 'Manager', 'Manager of Manager',
+          'Emp ID', 'Employee Name', 'Email', 'Role', 'Department', 'Process / Segment', 'Team Lead', 'Manager', 'Manager of Manager',
           'Date', 'Clock In', 'Clock Out', 'Shift Status',
           'Prod Minutes', 'Break Minutes', 'Total Minutes', 'Utilization %'
         ];
@@ -1063,6 +1167,8 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
             u?.fullName || u?.name || sh.userName,
             u?.email || sh.userEmail,
             u?.role || 'N/A',
+            u?.department || 'Operations',
+            u?.process || 'N/A',
             u?.teamLeadName || 'Unassigned',
             u?.mappedManagerName || u?.managerName || 'Unassigned',
             u ? getManagerOfManager(u, allUsers) : 'N/A',
@@ -1124,35 +1230,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
         XLSX.utils.book_append_sheet(workbook, ws, "Chronological Activity Log");
       }
 
-      // 3. Workforce Roster State (Always included for completeness)
-      const rosterHeaders = [
-        'Emp ID', 'Employee Name', 'Email', 'Role', 'Department', 'Process / Segment', 'Team Lead', 'Manager Name', 'Manager of Manager', 'Current Session Status', 'Last Activity Time'
-      ];
 
-      const rosterRows = mappedUsers.map(u => {
-        const live = activeShifts.find(s => s.userId === u.uid);
-        const liveStatus = live ? (live.status === 'BREAK' ? 'On Break' : 'Active Work') : 'Offline';
-        const lastActiveStr = live && live.activities && live.activities.length > 0
-          ? new Date(live.activities[live.activities.length - 1].startTime).toLocaleTimeString('en-IN')
-          : 'N/A';
-        
-        return [
-          u.employeeId || (u as any).empID || 'N/A',
-          u.fullName || u.name || 'N/A',
-          u.email,
-          u.role || 'N/A',
-          u.department || 'Operations',
-          u.process || 'N/A',
-          u.teamLeadName || 'Unassigned',
-          u.mappedManagerName || u.managerName || 'Unassigned',
-          getManagerOfManager(u, allUsers),
-          liveStatus,
-          lastActiveStr
-        ];
-      });
-
-      const wsRoster = XLSX.utils.aoa_to_sheet([rosterHeaders, ...rosterRows]);
-      XLSX.utils.book_append_sheet(workbook, wsRoster, "Workforce Roster State");
 
       if (exportFormat === 'excel') {
         XLSX.writeFile(workbook, `TMS_Enhanced_Report_${user.name.split(' ').join('_')}.xlsx`);
@@ -1250,6 +1328,19 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
     const offline = Math.max(0, total - loggedIn);
     const attendancePercent = total > 0 ? Math.round((loggedIn / total) * 100) : 0;
     
+    // session device tracking parameters
+    const activeDesktop = activeShiftList.filter(s => {
+      const dtype = s.deviceType || (s.clockInDevice === 'mobile' ? 'Mobile' : 'Desktop');
+      return dtype === 'Desktop';
+    }).length;
+
+    const activeMobile = activeShiftList.filter(s => {
+      const dtype = s.deviceType || (s.clockInDevice === 'mobile' ? 'Mobile' : 'Desktop');
+      return dtype === 'Mobile' || dtype === 'Tablet';
+    }).length;
+
+    const mobileAccessPercent = loggedIn > 0 ? Math.round((activeMobile / loggedIn) * 100) : 0;
+
     // Calculate team average utilization for all logged-in users under current scope
     let totalUtil = 0;
     activeShiftList.forEach(sh => {
@@ -1267,7 +1358,10 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
       active,
       offline,
       attendancePercent,
-      teamAvgUtilization
+      teamAvgUtilization,
+      activeDesktop,
+      activeMobile,
+      mobileAccessPercent
     };
   }, [filteredWorkforce, activeShifts, presentThreshold]);
 
@@ -1463,7 +1557,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
 
       {/* CORE STATS KPI TILES (TOP SUMMARY CARDS - REACTIVE TO ACTIVE FILTERS) */}
       <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-7 gap-2.5">
-        <div className="bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 p-2.5 rounded-xl shadow-xs text-center">
+        <div className="bg-white dark:bg-slate-900 border border-slate-250 dark:border-slate-950/30 p-2.5 rounded-xl shadow-xs text-center">
           <span className="text-[9px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-500 leading-none">Total Assigned</span>
           <h3 className="text-xl font-black text-slate-900 dark:text-white mt-0.5">{liveStats.total}</h3>
           <p className="text-[8px] text-slate-500 dark:text-slate-400 font-bold mt-0.5 leading-none">Roster Mapped</p>
@@ -1481,7 +1575,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
           <p className="text-[8px] text-amber-500 dark:text-amber-500/85 font-bold mt-0.5 leading-none">Rest Periods</p>
         </div>
 
-        <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-2.5 rounded-xl shadow-xs text-center">
+        <div className="bg-white dark:bg-slate-900 border border-slate-250 dark:border-slate-950/30 p-2.5 rounded-xl shadow-xs text-center">
           <span className="text-[9px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-500 leading-none">Offline</span>
           <h3 className="text-xl font-black text-slate-500 dark:text-slate-300 mt-0.5">{liveStats.offline}</h3>
           <p className="text-[8px] text-slate-400 dark:text-slate-500 font-bold mt-0.5 leading-none">Off-Duty staff</p>
@@ -1507,20 +1601,34 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
       </div>
 
       {/* ONBOARDING USER GUIDE BAR */}
-      <div className="bg-indigo-50/40 dark:bg-slate-900/60 border border-indigo-100/40 dark:border-slate-800 rounded-xl p-3 flex flex-col md:flex-row items-start md:items-center justify-between gap-3 text-xs">
-        <div className="flex items-center gap-2">
-          <span className="flex h-2 w-2 relative">
-            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-indigo-400 opacity-75"></span>
-            <span className="relative inline-flex rounded-full h-2 w-2 bg-indigo-500"></span>
-          </span>
-          <span className="font-semibold text-slate-600 dark:text-slate-300">
-            💡 <strong className="text-indigo-600 dark:text-indigo-400">First-Time User Tip:</strong> Toggle dashboards by clicking any menu option below.
-          </span>
+
+      {/* ADMIN DEVICE ACCESS ANALYTICS */}
+      <div className="bg-slate-50 dark:bg-slate-950 p-4 rounded-2xl border border-slate-200/80 dark:border-slate-800/80 flex flex-col md:flex-row md:items-center md:justify-between gap-4 select-none">
+        <div className="flex items-center gap-3">
+          <div className="p-2.5 bg-indigo-50 dark:bg-indigo-950/40 text-indigo-600 dark:text-indigo-400 rounded-xl shrink-0">
+            <Smartphone size={18} />
+          </div>
+          <div className="text-left leading-normal">
+            <h4 className="text-[11px] font-black text-slate-800 dark:text-slate-200 uppercase tracking-widest leading-none">
+              Device Access Analytics
+            </h4>
+            <p className="text-[10px] text-slate-500 mt-1 leading-none">Real-time visibility into agent devices, browsers, and access channels</p>
+          </div>
         </div>
-        <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] font-bold text-slate-500">
-          <span>📊 <strong>Monitoring</strong>: Real-time Distribution</span>
-          <span>⚙️ <strong>Controls</strong>: Agent Shift Operations</span>
-          <span>⚠️ <strong>Audit</strong>: Late & Break Exceptions</span>
+        
+        <div className="grid grid-cols-3 gap-3 shrink-0">
+          <div className="bg-white dark:bg-slate-900 border border-slate-200/60 dark:border-slate-800/80 px-4 py-2.5 rounded-xl text-center shadow-2xs min-w-28 sm:min-w-32">
+            <div className="text-[8px] uppercase tracking-wider text-slate-400 font-bold">Active Desktop</div>
+            <div className="text-base font-black text-sky-600 dark:text-sky-455 font-mono mt-0.5">{liveStats.activeDesktop || 0}</div>
+          </div>
+          <div className="bg-white dark:bg-slate-900 border border-slate-200/60 dark:border-slate-800/80 px-4 py-2.5 rounded-xl text-center shadow-2xs min-w-28 sm:min-w-32">
+            <div className="text-[8px] uppercase tracking-wider text-slate-400 font-bold">Active Mobile</div>
+            <div className="text-base font-black text-rose-500 font-mono mt-0.5">{liveStats.activeMobile || 0}</div>
+          </div>
+          <div className="bg-white dark:bg-slate-900 border border-slate-200/60 dark:border-slate-800/80 px-4 py-2.5 rounded-xl text-center shadow-2xs min-w-28 sm:min-w-32">
+            <div className="text-[8px] uppercase tracking-wider text-slate-400 font-bold">Mobile Access %</div>
+            <div className="text-base font-black text-indigo-600 dark:text-indigo-455 font-mono mt-0.5">{liveStats.mobileAccessPercent || 0}%</div>
+          </div>
         </div>
       </div>
 
@@ -1554,6 +1662,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
           </div>
           <span className={`text-[10px] font-medium ${activeTab === 'controls' ? 'text-indigo-100' : 'text-slate-500 dark:text-slate-400'}`}>Clock out, edit shift logs & filters</span>
         </button>
+
         <button 
           onClick={() => setActiveTab('exceptions')}
           className={`flex flex-col items-start gap-1 px-5 py-3 rounded-xl text-left transition-all cursor-pointer border shadow-sm select-none ${
@@ -1563,16 +1672,12 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
           }`}
         >
           <div className="flex items-center gap-1.5 font-black text-xs">
-            <AlertTriangle size={14} className={`${activeTab === 'exceptions' ? 'text-white' : 'text-rose-500'} ${activeTab !== 'exceptions' ? 'animate-bounce-slow' : ''}`} />
+            <AlertTriangle size={14} className={activeTab === 'exceptions' ? 'text-white' : 'text-rose-500'} />
             Audit & Exceptions
-            {summaryData?.exceptionCounts && (Object.values(summaryData.exceptionCounts).reduce((a: any, b: any) => a + b, 0) as number) > 0 && (
-              <span className={`font-mono text-[9px] font-black rounded-full h-4 px-1.5 flex items-center justify-center animate-pulse ${activeTab === 'exceptions' ? 'bg-white text-rose-600' : 'bg-rose-600 text-white'}`}>
-                {(Object.values(summaryData.exceptionCounts).reduce((a: any, b: any) => a + b, 0) as number)}
-              </span>
-            )}
           </div>
-          <span className={`text-[10px] font-medium ${activeTab === 'exceptions' ? 'text-rose-100' : 'text-slate-500 dark:text-slate-400'}`}>Tardiness, unexcused breaks, anomalies</span>
+          <span className={`text-[10px] font-medium ${activeTab === 'exceptions' ? 'text-rose-100' : 'text-slate-500 dark:text-slate-400'}`}>Monitor anomalies</span>
         </button>
+
         {user.role === 'ADMIN' && (
           <button 
             onClick={() => setActiveTab('hierarchy')}
@@ -1873,7 +1978,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
                   disabled={isExporting}
                   className="bg-emerald-600 hover:bg-emerald-700 text-white p-3 rounded-xl flex items-center justify-center gap-2 text-xs font-extrabold transition-colors cursor-pointer w-full"
                 >
-                  <FileSpreadsheet size={15} /> Export Workforce Roster State
+                  <FileSpreadsheet size={15} /> Export Utilization Report
                 </button>
               </div>
             </div>
@@ -2040,6 +2145,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
                     <th className="p-4">Process Mapping</th>
                     <th className="p-4">Current Activity</th>
                     <th className="p-4">Log In Time</th>
+                    <th className="p-4">Device</th>
                     <th className="p-4 cursor-pointer" onClick={() => { setSortKey('productive'); setSortOrder(prev => prev === 'asc' ? 'desc' : 'asc'); }}>Productive Duration</th>
                     <th className="p-4 text-center">Utilization</th>
                     <th className="p-4">Operational Status</th>
@@ -2094,6 +2200,30 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
                           </td>
                           <td className="p-4 text-slate-500 font-mono text-[10px]">
                             {live ? new Date(live.clockInTime).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }) : <span className="text-slate-400">Not Clocked</span>}
+                          </td>
+                          <td className="p-4">
+                            {live ? (
+                              <div className="flex items-center gap-1.5">
+                                {(() => {
+                                  const dtype = live.deviceType || (live.clockInDevice === 'mobile' ? 'Mobile' : 'Desktop');
+                                  if (dtype === 'Mobile') return <Smartphone size={14} className="text-rose-500 shrink-0" />;
+                                  if (dtype === 'Tablet') return <Tablet size={14} className="text-indigo-500 shrink-0" />;
+                                  return <Laptop size={14} className="text-sky-500 shrink-0" />;
+                                })()}
+                                <div className="flex flex-col text-left leading-normal">
+                                  <span className="font-bold text-slate-850 dark:text-slate-200 text-[11px]">
+                                    {live.deviceType || (live.clockInDevice === 'mobile' ? 'Mobile' : 'Desktop')}
+                                  </span>
+                                  {live.browser && (
+                                    <span className="text-[9px] text-slate-400 dark:text-slate-500 font-bold leading-none font-sans mt-0.5" title={live.os}>
+                                      {live.browser} / {live.os || 'Unknown OS'}
+                                    </span>
+                                  )}
+                                </div>
+                              </div>
+                            ) : (
+                              <span className="text-slate-400 font-sans text-xs">-</span>
+                            )}
                           </td>
                           <td className="p-4 font-bold text-teal-600 font-mono">
                             {stats ? stats.activeStr : <span className="text-slate-400 font-normal font-sans text-xs">Offline</span>}
@@ -2237,6 +2367,9 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
                                   </span>
                                 </div>
                               </div>
+
+                              {/* Temporary Device Diagnostics Saved Info for Active Live session */}
+                              {/* REMOVED as requested */}
                             </td>
                           </tr>
                         )}
@@ -2257,29 +2390,49 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
             </div>
 
             {/* Pagination Controls */}
-            {totalPages > 1 && (
-              <div className="p-4 border-t border-slate-100 flex items-center justify-between">
-                <span className="text-xs font-medium text-slate-500">
-                  Page {currentPage} of {totalPages} ({filteredWorkforce.length} visible users)
+            <div className="p-4 border-t border-slate-100 dark:border-slate-800 flex flex-col sm:flex-row items-center justify-between gap-4">
+              <div className="flex items-center gap-4 flex-wrap">
+                <span className="text-xs font-medium text-slate-500 dark:text-slate-400">
+                  Page {currentPage} of {totalPages || 1} ({filteredWorkforce.length} visible users)
                 </span>
+                
+                <div className="flex items-center gap-1.5">
+                  <span className="text-xs text-slate-400 dark:text-slate-500 font-medium">Show:</span>
+                  <select
+                    value={itemsPerPage}
+                    onChange={(e) => {
+                      const newSize = Number(e.target.value);
+                      setItemsPerPage(newSize);
+                      setCurrentPage(1); // Reset to page 1 on resize
+                    }}
+                    className="text-xs font-semibold bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded px-2 py-1 text-slate-700 dark:text-slate-300 outline-none cursor-pointer hover:bg-slate-100 dark:hover:bg-slate-800"
+                  >
+                    <option value={25}>25</option>
+                    <option value={50}>50</option>
+                    <option value={100}>100</option>
+                  </select>
+                </div>
+              </div>
+
+              {totalPages > 1 && (
                 <div className="flex items-center gap-1">
                   <button 
                     disabled={currentPage === 1}
                     onClick={() => setCurrentPage(prev => Math.max(1, prev - 1))}
-                    className="p-1.5 rounded-lg border border-slate-200 hover:bg-slate-50 disabled:opacity-40 cursor-pointer transition-colors"
+                    className="p-1.5 rounded-lg border border-slate-200 dark:border-slate-800 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-40 cursor-pointer transition-colors text-slate-600 dark:text-slate-400"
                   >
                     <ChevronLeft size={16} />
                   </button>
                   <button 
                     disabled={currentPage === totalPages}
                     onClick={() => setCurrentPage(prev => Math.min(totalPages, prev + 1))}
-                    className="p-1.5 rounded-lg border border-slate-200 hover:bg-slate-50 disabled:opacity-40 cursor-pointer transition-colors"
+                    className="p-1.5 rounded-lg border border-slate-200 dark:border-slate-800 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-40 cursor-pointer transition-colors text-slate-600 dark:text-slate-400"
                   >
                     <ChevronRight size={16} />
                   </button>
                 </div>
-              </div>
-            )}
+              )}
+            </div>
 
           </div>
         )}
@@ -2288,81 +2441,138 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
         {activeTab === 'exceptions' && (
           <div className="space-y-6">
             
-            {/* Operational Intelligence Center Header Banner */}
-            <div className="relative overflow-hidden bg-gradient-to-r from-rose-500/5 via-amber-500/5 to-indigo-500/10 border border-slate-200/80 dark:border-slate-800/80 p-6 rounded-2xl flex flex-col md:flex-row justify-between items-start md:items-center gap-4.5 shadow-xs">
-              <div className="space-y-1">
-                <div className="flex items-center gap-2">
-                  <div className="p-1 px-2.5 bg-rose-500/10 text-rose-600 dark:text-rose-400 rounded-lg text-[10px] font-extrabold uppercase tracking-widest leading-none">Compliancy</div>
-                  <h3 className="text-sm font-black text-slate-800 dark:text-white uppercase tracking-wider">Operational Audit & Compliance Center</h3>
-                </div>
-                <p className="text-xs text-slate-500 dark:text-slate-400 font-sans mt-1">
-                  Active monitoring tracks and displays real-time performance anomalies, outstanding break thresholds, and tool inactivity safely.
-                </p>
-              </div>
-              <div className="flex items-center gap-2 bg-white dark:bg-slate-950 px-4 py-2 rounded-xl border border-slate-200/80 dark:border-slate-800 text-xs font-bold leading-none shadow-xs text-slate-700 dark:text-slate-300 whitespace-nowrap">
-                Roster Health Score: <span className="text-emerald-500 font-extrabold ml-1 leading-none flex items-center gap-1 font-sans">● 100% compliant</span>
-              </div>
-            </div>
-
             {/* Actionable Exception Center Cards Grid */}
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
               
-              {/* Long Breaks Exception */}
-              <div className="relative bg-white dark:bg-slate-900 border border-rose-100 dark:border-rose-950 rounded-2xl p-6 shadow-xs hover:shadow-md hover:-translate-y-0.5 transition-all duration-300">
+              {/* Active Breaks Threshold Compliance */}
+              <div className="relative bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-6 shadow-xs hover:shadow-md hover:-translate-y-0.5 transition-all duration-300 col-span-1 lg:col-span-2">
                 <div className="absolute top-0 bottom-0 left-0 w-1 bg-rose-500 rounded-l-2xl" />
-                <div className="flex items-center justify-between border-b border-rose-50/60 dark:border-rose-950/40 pb-3 mb-4">
-                  <h4 className="text-xs font-extrabold text-rose-700 dark:text-rose-400 uppercase tracking-widest flex items-center gap-2 leading-none">
-                    <Coffee size={15} className="text-rose-500 animate-pulse" /> Active Long Breaks Exception {`> 45 mins`}
+                <div className="flex items-center justify-between border-b border-rose-50 dark:border-slate-850 pb-3 mb-4">
+                  <h4 className="text-xs font-extrabold text-slate-800 dark:text-slate-200 uppercase tracking-widest flex items-center gap-2 leading-none">
+                    <Coffee size={15} className="text-rose-500" /> Active Breaks Threshold Compliance
                   </h4>
                   <span className="bg-rose-50 dark:bg-rose-950/40 text-rose-700 dark:text-rose-400 text-[10px] font-black px-2.5 py-1 rounded-full leading-none font-mono">
-                    {summaryData?.exceptionsList?.longBreaks?.length || 0} active
+                    {(summaryData?.exceptionsList?.bioBreaks?.length || 0) + 
+                     (summaryData?.exceptionsList?.lunchBreaks?.length || 0) + 
+                     (summaryData?.exceptionsList?.shortBreaks?.length || 0)} total exceeded
                   </span>
                 </div>
                 
-                <div className="space-y-3.5 max-h-68 overflow-y-auto">
-                  {summaryData?.exceptionsList?.longBreaks?.map((item: any, idx: number) => (
-                    <div key={idx} className="flex justify-between items-center text-xs bg-rose-50/20 dark:bg-rose-950/10 p-3 rounded-xl border border-rose-100/40 dark:border-rose-950/20 font-sans">
-                      <div className="flex items-center gap-2.5 min-w-0">
-                        <div className="w-8 h-8 rounded-full bg-rose-100 dark:bg-rose-950 text-rose-700 dark:text-rose-400 flex items-center justify-center font-extrabold text-[11px] uppercase shrink-0">
-                          {item.userName ? item.userName.charAt(0) : 'U'}
-                        </div>
-                        <div className="min-w-0">
-                          <div className="font-extrabold text-slate-800 dark:text-slate-200 leading-tight truncate">{item.userName}</div>
-                          <div className="text-[10px] text-rose-600 dark:text-rose-400 font-bold mt-0.5 leading-none">{item.breakName} break for {item.durationMins}m</div>
-                        </div>
-                      </div>
-                      <button 
-                        onClick={() => selectAndFocusUser(item.userName)}
-                        className="bg-rose-100 hover:bg-rose-200 dark:bg-rose-950 dark:text-rose-300 dark:hover:bg-rose-900/60 text-rose-800 text-[10px] font-extrabold px-3 py-1.5 rounded-lg shrink-0 cursor-pointer transition-colors"
-                      >
-                        Focus Profile
-                      </button>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                  {/* Segment 1: Bio Breaks Exceeded */}
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between border-b border-fuchsia-100 dark:border-fuchsia-950 pb-1.5">
+                      <span className="text-[10px] font-black text-fuchsia-600 dark:text-fuchsia-400 uppercase tracking-widest flex items-center gap-1.5">
+                        <span className="w-1.5 h-1.5 rounded-full bg-fuchsia-500" /> Bio Breaks &gt; 5 Mins
+                      </span>
+                      <span className="bg-fuchsia-50 dark:bg-fuchsia-950 text-fuchsia-700 dark:text-fuchsia-300 text-[9px] font-bold px-1.5 py-0.5 rounded">
+                        {summaryData?.exceptionsList?.bioBreaks?.length || 0}
+                      </span>
                     </div>
-                  ))}
+                    <div className="space-y-2 max-h-52 overflow-y-auto pr-1">
+                      {summaryData?.exceptionsList?.bioBreaks?.map((item: any, idx: number) => (
+                        <div key={idx} className="flex justify-between items-start text-xs bg-fuchsia-50/20 dark:bg-fuchsia-950/10 p-2.5 rounded-xl border border-fuchsia-100/40 dark:border-fuchsia-950/20">
+                          <div className="min-w-0 flex-1">
+                            <div className="font-bold text-slate-800 dark:text-slate-200 truncate leading-tight">{item.userName}</div>
+                            <div className="text-[9px] text-fuchsia-600 dark:text-fuchsia-400 font-extrabold uppercase mt-1">🚨 Bio: {item.durationMins}m</div>
+                          </div>
+                          <button 
+                            onClick={() => selectAndFocusUser(item.userName)}
+                            className="bg-fuchsia-100 hover:bg-fuchsia-200 dark:bg-fuchsia-950 dark:text-fuchsia-300 text-fuchsia-800 text-[9px] font-extrabold px-2 py-1 rounded cursor-pointer shrink-0 ml-1 transition-colors"
+                          >
+                            Focus
+                          </button>
+                        </div>
+                      ))}
+                      {(!summaryData?.exceptionsList?.bioBreaks || summaryData.exceptionsList.bioBreaks.length === 0) && (
+                        <div className="text-center py-4 text-[10px] text-slate-400 dark:text-slate-500 font-bold uppercase tracking-wider">
+                          ✅ Compliant
+                        </div>
+                      )}
+                    </div>
+                  </div>
 
-                  {(!summaryData?.exceptionsList?.longBreaks || summaryData.exceptionsList.longBreaks.length === 0) && (
-                    <div className="text-center py-8">
-                      <p className="text-xs text-slate-400 dark:text-slate-500 font-bold uppercase tracking-widest leading-none">
-                        ✅ No active break violations
-                      </p>
+                  {/* Segment 2: Short Breaks Exceeded */}
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between border-b border-amber-100 dark:border-amber-950 pb-1.5">
+                      <span className="text-[10px] font-black text-amber-600 dark:text-amber-400 uppercase tracking-widest flex items-center gap-1.5">
+                        <span className="w-1.5 h-1.5 rounded-full bg-amber-500" /> Short Breaks &gt; 20 Mins
+                      </span>
+                      <span className="bg-amber-50 dark:bg-amber-950 text-amber-700 dark:text-amber-300 text-[9px] font-bold px-1.5 py-0.5 rounded">
+                        {summaryData?.exceptionsList?.shortBreaks?.length || 0}
+                      </span>
                     </div>
-                  )}
+                    <div className="space-y-2 max-h-52 overflow-y-auto pr-1">
+                      {summaryData?.exceptionsList?.shortBreaks?.map((item: any, idx: number) => (
+                        <div key={idx} className="flex justify-between items-start text-xs bg-amber-50/20 dark:bg-amber-950/10 p-2.5 rounded-xl border border-amber-100/40 dark:border-amber-950/20">
+                          <div className="min-w-0 flex-1">
+                            <div className="font-bold text-slate-800 dark:text-slate-200 truncate leading-tight">{item.userName}</div>
+                            <div className="text-[9px] text-amber-600 dark:text-amber-400 font-extrabold uppercase mt-1">⚠️ Exceeded: {item.durationMins}m</div>
+                          </div>
+                          <button 
+                            onClick={() => selectAndFocusUser(item.userName)}
+                            className="bg-amber-100 hover:bg-amber-200 dark:bg-amber-950 dark:text-amber-300 text-amber-800 text-[9px] font-extrabold px-2 py-1 rounded cursor-pointer shrink-0 ml-1 transition-colors"
+                          >
+                            Focus
+                          </button>
+                        </div>
+                      ))}
+                      {(!summaryData?.exceptionsList?.shortBreaks || summaryData.exceptionsList.shortBreaks.length === 0) && (
+                        <div className="text-center py-4 text-[10px] text-slate-400 dark:text-slate-500 font-bold uppercase tracking-wider">
+                          ✅ Compliant
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Segment 3: Lunch Breaks Exceeded */}
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between border-b border-rose-100 dark:border-rose-950 pb-1.5">
+                      <span className="text-[10px] font-black text-rose-600 dark:text-rose-400 uppercase tracking-widest flex items-center gap-1.5">
+                        <span className="w-1.5 h-1.5 rounded-full bg-rose-500" /> Lunch Breaks &gt; 45 Mins
+                      </span>
+                      <span className="bg-rose-50 dark:bg-rose-950 text-rose-700 dark:text-rose-300 text-[9px] font-bold px-1.5 py-0.5 rounded">
+                        {summaryData?.exceptionsList?.lunchBreaks?.length || 0}
+                      </span>
+                    </div>
+                    <div className="space-y-2 max-h-52 overflow-y-auto pr-1">
+                      {summaryData?.exceptionsList?.lunchBreaks?.map((item: any, idx: number) => (
+                        <div key={idx} className="flex justify-between items-start text-xs bg-rose-50/20 dark:bg-rose-950/10 p-2.5 rounded-xl border border-rose-100/40 dark:border-rose-950/20">
+                          <div className="min-w-0 flex-1">
+                            <div className="font-bold text-slate-800 dark:text-slate-200 truncate leading-tight">{item.userName}</div>
+                            <div className="text-[9px] text-rose-600 dark:text-rose-400 font-extrabold uppercase mt-1">🔥 Breach: {item.durationMins}m</div>
+                          </div>
+                          <button 
+                            onClick={() => selectAndFocusUser(item.userName)}
+                            className="bg-rose-100 hover:bg-rose-200 dark:bg-rose-950 dark:text-rose-300 text-rose-800 text-[9px] font-extrabold px-2 py-1 rounded cursor-pointer shrink-0 ml-1 transition-colors"
+                          >
+                            Focus
+                          </button>
+                        </div>
+                      ))}
+                      {(!summaryData?.exceptionsList?.lunchBreaks || summaryData.exceptionsList.lunchBreaks.length === 0) && (
+                        <div className="text-center py-4 text-[10px] text-slate-400 dark:text-slate-500 font-bold uppercase tracking-wider">
+                          ✅ Compliant
+                        </div>
+                      )}
+                    </div>
+                  </div>
                 </div>
               </div>
 
-              {/* Auto-Closed & Missed Attendance Exceptions */}
+              {/* Automatic Terminations (Auto-Closed Shifts) */}
               <div className="relative bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-6 shadow-xs hover:shadow-md hover:-translate-y-0.5 transition-all duration-300">
                 <div className="absolute top-0 bottom-0 left-0 w-1 bg-sky-500 rounded-l-2xl" />
                 <div className="flex items-center justify-between border-b border-slate-50 dark:border-slate-850 pb-3 mb-4">
                   <h4 className="text-xs font-extrabold text-[#D97706] dark:text-amber-400 uppercase tracking-widest flex items-center gap-2 leading-none">
-                    <UserX size={15} className="text-sky-500" /> Automatic Terminations & Absentees
+                    <UserX size={15} className="text-sky-500" /> Automatic Terminations
                   </h4>
                   <span className="bg-amber-50 dark:bg-amber-950/40 text-[#D97706] dark:text-amber-400 text-[10px] font-black px-2.5 py-1 rounded-full leading-none font-mono">
-                    {((summaryData?.exceptionsList?.autoClosed?.length || 0) + (summaryData?.exceptionsList?.attendanceExceptions?.length || 0))} anomalies
+                    {(summaryData?.exceptionsList?.autoClosed?.length || 0)} anomalies
                   </span>
                 </div>
 
-                <div className="space-y-3.5 max-h-68 overflow-y-auto">
+                <div className="space-y-3.5 max-h-80 overflow-y-auto">
                   {summaryData?.exceptionsList?.autoClosed?.map((item: any, idx: number) => (
                     <div key={idx} className="flex justify-between items-center text-xs bg-amber-50/10 dark:bg-amber-950/5 p-3 rounded-xl border border-amber-100/10 dark:border-amber-955/10 font-sans">
                       <div className="flex items-center gap-2.5 min-w-0">
@@ -2383,92 +2593,70 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
                     </div>
                   ))}
 
-                  {summaryData?.exceptionsList?.attendanceExceptions?.map((item: any, idx: number) => (
-                    <div key={idx} className="flex justify-between items-center text-xs bg-slate-50 dark:bg-slate-850/40 p-3 rounded-xl border border-slate-100 dark:border-slate-800 font-sans">
-                      <div className="flex items-center gap-2.5 min-w-0">
-                        <div className="w-8 h-8 rounded-full bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-400 flex items-center justify-center font-extrabold text-[11px] uppercase shrink-0">
-                          {item.userName ? item.userName.charAt(0) : 'U'}
-                        </div>
-                        <div className="min-w-0">
-                          <div className="font-extrabold text-slate-800 dark:text-slate-200 leading-tight truncate">{item.userName}</div>
-                          <div className="text-[10px] text-slate-500 dark:text-slate-450 mt-0.5 leading-none">{item.reason}</div>
-                        </div>
-                      </div>
-                      <button 
-                        onClick={() => selectAndFocusUser(item.userName)}
-                        className="bg-indigo-600 hover:bg-indigo-700 text-white text-[10px] font-bold px-3 py-1.5 rounded-lg shrink-0 cursor-pointer transition-colors"
-                      >
-                        Track Member
-                      </button>
-                    </div>
-                  ))}
-
-                  {(!summaryData?.exceptionsList?.autoClosed || summaryData.exceptionsList.autoClosed.length === 0) && 
-                   (!summaryData?.exceptionsList?.attendanceExceptions || summaryData.exceptionsList.attendanceExceptions.length === 0) && (
+                  {(!summaryData?.exceptionsList?.autoClosed || summaryData.exceptionsList.autoClosed.length === 0) && (
                     <div className="text-center py-8">
                       <p className="text-xs text-slate-400 dark:text-slate-500 font-bold uppercase tracking-widest leading-none">
-                        ✅ No missed attendance or closed records today
+                        ✅ No automatic terminations today
                       </p>
                     </div>
                   )}
                 </div>
               </div>
 
-            </div>
-
-            {/* DATA ACCURACY VALIDATION DIAGNOSTIC REPORT */}
-            <div className="bg-white dark:bg-slate-900 border border-indigo-100 dark:border-indigo-950/85 rounded-2xl p-6 shadow-xs space-y-5">
-              <div className="flex items-center gap-3 border-b border-slate-100 dark:border-slate-850 pb-4">
-                <div className="p-2 bg-indigo-50 dark:bg-indigo-950/30 text-indigo-600 dark:text-indigo-400 rounded-xl">
-                  <ShieldAlert size={20} />
-                </div>
-                <div>
-                  <h4 className="text-sm font-black text-slate-900 dark:text-white uppercase tracking-wider">
-                    Data Accuracy & Integrity Diagnostics report
+              {/* Mobile Phone Devices Log Audit */}
+              <div className="relative bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-6 shadow-xs hover:shadow-md hover:-translate-y-0.5 transition-all duration-300">
+                <div className="absolute top-0 bottom-0 left-0 w-1 bg-fuchsia-500 rounded-l-2xl" />
+                <div className="flex items-center justify-between border-b border-rose-50 dark:border-slate-850 pb-3 mb-4">
+                  <h4 className="text-xs font-extrabold text-fuchsia-700 dark:text-fuchsia-400 uppercase tracking-widest flex items-center gap-2 leading-none">
+                    <Smartphone size={15} className="text-fuchsia-500" /> Mobile Access &amp; Punches Log
                   </h4>
-                  <p className="text-xs text-slate-500 mt-0.5">Automated validation checks executing live structure audits against roster parameters.</p>
-                </div>
-              </div>
-
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-6 pt-2">
-                <div className="space-y-4">
-
-                  <div>
-                    <h5 className="text-[10px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest mb-2 font-mono">Inconsistencies & Profile Mappings</h5>
-                    <div className="space-y-2 max-h-40 overflow-y-auto pr-1">
-                      {summaryData?.validationReport?.teamInconsistencies?.map((item: any, idx: number) => (
-                        <div key={idx} className="text-xs p-3 bg-rose-50/20 dark:bg-rose-950/10 border border-rose-100/30 dark:border-rose-950/20 rounded-xl flex justify-between items-center">
-                          <span className="font-extrabold text-slate-850 dark:text-slate-200">{item.userName}</span>
-                          <span className="text-[10px] text-rose-600 dark:text-rose-450 font-medium">{item.issue}</span>
-                        </div>
-                      ))}
-                      {(!summaryData?.validationReport?.teamInconsistencies || summaryData.validationReport.teamInconsistencies.length === 0) && (
-                        <p className="text-[11px] text-slate-400 dark:text-slate-500 font-medium font-sans">All roster personnel mapped correctly with team anchors.</p>
-                      )}
-                    </div>
-                  </div>
+                  <span className="bg-fuchsia-50 dark:bg-fuchsia-950/40 text-fuchsia-700 dark:text-fuchsia-400 text-[10px] font-black px-2.5 py-1 rounded-full leading-none font-mono">
+                    {summaryData?.exceptionsList?.mobilePunches?.length || 0} device logs
+                  </span>
                 </div>
 
-                <div className="space-y-4">
-                  <div>
-                    <h5 className="text-[10px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest mb-2 font-mono">Active Clock mismatch anomalies</h5>
-                    <div className="space-y-2 max-h-40 overflow-y-auto pr-1">
-                      {summaryData?.validationReport?.countMismatches?.map((item: any, idx: number) => (
-                        <div key={idx} className="text-xs p-3 bg-rose-50/30 dark:bg-rose-950/10 border border-rose-200/30 dark:border-rose-950/20 rounded-xl flex justify-between items-center">
-                          <span className="font-extrabold text-slate-850 dark:text-slate-200">Anomaly: {item.metric}</span>
-                          <span className="text-[10px] text-rose-600 dark:text-rose-450 font-bold font-mono">Dashboard: {item.systemValue} | Real: {item.actualValue}</span>
+                <div className="space-y-3.5 max-h-80 overflow-y-auto">
+                  {Object.values((summaryData?.exceptionsList?.mobilePunches || []).reduce((acc: any, item: any) => {
+                    if (!acc[item.userName]) acc[item.userName] = { ...item, logs: [item] };
+                    else {
+                      acc[item.userName].mobilePunchesCount += item.mobilePunchesCount;
+                      acc[item.userName].logs.push(item);
+                    }
+                    return acc;
+                  }, {})).map((item: any, idx: number) => {
+                    return (
+                      <div key={idx} className="text-xs bg-fuchsia-50/10 dark:bg-fuchsia-950/5 p-3.5 rounded-xl border border-fuchsia-100/10 dark:border-fuchsia-955/10 font-sans space-y-2">
+                        <div className="flex justify-between items-center">
+                          <div className="flex items-center gap-2 min-w-0">
+                            <div className="w-7 h-7 rounded-full bg-fuchsia-100 dark:bg-fuchsia-950 text-fuchsia-700 dark:text-fuchsia-400 flex items-center justify-center font-extrabold text-[10px] uppercase shrink-0">
+                              {item.userName ? item.userName.charAt(0) : 'M'}
+                            </div>
+                            <div className="min-w-0">
+                              <div className="font-extrabold text-slate-800 dark:text-slate-200 leading-tight truncate">{item.userName}</div>
+                              <div className="text-[9px] text-slate-500 dark:text-slate-400">Total Mobile Action count: <span className="text-fuchsia-600 font-extrabold">{item.mobilePunchesCount}</span></div>
+                            </div>
+                          </div>
+                          <button 
+                            onClick={() => {
+                              setSelectedInvestigateLogs(item.logs);
+                              setShowInvestigateModal(true);
+                            }}
+                            className="bg-fuchsia-100 hover:bg-fuchsia-200 dark:bg-fuchsia-950 dark:text-fuchsia-300 text-fuchsia-850 text-[9px] font-extrabold px-2.5 py-1.5 rounded-lg shrink-0 cursor-pointer transition-colors"
+                          >
+                            Investigate
+                          </button>
                         </div>
-                      ))}
-                      {(!summaryData?.validationReport?.countMismatches || summaryData.validationReport.countMismatches.length === 0) && (
-                        <p className="text-[11px] text-slate-400 dark:text-slate-500 font-medium font-sans">No clock mismatches or numerical count exceptions resolved.</p>
-                      )}
-                    </div>
-                  </div>
+                      </div>
+                    );
+                  })}
 
-                  <div className="bg-slate-55 bg-slate-50 dark:bg-slate-950 p-4 rounded-xl border border-slate-200/60 dark:border-slate-800 text-[11px] leading-relaxed text-slate-500 dark:text-slate-400 font-medium font-sans animate-in fade-in">
-                    <p className="font-extrabold text-slate-850 dark:text-slate-200 uppercase tracking-wide mb-1 leading-none text-xs">Compliance Score Index: 100%</p>
-                    <p className="mt-1">Precision360 uses database synchronization rules to preserve relational invariants. If count deviations occur, click <b>Sync & Audit</b> above to run full diagnostic updates.</p>
-                  </div>
+                  {(!summaryData?.exceptionsList?.mobilePunches || summaryData.exceptionsList.mobilePunches.length === 0) && (
+                    <div className="text-center py-10">
+                      <p className="text-xs text-slate-400 dark:text-slate-500 font-bold uppercase tracking-widest leading-none">
+                        📱 Desktop access compliant. No mobile devices reported today.
+                      </p>
+                    </div>
+                  )}
                 </div>
               </div>
 
@@ -2478,6 +2666,33 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
         )}
 
       </div>
+
+      {/* MODAL: INVESTIGATE MOBILE LOGS */}
+      {showInvestigateModal && (
+        <div className="fixed inset-0 bg-slate-900/55 backdrop-blur-sm flex items-center justify-center z-[99999] p-4 text-slate-800 animate-in fade-in duration-200">
+          <div className="bg-white dark:bg-slate-900 rounded-2xl w-full max-w-lg p-6 border border-slate-200 dark:border-slate-800 shadow-2xl space-y-4">
+            <div className="flex justify-between items-center border-b pb-3.5">
+              <h3 className="font-extrabold text-slate-900 dark:text-slate-100">Mobile Log Investigation</h3>
+              <button onClick={() => setShowInvestigateModal(false)} className="text-slate-400 hover:text-slate-600">✕</button>
+            </div>
+            <div className="max-h-96 overflow-y-auto space-y-2">
+              {selectedInvestigateLogs.flatMap(log => 
+                (log.activities && log.activities.length > 0 ? log.activities : [{ name: 'Action', startTime: log.loginTimestamp || log.timestamp || Date.now() }])
+              ).map((activity: any, idx: number) => {
+                const ts = activity.startTime;
+                const dateStr = ts ? new Date(ts).toLocaleString() : 'N/A';
+                return (
+                  <div key={idx} className="bg-slate-50 p-3 rounded-lg border border-slate-100 text-xs">
+                    <span className="font-mono text-slate-500">{dateStr}</span>
+                    <div className="font-bold">{activity.name}</div>
+                  </div>
+                );
+              })}
+            </div>
+            <button onClick={() => setShowInvestigateModal(false)} className="w-full bg-slate-900 text-white py-2 rounded-xl text-xs font-bold">Close</button>
+          </div>
+        </div>
+      )}
 
       {/* MODAL 2: CONFIRM FORCE LOGOUT */}
       {showForceLogoutConfirm && (

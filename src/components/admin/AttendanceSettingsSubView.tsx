@@ -11,7 +11,8 @@ export function AttendanceSettingsSubView() {
     presentThreshold: 480,
     halfDayThreshold: 240,
     countBreakTime: false,
-    autoGenTimeHour: 4
+    autoGenTimeHour: 4,
+    desktopOnlyMode: false
   });
 
   const [emailSettings, setEmailSettings] = useState({
@@ -37,7 +38,8 @@ export function AttendanceSettingsSubView() {
             presentThreshold: data.presentThreshold ?? 480,
             halfDayThreshold: data.halfDayThreshold ?? 240,
             countBreakTime: data.countBreakTime ?? false,
-            autoGenTimeHour: data.autoGenTimeHour ?? 4
+            autoGenTimeHour: data.autoGenTimeHour ?? 4,
+            desktopOnlyMode: data.desktopOnlyMode ?? false
           });
         }
 
@@ -149,6 +151,19 @@ export function AttendanceSettingsSubView() {
                 onChange={e => setSettings({...settings, autoGenTimeHour: Number(e.target.value)})} 
               />
               <p className="text-[10px] text-slate-400">Hour (0-23) when backend cron logic attempts sweeping historical records.</p>
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-xs font-bold text-slate-600 dark:text-slate-400">Desktop Only Mode</label>
+              <select 
+                className="w-full bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl px-4 py-3 text-sm focus:ring-2 focus:ring-indigo-500 font-semibold"
+                value={settings.desktopOnlyMode ? 'true' : 'false'} 
+                onChange={e => setSettings({...settings, desktopOnlyMode: e.target.value === 'true'})}
+              >
+                <option value="false">No (Allow All Devices)</option>
+                <option value="true">Yes (Restrict Mobile/Tablets)</option>
+              </select>
+              <p className="text-[10px] text-slate-400">Force attendance clock-ins, actions, and features to be desktop/laptop only.</p>
             </div>
           </div>
         </div>

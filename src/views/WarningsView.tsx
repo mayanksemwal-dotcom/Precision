@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import * as XLSX from 'xlsx';
 import { 
   ShieldAlert, 
   AlertTriangle, 
@@ -16,7 +17,8 @@ import {
   Clock,
   Briefcase,
   Edit2,
-  Trash2
+  Trash2,
+  Download
 } from 'lucide-react';
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from '../components/ui/card';
 import { Button } from '../components/ui/button';
@@ -39,6 +41,49 @@ interface WarningsViewProps {
   allUsers: UserProfile[];
   onRefresh?: () => void;
   externalTheme?: 'light' | 'dark';
+}
+
+function RemarksCell({ remark }: { remark: string }) {
+  const [isExpanded, setIsExpanded] = useState(false);
+  const isTooLong = remark.length > 100;
+
+  return (
+    <div>
+      <p className={`text-xs text-slate-650 dark:text-slate-300 font-semibold italic leading-relaxed ${isExpanded ? '' : 'line-clamp-3'}`}>
+        "{remark}"
+      </p>
+      {isTooLong && (
+        <button 
+          onClick={() => setIsExpanded(!isExpanded)}
+          className="text-[10px] text-blue-600 font-bold mt-1 cursor-pointer hover:underline"
+        >
+          {isExpanded ? 'Read less' : 'Read more'}
+        </button>
+      )}
+    </div>
+  );
+}
+
+function HistoryCell({ history }: { history: any[] }) {
+  const [isExpanded, setIsExpanded] = useState(false);
+  
+  return (
+    <div className="mt-2 text-[10px] text-slate-500 dark:text-slate-400 border-t border-slate-100 dark:border-slate-800 pt-1.5 space-y-1 font-sans">
+      <p className="font-extrabold text-[8px] uppercase tracking-widest text-slate-400 cursor-pointer flex justify-between" onClick={() => setIsExpanded(!isExpanded)}>
+        Action History & Logs ({history.length})
+        <span>{isExpanded ? '▲' : '▼'}</span>
+      </p>
+      {isExpanded && history.map((hist, hIdx) => {
+        const formattedTime = hist.timestamp ? new Date(hist.timestamp).toLocaleDateString() : '';
+        return (
+          <div key={hIdx} className="leading-tight">
+            • <span className="font-semibold">{hist.action}</span> by <span className="font-semibold">{hist.userName || 'System'}</span> ({formattedTime})
+            {hist.remarks && <p className="text-[9px] italic text-slate-400 dark:text-slate-500 pl-2">"{hist.remarks}"</p>}
+          </div>
+        );
+      })}
+    </div>
+  );
 }
 
 export default function WarningsView({ warnings = [], user, allUsers = [], onRefresh, externalTheme }: WarningsViewProps) {
@@ -115,6 +160,23 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
              toast.error(`Deletion failed: ${err.message || 'Permission denied'}`);
         }
     }
+  };
+
+  const handleExport = () => {
+    const ws = XLSX.utils.json_to_sheet(filteredWarnings.map(w => ({
+        ID: w.id,
+        'Agent Name': w.agentName,
+        'Agent Email': w.agentEmail,
+        Level: w.level,
+        Severity: w.severity,
+        Status: w.status,
+        Remarks: w.remarks,
+        'CreatedAt': w.createdAt
+    })));
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Warnings Export");
+    XLSX.writeFile(wb, `Warnings_Export_${new Date().toLocaleDateString()}.xlsx`);
+    toast.success('Warnings exported successfully');
   };
 
   const getLevelColor = (level: string) => {
@@ -228,6 +290,16 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
                 <WarningManager allUsers={allUsers} onClose={() => { setIsWarningOpen(false); if (onRefresh) onRefresh(); }} />
               </DialogContent>
             </Dialog>
+          )}
+          
+          {['ADMIN', 'MANAGER', 'STL', 'OPS_TL', 'TEAM_LEAD', 'TRAINER_TL'].includes(user.role as string) && (
+              <Button 
+                onClick={handleExport}
+                variant="outline" 
+                className="bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 font-bold text-xs h-9 px-4 gap-2 rounded-xl cursor-pointer shadow-none"
+              >
+                  <Download size={16} /> Export
+              </Button>
           )}
 
           <div className="px-4 py-2 bg-slate-50/50 dark:bg-slate-800/50 rounded-lg border border-slate-100 dark:border-slate-700 flex items-center gap-3">
@@ -412,9 +484,7 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
                         </TableCell>
                         <TableCell>
                           <div className="flex flex-col gap-1.5 py-1 min-w-[300px] max-w-[550px]">
-                            <p className="text-xs text-slate-650 dark:text-slate-300 font-semibold italic leading-relaxed whitespace-pre-wrap break-words">
-                              "{ticket.remarks}"
-                            </p>
+                            <RemarksCell remark={ticket.remarks} />
                             {ticket.acceptedAt && (
                               <span className="text-[9px] text-slate-400 dark:text-slate-500 font-mono font-bold flex items-center gap-1 mt-1">
                                 <CheckCircle size={10} className="text-emerald-500" />
@@ -422,22 +492,11 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
                               </span>
                             )}
                             {ticket.history && (ticket.history as any[]).length > 0 && (
-                              <div className="mt-2 text-[10px] text-slate-500 dark:text-slate-400 border-t border-slate-100 dark:border-slate-800 pt-1.5 space-y-1 font-sans">
-                                <p className="font-extrabold text-[8px] uppercase tracking-widest text-slate-400">Action History & Logs</p>
-                                {(ticket.history as any[]).map((hist, hIdx) => {
-                                  const formattedTime = hist.timestamp ? new Date(hist.timestamp).toLocaleDateString() : '';
-                                  return (
-                                    <div key={hIdx} className="leading-tight">
-                                      • <span className="font-semibold">{hist.action}</span> by <span className="font-semibold">{hist.userName || 'System'}</span> ({formattedTime})
-                                      {hist.remarks && <p className="text-[9px] italic text-slate-400 dark:text-slate-500 pl-2">"{hist.remarks}"</p>}
-                                    </div>
-                                  );
-                                })}
-                              </div>
+                              <HistoryCell history={ticket.history as any[]} />
                             )}
                           </div>
                         </TableCell>
-                      <TableCell className="text-right pr-6">
+                        <TableCell className="text-right pr-6">
                           <div className="flex gap-1 justify-end">
                             {isSelfTarget && isPending && (
                               <Button 

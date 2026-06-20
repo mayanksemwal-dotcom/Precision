@@ -18,7 +18,11 @@ import {
   Award,
   ChevronLeft,
   ChevronRight,
-  Edit2
+  Edit2,
+  MonitorOff,
+  Laptop,
+  Tablet,
+  Smartphone
 } from 'lucide-react';
 import ProcessSelector from '../components/ProcessSelector';
 import SupervisorDashboard from '../components/tms/SupervisorDashboard';
@@ -68,6 +72,7 @@ export interface ShiftActivity {
   name: string; // e.g. HITL, Lunch
   startTime: string; // ISO
   endTime?: string; // ISO (undefined if active)
+  device?: 'mobile' | 'desktop';
 }
 
 export interface TMSShift {
@@ -81,6 +86,157 @@ export interface TMSShift {
   clockOutTime?: string; // ISO
   activities: ShiftActivity[];
   status: 'ACTIVE' | 'BREAK' | 'COMPLETED' | 'AUTO_CLOSED';
+  clockInDevice?: 'mobile' | 'desktop';
+  clockOutDevice?: 'mobile' | 'desktop';
+  hasMobilePunches?: boolean;
+  remarks?: string;
+
+  // Real-time Session Metadata
+  deviceType?: 'Mobile' | 'Desktop' | 'Tablet';
+  browser?: string;
+  os?: string;
+  loginTimestamp?: string;
+
+  // Diagnostics fields
+  userAgent?: string;
+  platform?: string;
+  maxTouchPoints?: number;
+  screenWidth?: number;
+  screenHeight?: number;
+  detectedDeviceType?: string;
+  detectedBrowser?: string;
+  detectedOS?: string;
+}
+
+export function getDeviceType(): 'mobile' | 'desktop' {
+  if (typeof window === 'undefined' || !navigator) return 'desktop';
+  const ua = (navigator.userAgent || '').toLowerCase();
+  
+  // 1. Standard mobile regular expression check
+  if (/mobile|android|iphone|ipad|ipod|blackberry|iemobile|opera mini|mobi|tablet|kindle/i.test(ua)) {
+    return 'mobile';
+  }
+  
+  // 2. Modern navigator.userAgentData API check (some browsers don't spoof this in "Desktop Site" mode)
+  // @ts-ignore
+  if (navigator.userAgentData && navigator.userAgentData.mobile) {
+    return 'mobile';
+  }
+  
+  // 3. iOS 13+ iPad Safari / iPhone "Request Desktop Site" check (Mac OS user agent style with touch support)
+  const isIPadOrIPhoneDesktopMode = (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  if (isIPadOrIPhoneDesktopMode) {
+    return 'mobile';
+  }
+
+  // 4. Robust touch support checking paired with pointer/screen/viewport thresholds
+  // 'pointer: coarse' matches touch devices (phones, tablets, touch monitors)
+  const hasTouch = ('ontouchstart' in window || navigator.maxTouchPoints > 0);
+  const isCoarsePointer = window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
+  
+  const screenWidth = window.screen ? (window.screen.width || 0) : 0;
+  const screenHeight = window.screen ? (window.screen.height || 0) : 0;
+  const isSmallScreenOrViewport = (
+    window.innerWidth <= 1024 || 
+    window.innerHeight <= 1024 || 
+    screenWidth <= 1024 || 
+    screenHeight <= 1024
+  );
+
+  // If a device has touch capabilities, and either has a coarse pointer or presents small screen sizes,
+  // it is categorized as a mobile/tablet system to prevent desktop restriction bypasses
+  if (hasTouch && (isCoarsePointer || isSmallScreenOrViewport)) {
+    return 'mobile';
+  }
+
+  return 'desktop';
+}
+
+export function getDetailedDeviceMetadata() {
+  if (typeof window === 'undefined' || !navigator) {
+    return {
+      deviceType: 'Desktop' as const,
+      browser: 'Unknown',
+      os: 'Unknown',
+      loginTimestamp: new Date().toISOString()
+    };
+  }
+
+  const ua = (navigator.userAgent || '').toLowerCase();
+  
+  // 1. Determine Device Type Check (relying on our robust getDeviceType)
+  let deviceType: 'Mobile' | 'Tablet' | 'Desktop' = 'Desktop';
+  const resolvedType = getDeviceType();
+  
+  if (resolvedType === 'mobile') {
+    const screenWidth = window.screen ? (window.screen.width || 0) : 0;
+    const isTabletUA = /ipad|tablet|playbook|silk/i.test(ua) || 
+                       (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    
+    if (isTabletUA) {
+      deviceType = 'Tablet';
+    } else if (screenWidth > 0 && screenWidth <= 640) {
+      deviceType = 'Mobile';
+    } else if (window.innerWidth <= 640) {
+      deviceType = 'Mobile';
+    } else {
+      deviceType = 'Mobile';
+    }
+  }
+
+  // 2. Determine Browser
+  let browser = 'Unknown Browser';
+  if (ua.includes('firefox')) {
+    browser = 'Firefox';
+  } else if (ua.includes('opera') || ua.includes('opr')) {
+    browser = 'Opera';
+  } else if (ua.includes('edg')) {
+    browser = 'Edge';
+  } else if (ua.includes('chrome') && !ua.includes('chromium')) {
+    browser = 'Chrome';
+  } else if (ua.includes('safari') && !ua.includes('chrome')) {
+    browser = 'Safari';
+  } else if (ua.includes('msie') || ua.includes('trident')) {
+    browser = 'Internet Explorer';
+  } else {
+    const match = ua.match(/(chrome|safari|firefox|msie|trident(?=\/))\/?\s*(\d+)/i);
+    if (match && match[1]) {
+      browser = match[1].charAt(0).toUpperCase() + match[1].slice(1);
+    }
+  }
+
+  // 3. Determine OS with spoof protection
+  let os = 'Unknown OS';
+  if (/windows|win32/i.test(ua)) {
+    os = 'Windows';
+  } else if (/iphone|ipad|ipod/i.test(ua)) {
+    os = 'iOS';
+  } else if (/android/i.test(ua)) {
+    os = 'Android';
+  } else if (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1) {
+    os = 'iOS';
+  } else if (/macintosh|mac os x/i.test(ua)) {
+    if (resolvedType === 'mobile') {
+      os = 'iOS';
+    } else {
+      os = 'Mac OS';
+    }
+  } else if (/linux/i.test(ua)) {
+    if (resolvedType === 'mobile') {
+      os = 'Android';
+    } else {
+      os = 'Linux';
+    }
+  } else if (/cros/i.test(ua)) {
+    os = 'Chrome OS';
+  }
+
+  return {
+    deviceType,
+    browser,
+    os,
+    loginTimestamp: new Date().toISOString()
+  };
 }
 
 export function getShiftProductiveMs(shift: TMSShift, referenceTime: number): number {
@@ -380,6 +536,9 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
   }, []);
 
   // Fetch Attendance present threshold in Real-time from config/attendanceSettings document
+  const [desktopOnlyMode, setDesktopOnlyMode] = useState<boolean>(false);
+  const [adminBypass, setAdminBypass] = useState<boolean>(false);
+
   useEffect(() => {
     if (!user) return;
     const unsub = onSnapshot(doc(db, 'config', 'attendanceSettings'), (snap) => {
@@ -390,6 +549,7 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
         } else if (data.presentThreshold) {
           setPresentThreshold(Number(data.presentThreshold));
         }
+        setDesktopOnlyMode(!!data.desktopOnlyMode);
       }
     }, (err) => {
       console.warn('Failed to subscribe config/attendanceSettings in TMSView', err);
@@ -572,7 +732,7 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
 
   useEffect(() => {
     if (!user || !canViewReports) return;
-    const qAllShifts = query(collection(db, 'tmsShifts'), orderBy('clockInTime', 'desc'), limit(1000));
+    const qAllShifts = query(collection(db, 'tmsShifts'), orderBy('clockInTime', 'desc'), limit(300));
     const unsubscribe = onSnapshot(qAllShifts, (snap) => {
       const shifts = snap.docs.map(doc => ({ id: doc.id, ...doc.data() } as TMSShift));
       setAllShifts(shifts);
@@ -927,6 +1087,24 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
     setIsProcessingPunch(true);
     try {
       const nowISO = getLiveTimeISO();
+      const currentDev = getDeviceType();
+      const meta = getDetailedDeviceMetadata();
+      
+      const uaVal = typeof navigator !== 'undefined' ? navigator.userAgent : 'N/A';
+      const platVal = typeof navigator !== 'undefined' ? navigator.platform : 'N/A';
+      const touchVal = typeof navigator !== 'undefined' ? navigator.maxTouchPoints : 0;
+      const swVal = typeof window !== 'undefined' && window.screen ? window.screen.width : 0;
+      const shVal = typeof window !== 'undefined' && window.screen ? window.screen.height : 0;
+
+      // Log exactly as requested
+      console.log(`[DEVICE DETECTION]`);
+      console.log(`userAgent=${uaVal}`);
+      console.log(`platform=${platVal}`);
+      console.log(`maxTouchPoints=${touchVal}`);
+      console.log(`detectedDeviceType=${meta.deviceType}`);
+      console.log(`detectedBrowser=${meta.browser}`);
+      console.log(`detectedOS=${meta.os}`);
+
       const newShift: TMSShift = {
         id: `shift-${user.uid || 'anon'}-${Date.now()}`,
         userId: user.uid || '',
@@ -936,11 +1114,27 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
         mappedManager: (user as any).mappedManagerEmail || (user as any).mappedManager || 'N/A',
         clockInTime: nowISO,
         status: 'ACTIVE',
+        clockInDevice: currentDev,
+        hasMobilePunches: currentDev === 'mobile',
+        deviceType: meta.deviceType,
+        browser: meta.browser,
+        os: meta.os,
+        loginTimestamp: meta.loginTimestamp,
+        // Diagnostics
+        userAgent: uaVal,
+        platform: platVal,
+        maxTouchPoints: touchVal,
+        screenWidth: swVal,
+        screenHeight: shVal,
+        detectedDeviceType: meta.deviceType,
+        detectedBrowser: meta.browser,
+        detectedOS: meta.os,
         activities: [
           {
             type: 'productive',
             name: targetProcess,
-            startTime: nowISO
+            startTime: nowISO,
+            device: currentDev
           }
         ]
       };
@@ -983,6 +1177,7 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
 
     try {
       const nowISO = getLiveTimeISO();
+      const currentDev = getDeviceType();
       const updatedActivities = [...currentShift.activities];
       
       // Terminate last activity
@@ -994,13 +1189,15 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
       updatedActivities.push({
         type: 'productive',
         name: targetProcess,
-        startTime: nowISO
+        startTime: nowISO,
+        device: currentDev
       });
 
       await saveShiftState({
         ...currentShift,
         activities: updatedActivities,
-        status: 'ACTIVE'
+        status: 'ACTIVE',
+        hasMobilePunches: currentShift.hasMobilePunches || currentDev === 'mobile'
       });
 
       setSelectedProcessInput(targetProcess);
@@ -1041,6 +1238,7 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
 
     try {
       const nowISO = getLiveTimeISO();
+      const currentDev = getDeviceType();
       const updatedActivities = [...currentShift.activities];
       
       // Terminate last active segment
@@ -1052,13 +1250,15 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
       updatedActivities.push({
         type: 'break',
         name: selectedBreakInput,
-        startTime: nowISO
+        startTime: nowISO,
+        device: currentDev
       });
 
       await saveShiftState({
         ...currentShift,
         activities: updatedActivities,
-        status: 'BREAK'
+        status: 'BREAK',
+        hasMobilePunches: currentShift.hasMobilePunches || currentDev === 'mobile'
       });
 
       toast.success(`Break started: ${selectedBreakInput}`);
@@ -1103,6 +1303,7 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
 
     try {
       const nowISO = getLiveTimeISO();
+      const currentDev = getDeviceType();
       const updatedActivities = [...currentShift.activities];
       
       // Terminate break segment
@@ -1114,13 +1315,15 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
       updatedActivities.push({
         type: 'productive',
         name: resumeProcess,
-        startTime: nowISO
+        startTime: nowISO,
+        device: currentDev
       });
 
       await saveShiftState({
         ...currentShift,
         activities: updatedActivities,
-        status: 'ACTIVE'
+        status: 'ACTIVE',
+        hasMobilePunches: currentShift.hasMobilePunches || currentDev === 'mobile'
       });
 
       setSelectedProcessInput(resumeProcess);
@@ -1144,6 +1347,7 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
     if (!currentShift) return;
     try {
       const nowISO = getLiveTimeISO();
+      const currentDev = getDeviceType();
       const updatedActivities = [...currentShift.activities];
       
       // Terminate last activity
@@ -1155,7 +1359,9 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
         ...currentShift,
         activities: updatedActivities,
         clockOutTime: nowISO,
-        status: 'COMPLETED'
+        status: 'COMPLETED' as const,
+        clockOutDevice: currentDev,
+        hasMobilePunches: currentShift.hasMobilePunches || currentDev === 'mobile'
       };
 
       await saveShiftState(finalizedShift as any);
@@ -1355,6 +1561,60 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
     UserRole.MIS
   ];
   const isDashboardUser = dashboardRoles.includes(user.role as UserRole);
+
+  const { deviceType, browser, os } = getDetailedDeviceMetadata();
+  const isMobileOrTablet = deviceType !== 'Desktop';
+
+  if (desktopOnlyMode && isMobileOrTablet && !adminBypass) {
+    const isAdmin = user.role === 'ADMIN' || user.role === UserRole.ADMIN;
+    return (
+      <div className="flex flex-col items-center justify-center min-h-[70vh] p-8 text-center bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-3xl shadow-xl max-w-2xl mx-auto my-12 space-y-6">
+        <div className="w-20 h-20 rounded-full bg-rose-100 dark:bg-rose-950 flex items-center justify-center text-rose-600 dark:text-rose-450 animate-bounce">
+          <MonitorOff size={40} />
+        </div>
+        <h2 className="text-2xl font-black text-rose-650 tracking-tight dark:text-rose-400">
+          Device Restricted
+        </h2>
+        <p className="text-slate-650 dark:text-slate-300 font-extrabold leading-relaxed text-sm">
+          TMS is supported only on Desktop/Laptop devices.
+        </p>
+        
+        <div className="bg-slate-50 dark:bg-slate-950 p-4 rounded-xl border border-slate-150 dark:border-slate-800/60 w-full text-left space-y-2 max-w-sm font-semibold">
+          <div className="text-[10px] uppercase tracking-wider font-bold text-slate-400 font-mono">YOUR DEVICE METADATA</div>
+          <div className="text-xs text-slate-700 dark:text-slate-300 flex justify-between">
+            <span>Detected Type:</span>
+            <span className="font-bold text-rose-500">{deviceType}</span>
+          </div>
+          <div className="text-xs text-slate-700 dark:text-slate-300 flex justify-between">
+            <span>Browser:</span>
+            <span>{browser}</span>
+          </div>
+          <div className="text-xs text-slate-700 dark:text-slate-350 flex justify-between">
+            <span>OS:</span>
+            <span>{os}</span>
+          </div>
+        </div>
+
+        <p className="text-[10px] text-slate-400 font-medium">
+          If you are on a desktop browser, please maximize your window or disable device emulation.
+        </p>
+        
+        {isAdmin && (
+          <div className="pt-2">
+            <Button 
+              onClick={() => {
+                toast.success('Admin Device Restricted Override active for this session.');
+                setAdminBypass(true);
+              }}
+              className="bg-indigo-650 hover:bg-indigo-755 text-white font-bold text-xs px-4 py-2 rounded-xl"
+            >
+              Force Access (Admin Overrule)
+            </Button>
+          </div>
+        )}
+      </div>
+    );
+  }
 
   if (isDashboardUser) {
     return (
@@ -2711,7 +2971,7 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
             </CardHeader>
             <CardContent className="p-0 max-h-80 overflow-y-auto">
               <div className="divide-y divide-slate-100">
-                {myPastShifts.filter(s => s.status === 'COMPLETED').map((sh) => {
+                {myPastShifts.filter(s => s.status === 'COMPLETED' && (Date.now() - new Date(s.clockInTime).getTime()) <= 7 * 24 * 60 * 60 * 1000).map((sh) => {
                   const stats = computeShiftStats(sh);
                   return (
                     <div key={sh.id} className="p-4 hover:bg-slate-50 transition-colors flex items-center justify-between text-xs">
@@ -2736,9 +2996,9 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
                     </div>
                   );
                 })}
-                {myPastShifts.filter(s => s.status === 'COMPLETED').length === 0 && (
+                {myPastShifts.filter(s => s.status === 'COMPLETED' && (Date.now() - new Date(s.clockInTime).getTime()) <= 7 * 24 * 60 * 60 * 1000).length === 0 && (
                   <div className="text-center py-10 opacity-40 text-[10px] uppercase font-black tracking-widest text-slate-600">
-                    No completed shift logs found
+                    No completed shift logs found (past 7 days)
                   </div>
                 )}
               </div>
