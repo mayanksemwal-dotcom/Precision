@@ -477,13 +477,22 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
   const [allShifts, setAllShifts] = useState<TMSShift[]>([]);
   const [adminSearch, setAdminSearch] = useState('');
   const [currentPage, setCurrentPage] = useState(1);
-  const [selectedProcessInput, setSelectedProcessInput] = useState('');
+  const [selectedProcessInput, setSelectedProcessInput] = useState(user.lastUsedProcess || '');
+  
+  // Reactively pre-select last used process if user profile updates
+  useEffect(() => {
+    if (user.lastUsedProcess && !selectedProcessInput) {
+      setSelectedProcessInput(user.lastUsedProcess);
+    }
+  }, [user.lastUsedProcess]);
+
   const [selectedBreakInput, setSelectedBreakInput] = useState(BREAK_OPTIONS[0]);
   const [activeShiftFilter, setActiveShiftFilter] = useState('all');
   const [editingProcessName, setEditingProcessName] = useState<string | null>(null);
   const [editingProcessValue, setEditingProcessValue] = useState<string>('');
 
   // Custom modal confirmations instead of window.confirm inside sandboxed iframe
+  const [showClockInConfirm, setShowClockInConfirm] = useState(false);
   const [showClockOutConfirm, setShowClockOutConfirm] = useState(false);
   const [confirmDeleteProcessName, setConfirmDeleteProcessName] = useState<string | null>(null);
 
@@ -1084,6 +1093,16 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
       return;
     }
 
+    // Show confirmation modal instead of immediate punch
+    setSelectedProcessInput(targetProcess);
+    setShowClockInConfirm(true);
+  };
+
+  const performClockIn = async () => {
+    if (isProcessingPunch) return;
+    const targetProcess = selectedProcessInput;
+    if (!targetProcess) return;
+
     setIsProcessingPunch(true);
     try {
       const nowISO = getLiveTimeISO();
@@ -1143,7 +1162,8 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
       const userRef = doc(db, 'users', user.uid);
       await updateDoc(userRef, {
         status: 'ONLINE',
-        lastLoginAt: nowISO
+        lastLoginAt: nowISO,
+        lastUsedProcess: targetProcess
       });
 
       await saveShiftState(newShift);
@@ -1153,6 +1173,7 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
       handleFirestoreError(e, OperationType.WRITE, 'tmsShifts');
     } finally {
       setIsProcessingPunch(false);
+      setShowClockInConfirm(false);
     }
   };
 
@@ -3165,7 +3186,7 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
       {/* Custom clock-out confirmation overlay modal */}
       {showClockOutConfirm && (
         <div className="fixed inset-0 bg-slate-900/55 backdrop-blur-sm flex items-center justify-center z-[99999] p-4 animate-in fade-in duration-200">
-          <div className="bg-white rounded-2xl max-w-sm w-full p-6 shadow-xl border border-slate-200 space-y-4">
+          <div className="bg-white rounded-2xl max-w-sm w-full p-6 shadow-xl border border-slate-200 space-y-4 text-left">
             <div className="flex items-center gap-3 text-red-600">
               <div className="w-10 h-10 rounded-full bg-red-50 flex items-center justify-center shrink-0">
                 <AlertCircle size={20} />
@@ -3176,11 +3197,52 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
               </div>
             </div>
             <div className="flex justify-end gap-2 text-xs font-bold pt-2 border-t">
-              <Button variant="ghost" onClick={() => setShowClockOutConfirm(false)}>Cancel</Button>
-              <Button className="bg-red-600 hover:bg-red-700 text-white font-bold" onClick={() => {
+              <Button variant="ghost" onClick={() => setShowClockOutConfirm(false)} className="cursor-pointer">Cancel</Button>
+              <Button className="bg-red-600 hover:bg-red-700 text-white font-bold cursor-pointer" onClick={() => {
                 setShowClockOutConfirm(false);
                 performClockOut();
               }}>Confirm Clock Out</Button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Custom clock-in confirmation overlay modal */}
+      {showClockInConfirm && (
+        <div className="fixed inset-0 bg-slate-900/55 backdrop-blur-sm flex items-center justify-center z-[99999] p-4 animate-in fade-in zoom-in-95 duration-200">
+          <div className="bg-white rounded-2xl max-w-sm w-full p-6 shadow-2xl border border-slate-100 space-y-5 text-left">
+            <div className="flex items-center gap-4 text-emerald-600 border-b border-slate-50 pb-4">
+              <div className="w-12 h-12 rounded-full bg-emerald-50 flex items-center justify-center shrink-0">
+                <Clock size={24} />
+              </div>
+              <div className="flex-1">
+                <h4 className="font-black text-slate-900 text-sm uppercase tracking-tight">Confirm Shift Start</h4>
+                <p className="text-slate-500 text-[10px] font-bold mt-0.5 leading-tight">Verification required before punch</p>
+              </div>
+            </div>
+            
+            <div className="p-4 bg-slate-50 rounded-xl border border-slate-100 flex flex-col items-center justify-center text-center">
+              <p className="text-[10px] uppercase font-black text-slate-400 tracking-widest">Target Work Process</p>
+              <p className="text-lg font-black text-slate-900 mt-1 leading-tight">{selectedProcessInput}</p>
+              <p className="text-[10px] text-slate-500 font-semibold mt-2 max-w-[200px]">You are about to start work in the following process: <span className="font-bold text-emerald-600">{selectedProcessInput}</span></p>
+            </div>
+
+            <div className="flex flex-col gap-2 pt-2">
+              <Button 
+                className="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-black text-xs h-11 rounded-xl shadow-lg shadow-emerald-100 flex items-center justify-center gap-2 cursor-pointer"
+                onClick={performClockIn}
+                disabled={isProcessingPunch}
+              >
+                {isProcessingPunch ? <RefreshCw size={14} className="animate-spin" /> : <Play size={14} />}
+                CONFIRM & START SHIFT
+              </Button>
+              <Button 
+                variant="ghost" 
+                className="w-full text-slate-500 hover:text-slate-800 hover:bg-slate-100 font-bold text-xs h-10 rounded-xl cursor-pointer"
+                onClick={() => setShowClockInConfirm(false)}
+              >
+                CHANGE PROCESS
+              </Button>
             </div>
           </div>
         </div>

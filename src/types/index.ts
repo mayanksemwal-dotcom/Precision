@@ -43,6 +43,7 @@ export interface UserProfile {
   mappedQA?: string;
   mappedManager?: string;
   process?: string;
+  lastUsedProcess?: string;
   dateJoined?: string;
   lastUpdated?: string;
 }
