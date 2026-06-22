@@ -136,6 +136,7 @@ export default function App() {
     const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
       console.log('onAuthStateChanged fired. User:', firebaseUser ? firebaseUser.email : 'null');
       if (firebaseUser) {
+        // Direct login allowed without email verification per user request
         try {
           const getCleanName = () => {
             if (firebaseUser.displayName) return firebaseUser.displayName;
@@ -163,6 +164,9 @@ export default function App() {
               console.log('User document found, syncing profile.');
               const currentData = userDoc.data() as any;
               
+              // Promote users to 'Active'
+              let finalStatus = currentData.status === 'Pending Verification' ? 'Active' : (currentData.status || 'Active');
+
               userProfile = {
                 ...currentData,
                 uid: firebaseUser.uid,
@@ -170,7 +174,7 @@ export default function App() {
                 name: currentData.name || currentData.fullName || getCleanName(),
                 fullName: currentData.fullName || currentData.name || getCleanName(),
                 role: (firebaseUser.email?.toLowerCase().trim() === 'mayank.semwal@bergtechnologies.co.in') ? 'ADMIN' : (currentData.role || UserRole.AGENT).toUpperCase(),
-                status: currentData.status || 'Active',
+                status: finalStatus,
                 department: currentData.department || 'Operations',
                 Manager: currentData.Manager || '',
                 createdAt: currentData.createdAt || now.toISOString(),
@@ -179,49 +183,84 @@ export default function App() {
 
               await setDoc(userDocRef, userProfile, { merge: true });
             } else {
-              console.log('New user detected or profile missing, checking pre-provisioning...');
-              const usersRef = collection(db, 'users');
-              const checkQuery = query(usersRef, where('email', '==', (firebaseUser.email || '').toLowerCase().trim()));
-              const querySnap = await getDocs(checkQuery);
+              // Wait if registration is currently active in the client
+              const isRegistering = localStorage.getItem('is_registering') === 'true';
+              let resolvedFromRegister = false;
               
-              if (!querySnap.empty) {
-                const matchedDoc = querySnap.docs[0];
-                console.log('Pre-provisioned user found. Triggering server-side profile linking and migration...', matchedDoc.id);
-                
-                const idToken = await firebaseUser.getIdToken(true);
-                const response = await fetch('/api/link-user-profile', {
-                  method: 'POST',
-                  headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${idToken}`
-                  },
-                  body: JSON.stringify({ oldDocId: matchedDoc.id })
-                });
-
-                if (!response.ok) {
-                  throw new Error(`Profile migration failed: ${await response.text()}`);
+              if (isRegistering) {
+                console.log('Detected client-side registration in progress. Waiting up to 3 seconds for LoginView database setup...');
+                for (let i = 0; i < 6; i++) {
+                  await new Promise(resolve => setTimeout(resolve, 500));
+                  const checkDoc = await getDoc(userDocRef);
+                  if (checkDoc.exists()) {
+                    console.log('Registration document detected in auth listener after wait.');
+                    const currentData = checkDoc.data() as any;
+                    let finalStatus = currentData.status === 'Pending Verification' ? 'Active' : (currentData.status || 'Active');
+                    userProfile = {
+                      ...currentData,
+                      uid: firebaseUser.uid,
+                      email: (firebaseUser.email || '').toLowerCase().trim(),
+                      name: currentData.name || currentData.fullName || getCleanName(),
+                      fullName: currentData.fullName || currentData.name || getCleanName(),
+                      role: (firebaseUser.email?.toLowerCase().trim() === 'mayank.semwal@bergtechnologies.co.in') ? 'ADMIN' : (currentData.role || UserRole.AGENT).toUpperCase(),
+                      status: finalStatus,
+                      department: currentData.department || 'Operations',
+                      Manager: currentData.Manager || '',
+                      createdAt: currentData.createdAt || now.toISOString(),
+                      lastLoginAt: now.toISOString(),
+                    };
+                    await setDoc(userDocRef, userProfile, { merge: true });
+                    resolvedFromRegister = true;
+                    break;
+                  }
                 }
+              }
 
-                const resData = await response.json();
-                userProfile = resData.user;
-                console.log('Successfully completed server-side profile linking and migration.');
-              } else {
-                console.log('No pre-provisioned profile, creating clean profile...');
-                const isEmail = firebaseUser.providerData.some(p => p.providerId === 'password');
-                userProfile = {
-                  uid: firebaseUser.uid,
-                  email: (firebaseUser.email || '').toLowerCase().trim(),
-                  name: getCleanName(),
-                  fullName: getCleanName(),
-                  role: UserRole.AGENT,
-                  status: 'Active',
-                  department: 'Operations',
-                  Manager: '',
-                  createdAt: now.toISOString(),
-                  lastLoginAt: now.toISOString(),
-                  authProvider: isEmail ? 'email' : 'google',
-                };
-                await setDoc(userDocRef, userProfile);
+              if (!resolvedFromRegister) {
+                console.log('New user detected or profile missing, checking pre-provisioning...');
+                const usersRef = collection(db, 'users');
+                const checkQuery = query(usersRef, where('email', '==', (firebaseUser.email || '').toLowerCase().trim()));
+                const querySnap = await getDocs(checkQuery);
+                
+                if (!querySnap.empty) {
+                  const matchedDoc = querySnap.docs[0];
+                  console.log('Pre-provisioned user found. Triggering server-side profile linking and migration...', matchedDoc.id);
+                  
+                  const idToken = await firebaseUser.getIdToken(true);
+                  const response = await fetch('/api/link-user-profile', {
+                    method: 'POST',
+                    headers: {
+                      'Content-Type': 'application/json',
+                      'Authorization': `Bearer ${idToken}`
+                    },
+                    body: JSON.stringify({ oldDocId: matchedDoc.id })
+                  });
+
+                  if (!response.ok) {
+                    throw new Error(`Profile migration failed: ${await response.text()}`);
+                  }
+
+                  const resData = await response.json();
+                  userProfile = resData.user;
+                  console.log('Successfully completed server-side profile linking and migration.');
+                } else {
+                  console.log('No pre-provisioned profile, creating clean profile...');
+                  const isEmail = firebaseUser.providerData.some(p => p.providerId === 'password');
+                  userProfile = {
+                    uid: firebaseUser.uid,
+                    email: (firebaseUser.email || '').toLowerCase().trim(),
+                    name: getCleanName(),
+                    fullName: getCleanName(),
+                    role: (firebaseUser.email?.toLowerCase().trim() === 'mayank.semwal@bergtechnologies.co.in') ? UserRole.ADMIN : UserRole.AGENT,
+                    status: 'Active',
+                    department: 'Operations',
+                    Manager: '',
+                    createdAt: now.toISOString(),
+                    lastLoginAt: now.toISOString(),
+                    authProvider: isEmail ? 'email' : 'google',
+                  };
+                  await setDoc(userDocRef, userProfile);
+                }
               }
               console.log('Bootstrapped user profile saved to Firestore.');
             }

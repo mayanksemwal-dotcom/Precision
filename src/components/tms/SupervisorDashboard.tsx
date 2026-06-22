@@ -304,32 +304,19 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
       return s !== 'inactive';
     };
 
-    if (isManagerOrAdmin) {
+    if (isManagerOrAdmin || isTeamLeadOrSupervisor) {
       if (selectedTLs.length > 0) {
         return allUsers.filter(u => isActive(u) && (
           selectedTLs.includes(u.teamLeadName || '') || 
           selectedTLs.includes(u.teamLeadId || '') || 
           selectedTLs.includes(u.name) || 
           selectedTLs.includes(u.fullName || '') || 
-          selectedTLs.includes(u.uid)
-        ));
-      }
-      return allUsers.filter(u => isActive(u));
-    } else if (isTeamLeadOrSupervisor) {
-      // If specific Team Leads are selected, show resources belonging to those Team Leads, plus themselves
-      if (selectedTLs.length > 0) {
-        return allUsers.filter(u => isActive(u) && (
-          selectedTLs.includes(u.teamLeadName || '') || 
-          selectedTLs.includes(u.teamLeadId || '') || 
           selectedTLs.includes(u.uid) ||
-          selectedTLs.includes(u.name) ||
-          selectedTLs.includes(u.fullName || '') ||
           (u.teamLeadEmail && selectedTLs.some(st => u.teamLeadEmail.toLowerCase() === st.toLowerCase())) ||
           (u.email && selectedTLs.some(st => u.email.toLowerCase() === st.toLowerCase()))
         ));
       }
-      // By default, fallback to their own mapped resources, plus themselves so they see their own status & attendance
-      return allUsers.filter(u => isActive(u) && (u.uid === user.uid || canActOn(user, u, allUsers)));
+      return allUsers.filter(u => isActive(u));
     }
     return allUsers.filter(u => isActive(u) && (u.uid === user.uid || canActOn(user, u, allUsers)));
   }, [allUsers, user, selectedTLs]);
@@ -341,6 +328,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
   // Performance optimization: cache today's shift query results during massive real-time ticks
   const lastTodayShiftsFetchTimeRef = React.useRef<number>(0);
   const cachedTodayShiftsRef = React.useRef<any[]>([]);
+  const cachedTwoDaysShiftsRef = React.useRef<any[]>([]);
 
   useEffect(() => {
     mappedUsersRef.current = mappedUsers;
@@ -589,6 +577,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
 
       // Timezone-safe daily shifts retrieval with aggressive performance caching (20s) to fix lag issues
       let todayShifts: any[] = [];
+      let twoDaysShifts: any[] = [];
       const currentTimestampMs = Date.now();
       const CACHE_EXPIRY_MS = 20000;
       
@@ -598,28 +587,37 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
 
       if (isCacheValid) {
         todayShifts = cachedTodayShiftsRef.current;
+        twoDaysShifts = cachedTwoDaysShiftsRef.current || [];
       } else {
-        // Go back 30 hours to safely cover any possible timezone skew (UTC offset overlap)
-        const startOfTodayQuery = new Date(currentTimestampMs - 30 * 60 * 60 * 1000);
-        const todayShiftsQuery = query(
+        // Go back 60 hours to cover last 2 days plus timezone offsets
+        const sixtyHoursMs = 60 * 3600000;
+        const startOfRangeQuery = new Date(currentTimestampMs - sixtyHoursMs);
+        const shiftsQuery = query(
           collection(db, 'tmsShifts'),
-          where('clockInTime', '>=', startOfTodayQuery.toISOString())
+          where('clockInTime', '>=', startOfRangeQuery.toISOString())
         );
-        const todayShiftsSnapshot = await getDocs(todayShiftsQuery);
+        const shiftsSnapshot = await getDocs(shiftsQuery);
+        const allFetchedShifts = shiftsSnapshot.docs.map(d => ({ id: d.id, ...d.data() } as any));
         
         // Filter in memory for supervisor's current calendar day (same local date) OR within last 24 hours
         const nowLocalDateStr = new Date().toDateString();
-        todayShifts = todayShiftsSnapshot.docs
-          .map(d => ({ id: d.id, ...d.data() } as any))
-          .filter(sh => {
-            if (!scopeIds.has(sh.userId)) return false;
-            const shiftLocalDateStr = new Date(sh.clockInTime).toDateString();
-            const isTodayLocal = shiftLocalDateStr === nowLocalDateStr;
-            const within24h = (currentTimestampMs - new Date(sh.clockInTime).getTime()) < 24 * 60 * 60 * 1000;
-            return isTodayLocal || within24h;
-          });
+        todayShifts = allFetchedShifts.filter(sh => {
+          if (!scopeIds.has(sh.userId)) return false;
+          const shiftLocalDateStr = new Date(sh.clockInTime).toDateString();
+          const isTodayLocal = shiftLocalDateStr === nowLocalDateStr;
+          const within24h = (currentTimestampMs - new Date(sh.clockInTime).getTime()) < 24 * 60 * 60 * 1000;
+          return isTodayLocal || within24h;
+        });
+
+        // Filter for last 2 days (within 48 hours)
+        twoDaysShifts = allFetchedShifts.filter(sh => {
+          if (!scopeIds.has(sh.userId)) return false;
+          const within48h = (currentTimestampMs - new Date(sh.clockInTime).getTime()) < 48 * 60 * 60 * 1000;
+          return within48h;
+        });
           
         cachedTodayShiftsRef.current = todayShifts;
+        cachedTwoDaysShiftsRef.current = twoDaysShifts;
         lastTodayShiftsFetchTimeRef.current = currentTimestampMs;
       }
 
@@ -697,8 +695,8 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
         }
       });
 
-      // 2. Scan today's shifts for used mobile punches
-      todayShifts.forEach(sh => {
+      // 2. Scan last 2 days' shifts for used mobile punches
+      twoDaysShifts.forEach(sh => {
         const hasMobile = sh.hasMobilePunches === true || 
                           sh.clockInDevice === 'mobile' || 
                           sh.clockOutDevice === 'mobile' || 
@@ -714,6 +712,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
             email: sh.userEmail,
             shiftId: sh.id,
             clockInTime: sh.clockInTime,
+            clockOutTime: sh.clockOutTime || null,
             status: sh.status,
             mobilePunchesCount,
             activities: sh.activities || [],
@@ -1557,8 +1556,8 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
 
       {/* CORE STATS KPI TILES (TOP SUMMARY CARDS - REACTIVE TO ACTIVE FILTERS) */}
       <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-7 gap-2.5">
-        <div className="bg-white dark:bg-slate-900 border border-slate-250 dark:border-slate-950/30 p-2.5 rounded-xl shadow-xs text-center">
-          <span className="text-[9px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-500 leading-none">Total Assigned</span>
+          <div className="bg-white dark:bg-slate-900 border-2 border-indigo-200 dark:border-indigo-900/50 p-2.5 rounded-xl shadow-sm text-center">
+          <span className="text-[9px] font-black uppercase tracking-widest text-indigo-600 dark:text-indigo-400 leading-none">Total Assigned</span>
           <h3 className="text-xl font-black text-slate-900 dark:text-white mt-0.5">{liveStats.total}</h3>
           <p className="text-[8px] text-slate-500 dark:text-slate-400 font-bold mt-0.5 leading-none">Roster Mapped</p>
         </div>
@@ -1575,7 +1574,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
           <p className="text-[8px] text-amber-500 dark:text-amber-500/85 font-bold mt-0.5 leading-none">Rest Periods</p>
         </div>
 
-        <div className="bg-white dark:bg-slate-900 border border-slate-250 dark:border-slate-950/30 p-2.5 rounded-xl shadow-xs text-center">
+          <div className="bg-white dark:bg-slate-900 border-2 border-slate-300 dark:border-slate-700 p-2.5 rounded-xl shadow-sm text-center">
           <span className="text-[9px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-500 leading-none">Offline</span>
           <h3 className="text-xl font-black text-slate-500 dark:text-slate-300 mt-0.5">{liveStats.offline}</h3>
           <p className="text-[8px] text-slate-400 dark:text-slate-500 font-bold mt-0.5 leading-none">Off-Duty staff</p>
@@ -2676,18 +2675,49 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
               <button onClick={() => setShowInvestigateModal(false)} className="text-slate-400 hover:text-slate-600">✕</button>
             </div>
             <div className="max-h-96 overflow-y-auto space-y-2">
-              {selectedInvestigateLogs.flatMap(log => 
-                (log.activities && log.activities.length > 0 ? log.activities : [{ name: 'Action', startTime: log.loginTimestamp || log.timestamp || Date.now() }])
-              ).map((activity: any, idx: number) => {
-                const ts = activity.startTime;
-                const dateStr = ts ? new Date(ts).toLocaleString() : 'N/A';
-                return (
-                  <div key={idx} className="bg-slate-50 p-3 rounded-lg border border-slate-100 text-xs">
-                    <span className="font-mono text-slate-500">{dateStr}</span>
-                    <div className="font-bold">{activity.name}</div>
-                  </div>
-                );
-              })}
+              {(() => {
+                const allMobileEvents: any[] = [];
+                selectedInvestigateLogs.forEach(log => {
+                  const events = getMobileEvents(log);
+                  allMobileEvents.push(...events);
+                });
+                
+                if (allMobileEvents.length === 0) {
+                  return (
+                    <div className="text-center py-6 text-xs text-slate-400 dark:text-slate-500 font-bold uppercase tracking-wider">
+                      No mobile events recorded in this segment
+                    </div>
+                  );
+                }
+                
+                return allMobileEvents.map((evt: any, idx: number) => {
+                  const dateStr = evt.timestamp ? new Date(evt.timestamp).toLocaleString('en-IN', {
+                    day: 'numeric',
+                    month: 'short',
+                    year: 'numeric',
+                    hour: '2-digit',
+                    minute: '2-digit',
+                    second: '2-digit'
+                  }) : 'N/A';
+                  
+                  return (
+                    <div key={idx} className="bg-fuchsia-500/5 dark:bg-fuchsia-950/20 p-3 rounded-lg border border-fuchsia-500/10 text-xs flex justify-between items-center text-slate-800 dark:text-slate-100 dark:border-slate-800">
+                      <div>
+                        <div className="font-extrabold flex items-center gap-1.5">
+                          <Smartphone size={12} className="text-fuchsia-500 shrink-0" />
+                          {evt.name}
+                        </div>
+                        <span className="font-mono text-[10px] text-slate-400 dark:text-slate-500 mt-1 block">
+                          {dateStr}
+                        </span>
+                      </div>
+                      <span className="bg-fuchsia-100 dark:bg-fuchsia-950/60 text-fuchsia-700 dark:text-fuchsia-400 text-[9px] font-black px-1.5 py-0.5 rounded uppercase tracking-wider select-none shrink-0">
+                        Mobile
+                      </span>
+                    </div>
+                  );
+                });
+              })()}
             </div>
             <button onClick={() => setShowInvestigateModal(false)} className="w-full bg-slate-900 text-white py-2 rounded-xl text-xs font-bold">Close</button>
           </div>
@@ -2938,4 +2968,97 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
 
     </div>
   );
+}
+
+interface MobileEvent {
+  name: string;
+  timestamp: string;
+  device: string;
+}
+
+function getMobileEvents(log: any): MobileEvent[] {
+  const events: MobileEvent[] = [];
+  
+  // 1. Clock In Event
+  if (log.clockInTime && log.clockInDevice === 'mobile') {
+    events.push({
+      name: "Clock In - Punched",
+      timestamp: log.clockInTime,
+      device: 'mobile'
+    });
+  }
+  
+  // 2. Activities Events
+  if (log.activities && Array.isArray(log.activities)) {
+    log.activities.forEach((act: any) => {
+      // If start of activity gets punched on mobile
+      if (act.startTime && act.device === 'mobile') {
+        let nameToDisplay = act.name || '';
+        if (act.type === 'break') {
+          if (nameToDisplay.toLowerCase().includes('lunch')) {
+            nameToDisplay = 'Lunch Break';
+          } else if (nameToDisplay.toLowerCase().includes('short')) {
+            nameToDisplay = 'Short Break';
+          } else if (nameToDisplay.toLowerCase().includes('bio')) {
+            nameToDisplay = 'Bio Break';
+          } else {
+            nameToDisplay = nameToDisplay.split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ');
+          }
+          events.push({
+            name: `${nameToDisplay} - Punched`,
+            timestamp: act.startTime,
+            device: 'mobile'
+          });
+        } else {
+          const formattedProdName = nameToDisplay ? nameToDisplay.split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ') : 'Production';
+          events.push({
+            name: `${formattedProdName} - Punched`,
+            timestamp: act.startTime,
+            device: 'mobile'
+          });
+        }
+      }
+      
+      // If end of activity (resume) gets punched on mobile
+      if (act.endTime && act.device === 'mobile') {
+        let nameToDisplay = act.name || '';
+        if (act.type === 'break') {
+          if (nameToDisplay.toLowerCase().includes('lunch')) {
+            nameToDisplay = 'Lunch Break';
+          } else if (nameToDisplay.toLowerCase().includes('short')) {
+            nameToDisplay = 'Short Break';
+          } else if (nameToDisplay.toLowerCase().includes('bio')) {
+            nameToDisplay = 'Bio Break';
+          } else {
+            nameToDisplay = nameToDisplay.split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ');
+          }
+          events.push({
+            name: `${nameToDisplay} - Resumed`,
+            timestamp: act.endTime,
+            device: 'mobile'
+          });
+        } else {
+          const formattedProdName = nameToDisplay ? nameToDisplay.split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ') : 'Production';
+          events.push({
+            name: `${formattedProdName} - Resumed`,
+            timestamp: act.endTime,
+            device: 'mobile'
+          });
+        }
+      }
+    });
+  }
+  
+  // 3. Clock Out Event
+  if (log.clockOutTime && log.clockOutDevice === 'mobile') {
+    events.push({
+      name: "Clock Out - Punched",
+      timestamp: log.clockOutTime,
+      device: 'mobile'
+    });
+  }
+  
+  // Sort chronologically
+  events.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+  return events;
 }

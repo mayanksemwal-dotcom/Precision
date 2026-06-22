@@ -1104,6 +1104,7 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
     if (!targetProcess) return;
 
     setIsProcessingPunch(true);
+    setShowClockInConfirm(false); // Close modal on confirmed start
     try {
       const nowISO = getLiveTimeISO();
       const currentDev = getDeviceType();

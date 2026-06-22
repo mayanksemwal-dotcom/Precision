@@ -8,6 +8,7 @@ import { auth, db, handleFirestoreError, OperationType } from '../lib/firebase';
 import { doc, setDoc, addDoc, collection, getDoc } from 'firebase/firestore';
 import { WarningTicket, UserProfile, UserRole } from '../types';
 import { UserPicker } from './UserPicker';
+import { triggerEmail } from '../lib/emailTrigger';
 import { sendEmailViaGmailApi } from '../lib/gmailService';
 
 interface WarningManagerProps {
@@ -254,11 +255,10 @@ CC Checklist:
           }
         });
 
-        // Write email queue documents for Custom Email Delivery Service background worker
-        const realEmailDoc = {
+        // Write email queue documents for Trigger Email from Firestore extension
+        const emailPayload = {
           to: finalTo,
           cc: finalCc,
-          from: fromEmail, // From: The user who triggered it
           message: {
             subject: `[DISCIPLINARY ACTION] Disciplinary Warning Issued - ${name} (${level})`,
             text: emailText,
@@ -303,34 +303,36 @@ CC Checklist:
               </div>
             `
           },
-          createdAt: nowISO,
-          status: 'pending'
+          metadata: {
+            ticketId: ticket.id,
+            employeeId: employeeId,
+            level: level,
+            performer: performerName
+          }
         };
 
-        try {
-          await addDoc(collection(db, 'mail'), realEmailDoc);
-          await addDoc(collection(db, 'emails'), realEmailDoc);
-          console.log("Successfully wrote warning email to Firestore queues");
-        } catch (mailErr) {
-          console.error("Failed to write warning email to mail collections: ", mailErr);
+        const emailTriggerResult = await triggerEmail(emailPayload);
+        if (emailTriggerResult.success) {
+          console.log("Successfully triggered warning email via Firestore extension");
+        } else {
+          console.warn("Failed to trigger email via Firestore:", emailTriggerResult.error);
         }
 
-        // Direct Gmail REST API sending logic
+        // Direct Gmail REST API sending logic as secondary fallback or direct dispatch
         try {
           const mailConfig = {
             to: finalTo,
             cc: finalCc,
             subject: `[DISCIPLINARY ACTION] Disciplinary Warning Issued - ${name} (${level})`,
             bodyText: emailText,
-            bodyHtml: realEmailDoc.message.html,
+            bodyHtml: emailPayload.message.html,
             fromEmail: fromEmail || 'compliance@bergtechnologies.co.in'
           };
           const gmailResult = await sendEmailViaGmailApi(mailConfig);
           if (gmailResult.success) {
-            toast.success(`Warning issued and notification email dispatched directly through your Gmail (Sent folder updated)!`);
+            toast.success(`Warning issued and notification email dispatched directly through your Gmail!`);
           } else {
-            console.warn('Could not dispatch via Gmail direct API:', gmailResult.error);
-            toast.success(`Warning issued and notification email queued in Firestore!`);
+            toast.success(`Warning issued and notification email queued in Firestore extension!`);
           }
         } catch (gmailErr: any) {
           console.error('Failed to trigger Gmail API wrapper:', gmailErr);

@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { db, auth } from '../../lib/firebase';
 import { collection, onSnapshot, query, orderBy, limit, addDoc } from 'firebase/firestore';
+import { triggerEmail } from '../../lib/emailTrigger';
 import { 
   Mail, Send, AlertTriangle, CheckCircle, Clock, Settings, RefreshCw, 
   HelpCircle, Eye, AlertCircle, FileText, User, Tag 
@@ -57,15 +58,27 @@ export const EmailDashboardSubView: React.FC<EmailDashboardSubViewProps> = ({ ad
                     
       // Sort in-place by chronological creation time
       all.sort((a, b) => {
-        const dateA = new Date(a.createdAt || 0).getTime();
-        const dateB = new Date(b.createdAt || 0).getTime();
-        return dateB - dateA;
+        const getTime = (val: any) => {
+          if (!val) return 0;
+          if (val.toMillis) return val.toMillis();
+          if (val.toDate) return val.toDate().getTime();
+          return new Date(val).getTime() || 0;
+        };
+        return getTime(b.createdAt || b.sentAt) - getTime(a.createdAt || a.sentAt);
       });
       
       all.forEach(item => {
         const toStr = String(item.to || item.message?.to || '').toLowerCase().trim();
         const subjStr = String(item.subject || item.message?.subject || '').toLowerCase().trim();
-        const ms = new Date(item.createdAt || 0).getTime();
+        
+        const getTime = (val: any) => {
+          if (!val) return 0;
+          if (val.toMillis) return val.toMillis();
+          if (val.toDate) return val.toDate().getTime();
+          return new Date(val).getTime() || 0;
+        };
+        const ms = getTime(item.createdAt);
+
         // Bucket within 5 seconds for deduplicating same dispatch logged to both collections
         const hash = `${toStr}_${subjStr}_${Math.round(ms / 5000)}`;
         
@@ -77,8 +90,8 @@ export const EmailDashboardSubView: React.FC<EmailDashboardSubViewProps> = ({ ad
             if (other.id === item.id) return false;
             const otherToStr = String(other.to || other.message?.to || '').toLowerCase().trim();
             const otherSubjStr = String(other.subject || other.message?.subject || '').toLowerCase().trim();
-            const otherMs = new Date(other.createdAt || 0).getTime();
-            return otherToStr === toStr && otherSubjStr === subjStr && Math.abs(otherMs - ms) < 10000 && other.delivery;
+            const otherMs = getTime(other.createdAt);
+            return otherToStr === toStr && otherSubjStr === subjStr && Math.abs(otherMs - ms) < 15000 && other.delivery;
           });
 
           if (richerInstance) {
@@ -166,6 +179,7 @@ export const EmailDashboardSubView: React.FC<EmailDashboardSubViewProps> = ({ ad
     let pending = 0;
     let sent = 0;
     let failed = 0;
+    let processing = 0;
     
     emails.forEach(e => {
       const state = (e.delivery?.state || e.status || 'pending').toLowerCase();
@@ -173,12 +187,14 @@ export const EmailDashboardSubView: React.FC<EmailDashboardSubViewProps> = ({ ad
         sent++;
       } else if (state === 'error' || state === 'failed') {
         failed++;
+      } else if (state === 'processing') {
+        processing++;
       } else {
         pending++;
       }
     });
     
-    return { pending, sent, failed, total: emails.length };
+    return { pending, sent, failed, processing, total: emails.length };
   }, [emails]);
 
   // Trigger test email write
@@ -192,12 +208,9 @@ export const EmailDashboardSubView: React.FC<EmailDashboardSubViewProps> = ({ ad
     setSendingTest(true);
     const nowISO = new Date().toISOString();
 
-    const testEmailDoc = {
+    const emailPayload = {
       to: testTo.trim(),
       cc: testCc ? testCc.split(',').map(s => s.trim()).filter(Boolean) : [],
-      createdAt: nowISO,
-      status: 'pending',
-      retryCount: 0,
       message: {
         subject: testSubject.trim() || 'Precision360 Custom Email Delivery System - Test Email',
         text: testBody.trim() || 'This email confirms the custom Email Delivery Service is live, operational, and connected to your background process queue!',
@@ -220,18 +233,25 @@ export const EmailDashboardSubView: React.FC<EmailDashboardSubViewProps> = ({ ad
             </p>
           </div>
         `
+      },
+      metadata: {
+        type: 'Diagnostic Test',
+        smtpHost: smtpStatus?.host
       }
     };
 
     try {
-      await addDoc(collection(db, 'emails'), testEmailDoc);
-      await addDoc(collection(db, 'mail'), testEmailDoc);
-      toast.success('Test email queue document registered in Firestore (emails & mail)! The background extension/trigger is processing it.');
-      // Clear fields
-      setTestTo('');
-      setTestCc('');
-      setTestSubject('');
-      setTestBody('');
+      const result = await triggerEmail(emailPayload);
+      if (result.success) {
+        toast.success('Test email queue document registered in Firestore (Trigger Email extension path)!');
+        // Clear fields
+        setTestTo('');
+        setTestCc('');
+        setTestSubject('');
+        setTestBody('');
+      } else {
+        toast.error('Failed to queue test email: ' + result.error);
+      }
     } catch (err: any) {
       console.error('Failed to create test email document:', err);
       toast.error('Failed to queue test email: ' + err.message);
@@ -287,9 +307,17 @@ export const EmailDashboardSubView: React.FC<EmailDashboardSubViewProps> = ({ ad
           <div>
             <h4 className="font-bold text-sm text-indigo-550 dark:text-indigo-300">Custom Email Delivery Service Trigger</h4>
             <p className="text-xs text-indigo-500/80 mt-1">
-              Currently running an integrated real-time service that monitors the <strong>emails</strong> collection. 
-              SMTP credentials (SMTP_USER and SMTP_PASS) are securely loaded server-side using Secret Manager.
+              Currently running an integrated real-time service that monitors the <strong>emails</strong> collection on database:
+              <code className="mx-1 px-1 py-0.5 bg-indigo-500/10 rounded font-mono text-[10px]">ai-studio-69f7a1ee-9b74-4113-9d67-df0f0cfb56c0</code>. 
             </p>
+            {stats.pending > 0 && (
+              <div className="mt-2 flex items-center gap-1.5 p-2 bg-amber-500/10 border border-amber-500/20 rounded-lg text-amber-600 dark:text-amber-400">
+                <AlertTriangle size={14} />
+                <span className="text-[10px] font-bold">
+                  Diagnostic: {stats.pending} items are stuck in "Pending". This indicates the background Extension or Cloud Function is not configured, not authorized, or targetting a different collection.
+                </span>
+              </div>
+            )}
           </div>
         </div>
         <button 
@@ -368,10 +396,12 @@ export const EmailDashboardSubView: React.FC<EmailDashboardSubViewProps> = ({ ad
           <div className={`p-4 rounded-2xl border ${adminTheme === 'dark' ? 'bg-slate-850 border-slate-800' : 'bg-white border-slate-150'} flex flex-col justify-between border-l-4 border-l-amber-500`}>
             <span className="text-[10px] uppercase font-bold text-amber-500">Pending / Processing</span>
             <div className="mt-2 flex items-baseline gap-2">
-              <span className="text-2xl font-black text-amber-500">{stats.pending}</span>
-              <span className="text-xs text-slate-400">queued</span>
+              <span className="text-2xl font-black text-amber-500">{stats.pending + stats.processing}</span>
+              <span className="text-xs text-slate-400">items</span>
             </div>
-            <div className="mt-3 text-[10px] text-slate-400">Awaiting trigger handler</div>
+            <div className="mt-3 text-[10px] text-slate-400">
+              {stats.processing > 0 ? `${stats.processing} currently processing` : 'Awaiting trigger handler'}
+            </div>
           </div>
 
           <div className={`p-4 rounded-2xl border ${adminTheme === 'dark' ? 'bg-slate-850 border-slate-800' : 'bg-white border-slate-150'} flex flex-col justify-between border-l-4 border-l-emerald-500`}>
@@ -504,7 +534,13 @@ export const EmailDashboardSubView: React.FC<EmailDashboardSubViewProps> = ({ ad
                 const toAddress = email.to || email.message?.to || 'Unknown';
                 const subject = email.subject || email.message?.subject || 'No Subject';
                 const dateRaw = email.createdAt || email.sentAt;
-                const formattedDate = dateRaw ? new Date(dateRaw).toLocaleString() : 'N/A';
+                
+                let formattedDate = 'N/A';
+                if (dateRaw) {
+                  if (dateRaw.toDate) formattedDate = dateRaw.toDate().toLocaleString();
+                  else formattedDate = new Date(dateRaw).toLocaleString();
+                }
+                
                 const err = email.errorMessage || email.deliveryError;
 
                 return (

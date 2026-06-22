@@ -45,19 +45,25 @@ interface WarningsViewProps {
 
 function RemarksCell({ remark }: { remark: string }) {
   const [isExpanded, setIsExpanded] = useState(false);
-  const isTooLong = remark.length > 100;
+  const isTooLong = remark.length > 80;
 
   return (
-    <div>
-      <p className={`text-xs text-slate-650 dark:text-slate-300 font-semibold italic leading-relaxed ${isExpanded ? '' : 'line-clamp-3'}`}>
+    <div className="group/remark relative">
+      <div className={`text-xs text-slate-650 dark:text-slate-300 font-semibold italic border-l-2 border-slate-200 dark:border-slate-700 pl-3 py-1 bg-slate-50/30 dark:bg-slate-800/20 rounded-r-lg transition-all duration-300 ${
+        isExpanded ? 'max-h-[300px] overflow-y-auto' : 'line-clamp-2 max-h-10'
+      }`}>
         "{remark}"
-      </p>
+      </div>
       {isTooLong && (
         <button 
           onClick={() => setIsExpanded(!isExpanded)}
-          className="text-[10px] text-blue-600 font-bold mt-1 cursor-pointer hover:underline"
+          className="text-[9px] text-indigo-600 dark:text-indigo-400 font-black mt-1.5 cursor-pointer uppercase tracking-widest hover:text-indigo-700 flex items-center gap-1"
         >
-          {isExpanded ? 'Read less' : 'Read more'}
+          {isExpanded ? (
+            <>Read less <span className="text-[8px]">▲</span></>
+          ) : (
+            <>Read full remark <span className="text-[8px]">▼</span></>
+          )}
         </button>
       )}
     </div>
@@ -68,22 +74,59 @@ function HistoryCell({ history }: { history: any[] }) {
   const [isExpanded, setIsExpanded] = useState(false);
   
   return (
-    <div className="mt-2 text-[10px] text-slate-500 dark:text-slate-400 border-t border-slate-100 dark:border-slate-800 pt-1.5 space-y-1 font-sans">
-      <p className="font-extrabold text-[8px] uppercase tracking-widest text-slate-400 cursor-pointer flex justify-between" onClick={() => setIsExpanded(!isExpanded)}>
-        Action History & Logs ({history.length})
-        <span>{isExpanded ? '▲' : '▼'}</span>
-      </p>
-      {isExpanded && history.map((hist, hIdx) => {
-        const formattedTime = hist.timestamp ? new Date(hist.timestamp).toLocaleDateString() : '';
-        return (
-          <div key={hIdx} className="leading-tight">
-            • <span className="font-semibold">{hist.action}</span> by <span className="font-semibold">{hist.userName || 'System'}</span> ({formattedTime})
-            {hist.remarks && <p className="text-[9px] italic text-slate-400 dark:text-slate-500 pl-2">"{hist.remarks}"</p>}
-          </div>
-        );
-      })}
+    <div className="mt-3 text-[10px] border-t border-slate-100 dark:border-slate-800 pt-2 font-sans">
+      <button 
+        onClick={() => setIsExpanded(!isExpanded)}
+        className="group flex items-center justify-between w-full text-[8px] font-black uppercase tracking-tighter text-slate-400 hover:text-slate-600 transition-colors"
+      >
+        <span className="flex items-center gap-1.5">
+          <History size={10} className="text-slate-300" />
+          Audit Timeline ({history.length})
+        </span>
+        <span className="bg-slate-100 dark:bg-slate-800 px-1 py-0.5 rounded text-[7px] group-hover:bg-slate-200 transition-colors">
+          {isExpanded ? 'Hide' : 'Show'}
+        </span>
+      </button>
+      
+      {isExpanded && (
+        <div className="mt-2 space-y-2 max-h-[150px] overflow-y-auto scrollbar-hide pr-1 animate-in fade-in slide-in-from-top-1 duration-200">
+          {history.map((hist, hIdx) => {
+            const formattedTime = hist.timestamp ? new Date(hist.timestamp).toLocaleString('en-IN', {
+              day: 'numeric',
+              month: 'short',
+              year: 'numeric',
+              hour: '2-digit',
+              minute: '2-digit'
+            }) : '';
+            
+            return (
+              <div key={hIdx} className="relative pl-3 border-l border-slate-200 dark:border-slate-700 pb-1">
+                <div className="absolute -left-1 top-1 w-2 h-2 rounded-full bg-slate-200 dark:bg-slate-700" />
+                <p className="text-[9px] leading-tight font-bold text-slate-700 dark:text-slate-300">
+                  {hist.action}
+                </p>
+                <p className="text-[8px] text-slate-400 dark:text-slate-500 font-medium">
+                  {hist.userName || 'System Auto'} • {formattedDate(hist.timestamp)}
+                </p>
+                {hist.remarks && (
+                  <p className="text-[9px] italic text-slate-500 dark:text-slate-400 mt-1 bg-slate-50 dark:bg-slate-800/50 p-1.5 rounded border border-slate-100 dark:border-slate-800 line-clamp-2 hover:line-clamp-none transition-all">
+                    "{hist.remarks}"
+                  </p>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
+}
+
+// Helper to format date nicely
+function formattedDate(timestamp: any) {
+  if (!timestamp) return 'N/A';
+  const d = new Date(timestamp);
+  return d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' });
 }
 
 export default function WarningsView({ warnings = [], user, allUsers = [], onRefresh, externalTheme }: WarningsViewProps) {
@@ -292,7 +335,7 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
             </Dialog>
           )}
           
-          {['ADMIN', 'MANAGER', 'STL', 'OPS_TL', 'TEAM_LEAD', 'TRAINER_TL'].includes(user.role as string) && (
+          {['ADMIN', 'MANAGER', 'STL', 'OPS_TL', 'TEAM_LEAD'].includes(user.role as string) && (
               <Button 
                 onClick={handleExport}
                 variant="outline" 

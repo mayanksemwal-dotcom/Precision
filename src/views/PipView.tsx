@@ -52,6 +52,7 @@ import { toast } from 'sonner';
 import { usePermission } from '../components/PermissionContext';
 import { canActOn } from '../lib/hierarchy';
 import { sendEmailViaGmailApi } from '../lib/gmailService';
+import { triggerEmail } from '../lib/emailTrigger';
 
 interface PipViewProps {
   user: UserProfile;
@@ -325,11 +326,10 @@ Berg Technologies Corp HS Division
           }
         });
 
-        // Write email queue documents for Custom Email Delivery Service background worker
-        const realEmailDoc = {
+        // Write email queue documents for Trigger Email from Firestore extension
+        const emailPayload = {
           to: finalTo,
           cc: reportingLineCC,
-          from: fromEmail, // From: The user who triggered it
           message: {
             subject: emailSubject,
             text: emailBody,
@@ -386,38 +386,39 @@ Berg Technologies Corp HS Division
               </div>
             `
           },
-          createdAt: nowISO,
-          status: 'pending'
+          metadata: {
+            pipId,
+            agentId: targetAgent.uid,
+            initiator: performerName
+          }
         };
 
-        try {
-          await addDoc(collection(db, 'mail'), realEmailDoc);
-          await addDoc(collection(db, 'emails'), realEmailDoc);
-          console.log("Successfully wrote PIP email to Firestore queues");
-        } catch (mailErr) {
-          console.error("Failed to write to mail collections: ", mailErr);
+        const emailTriggerResult = await triggerEmail(emailPayload);
+        if (emailTriggerResult.success) {
+          console.log("Successfully triggered PIP email via Firestore extension");
+        } else {
+          console.warn("Failed to trigger email via Firestore:", emailTriggerResult.error);
         }
 
-        // Direct Gmail REST API sending logic
+        // Direct Gmail REST API sending logic as secondary
         try {
           const mailConfig = {
             to: finalTo,
             cc: reportingLineCC,
             subject: emailSubject,
             bodyText: emailBody,
-            bodyHtml: realEmailDoc.message.html,
+            bodyHtml: emailPayload.message.html,
             fromEmail: fromEmail || 'compliance@bergtechnologies.co.in'
           };
           const gmailResult = await sendEmailViaGmailApi(mailConfig);
           if (gmailResult.success) {
-            toast.success(`Automated notification email dispatched directly through your Gmail (Sent folder updated)!`);
+            toast.success(`Automated notification email dispatched directly through your Gmail!`);
           } else {
-            console.warn('Could not dispatch via Gmail direct API:', gmailResult.error);
-            toast.success(`Automated notification email queued in Firestore!`);
+            toast.success(`Automated notification email queued in Firestore extension!`);
           }
         } catch (gmailErr: any) {
           console.error('Failed to trigger Gmail API wrapper:', gmailErr);
-          toast.success(`Automated notification email queued in Firestore!`);
+          toast.success(`Automated notification email queued in Firestore extension!`);
         }
       } else {
         // Audit Log: Email Skipped
