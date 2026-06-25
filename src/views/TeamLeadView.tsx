@@ -412,7 +412,24 @@ export default function TeamLeadView({
                <TableBody>
                  {paginatedReports.map((agent, i) => (
                    <TableRow key={agent.name + i}>
-                     <TableCell className="font-medium">{agent.name}</TableCell>
+                     <TableCell className="font-medium">
+                       <div className="flex items-center gap-2">
+                          {(() => {
+                            const ap = allUsers.find(u => (u.fullName || u.name || '').toLowerCase().trim() === (agent.name || '').toLowerCase().trim());
+                            return (
+                              <div className="w-7 h-7 rounded-full overflow-hidden bg-slate-100 flex items-center justify-center font-bold text-[10px] text-slate-400 border border-slate-200">
+                                {ap?.photoURL ? (
+                                  <img src={ap.photoURL} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                                ) : (
+                                  (agent.name || '??').split(' ').map(n => n[0]).slice(0, 2).join('')
+                                )}
+                              </div>
+                            );
+                          })()}
+                          <span>{agent.name}</span>
+                       </div>
+                     </TableCell>
+
                      <TableCell className="font-semibold text-slate-600">{agent.production.toLocaleString()}</TableCell>
                      <TableCell className="font-semibold text-slate-800">{agent.auditsDone}</TableCell>
                      <TableCell className="font-semibold text-blue-600">{agent.totalRowsAudited}</TableCell>

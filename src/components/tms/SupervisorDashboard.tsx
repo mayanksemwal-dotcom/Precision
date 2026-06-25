@@ -61,7 +61,7 @@ import { canActOn } from '../../lib/hierarchy';
 import { usePermission } from '../PermissionContext';
 import { MultiSelectDropdown } from '../ui/multi-select';
 import * as XLSX from 'xlsx';
-import { getManagerOfManager, getShiftProductiveMs, truncateShiftToProductiveTime, getDeviceType } from '../../views/TMSView';
+import { getManagerOfManager, getShiftProductiveMs, truncateShiftToProductiveTime, getDeviceType, getDetailedDeviceMetadata } from '../../views/TMSView';
 import { getLiveTime, getLiveTimeISO } from '../../lib/timeSync';
 
 interface SupervisorDashboardProps {
@@ -76,6 +76,7 @@ interface ShiftActivity {
   name: string;
   startTime: string;
   endTime?: string;
+  device?: string;
 }
 
 interface TMSShift {
@@ -91,6 +92,7 @@ interface TMSShift {
   status: 'ACTIVE' | 'BREAK' | 'COMPLETED' | 'AUTO_CLOSED';
   clockInDevice?: string;
   clockOutDevice?: string;
+  hasMobilePunches?: boolean;
   deviceType?: string;
   browser?: string;
   os?: string;
@@ -109,7 +111,7 @@ interface TMSShift {
 }
 
 export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, externalTheme }: SupervisorDashboardProps) {
-  const { hasTmsPermission } = usePermission();
+  const { hasTmsPermission, permissions, loading: permissionsLoading } = usePermission();
   const isDark = document.documentElement.classList.contains('dark') || externalTheme === 'dark';
   
   // Tab control
@@ -144,9 +146,17 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedProcesses, setSelectedProcesses] = useState<string[]>([]);
   const [shiftFilter, setShiftFilter] = useState('all'); // all, active, break, offline
-  const [selectedTLs, setSelectedTLs] = useState<string[]>([]);
+  const [selectedTLs, setSelectedTLs] = useState<string[]>(() => {
+    const roleNormalized = (user.role || '').toString().toUpperCase().trim();
+    const isTeamLeadOrSupervisor = ['TEAM_LEAD', 'STL', 'QTL', 'OPS_TL', 'TRAINER_TL', 'SME', 'TEAM LEAD', 'OPS TL', 'TRAINER TL'].includes(roleNormalized);
+    if (isTeamLeadOrSupervisor) {
+      const defaultName = user.fullName || user.name || '';
+      return defaultName ? [defaultName] : [];
+    }
+    return [];
+  });
   const [selectedManagers, setSelectedManagers] = useState<string[]>(() => {
-    const isOnlyManager = (user.role || '').toString().toUpperCase() === 'MANAGER';
+    const isOnlyManager = ['MANAGER', 'OPS_HEAD', 'HR', 'IT_MANAGER'].includes((user.role || '').toString().toUpperCase());
     return isOnlyManager ? [user.fullName || user.name] : [];
   });
   const [sortKey, setSortKey] = useState<'name' | 'productive' | 'status'>('name');
@@ -275,13 +285,13 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
 
     // Check if the current user has TL profile or is manager/admin
     const roleNormalized = (user.role || '').toUpperCase();
-    const isTL = ['TEAM_LEAD', 'STL', 'QTL', 'OPS_TL', 'TRAINER_TL'].includes(roleNormalized);
-    const isManagerOrAdmin = ['ADMIN', 'MANAGER'].includes(roleNormalized);
+    const isTL = ['TEAM_LEAD', 'STL', 'QTL', 'OPS_TL', 'TRAINER_TL', 'SME'].includes(roleNormalized);
+    const isManagerOrAdmin = ['ADMIN', 'MANAGER', 'OPS_HEAD', 'HR', 'IT_MANAGER'].includes(roleNormalized);
 
     // Allow TLs to force-out users of other team members
     if (isTL || isManagerOrAdmin) {
       const targetRole = (target.role || '').toUpperCase();
-      const isTargetHigher = ['ADMIN', 'MANAGER'].includes(targetRole);
+      const isTargetHigher = ['ADMIN', 'MANAGER', 'OPS_HEAD', 'HR', 'IT_MANAGER'].includes(targetRole);
       if (isTargetHigher && !isManagerOrAdmin) {
         return false;
       }
@@ -295,8 +305,8 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
   const mappedUsers = useMemo(() => {
     // ADMIN and MANAGER can see organization-wide; other roles filter by team hierarchy
     const roleNormalized = (user.role || '').toUpperCase();
-    const isManagerOrAdmin = ['ADMIN', 'MANAGER'].includes(roleNormalized);
-    const isTeamLeadOrSupervisor = ['TEAM_LEAD', 'STL', 'QTL', 'OPS_TL', 'TRAINER_TL'].includes(roleNormalized);
+    const isManagerOrAdmin = ['ADMIN', 'MANAGER', 'OPS_HEAD', 'HR', 'IT_MANAGER'].includes(roleNormalized);
+    const isTeamLeadOrSupervisor = ['TEAM_LEAD', 'STL', 'QTL', 'OPS_TL', 'TRAINER_TL', 'SME'].includes(roleNormalized);
     
     // Status normalization (only filter out deactivated/inactive accounts, so offline agents show up in roster)
     const isActive = (u: UserProfile) => {
@@ -306,14 +316,29 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
 
     if (isManagerOrAdmin || isTeamLeadOrSupervisor) {
       if (selectedTLs.length > 0) {
+        const tlRefs = new Set<string>();
+        selectedTLs.forEach(tlName => {
+          const cleanName = tlName.toLowerCase().trim();
+          tlRefs.add(cleanName);
+          allUsers.forEach(candidate => {
+            const candName = (candidate.name || '').toLowerCase().trim();
+            const candFullName = (candidate.fullName || '').toLowerCase().trim();
+            if (candName === cleanName || candFullName === cleanName) {
+              if (candidate.uid) tlRefs.add(candidate.uid.toLowerCase().trim());
+              if (candidate.email) tlRefs.add(candidate.email.toLowerCase().trim());
+            }
+          });
+        });
+
         return allUsers.filter(u => isActive(u) && (
-          selectedTLs.includes(u.teamLeadName || '') || 
-          selectedTLs.includes(u.teamLeadId || '') || 
-          selectedTLs.includes(u.name) || 
-          selectedTLs.includes(u.fullName || '') || 
-          selectedTLs.includes(u.uid) ||
-          (u.teamLeadEmail && selectedTLs.some(st => u.teamLeadEmail.toLowerCase() === st.toLowerCase())) ||
-          (u.email && selectedTLs.some(st => u.email.toLowerCase() === st.toLowerCase()))
+          (u.teamLeadId && tlRefs.has(u.teamLeadId.toLowerCase().trim())) ||
+          (u.teamLeadUid && tlRefs.has(u.teamLeadUid.toLowerCase().trim())) ||
+          (u.teamLeadName && tlRefs.has(u.teamLeadName.toLowerCase().trim())) ||
+          (u.teamLeadEmail && tlRefs.has(u.teamLeadEmail.toLowerCase().trim())) ||
+          (u.mappedTL && tlRefs.has(u.mappedTL.toLowerCase().trim())) ||
+          (u.uid && tlRefs.has(u.uid.toLowerCase().trim())) ||
+          (u.name && tlRefs.has(u.name.toLowerCase().trim())) ||
+          (u.fullName && tlRefs.has(u.fullName.toLowerCase().trim()))
         ));
       }
       return allUsers.filter(u => isActive(u));
@@ -350,10 +375,11 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
     });
 
     // 2. Add anyone who holds a Team Lead/Supervisor-like role and has status = 'Active'
-    const tlRoles = ['TEAM_LEAD', 'STL', 'OPS_TL', 'QTL', 'TRAINER_TL', 'TEAM LEAD', 'OPS TL', 'TRAINER TL'];
+    const tlRoles = ['TEAM_LEAD', 'STL', 'OPS_TL', 'QTL', 'TRAINER_TL', 'TEAM LEAD', 'OPS TL', 'TRAINER TL', 'SME'];
     allUsers.forEach(u => {
       const roleUpper = (u.role || '').toString().toUpperCase().trim();
-      if (u.status === 'Active' && tlRoles.includes(roleUpper)) {
+      const statusActive = !u.status || u.status.toLowerCase().trim() === 'active' || u.isActive === true;
+      if (statusActive && tlRoles.includes(roleUpper)) {
         const tlName = u.fullName || u.name || u.employeeName;
         if (tlName) {
           leads.set(u.uid, { name: tlName, role: String(u.role) });
@@ -387,7 +413,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
   const managersList = useMemo(() => {
     return allUsers.filter(u => {
       const roleUpper = (u.role || '').toString().toUpperCase().trim();
-      return roleUpper === 'MANAGER' || roleUpper === 'ADMIN';
+      return ['MANAGER', 'ADMIN', 'OPS_HEAD', 'HR', 'IT_MANAGER'].includes(roleUpper);
     });
   }, [allUsers]);
 
@@ -839,6 +865,22 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
 
   // Filter & paginate the workforce controls list
   const filteredWorkforce = useMemo(() => {
+    const tlRefs = new Set<string>();
+    if (selectedTLs.length > 0) {
+      selectedTLs.forEach(tlName => {
+        const cleanName = tlName.toLowerCase().trim();
+        tlRefs.add(cleanName);
+        allUsers.forEach(candidate => {
+          const candName = (candidate.name || '').toLowerCase().trim();
+          const candFullName = (candidate.fullName || '').toLowerCase().trim();
+          if (candName === cleanName || candFullName === cleanName) {
+            if (candidate.uid) tlRefs.add(candidate.uid.toLowerCase().trim());
+            if (candidate.email) tlRefs.add(candidate.email.toLowerCase().trim());
+          }
+        });
+      });
+    }
+
     return mappedUsers.filter(u => {
       // search
       const matchesSearch = !searchTerm 
@@ -905,9 +947,15 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
 
       // TL filter
       if (selectedTLs.length > 0) {
-        const matchesTL = selectedTLs.includes(u.teamLeadId || '') || 
-                         selectedTLs.includes(u.teamLeadName || '') ||
-                         (u.teamLeadEmail && selectedTLs.some(st => u.teamLeadEmail.toLowerCase() === st.toLowerCase()));
+        const matchesTL = 
+          (u.teamLeadId && tlRefs.has(u.teamLeadId.toLowerCase().trim())) ||
+          (u.teamLeadUid && tlRefs.has(u.teamLeadUid.toLowerCase().trim())) ||
+          (u.teamLeadName && tlRefs.has(u.teamLeadName.toLowerCase().trim())) ||
+          (u.teamLeadEmail && tlRefs.has(u.teamLeadEmail.toLowerCase().trim())) ||
+          (u.mappedTL && tlRefs.has(u.mappedTL.toLowerCase().trim())) ||
+          (u.uid && tlRefs.has(u.uid.toLowerCase().trim())) ||
+          (u.name && tlRefs.has(u.name.toLowerCase().trim())) ||
+          (u.fullName && tlRefs.has(u.fullName.toLowerCase().trim()));
         if (!matchesTL) return false;
       }
 
@@ -1456,6 +1504,15 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
               onClick={() => {
                 // Clock-In/Out logic for supervisor
                 const myShift = activeShifts.find(s => s.userId === user.uid);
+                const currentDev = getDeviceType();
+                const meta = getDetailedDeviceMetadata();
+                
+                const uaVal = typeof navigator !== 'undefined' ? navigator.userAgent : 'N/A';
+                const platVal = typeof navigator !== 'undefined' ? navigator.platform : 'N/A';
+                const touchVal = typeof navigator !== 'undefined' ? navigator.maxTouchPoints : 0;
+                const swVal = typeof window !== 'undefined' && window.screen ? window.screen.width : 0;
+                const shVal = typeof window !== 'undefined' && window.screen ? window.screen.height : 0;
+
                 if (myShift) {
                   // Clock Out logic - Perform standard end of work
                   const myShiftId = myShift.id;
@@ -1472,8 +1529,10 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
                   const finalShift = {
                     ...myShift,
                     activities: updatedActivities,
-                    status: 'COMPLETED',
-                    clockOutTime: nowISO
+                    status: 'COMPLETED' as const,
+                    clockOutTime: nowISO,
+                    clockOutDevice: currentDev,
+                    hasMobilePunches: myShift.hasMobilePunches || currentDev === 'mobile'
                   };
                   
                   setDoc(doc(db, 'tmsShifts', myShiftId), finalShift).then(() => {
@@ -1483,15 +1542,30 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
                   });
                 } else {
                   // Clock In logic - create new shift record
+                  const nowISO = getLiveTimeISO();
                   const newShift: Omit<TMSShift, 'id'> = {
                     userId: user.uid,
                     userName: user.name,
                     userEmail: user.email,
                     mappedTL: (user as any).teamLeadEmail || (user as any).mappedTL || 'N/A',
                     mappedManager: (user as any).mappedManagerEmail || (user as any).mappedManager || 'N/A',
-                    clockInTime: getLiveTimeISO(),
-                    activities: [{ type: 'productive', name: 'Work Start', startTime: getLiveTimeISO() }],
-                    status: 'ACTIVE'
+                    clockInTime: nowISO,
+                    activities: [{ type: 'productive', name: 'Work Start', startTime: nowISO, device: currentDev }],
+                    status: 'ACTIVE',
+                    clockInDevice: currentDev,
+                    hasMobilePunches: currentDev === 'mobile',
+                    deviceType: meta.deviceType,
+                    browser: meta.browser,
+                    os: meta.os,
+                    loginTimestamp: meta.loginTimestamp,
+                    userAgent: uaVal,
+                    platform: platVal,
+                    maxTouchPoints: touchVal,
+                    screenWidth: swVal,
+                    screenHeight: shVal,
+                    detectedDeviceType: meta.deviceType,
+                    detectedBrowser: meta.browser,
+                    detectedOS: meta.os
                   };
                   addDoc(collection(db, 'tmsShifts'), newShift).then((docRef) => {
                     toast.success('Clocked in successfully');
@@ -1523,6 +1597,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
                   if (!myShift) return;
                   
                   const nowISO = getLiveTimeISO();
+                  const currentDev = getDeviceType();
                   const updatedActivities = [...(myShift.activities || [])];
                   const lastActivity = updatedActivities[updatedActivities.length - 1];
                   
@@ -1531,16 +1606,26 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
                     if (lastActivity && !lastActivity.endTime) {
                       lastActivity.endTime = nowISO;
                     }
-                    updatedActivities.push({ type: 'break', name: 'Break', startTime: nowISO });
-                    setDoc(doc(db, 'tmsShifts', myShift.id), { ...myShift, activities: updatedActivities, status: 'BREAK' })
+                    updatedActivities.push({ type: 'break', name: 'Break', startTime: nowISO, device: currentDev });
+                    setDoc(doc(db, 'tmsShifts', myShift.id), { 
+                      ...myShift, 
+                      activities: updatedActivities, 
+                      status: 'BREAK',
+                      hasMobilePunches: myShift.hasMobilePunches || currentDev === 'mobile'
+                    })
                       .then(() => { toast.success('Break started'); loadAndRecomputeData(true); });
                   } else if (myShift.status === 'BREAK') {
                     // End Break
                     if (lastActivity && !lastActivity.endTime) {
                       lastActivity.endTime = nowISO;
                     }
-                    updatedActivities.push({ type: 'productive', name: 'Work Resumed', startTime: nowISO });
-                    setDoc(doc(db, 'tmsShifts', myShift.id), { ...myShift, activities: updatedActivities, status: 'ACTIVE' })
+                    updatedActivities.push({ type: 'productive', name: 'Work Resumed', startTime: nowISO, device: currentDev });
+                    setDoc(doc(db, 'tmsShifts', myShift.id), { 
+                      ...myShift, 
+                      activities: updatedActivities, 
+                      status: 'ACTIVE',
+                      hasMobilePunches: myShift.hasMobilePunches || currentDev === 'mobile'
+                    })
                       .then(() => { toast.success('Break ended'); loadAndRecomputeData(true); });
                   }
                 }}
@@ -1677,7 +1762,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
           <span className={`text-[10px] font-medium ${activeTab === 'exceptions' ? 'text-rose-100' : 'text-slate-500 dark:text-slate-400'}`}>Monitor anomalies</span>
         </button>
 
-        {user.role === 'ADMIN' && (
+        {['ADMIN', 'MANAGER', 'OPS_HEAD', 'HR', 'IT_MANAGER'].includes((user.role || '').toUpperCase()) && (
           <button 
             onClick={() => setActiveTab('hierarchy')}
             className={`flex flex-col items-start gap-1 px-5 py-3 rounded-xl text-left transition-all cursor-pointer border shadow-sm select-none ${
@@ -1699,7 +1784,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
       <div className="space-y-6">
         
         {/* TAB 4: HIERARCHY VALIDATION REPORT (ADMIN ONLY) */}
-        {activeTab === 'hierarchy' && user.role === 'ADMIN' && (
+        {activeTab === 'hierarchy' && ['ADMIN', 'MANAGER', 'OPS_HEAD', 'HR', 'IT_MANAGER'].includes((user.role || '').toUpperCase()) && (
           <div className="space-y-6 animate-in fade-in slide-in-from-bottom-2 duration-300">
             <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-6 shadow-sm">
               <div className="flex items-center justify-between mb-6">
@@ -1729,7 +1814,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
                 <div className="bg-slate-50 dark:bg-slate-950/40 p-4 rounded-xl border border-slate-100 dark:border-slate-800">
                   <span className="text-[10px] font-black uppercase text-slate-400 tracking-wider">Total Active Units</span>
                   <div className="flex items-center gap-3 mt-1">
-                    <span className="text-2xl font-black text-slate-800 dark:text-slate-200">{allUsers.filter(u => u.status === 'Active').length}</span>
+                    <span className="text-2xl font-black text-slate-800 dark:text-slate-200">{allUsers.filter(u => !u.status || u.status.toLowerCase().trim() === 'active' || u.isActive === true).length}</span>
                     <span className="text-[10px] bg-indigo-50 dark:bg-indigo-900/20 text-indigo-600 px-2 py-0.5 rounded-full font-bold">Roster Capacity</span>
                   </div>
                 </div>
@@ -2097,7 +2182,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
                   />
                 </div>
 
-                {['ADMIN', 'MANAGER'].includes((user.role || '').toUpperCase()) ? (
+                {['ADMIN', 'MANAGER', 'OPS_HEAD', 'HR', 'IT_MANAGER'].includes((user.role || '').toUpperCase()) ? (
                   <div className="relative">
                     <label className="block text-[10px] uppercase font-bold text-slate-400 mb-1">Manager Filter</label>
                     <MultiSelectDropdown
@@ -2122,7 +2207,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
                       setShiftFilter('all');
                       setSelectedTLs([]);
                       setSelectedManagers(() => {
-                        const isOnlyManager = (user.role || '').toString().toUpperCase() === 'MANAGER';
+                        const isOnlyManager = ['MANAGER', 'OPS_HEAD', 'HR', 'IT_MANAGER'].includes((user.role || '').toString().toUpperCase());
                         return isOnlyManager ? [user.fullName || user.name] : [];
                       });
                       setCurrentPage(1);
@@ -2170,7 +2255,17 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
                               >
                                 {expandedUserId === u.uid ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
                               </button>
-                              <div className="flex flex-col">
+                              
+                              {/* Avatar display */}
+                              <div className="w-8 h-8 rounded-full overflow-hidden bg-slate-100 flex items-center justify-center font-bold text-[10px] text-slate-500 shrink-0 border border-slate-200 ml-1">
+                                {u.photoURL ? (
+                                  <img src={u.photoURL} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                                ) : (
+                                  u.name.split(' ').map(n => n[0]).slice(0, 2).join('')
+                                )}
+                              </div>
+
+                              <div className="flex flex-col ml-1">
                                 <div 
                                   className="font-extrabold text-slate-900 leading-none cursor-pointer hover:text-indigo-600"
                                   onClick={() => setExpandedUserId(prev => prev === u.uid ? null : u.uid)}
@@ -2559,12 +2654,12 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
                 </div>
               </div>
 
-              {/* Automatic Terminations (Auto-Closed Shifts) */}
+              {/* Automatic Logouts (Auto-Closed Shifts) */}
               <div className="relative bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-6 shadow-xs hover:shadow-md hover:-translate-y-0.5 transition-all duration-300">
                 <div className="absolute top-0 bottom-0 left-0 w-1 bg-sky-500 rounded-l-2xl" />
                 <div className="flex items-center justify-between border-b border-slate-50 dark:border-slate-850 pb-3 mb-4">
                   <h4 className="text-xs font-extrabold text-[#D97706] dark:text-amber-400 uppercase tracking-widest flex items-center gap-2 leading-none">
-                    <UserX size={15} className="text-sky-500" /> Automatic Terminations
+                    <UserX size={15} className="text-sky-500" /> Automatic Logouts
                   </h4>
                   <span className="bg-amber-50 dark:bg-amber-950/40 text-[#D97706] dark:text-amber-400 text-[10px] font-black px-2.5 py-1 rounded-full leading-none font-mono">
                     {(summaryData?.exceptionsList?.autoClosed?.length || 0)} anomalies
@@ -2584,7 +2679,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
                         </div>
                       </div>
                       <button 
-                        onClick={() => selectAndFocusUser(item.userName)}
+                      onClick={() => selectAndFocusUser(item.userName)}
                         className="bg-amber-100 hover:bg-amber-150 dark:bg-amber-950 dark:text-amber-300 dark:hover:bg-amber-900/60 text-amber-850 text-[10px] font-extrabold px-3 py-1.5 rounded-lg shrink-0 cursor-pointer transition-colors"
                       >
                         Audit Profile
@@ -2595,7 +2690,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
                   {(!summaryData?.exceptionsList?.autoClosed || summaryData.exceptionsList.autoClosed.length === 0) && (
                     <div className="text-center py-8">
                       <p className="text-xs text-slate-400 dark:text-slate-500 font-bold uppercase tracking-widest leading-none">
-                        ✅ No automatic terminations today
+                        ✅ No automatic logouts today
                       </p>
                     </div>
                   )}

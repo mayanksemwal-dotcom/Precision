@@ -114,7 +114,7 @@ export const performPermissionRecovery = async () => {
 
   for (const role of allRoleKeys) {
     for (const mod of modules) {
-      const permId = `${role}_${mod.replace(/\s+/g, '_')}`;
+      const permId = `${role}_${mod}`;
       const docRef = doc(db, 'role_permissions', permId);
       
       let perms = {

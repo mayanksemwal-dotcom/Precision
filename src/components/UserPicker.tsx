@@ -26,6 +26,7 @@ interface UserPickerProps {
   roleFilter?: string[];
   className?: string;
   label?: string;
+  allUsers?: UserProfile[];
 }
 
 export const UserPicker = ({ 
@@ -34,7 +35,8 @@ export const UserPicker = ({
   placeholder = "Search and select employee...",
   roleFilter,
   className,
-  label
+  label,
+  allUsers
 }: UserPickerProps) => {
   const [isOpen, setIsOpen] = useState(false);
   const [search, setSearch] = useState('');
@@ -54,38 +56,62 @@ export const UserPicker = ({
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
 
+  // Sync with allUsers prop if provided
+  useEffect(() => {
+    if (allUsers && allUsers.length > 0) {
+      const activeUsers = allUsers
+        .map(u => ({
+          ...u,
+          role: (u.role || '').toUpperCase()
+        }))
+        .filter(u => !u.status || u.status.toLowerCase().trim() === 'active' || u.isActive === true);
+      activeUsers.sort((a, b) => {
+        const nameA = (a.fullName || a.name || a.employeeName || '').toLowerCase();
+        const nameB = (b.fullName || b.name || b.employeeName || '').toLowerCase();
+        return nameA.localeCompare(nameB);
+      });
+      setAllFetchedUsers(activeUsers);
+    }
+  }, [allUsers]);
+
   // Fetch selected user details if not provided
   useEffect(() => {
     const fetchSelected = async () => {
       if (selectedUserId && (!selectedUser || selectedUser.uid !== selectedUserId)) {
-        const uDoc = await getDoc(doc(db, 'users', selectedUserId));
-        if (uDoc.exists()) {
-          setSelectedUser({ uid: uDoc.id, ...uDoc.data() } as UserProfile);
+        const found = allFetchedUsers.find(u => u.uid === selectedUserId);
+        if (found) {
+          setSelectedUser(found);
+        } else {
+          const uDoc = await getDoc(doc(db, 'users', selectedUserId));
+          if (uDoc.exists()) {
+            setSelectedUser({ uid: uDoc.id, ...uDoc.data() } as UserProfile);
+          }
         }
       } else if (!selectedUserId) {
         setSelectedUser(null);
       }
     };
     fetchSelected();
-  }, [selectedUserId]);
+  }, [selectedUserId, allFetchedUsers]);
 
   // Pre-load all active users once
   const loadAllUsers = useCallback(async () => {
     setLoading(true);
     try {
-      const q = query(
-        collection(db, 'users'),
-        where('status', '==', 'Active')
-      );
+      const q = query(collection(db, 'users'));
       const snap = await getDocs(q);
-      const results = snap.docs.map(d => {
-        const data = d.data() as any;
-        return { 
-          uid: d.id, 
-          ...data,
-          role: (data.role || '').toUpperCase()
-        } as UserProfile;
-      });
+      const results = snap.docs
+        .map(d => {
+          const data = d.data() as any;
+          return { 
+            uid: d.id, 
+            ...data,
+            photoURL: data.profilePhotoUrl || data.photoURL || '',
+            role: (data.role || '').toUpperCase()
+          } as UserProfile;
+        })
+        .filter(u => !u.status || u.status.toLowerCase().trim() === 'active' || u.isActive === true);
+
       results.sort((a, b) => {
         const nameA = (a.fullName || a.name || a.employeeName || '').toLowerCase();
         const nameB = (b.fullName || b.name || b.employeeName || '').toLowerCase();
@@ -140,7 +166,13 @@ export const UserPicker = ({
         }}
       >
         <div className="flex items-center gap-2 overflow-hidden flex-1">
-          <UserIcon size={16} className={selectedUser ? 'text-sky-500' : 'text-slate-300'} />
+          {selectedUser && selectedUser.photoURL ? (
+            <div className="w-6 h-6 rounded-full overflow-hidden shrink-0 border border-slate-200">
+              <img src={selectedUser.photoURL} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+            </div>
+          ) : (
+            <UserIcon size={16} className={selectedUser ? 'text-sky-500' : 'text-slate-300'} />
+          )}
           {selectedUser ? (
                     <div className="flex flex-col items-start overflow-hidden">
                        <span className="text-xs font-black text-slate-900 truncate leading-none">
@@ -202,8 +234,12 @@ export const UserPicker = ({
                 }}
               >
                 <div className="flex items-center gap-3">
-                  <div className="w-8 h-8 rounded-lg bg-slate-100 flex items-center justify-center text-slate-400 group-hover:bg-sky-50 group-hover:text-sky-600 transition-colors">
-                    <UserIcon size={14} />
+                  <div className="w-8 h-8 rounded-full overflow-hidden bg-slate-100 flex items-center justify-center font-bold text-[10px] text-slate-400 border border-slate-200 shrink-0">
+                    {u.photoURL ? (
+                      <img src={u.photoURL} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                    ) : (
+                      <UserIcon size={14} />
+                    )}
                   </div>
                   <div>
                     <p className="text-xs font-black text-slate-900 leading-none">{u.employeeName || u.fullName || u.name}</p>

@@ -6,16 +6,17 @@ import { Label } from './ui/label';
 import { Badge } from './ui/badge';
 import { ScrollArea } from './ui/scroll-area';
 import { toast } from 'sonner';
-import { UserRole, AuditRecord, DisputeStatus, DisputeHistory } from '../types';
+import { UserRole, AuditRecord, DisputeStatus, DisputeHistory, UserProfile } from '../types';
 import { motion, AnimatePresence } from 'motion/react';
 
 interface DisputeWorkflowProps {
   audit: AuditRecord;
   currentUser: { name: string; role: UserRole };
+  allUsers?: UserProfile[];
   onUpdate: (updatedAudit: AuditRecord) => void;
 }
 
-export default function DisputeWorkflow({ audit, currentUser, onUpdate }: DisputeWorkflowProps) {
+export default function DisputeWorkflow({ audit, currentUser, allUsers = [], onUpdate }: DisputeWorkflowProps) {
   const [comment, setComment] = useState('');
 
   const addDisputeStep = (newStatus: DisputeStatus) => {
@@ -82,25 +83,21 @@ export default function DisputeWorkflow({ audit, currentUser, onUpdate }: Disput
               animate={{ opacity: 1, x: 0 }}
               className={`flex gap-3 ${step.userRole === UserRole.QA ? 'flex-row-reverse' : ''}`}
             >
-              <div className={`w-8 h-8 rounded-full flex items-center justify-center shrink-0 shadow-sm ${
+              <div className={`p-3 rounded-2xl shadow-sm text-sm ${
+                step.userRole === UserRole.QA 
+                  ? 'bg-blue-600 text-white rounded-tr-none' 
+                  : 'bg-white border rounded-tl-none text-slate-700'
+              }`}>
+                {step.comment}
+              </div>
+              <div className={`w-8 h-8 rounded-full flex items-center justify-center shrink-0 shadow-sm overflow-hidden ${
                 step.userRole === UserRole.QA ? 'bg-blue-600 text-white' : 'bg-white border text-slate-600'
               }`}>
-                <UserIcon size={14} />
-              </div>
-              <div className={`max-w-[80%] space-y-1 ${step.userRole === UserRole.QA ? 'text-right' : ''}`}>
-                <div className="flex items-center gap-2 text-xs font-bold text-slate-500 justify-start">
-                  {step.userRole === UserRole.QA ? '' : <span className="text-blue-600 uppercase">{step.userName}</span>}
-                  <Clock size={10} />
-                  <span>{new Date(step.timestamp).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })}</span>
-                  {step.userRole === UserRole.QA ? <span className="text-blue-600 uppercase">{step.userName}</span> : ''}
-                </div>
-                <div className={`p-3 rounded-2xl shadow-sm text-sm ${
-                  step.userRole === UserRole.QA 
-                    ? 'bg-blue-600 text-white rounded-tr-none' 
-                    : 'bg-white border rounded-tl-none text-slate-700'
-                }`}>
-                  {step.comment}
-                </div>
+                {(() => {
+                  const p = allUsers.find(u => (u.fullName || u.name || '').toLowerCase().trim() === (step.userName || '').toLowerCase().trim());
+                  if (p?.photoURL) return <img src={p.photoURL} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" />;
+                  return <UserIcon size={14} />;
+                })()}
               </div>
             </motion.div>
           ))}

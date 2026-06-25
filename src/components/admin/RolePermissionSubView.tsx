@@ -57,7 +57,8 @@ const ALL_MASTER_MODULES = [
   'Historical Records',
   'Important Quality Links',
   'Console',
-  'Attendance'
+  'Attendance',
+  'IT Help Desk'
 ];
 
 interface RolePermissionSubViewProps {
@@ -149,19 +150,38 @@ export const RolePermissionSubView: React.FC<RolePermissionSubViewProps> = ({ ad
 
       // 3. Fetch permissions matrix map
       const permissionsSnap = await getDocs(collection(db, 'role_permissions'));
-      const permDocs = permissionsSnap.docs.map(d => d.data() as RolePermissionDoc);
       
-      if (permDocs.length === 0) {
+      if (permissionsSnap.empty) {
         // Auto seed dynamic permission matrix
         await seedDefaultPermissions(fetchedRoles, fetchedModules);
       } else {
         // Convert flat documents structure to nested Record structure
         const matrixMap: Record<string, Record<string, Omit<RolePermissionDoc, 'role_name' | 'module_name'>>> = {};
-        
-        permDocs.forEach(docItem => {
+        const cleanfbBatch = writeBatch(db);
+        let needsCleanupCommit = false;
+
+        const existingKeys = new Set<string>();
+
+        permissionsSnap.docs.forEach(docSnap => {
+          const docId = docSnap.id;
+          const docItem = docSnap.data() as RolePermissionDoc;
           const r = (docItem.role_name || '').toUpperCase();
           const m = docItem.module_name;
           if (!r || !m) return;
+
+          const expectedId = `${docItem.role_name}_${m}`;
+          const underscoreId = `${docItem.role_name}_${m.replace(/\s+/g, '_')}`;
+
+          // If this is a legacy/duplicate document with underscores instead of spaces, 
+          // we securely delete it and skip processing it to prevent overwriting correct space-keyed documents.
+          if (docId === underscoreId && underscoreId !== expectedId) {
+            cleanfbBatch.delete(doc(db, 'role_permissions', docId));
+            needsCleanupCommit = true;
+            return;
+          }
+
+          existingKeys.add(`${r}_${m}`);
+
           if (!matrixMap[r]) matrixMap[r] = {};
           matrixMap[r][m] = {
             can_view: !!docItem.can_view,
@@ -192,6 +212,119 @@ export const RolePermissionSubView: React.FC<RolePermissionSubViewProps> = ({ ad
              delete matrixMap[r][m].tms_permissions;
           }
         });
+
+        // Auto-sync / Backfill missing module permissions (e.g. IT Help Desk) for existing roles
+        let needsSyncCommit = false;
+        fetchedRoles.forEach(role => {
+          fetchedModules.forEach(mod => {
+            const key = `${role}_${mod}`;
+            if (!existingKeys.has(key)) {
+              let defaults = {
+                can_view: false,
+                can_create: false,
+                can_edit: false,
+                can_delete: false,
+                can_export: false,
+                can_approve: false,
+                view_team: false,
+                view_all: false,
+                assign: false,
+                override: false,
+                force_action: false,
+                manage_settings: false,
+                manage_masters: false,
+                audit_access: false,
+                email_trigger: false,
+                bulk_action: false,
+                reopen_records: false,
+                escalate: false,
+                comment: mod === 'IT Help Desk',
+                view_sensitive_data: false
+              };
+
+              // Define custom defaults for 'IT Help Desk' specifically
+              if (mod === 'IT Help Desk') {
+                if (role === 'ADMIN') {
+                  defaults = {
+                    can_view: true,
+                    can_create: true,
+                    can_edit: true,
+                    can_delete: true,
+                    can_export: true,
+                    can_approve: true,
+                    view_team: true,
+                    view_all: true,
+                    assign: true,
+                    override: true,
+                    force_action: true,
+                    manage_settings: true,
+                    manage_masters: true,
+                    audit_access: true,
+                    email_trigger: true,
+                    bulk_action: true,
+                    reopen_records: true,
+                    escalate: true,
+                    comment: true,
+                    view_sensitive_data: true
+                  };
+                } else if (role === 'MANAGER' || role === 'MIS') {
+                  defaults = {
+                    ...defaults,
+                    can_view: true,
+                    can_create: true,
+                    can_edit: true,
+                    can_export: true,
+                    can_approve: true,
+                    view_all: true,
+                    assign: true,
+                    bulk_action: true,
+                  };
+                } else if (['TEAM_LEAD', 'STL', 'OPS_TL', 'TRAINER_TL', 'QTL'].includes(role)) {
+                  defaults = {
+                    ...defaults,
+                    can_view: true,
+                    can_create: true,
+                    can_edit: true,
+                    view_team: true,
+                  };
+                } else {
+                  // Agent, SME, QA, Trainer
+                  defaults = {
+                    ...defaults,
+                    can_view: true,
+                    can_create: true,
+                  };
+                }
+              } else {
+                // Other modules generic fallback
+                if (role === 'ADMIN') {
+                  defaults.can_view = true;
+                  defaults.can_create = true;
+                  defaults.can_edit = true;
+                  defaults.can_delete = true;
+                  defaults.can_export = true;
+                  defaults.can_approve = true;
+                }
+              }
+
+              if (!matrixMap[role]) matrixMap[role] = {};
+              matrixMap[role][mod] = defaults;
+
+              cleanfbBatch.set(doc(db, 'role_permissions', key), {
+                id: key,
+                role_name: role,
+                module_name: mod,
+                ...defaults
+              });
+              needsSyncCommit = true;
+            }
+          });
+        });
+
+        if (needsCleanupCommit || needsSyncCommit) {
+          cleanfbBatch.commit().catch(err => console.error("Could not complete self-healing / sync permission cleanup batch:", err));
+        }
+
         setPermissions(matrixMap);
       }
 
@@ -319,6 +452,39 @@ export const RolePermissionSubView: React.FC<RolePermissionSubViewProps> = ({ ad
           const moduleDefaults: any = { ...defaults };
           if (mod === 'Workforce TMS') {
             moduleDefaults.tms_permissions = getDefaultTmsPermissions(role);
+          }
+
+          // Override specific defaults for the IT Help Desk module
+          if (mod === 'IT Help Desk') {
+            if (role === 'ADMIN') {
+              moduleDefaults.can_view = true;
+              moduleDefaults.can_create = true;
+              moduleDefaults.can_edit = true;
+              moduleDefaults.can_delete = true;
+              moduleDefaults.can_export = true;
+              moduleDefaults.can_approve = true;
+            } else if (role === 'MANAGER' || role === 'MIS') {
+              moduleDefaults.can_view = true;
+              moduleDefaults.can_create = true;
+              moduleDefaults.can_edit = true;
+              moduleDefaults.can_delete = false;
+              moduleDefaults.can_export = true;
+              moduleDefaults.can_approve = true;
+            } else if (['TEAM_LEAD', 'STL', 'OPS_TL', 'TRAINER_TL', 'QTL'].includes(role)) {
+              moduleDefaults.can_view = true;
+              moduleDefaults.can_create = true;
+              moduleDefaults.can_edit = true;
+              moduleDefaults.can_delete = false;
+              moduleDefaults.can_export = false;
+              moduleDefaults.can_approve = false;
+            } else {
+              moduleDefaults.can_view = true;
+              moduleDefaults.can_create = true;
+              moduleDefaults.can_edit = false;
+              moduleDefaults.can_delete = false;
+              moduleDefaults.can_export = false;
+              moduleDefaults.can_approve = false;
+            }
           }
 
           matrixMap[role][mod] = moduleDefaults;
@@ -621,7 +787,21 @@ export const RolePermissionSubView: React.FC<RolePermissionSubViewProps> = ({ ad
           can_edit: !!item.can_edit,
           can_delete: !!item.can_delete,
           can_export: !!item.can_export,
-          can_approve: !!item.can_approve
+          can_approve: !!item.can_approve,
+          view_team: item.view_team !== undefined ? !!item.view_team : false,
+          view_all: item.view_all !== undefined ? !!item.view_all : false,
+          assign: item.assign !== undefined ? !!item.assign : false,
+          override: item.override !== undefined ? !!item.override : false,
+          force_action: item.force_action !== undefined ? !!item.force_action : false,
+          manage_settings: item.manage_settings !== undefined ? !!item.manage_settings : false,
+          manage_masters: item.manage_masters !== undefined ? !!item.manage_masters : false,
+          audit_access: item.audit_access !== undefined ? !!item.audit_access : false,
+          email_trigger: item.email_trigger !== undefined ? !!item.email_trigger : false,
+          bulk_action: item.bulk_action !== undefined ? !!item.bulk_action : false,
+          reopen_records: item.reopen_records !== undefined ? !!item.reopen_records : false,
+          escalate: item.escalate !== undefined ? !!item.escalate : false,
+          comment: item.comment !== undefined ? !!item.comment : false,
+          view_sensitive_data: item.view_sensitive_data !== undefined ? !!item.view_sensitive_data : false
         };
 
         if (mod === 'Workforce TMS') {

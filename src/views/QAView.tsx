@@ -946,19 +946,28 @@ export default function QAView({
               <Badge variant="secondary" className={`${!selectedAgent ? 'bg-slate-800 text-white' : 'bg-slate-100 text-slate-600'} font-bold`}>{totalCount}</Badge>
             </button>
             <div className="h-px bg-slate-50 mx-4 my-2"></div>
-            {displayedAgents.map(agent => (
-              <button 
-                key={agent}
-                onClick={() => setSelectedAgent(agent)}
-                className={`w-full flex items-center gap-3 p-4 rounded-xl transition-all duration-200 group ${selectedAgent === agent ? 'bg-blue-600 text-white shadow-lg shadow-blue-600/20' : 'text-slate-600 hover:bg-slate-50'}`}
-              >
-                <div className={`w-2 h-2 rounded-full ${selectedAgent === agent ? 'bg-white animate-pulse' : 'bg-slate-300 group-hover:bg-blue-400'}`}></div>
-                <span className={`text-sm font-bold flex-1 truncate ${selectedAgent === agent ? 'text-white' : 'text-slate-700'}`}>
-                  {agent}
-                </span>
-                {selectedAgent === agent && <ChevronRight size={14} className="text-white/50" />}
-              </button>
-            ))}
+            {displayedAgents.map((agent: any) => {
+              const ap = allUsers.find(u => (u.fullName || u.name || '').toLowerCase().trim() === String(agent || '').toLowerCase().trim());
+              return (
+                <button 
+                  key={String(agent)}
+                  onClick={() => setSelectedAgent(String(agent))}
+                  className={`w-full flex items-center gap-3 p-4 rounded-xl transition-all duration-200 group ${selectedAgent === agent ? 'bg-blue-600 text-white shadow-lg shadow-blue-600/20' : 'text-slate-600 hover:bg-slate-50'}`}
+                >
+                  <div className="w-8 h-8 rounded-full overflow-hidden bg-slate-100 flex items-center justify-center font-bold text-[10px] text-slate-400 border border-slate-200 shrink-0">
+                    {ap?.photoURL ? (
+                      <img src={ap.photoURL} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                    ) : (
+                      String(agent || '??').split(' ').map(n => n[0]).slice(0, 2).join('')
+                    )}
+                  </div>
+                  <span className={`text-sm font-bold flex-1 truncate ${selectedAgent === agent ? 'text-white' : 'text-slate-700'}`}>
+                    {String(agent)}
+                  </span>
+                  {selectedAgent === agent && <ChevronRight size={14} className="text-white/50" />}
+                </button>
+              );
+            })}
           </div>
         </div>
 
@@ -1017,9 +1026,20 @@ export default function QAView({
                           </Badge>
                         </div>
                         <div className="flex items-center justify-between mt-4">
-                           <div className="flex -space-x-2">
-                              <div className="w-5 h-5 rounded-full bg-slate-100 border border-white flex items-center justify-center text-[8px] font-bold text-slate-400">?</div>
-                              <div className="w-5 h-5 rounded-full bg-blue-50 border border-white flex items-center justify-center text-[8px] font-bold text-blue-400">!</div>
+                           <div className="flex -space-x-1.5">
+                              {(() => {
+                                const ap = allUsers.find(u => (u.fullName || u.name || '').toLowerCase().trim() === (task.qvName || '').toLowerCase().trim());
+                                return (
+                                  <div className="w-6 h-6 rounded-full bg-slate-100 border-2 border-white flex items-center justify-center text-[8px] font-bold text-slate-400 overflow-hidden shadow-sm">
+                                    {ap?.photoURL ? (
+                                      <img src={ap.photoURL} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                                    ) : (
+                                      (task.qvName || '??').split(' ').map(n => n[0]).slice(0, 2).join('')
+                                    )}
+                                  </div>
+                                );
+                              })()}
+                              <div className="w-5 h-5 rounded-full bg-blue-50 border border-white flex items-center justify-center text-[8px] font-bold text-blue-400 z-10 translate-y-0.5">!</div>
                            </div>
                            <Button size="sm" variant="ghost" className="h-7 px-2 text-[10px] font-black text-blue-600 opacity-0 group-hover:opacity-100 transition-all gap-1">
                              AUDIT <ChevronRight size={10} />

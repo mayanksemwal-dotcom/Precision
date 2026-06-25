@@ -8,6 +8,7 @@ import { auth, db, handleFirestoreError, OperationType } from '../lib/firebase';
 import { doc, setDoc, addDoc, collection, getDoc } from 'firebase/firestore';
 import { WarningTicket, UserProfile, UserRole } from '../types';
 import { UserPicker } from './UserPicker';
+import { canActOn, normalizeRole } from '../lib/hierarchy';
 import { triggerEmail } from '../lib/emailTrigger';
 import { sendEmailViaGmailApi } from '../lib/gmailService';
 
@@ -34,63 +35,47 @@ export default function WarningManager({ agentName: initialName, agentId: initia
   const getEligibleWarningTargets = (): UserProfile[] => {
     if (!currentUserProfile) return [];
 
-    // Admin can warn anyone except themselves
-    if (currentUserProfile.role === UserRole.ADMIN) {
-      return allUsers.filter(u => u.uid !== currentUserProfile.uid);
-    }
+    const actorRole = normalizeRole(currentUserProfile.role);
 
-    const isManager = currentUserProfile.role === UserRole.MANAGER;
-    if (isManager) {
-      // Manager can warn Team Leads, Agents, QAs, SMEs, Trainers, Assistant Managers under their reporting structure
-      const managerTargetRoles = [
-        UserRole.TEAM_LEAD, UserRole.OPS_TL, UserRole.QTL, UserRole.STL, UserRole.TRAINER_TL,
-        UserRole.SME, UserRole.QA, UserRole.TRAINER, UserRole.AGENT
-      ] as string[];
-
-      return allUsers.filter(u => {
-        if (u.uid === currentUserProfile.uid) return false;
-        // Match role or Assistant Manager / AM identifiers
-        const roleMatch = managerTargetRoles.includes(u.role) || 
-                          u.role.toLowerCase().includes('manager') || 
-                          u.role.toLowerCase().includes('am');
-        if (!roleMatch) return false;
-
-        // Check structure
-        const isDirectReport = u.mappedManagerId === currentUserProfile.uid;
-        const isIndirectReport = (() => {
-          if (!u.teamLeadId) return false;
-          const tl = allUsers.find(item => item.uid === u.teamLeadId);
-          return tl ? tl.mappedManagerId === currentUserProfile.uid : false;
-        })();
-
-        return isDirectReport || isIndirectReport;
-      });
-    }
+    const executiveRoles = [
+      UserRole.ADMIN,
+      UserRole.MANAGER,
+      UserRole.OPS_HEAD,
+      UserRole.HR,
+      UserRole.IT_MANAGER
+    ];
 
     const isTL = [
-      UserRole.TEAM_LEAD, UserRole.OPS_TL, UserRole.QTL, UserRole.STL, UserRole.TRAINER_TL
-    ].includes(currentUserProfile.role as UserRole);
+      UserRole.TEAM_LEAD,
+      UserRole.OPS_TL,
+      UserRole.QTL,
+      UserRole.STL,
+      UserRole.TRAINER_TL,
+      UserRole.SME
+    ].includes(actorRole);
 
-    if (isTL) {
-      // Team Lead can warn Agents, QAs, SMEs, Trainers mapped under them
-      const tlTargetRoles = [
-        UserRole.SME, UserRole.QA, UserRole.TRAINER, UserRole.AGENT
-      ] as string[];
+    // Consolidated filtering logic
+    return allUsers.filter(u => {
+      if (u.uid === currentUserProfile.uid) return false;
 
-      return allUsers.filter(u => {
-        if (u.uid === currentUserProfile.uid) return false;
-        // Match role
-        const roleMatch = tlTargetRoles.includes(u.role);
-        if (!roleMatch) return false;
+      const targetRole = normalizeRole(u.role);
 
-        // Check if mapped under their team or direct teamLeadId
-        const isMapped = u.teamLeadId === currentUserProfile.uid || 
-                         (currentUserProfile.team && u.team === currentUserProfile.team);
-        return isMapped;
-      });
-    }
+      // Admin bypass
+      if (actorRole === UserRole.ADMIN) return true;
 
-    return [];
+      // Other Executive roles (Manager, etc.) see everyone except other Executives (unless Admin)
+      if (executiveRoles.includes(actorRole)) {
+        return !executiveRoles.includes(targetRole);
+      }
+
+      // Team Leads & SMEs see everyone except Managers/Executives
+      if (isTL) {
+        return !executiveRoles.includes(targetRole);
+      }
+
+      // Default: check centralized authority
+      return canActOn(currentUserProfile, u, allUsers);
+    });
   };
 
   const eligibleTargets = getEligibleWarningTargets();
@@ -395,6 +380,7 @@ CC Checklist:
               selectedUserId={selectedAgentId}
               placeholder="Search employee to warn..."
               roleFilter={eligibleTargets.map(u => u.role)}
+              allUsers={eligibleTargets}
             />
           ) : (
             <div className="space-y-1">

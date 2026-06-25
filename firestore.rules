@@ -89,8 +89,8 @@ service cloud.firestore {
     match /users/{userId} {
       allow get: if isVerified();
       allow list: if isVerified();
-      allow create: if isVerified() && (isOwner(userId) || isAdmin() || isManager());
-      allow update: if isVerified() && (isOwner(userId) || isAdmin() || isManager());
+      allow create: if isVerified() && (isOwner(userId) || isAdmin() || isManager() || isRole('HR'));
+      allow update: if isVerified() && (isOwner(userId) || isAdmin() || isManager() || isRole('HR'));
       allow delete: if isAdmin();
     }
 
@@ -314,7 +314,7 @@ service cloud.firestore {
 
     match /employee_master/{id} {
       allow read: if isVerified();
-      allow create, update: if isAdmin() || isManager() || isTL();
+      allow create, update: if isAdmin() || isManager() || isTL() || isRole('HR');
       allow delete: if isAdmin();
     }
 
@@ -335,6 +335,12 @@ service cloud.firestore {
     match /emails/{id} {
       allow create: if isVerified();
       allow read: if isVerified() && (isAdmin() || isTL() || isQA());
+    }
+
+    match /employeeProfiles/{employeeId} {
+      allow read: if isVerified() && (isOwner(employeeId) || isAdmin() || isManager() || isRole('HR'));
+      allow create, update: if isVerified() && (isOwner(employeeId) || isAdmin() || isManager() || isRole('HR'));
+      allow delete: if isAdmin();
     }
   }
 }

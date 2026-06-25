@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { db, auth } from '../../lib/firebase';
 import { collection, query, getDocs, doc, setDoc, writeBatch, where, orderBy, getDoc, addDoc } from 'firebase/firestore';
 import { UserProfile, UserRole } from '../../types';
@@ -40,6 +40,11 @@ interface AttendanceConfig {
 
 export default function AttendanceDashboard({ user, allUsers }: { user: UserProfile; allUsers: any[] }) {
   const { canEdit, canExport, hasTmsPermission } = usePermission();
+  const roleNormalized = (user.role || '').toUpperCase().trim().replace(/\s+/g, '_');
+  const isTopAdmin = ['ADMIN', 'MANAGER', 'MIS', 'OPS_HEAD', 'HR', 'IT_MANAGER'].includes(roleNormalized);
+  const isStrictAdminOrManager = ['ADMIN', 'MANAGER', 'MIS', 'ASSISTANT_MANAGER', 'OPS_HEAD', 'HR', 'IT_MANAGER'].includes(roleNormalized);
+  const isTLRole = ['QTL', 'STL', 'OPS_TL', 'TRAINER_TL', 'TEAM_LEAD', 'TRAINER', 'SME'].includes(roleNormalized);
+
   const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState(false);
   const [records, setRecords] = useState<AttendanceSummary[]>([]);
@@ -59,6 +64,18 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
   // Date Range state for Custom
   const [customStartDate, setCustomStartDate] = useState(new Date().toISOString().split('T')[0]);
   const [customEndDate, setCustomEndDate] = useState(new Date().toISOString().split('T')[0]);
+  const initialFilterApplied = useRef(false);
+
+  // Default filter for TLs
+  useEffect(() => {
+    if (!initialFilterApplied.current && isTLRole && !isTopAdmin && selectedTLs.length === 0) {
+      const userName = (user.fullName || user.name || '').trim();
+      if (userName) {
+        setSelectedTLs([userName]);
+        initialFilterApplied.current = true;
+      }
+    }
+  }, [isTLRole, isTopAdmin, user]);
 
   // Real-time Employee Lookup
   const userLookup = useMemo(() => {
@@ -125,6 +142,54 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
 
   const filteredRecords = useMemo(() => {
     return enhancedRecords.filter(r => {
+      // 1. Base Security: If not top admin, enforce visibility rules
+      if (!isTopAdmin) {
+        const userEmail = (user.email || '').toLowerCase().trim();
+        const userName = (user.fullName || user.name || '').toLowerCase().trim();
+        const isOwnRecord = r.userId === user.uid || (r.employeeEmail || '').toLowerCase().trim() === userEmail;
+        
+        if (!isOwnRecord) {
+          const employeeProfile = allUsers.find(u => u.uid === r.userId || (u.email && u.email.toLowerCase().trim() === (r.employeeEmail || '').toLowerCase().trim()));
+          const targetRole = employeeProfile ? (employeeProfile.role || '').toString().toUpperCase().trim().replace(/\s+/g, '_') : '';
+          const executiveRoles = ['ADMIN', 'MANAGER', 'OPS_HEAD', 'HR', 'IT_MANAGER'];
+          
+          if (executiveRoles.includes(targetRole)) return false; // Non-admins can't see executive attendance
+
+          // Check reporting structure
+          let isReport = false;
+          if (employeeProfile) {
+            const empTLId = employeeProfile.teamLeadId;
+            const empMgrId = employeeProfile.mappedManagerId || employeeProfile.managerId;
+            const empTLEmail = (employeeProfile.teamLeadEmail || '').toLowerCase().trim();
+            const empMgrEmail = (employeeProfile.mappedManagerEmail || employeeProfile.managerEmail || '').toLowerCase().trim();
+            const empTLName = (employeeProfile.teamLeadName || '').toLowerCase().trim();
+            const empMgrName = (employeeProfile.mappedManagerName || '').toLowerCase().trim();
+
+            isReport = (
+              empTLId === user.uid || 
+              empMgrId === user.uid || 
+              (empTLEmail && empTLEmail === userEmail) ||
+              (empMgrEmail && empMgrEmail === userEmail) ||
+              (empTLName && empTLName === userName) ||
+              (empMgrName && empMgrName === userName)
+            );
+          }
+          
+          const rTL = (r.mappedTL || '').toLowerCase().trim();
+          const rMgr = (r.mappedManager || '').toLowerCase().trim();
+          const matchesRecordSupervisor = (rTL === userName || rTL === userEmail || rMgr === userName || rMgr === userEmail);
+          
+          const isAuthorizedSupervisor = isReport || matchesRecordSupervisor;
+          
+          // If they are a TL/SME/Trainer, allow seeing everyone except executives (already checked above)
+          if (isTLRole) {
+            // Authorized to see all non-executives
+          } else if (!isAuthorizedSupervisor) {
+            return false;
+          }
+        }
+      }
+
       const matchesSearch = !searchTerm || r.employeeName.toLowerCase().includes(searchTerm.toLowerCase()) || r.employeeEmail.toLowerCase().includes(searchTerm.toLowerCase());
       const matchesProcess = selectedProcesses.length === 0 || selectedProcesses.includes(r.process);
       const matchesTL = selectedTLs.length === 0 || selectedTLs.includes(r.mappedTL);
@@ -134,7 +199,7 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
       
       return matchesSearch && matchesProcess && matchesTL && matchesManager && matchesStatus && matchesManual;
     });
-  }, [enhancedRecords, searchTerm, selectedProcesses, selectedTLs, selectedManagers, selectedStatuses, filterManualOnly]);
+  }, [enhancedRecords, searchTerm, selectedProcesses, selectedTLs, selectedManagers, selectedStatuses, filterManualOnly, isTopAdmin, isTLRole, user]);
 
   const paginatedRecords = useMemo(() => {
     const start = (currentPage - 1) * itemsPerPage;
@@ -163,27 +228,33 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
   const [exportFormatModal, setExportFormatModal] = useState(false);
 
   // Authorization for edits
-  const canModifyAttendance = canEdit('Attendance');
+  const canModifyAttendance = canEdit('Attendance') && !isTLRole;
   const canExportAttendance = canExport('Attendance');
-  const isTopAdmin = ['ADMIN', 'MANAGER', 'MIS'].includes(user.role.toUpperCase());
-  const isStrictAdminOrManager = ['ADMIN', 'MANAGER', 'MIS', 'ASSISTANT_MANAGER'].includes(user.role.toUpperCase());
-  const isTLRole = ['QTL', 'STL', 'OPS_TL', 'TRAINER_TL', 'TEAM_LEAD'].includes(user.role.toUpperCase());
 
-  // Dynamic Process filter: If IC, only show processes user has worked in
+  // Dynamic Process filter: Get processes from both user master and existing records for maximum robustness
   const availableProcesses = useMemo(() => {
-    const list = Array.from(new Set(allUsers.map(u => u.process).filter(p => p !== 'N/A' && !!p)));
+    const fromUsers = allUsers.map(u => u.process);
+    const fromRecords = records.map(r => r.process);
+    const combined = [...fromUsers, ...fromRecords];
+    const list = Array.from(new Set(combined.filter(p => p !== 'N/A' && !!p)));
     return list.sort();
-  }, [allUsers]);
+  }, [allUsers, records]);
 
   const availableTLs = useMemo(() => {
-    const list = Array.from(new Set(allUsers.map(u => u.teamLeadName).filter(tl => tl !== 'N/A' && !!tl)));
+    const fromUsers = allUsers.map(u => u.teamLeadName);
+    const fromRecords = records.map(r => r.mappedTL);
+    const combined = [...fromUsers, ...fromRecords];
+    const list = Array.from(new Set(combined.filter(tl => tl !== 'N/A' && !!tl)));
     return list.sort();
-  }, [allUsers]);
+  }, [allUsers, records]);
 
   const availableManagers = useMemo(() => {
-    const list = Array.from(new Set(allUsers.map(u => u.mappedManagerName || u.Manager).filter(m => m !== 'N/A' && !!m)));
+    const fromUsers = allUsers.map(u => u.mappedManagerName || u.Manager);
+    const fromRecords = records.map(r => r.mappedManager);
+    const combined = [...fromUsers, ...fromRecords];
+    const list = Array.from(new Set(combined.filter(m => m !== 'N/A' && !!m)));
     return list.sort();
-  }, [allUsers]);
+  }, [allUsers, records]);
 
   const openEditModal = (r: AttendanceSummary) => {
     setEditingRecord(r);
@@ -221,99 +292,61 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
         setConfig(currConfig);
       }
 
-      // 2. Fetch Records based on dateRange
-      const now = new Date();
-      let startDate = new Date();
-      let endDate = new Date();
+      // 2. Fetch Records based on dateRange using robust local-timezone date strings
+      const getLocalDateString = (d: Date): string => {
+        const yyyy = d.getFullYear();
+        const mm = String(d.getMonth() + 1).padStart(2, '0');
+        const dd = String(d.getDate()).padStart(2, '0');
+        return `${yyyy}-${mm}-${dd}`;
+      };
+
+      let startStr = '';
+      let endStr = '';
 
       if (dateRange === 'today') {
-        startDate = new Date();
-        startDate.setHours(0,0,0,0);
-        endDate = new Date();
-        endDate.setHours(23,59,59,999);
+        const todayStr = getLocalDateString(new Date());
+        startStr = todayStr;
+        endStr = todayStr;
       } else if (dateRange === 'yesterday') {
-        startDate = new Date(now.setDate(now.getDate() - 1));
-        startDate.setHours(0,0,0,0);
-        endDate = new Date(startDate);
-        endDate.setHours(23,59,59,999);
+        const d = new Date();
+        d.setDate(d.getDate() - 1);
+        const yesterdayStr = getLocalDateString(d);
+        startStr = yesterdayStr;
+        endStr = yesterdayStr;
       } else if (dateRange === 'week') {
-        startDate.setDate(now.getDate() - 7);
+        const d = new Date();
+        d.setDate(d.getDate() - 7);
+        startStr = getLocalDateString(d);
+        endStr = getLocalDateString(new Date());
       } else if (dateRange === 'month') {
-        startDate.setDate(now.getDate() - 30);
+        const d = new Date();
+        d.setDate(d.getDate() - 30);
+        startStr = getLocalDateString(d);
+        endStr = getLocalDateString(new Date());
       } else if (dateRange === 'current_month') {
-        startDate = new Date(now.getFullYear(), now.getMonth(), 1);
+        const d = new Date();
+        const firstDay = new Date(d.getFullYear(), d.getMonth(), 1);
+        startStr = getLocalDateString(firstDay);
+        endStr = getLocalDateString(d);
       } else if (dateRange === 'previous_month') {
-        startDate = new Date(now.getFullYear(), now.getMonth() - 1, 1);
-        endDate = new Date(now.getFullYear(), now.getMonth(), 0);
+        const d = new Date();
+        const firstDayOfPrev = new Date(d.getFullYear(), d.getMonth() - 1, 1);
+        const lastDayOfPrev = new Date(d.getFullYear(), d.getMonth(), 0);
+        startStr = getLocalDateString(firstDayOfPrev);
+        endStr = getLocalDateString(lastDayOfPrev);
       } else if (dateRange === 'custom') {
-        startDate = new Date(customStartDate);
-        endDate = new Date(customEndDate);
+        startStr = customStartDate;
+        endStr = customEndDate;
       }
       
       const attRef = collection(db, 'attendanceSummary');
-      const q = query(attRef, where('attendanceDate', '>=', startDate.toISOString().split('T')[0]), where('attendanceDate', '<=', endDate.toISOString().split('T')[0]));
+      const q = query(attRef, where('attendanceDate', '>=', startStr), where('attendanceDate', '<=', endStr));
       const snap = await getDocs(q);
       
       const attData = snap.docs.map(d => ({ ...d.data(), id: d.id } as AttendanceSummary));
       attData.sort((a, b) => new Date(b.sessionStart).getTime() - new Date(a.sessionStart).getTime());
       
-      let filtered = attData;
-      // If not organization-wide admin, filter to see only their team/self
-      if (!isTopAdmin) {
-         filtered = attData.filter(r => {
-           if (r.userId === user.uid) return true;
-
-           const userEmail = (user.email || '').toLowerCase();
-           const userName = (user.fullName || user.name || '').toLowerCase();
-           const rTL = (r.mappedTL || '').toLowerCase();
-           const rMgr = (r.mappedManager || '').toLowerCase();
-
-           const employeeProfile = allUsersRef.current.find(u => u.uid === r.userId || u.email.toLowerCase() === r.employeeEmail.toLowerCase());
-           
-           // STERN RULE: TLs cannot see Managers or Admins
-           if (employeeProfile) {
-             const targetRole = (employeeProfile.role || '').toString().toUpperCase();
-             const isSelf = employeeProfile.uid === user.uid;
-             const privilegedRoles = ['ADMIN', 'MANAGER', 'TEAM_LEAD', 'STL', 'OPS_TL', 'QTL', 'TRAINER_TL'];
-             if (!isSelf && privilegedRoles.includes(targetRole)) return false;
-           }
-
-           // If specific TLs/Managers are selected, allow TL role users to view them IF they follow the mapping
-           // But actually, the prompt says "Can ONLY view their mapped agents/QA/SME/trainers".
-           // So if they select a filter, it must still be within their authority.
-           
-           if (employeeProfile) {
-             const empTLId = employeeProfile.teamLeadId;
-             const empMgrId = employeeProfile.mappedManagerId || employeeProfile.managerId;
-             const empTLEmail = (employeeProfile.teamLeadEmail || '').toLowerCase();
-             const empMgrEmail = (employeeProfile.mappedManagerEmail || employeeProfile.managerEmail || '').toLowerCase();
-
-             const isReport = (empTLId === user.uid || 
-                              empMgrId === user.uid || 
-                              (empTLEmail && empTLEmail === userEmail) ||
-                              (empMgrEmail && empMgrEmail === userEmail));
-             
-             if (isReport) {
-               // Apply specific dropdown filters if active
-               const matchesTLFilter = selectedTLs.length === 0 || selectedTLs.includes(r.mappedTL) || selectedTLs.map(s => s.toLowerCase()).includes(rTL);
-               const matchesMgrFilter = selectedManagers.length === 0 || selectedManagers.includes(r.mappedManager) || selectedManagers.map(s => s.toLowerCase()).includes(rMgr);
-               return matchesTLFilter && matchesMgrFilter;
-             }
-           }
-           
-           // Fallback for when profile is missing but record has names
-           const isNameMatch = (rTL === userName || rTL === userEmail || rMgr === userEmail || rMgr === userName);
-           if (isNameMatch) {
-              const matchesTLFilter = selectedTLs.length === 0 || selectedTLs.includes(r.mappedTL) || selectedTLs.map(s => s.toLowerCase()).includes(rTL);
-              const matchesMgrFilter = selectedManagers.length === 0 || selectedManagers.includes(r.mappedManager) || selectedManagers.map(s => s.toLowerCase()).includes(rMgr);
-              return matchesTLFilter && matchesMgrFilter;
-           }
-
-           return false;
-         });
-      }
-
-      setRecords(filtered);
+      setRecords(attData);
     } catch (e: any) {
       console.error('Error loading attendance records:', e);
       toast.error(`Failed to load attendance records: ${e.message || 'Unknown error'}`);
@@ -539,7 +572,7 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
             </button>
           )}
           <button onClick={() => {
-            if (['ADMIN', 'MANAGER', 'MIS'].includes(user.role.toUpperCase())) {
+            if (isTopAdmin) {
               handleSyncAttendance();
             } else {
               toast.error('Only Admins or Managers can perform a full sync.');
@@ -634,9 +667,25 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
                   {paginatedRecords.map(r => (
                     <tr key={r.id} className="hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors">
                       <td className="py-1.5 px-3 pl-4">
-                        <div className="font-extrabold text-slate-800 dark:text-slate-200 text-xs leading-none">{r.employeeName}</div>
-                        <div className="text-[10px] text-slate-400 mt-0.5 leading-none">{r.employeeEmail}</div>
-                        {r.isOvernight && <span className="mt-1 inline-flex items-center gap-0.5 bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-300 text-[8px] px-1 py-0.2 rounded font-bold uppercase"><Clock size={9} /> Overnight</span>}
+                        <div className="flex items-center gap-2">
+                           {(() => {
+                             const ap = userLookup[r.employeeEmail.toLowerCase().trim()];
+                             return (
+                               <div className="w-7 h-7 rounded-full overflow-hidden bg-slate-100 flex items-center justify-center font-bold text-[10px] text-slate-400 border border-slate-200">
+                                 {ap?.photoURL ? (
+                                   <img src={ap.photoURL} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                                 ) : (
+                                   (r.employeeName || '??').split(' ').map(n => n[0]).slice(0, 2).join('')
+                                 )}
+                               </div>
+                             );
+                           })()}
+                           <div>
+                             <div className="font-extrabold text-slate-800 dark:text-slate-200 text-xs leading-none">{r.employeeName}</div>
+                             <div className="text-[10px] text-slate-400 mt-0.5 leading-none">{r.employeeEmail}</div>
+                           </div>
+                        </div>
+                        {r.isOvernight && <span className="mt-1 inline-flex items-center gap-0.5 bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-300 text-[8px] px-1 py-0.2 rounded font-bold uppercase ml-9"><Clock size={9} /> Overnight</span>}
                       </td>
                       <td className="py-1.5 px-3 text-xs font-bold text-slate-600 dark:text-slate-300">
                         {r.attendanceDate}

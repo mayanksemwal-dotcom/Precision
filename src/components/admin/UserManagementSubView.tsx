@@ -384,6 +384,7 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
       uid: u.uid || u.id || u.employeeId || Math.random().toString(36).substring(7),
       name: u.fullName || u.name || u.employeeName || 'Unknown User',
       fullName: u.fullName || u.name || u.employeeName || 'Unknown User',
+      photoURL: u.profilePhotoUrl || u.photoURL || '',
       mappedManagerName: u.mappedManagerName || u.managerName || u.Manager || '',
       teamLeadName: u.teamLeadName || '',
     }));
@@ -1340,7 +1341,18 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
                         </button>
                       </td>
                       <td className="p-4 font-mono font-bold">{user.employeeId || 'E-N/A'}</td>
-                      <td className="p-4 font-extrabold">{user.fullName || user.name}</td>
+                      <td className="p-4 font-extrabold text-[#0F172A] dark:text-slate-100 uppercase">
+                        <div className="flex items-center gap-2">
+                           <div className="w-6 h-6 rounded-full overflow-hidden bg-slate-100 flex items-center justify-center font-bold text-[10px] text-slate-400 border border-slate-200 shrink-0">
+                             {user.photoURL ? (
+                               <img src={user.photoURL} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                             ) : (
+                               (user.fullName || user.name || '??').split(' ').map((n: string) => n[0]).slice(0, 2).join('')
+                             )}
+                           </div>
+                           <span>{user.fullName || user.name}</span>
+                        </div>
+                      </td>
                       <td className="p-4 text-slate-400 dark:text-slate-500 font-semibold">{user.email}</td>
                       <td className="p-4">
                         <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${

@@ -138,11 +138,11 @@ import { UserPicker } from '../components/UserPicker';
 interface ScorecardViewProps {
   user: UserProfile;
   allUsers: UserProfile[];
-  onRefreshAllData?: () => void;
+  onRefreshAllData?: (isManual?: boolean) => void;
   externalTheme?: 'light' | 'dark';
 }
 
-export default function ScorecardView({ user, allUsers = [], onRefreshAllData, externalTheme = 'light' }: ScorecardViewProps) {
+export default React.memo(function ScorecardView({ user, allUsers = [], onRefreshAllData, externalTheme = 'light' }: ScorecardViewProps) {
   const theme = externalTheme;
   const { canView, canCreate, canEdit, canDelete } = usePermission();
 
@@ -1068,7 +1068,7 @@ export default function ScorecardView({ user, allUsers = [], onRefreshAllData, e
       setStagingFileName('');
       await fetchAllKPIData();
       
-      if (onRefreshAllData) onRefreshAllData();
+      if (onRefreshAllData) onRefreshAllData(true);
       toast.success(`KPI calculations successfully loaded! All leaderboards & scorecards are updated.`);
 
     } catch (err) {
@@ -1985,14 +1985,28 @@ export default function ScorecardView({ user, allUsers = [], onRefreshAllData, e
                           )}
                         </TableCell>
                         <TableCell>
-                          <div className="flex flex-col">
-                            <span className="font-extrabold text-xs text-slate-900 flex items-center gap-1">
-                              {sc.employeeName}
-                              {sc.employeeEmail.toLowerCase() === user.email.toLowerCase() && (
-                                <Badge className="bg-indigo-600 h-4 text-[9px] font-bold text-white uppercase">Me</Badge>
-                              )}
-                            </span>
-                            <span className="text-[10px] text-slate-400 font-semibold">{sc.employeeEmail}</span>
+                          <div className="flex items-center gap-2">
+                             {(() => {
+                               const ap = allUsers.find(u => u.email.toLowerCase().trim() === sc.employeeEmail.toLowerCase().trim());
+                               return (
+                                 <div className="w-7 h-7 rounded-full overflow-hidden bg-slate-100 flex items-center justify-center font-bold text-[10px] text-slate-400 border border-slate-200 shrink-0">
+                                   {ap?.photoURL ? (
+                                     <img src={ap.photoURL} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                                   ) : (
+                                     (sc.employeeName || '??').split(' ').map(n => n[0]).slice(0, 2).join('')
+                                   )}
+                                 </div>
+                               );
+                             })()}
+                             <div className="flex flex-col">
+                               <span className="font-extrabold text-xs text-slate-900 flex items-center gap-1">
+                                 {sc.employeeName}
+                                 {sc.employeeEmail.toLowerCase() === user.email.toLowerCase() && (
+                                   <Badge className="bg-indigo-600 h-4 text-[9px] font-bold text-white uppercase">Me</Badge>
+                                 )}
+                               </span>
+                               <span className="text-[10px] text-slate-400 font-semibold">{sc.employeeEmail}</span>
+                             </div>
                           </div>
                         </TableCell>
                         <TableCell className="text-center">
@@ -2575,4 +2589,4 @@ export default function ScorecardView({ user, allUsers = [], onRefreshAllData, e
 
     </div>
   );
-}
+});

@@ -20,6 +20,45 @@ const HIERARCHY_MAP: Record<UserRole, UserRole[]> = {
     UserRole.TRAINER_TL, 
     UserRole.QA, 
     UserRole.AGENT,
+    UserRole.OPS_HEAD,
+    UserRole.HR,
+    UserRole.IT_MANAGER,
+  ],
+  [UserRole.OPS_HEAD]: [
+    UserRole.MANAGER,
+    UserRole.TEAM_LEAD, 
+    UserRole.STL, 
+    UserRole.QTL, 
+    UserRole.OPS_TL,
+    UserRole.SME, 
+    UserRole.TRAINER, 
+    UserRole.TRAINER_TL, 
+    UserRole.QA, 
+    UserRole.AGENT,
+  ],
+  [UserRole.HR]: [
+    UserRole.MANAGER,
+    UserRole.TEAM_LEAD, 
+    UserRole.STL, 
+    UserRole.QTL, 
+    UserRole.OPS_TL,
+    UserRole.SME, 
+    UserRole.TRAINER, 
+    UserRole.TRAINER_TL, 
+    UserRole.QA, 
+    UserRole.AGENT,
+  ],
+  [UserRole.IT_MANAGER]: [
+    UserRole.MANAGER,
+    UserRole.TEAM_LEAD, 
+    UserRole.STL, 
+    UserRole.QTL, 
+    UserRole.OPS_TL,
+    UserRole.SME, 
+    UserRole.TRAINER, 
+    UserRole.TRAINER_TL, 
+    UserRole.QA, 
+    UserRole.AGENT,
   ],
   [UserRole.OPS_TL]: [UserRole.SME, UserRole.TRAINER, UserRole.QA, UserRole.AGENT],
   [UserRole.STL]: [UserRole.SME, UserRole.TRAINER, UserRole.QA, UserRole.AGENT],
@@ -29,9 +68,60 @@ const HIERARCHY_MAP: Record<UserRole, UserRole[]> = {
   [UserRole.QA]: [],
   [UserRole.AGENT]: [],
   [UserRole.MIS]: [],
-  [UserRole.SME]: [],
+  [UserRole.SME]: [UserRole.AGENT, UserRole.TRAINER, UserRole.QA],
   [UserRole.TRAINER]: [],
 };
+
+export function normalizeRole(role: string | undefined | null): UserRole {
+  if (!role) return '' as any;
+  const raw = role.toString().toUpperCase().trim().replace(/[\s\-_]+/g, '_');
+  if (raw === 'TEAM_LEAD' || raw === 'TEAMLEAD' || raw === 'TEAM_LEADS' || raw === 'TEAM' || raw === 'TEAM_LEADERS') {
+    return UserRole.TEAM_LEAD;
+  }
+  if (raw === 'TRAINER_TL' || raw === 'TRAINERTL') {
+    return UserRole.TRAINER_TL;
+  }
+  if (raw === 'OPS_TL' || raw === 'OPSTL' || raw === 'OPS_TEAM_LEAD') {
+    return UserRole.OPS_TL;
+  }
+  if (raw === 'STL') {
+    return UserRole.STL;
+  }
+  if (raw === 'QTL') {
+    return UserRole.QTL;
+  }
+  if (raw === 'ADMIN' || raw === 'ADMINISTRATOR') {
+    return UserRole.ADMIN;
+  }
+  if (raw === 'MANAGER' || raw === 'MANAGERS') {
+    return UserRole.MANAGER;
+  }
+  if (raw === 'OPS_HEAD' || raw === 'OPSHEAD' || raw === 'OPERATIONS_HEAD') {
+    return UserRole.OPS_HEAD;
+  }
+  if (raw === 'HR' || raw === 'HUMAN_RESOURCES') {
+    return UserRole.HR;
+  }
+  if (raw === 'IT_MANAGER' || raw === 'ITMANAGER') {
+    return UserRole.IT_MANAGER;
+  }
+  if (raw === 'QA' || raw === 'QAS' || raw === 'QUALITY_ANALYST') {
+    return UserRole.QA;
+  }
+  if (raw === 'SME' || raw === 'SMES') {
+    return UserRole.SME;
+  }
+  if (raw === 'TRAINER' || raw === 'TRAINERS') {
+    return UserRole.TRAINER;
+  }
+  if (raw === 'AGENT' || raw === 'AGENTS' || raw === 'EMPLOYEE') {
+    return UserRole.AGENT;
+  }
+  if (raw === 'MIS') {
+    return UserRole.MIS;
+  }
+  return raw as UserRole;
+}
 
 /**
  * Checks if the actor has supervisorial authority over the target.
@@ -47,16 +137,15 @@ export function canActOn(actor: UserProfile, target: UserProfile, allUsers: User
   if (!actor || !target) return false;
   if (actor.uid === target.uid) return false; // Usually can't act on self in supervisorial contexts
 
-  const actorRole = actor.role as UserRole;
-  const targetRole = target.role as UserRole;
+  const actorRole = normalizeRole(actor.role);
+  const targetRole = normalizeRole(target.role);
 
   // 1. Admin bypass
   if (actorRole === UserRole.ADMIN) return true;
 
-  // 2. Manager bypass: Managers are executive roles that have global authority over all subordinate roles.
-  if (actorRole === UserRole.MANAGER) {
-    const subordinates = HIERARCHY_MAP[UserRole.MANAGER] || [];
-    return subordinates.includes(targetRole);
+  // 2. Manager/Executive bypass: Managers are executive roles that have global authority over all subordinate roles.
+  if (actorRole === UserRole.MANAGER || actorRole === UserRole.OPS_HEAD || actorRole === UserRole.HR || actorRole === UserRole.IT_MANAGER) {
+    return true; // Executive roles see everyone below Admin
   }
 
   // 3. Check if actor role is allowed to supervise target role

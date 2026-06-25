@@ -50,7 +50,7 @@ import { db, handleFirestoreError, OperationType } from '../lib/firebase';
 import { doc, setDoc, updateDoc, collection, addDoc, onSnapshot, query, where, orderBy, getDocs, serverTimestamp, getDoc } from 'firebase/firestore';
 import { toast } from 'sonner';
 import { usePermission } from '../components/PermissionContext';
-import { canActOn } from '../lib/hierarchy';
+import { canActOn, normalizeRole } from '../lib/hierarchy';
 import { sendEmailViaGmailApi } from '../lib/gmailService';
 import { triggerEmail } from '../lib/emailTrigger';
 
@@ -68,6 +68,29 @@ export default function PipView({ user, allUsers = [], externalTheme }: PipViewP
   const [statusFilter, setStatusFilter] = useState<string>('All');
   const [selectedPip, setSelectedPip] = useState<PipRecord | null>(null);
   const [sendEmailNotification, setSendEmailNotification] = useState(true);
+
+  // Filter eligible targets based on real-time allUsers and hierarchal permissions
+  const eligiblePipTargets = React.useMemo(() => {
+    const actorRole = normalizeRole(user.role);
+    const isSupervisor = [
+      UserRole.ADMIN,
+      UserRole.MANAGER,
+      UserRole.OPS_HEAD,
+      UserRole.HR,
+      UserRole.IT_MANAGER,
+      UserRole.TEAM_LEAD,
+      UserRole.OPS_TL,
+      UserRole.QTL,
+      UserRole.STL,
+      UserRole.TRAINER_TL,
+      UserRole.SME
+    ].includes(actorRole);
+
+    if (!isSupervisor) return [];
+
+    // All supervisor roles can see and act on any other user in the PIP dropdown
+    return allUsers.filter(u => u.uid !== user.uid);
+  }, [user, allUsers]);
 
   const getTodayYmd = () => new Date().toISOString().slice(0, 10);
   const getThirtyDaysAheadYmd = () => {
@@ -131,12 +154,15 @@ export default function PipView({ user, allUsers = [], externalTheme }: PipViewP
     // 1. Visibility check: 
     // Is it my own PIP?
     const isMine = p.agentId === user.uid;
+
+    // Am I the initiator who created this PIP?
+    const isInitiator = p.initiatorId === user.uid;
     
     // Is it someone I supervise?
     const targetUser = allUsers.find(u => u.uid === p.agentId);
     const isSubordinate = targetUser ? canActOn(user, targetUser, allUsers) : false;
 
-    if (!isMine && !isSubordinate) return false;
+    if (!isMine && !isSubordinate && !isInitiator) return false;
 
     // 2. Status Filter
     if (statusFilter !== 'All' && p.status !== statusFilter) return false;
@@ -719,11 +745,11 @@ Berg Technologies Corp HS Division
                 <div className="space-y-4 py-4 text-left">
                   {/* Select Agent */}
                   <UserPicker 
-                    label="Select Employee (Agent)"
+                    label="Select Employee"
                     onSelect={(u) => setNewPipForm({ ...newPipForm, agentId: u.uid })}
                     selectedUserId={newPipForm.agentId}
-                    roleFilter={['AGENT']}
-                    placeholder="Search agent for PIP..."
+                    placeholder="Search employee or supervisor for PIP..."
+                    allUsers={eligiblePipTargets}
                   />
 
                   <div className="grid grid-cols-2 gap-4">
@@ -958,8 +984,12 @@ Berg Technologies Corp HS Division
                         >
                           <TableCell className="py-3.5">
                             <div className="flex items-center gap-2.5">
-                              <div className="w-8 h-8 rounded-full bg-slate-100 border border-slate-200 flex items-center justify-center font-bold text-xs text-slate-600">
-                                {agentName.charAt(0)}
+                              <div className="w-8 h-8 rounded-full bg-slate-100 border border-slate-200 flex items-center justify-center font-bold text-xs text-slate-600 overflow-hidden">
+                                {targetUser?.photoURL ? (
+                                  <img src={targetUser.photoURL} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                                ) : (
+                                  agentName.charAt(0)
+                                )}
                               </div>
                               <div className="flex flex-col text-left">
                                 <span className="font-bold text-xs text-[#0F172A]">{agentName}</span>

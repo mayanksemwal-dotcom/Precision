@@ -335,7 +335,7 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
             </Dialog>
           )}
           
-          {['ADMIN', 'MANAGER', 'STL', 'OPS_TL', 'TEAM_LEAD'].includes(user.role as string) && (
+          {['ADMIN', 'MANAGER', 'STL', 'OPS_TL', 'TEAM_LEAD', 'OPS_HEAD', 'HR', 'IT_MANAGER', 'SME'].includes(user.role as string) && (
               <Button 
                 onClick={handleExport}
                 variant="outline" 
@@ -497,14 +497,24 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
                           </div>
                         </TableCell>
                         <TableCell>
-                          <div className="flex flex-col gap-0.5 py-1">
-                            <span className="font-black text-xs text-slate-900 dark:text-white">{agentDisplayName}</span>
-                            <span className="text-[10px] text-slate-500 dark:text-slate-400 font-mono font-medium">{agentDisplayEmail}</span>
-                            <span className="text-[9px] text-blue-650 dark:text-blue-400 font-bold bg-blue-50/80 dark:bg-blue-900/30 px-1.5 py-0.5 rounded border border-blue-105 dark:border-blue-800 inline-block w-fit font-mono mt-1">
-                              {agentDisplayEmpId}
-                            </span>
-                            {targetUser && (
-                              <div className="mt-1.5 space-y-0.5">
+                          <div className="flex items-center gap-3 py-1">
+                            <div className="w-8 h-8 rounded-full overflow-hidden bg-slate-100 flex items-center justify-center font-bold text-[10px] text-slate-400 border border-slate-200 shrink-0">
+                               {targetUser?.photoURL ? (
+                                 <img src={targetUser.photoURL} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                               ) : (
+                                 (agentDisplayName || '??').split(' ').map(n => n[0]).slice(0, 2).join('')
+                               )}
+                            </div>
+                            <div className="flex flex-col gap-0.5">
+                              <span className="font-black text-xs text-slate-900 dark:text-white">{agentDisplayName}</span>
+                              <span className="text-[10px] text-slate-500 dark:text-slate-400 font-mono font-medium">{agentDisplayEmail}</span>
+                              <span className="text-[9px] text-blue-650 dark:text-blue-400 font-bold bg-blue-50/80 dark:bg-blue-900/30 px-1.5 py-0.5 rounded border border-blue-105 dark:border-blue-800 inline-block w-fit font-mono mt-1">
+                                {agentDisplayEmpId}
+                              </span>
+                            </div>
+                         </div>
+                         {targetUser && (
+                           <div className="mt-1.5 pl-11 space-y-0.5">
                                 <p className="text-[9px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-tighter">
                                   Process: <span className="text-slate-600 dark:text-slate-300">{targetUser.department || targetUser.team || 'N/A'}</span>
                                 </p>
@@ -513,7 +523,6 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
                                 </p>
                               </div>
                             )}
-                          </div>
                         </TableCell>
                         <TableCell>
                           <Badge className={`border px-2 py-0.5 rounded-md font-bold text-[10px] ${getSeverityColor(ticket.severity || 'Mild')}`}>

@@ -1,4 +1,5 @@
 import { initializeApp } from 'firebase/app';
+import { getStorage } from 'firebase/storage';
 import { 
   getAuth, 
   GoogleAuthProvider, 
@@ -24,6 +25,8 @@ export const auth = getAuth(app);
 export const db = (firebaseConfig as any).firestoreDatabaseId 
   ? getFirestore(app, (firebaseConfig as any).firestoreDatabaseId)
   : getFirestore(app);
+
+export const storage = getStorage(app);
 
 const googleProvider = new GoogleAuthProvider();
 googleProvider.addScope('https://www.googleapis.com/auth/gmail.send');

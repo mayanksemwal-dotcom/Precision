@@ -1,6 +1,9 @@
 export enum UserRole {
   ADMIN = 'ADMIN',
   MANAGER = 'MANAGER',
+  OPS_HEAD = 'OPS_HEAD',
+  HR = 'HR',
+  IT_MANAGER = 'IT_MANAGER',
   STL = 'STL',
   OPS_TL = 'OPS_TL',
   SME = 'SME',
@@ -31,6 +34,7 @@ export interface UserProfile {
   isActive?: boolean;
   team?: string;
   teamLeadId?: string;
+  teamLeadUid?: string;
   teamLeadName?: string;
   teamLeadEmail?: string;
   managerId?: string; // Master field
@@ -39,6 +43,10 @@ export interface UserProfile {
   mappedManagerId?: string; // Legacy/Auth field
   mappedManagerName?: string; // Legacy/Auth field
   mappedManagerEmail?: string;
+  managerOfManagerId?: string;
+  managerOfManagerName?: string;
+  mappedManagerOfManagerId?: string;
+  mappedManagerOfManagerName?: string;
   mappedTL?: string;
   mappedQA?: string;
   mappedManager?: string;
@@ -46,6 +54,8 @@ export interface UserProfile {
   lastUsedProcess?: string;
   dateJoined?: string;
   lastUpdated?: string;
+  photoURL?: string;
+  profilePhotoUrl?: string;
 }
 
 export enum DisputeStatus {
@@ -288,6 +298,64 @@ export interface PipRecord {
   signedAndAcknowledgedAt?: any;
   signedAndAcknowledgedBy?: string;
 }
+
+export interface ITTicketComment {
+  id: string;
+  text: string;
+  authorId: string;
+  authorName: string;
+  authorRole: string;
+  isInternal: boolean;
+  createdAt: any;
+}
+
+export interface ITTicketAttachment {
+  name: string;
+  url: string;
+  type: string;
+}
+
+export interface ITTicket {
+  id: string;
+  ticketId: string;
+  employeeId: string;
+  employeeName: string;
+  employeeEmail: string;
+  employeeDepartment?: string;
+  category: string;
+  subCategory?: string;
+  priority: 'Low' | 'Medium' | 'High' | 'Critical';
+  subject: string;
+  description: string;
+  status: 'New' | 'Assigned' | 'In Progress' | 'Waiting for User' | 'Resolved' | 'Closed' | 'Rejected';
+  assignedTo?: string;
+  assignedToName?: string;
+  assignedToEmail?: string;
+  comments: ITTicketComment[];
+  attachments: ITTicketAttachment[];
+  deviceInfo?: string;
+  browserInfo?: string;
+  osInfo?: string;
+  assetId?: string;
+  createdAt: any;
+  updatedAt: any;
+  resolvedAt?: any;
+  closedAt?: any;
+  firstResponseAt?: any;
+  slaStatus: 'Met' | 'Breached' | 'In Progress' | 'Near Breach';
+  slaDeadline: any;
+}
+
+export interface ITAsset {
+  id: string;
+  assetType: string;
+  serialNumber: string;
+  assignedUser?: string;
+  assignedUserName?: string;
+  issueDate?: string;
+  status: 'Active' | 'In Maintenance' | 'Replaced' | 'Retired';
+}
+
 
 
 

@@ -63,7 +63,7 @@ import { getLiveTime, getLiveTimeISO } from '../lib/timeSync';
 interface TMSViewProps {
   user: UserProfile;
   allUsers: UserProfile[];
-  onRefreshAllData?: () => void;
+  onRefreshAllData?: (isManual?: boolean) => void;
   externalTheme?: 'light' | 'dark';
 }
 
@@ -129,23 +129,31 @@ export function getDeviceType(): 'mobile' | 'desktop' {
     return 'mobile';
   }
 
-  // 4. Robust touch support checking paired with pointer/screen/viewport thresholds
-  // 'pointer: coarse' matches touch devices (phones, tablets, touch monitors)
-  const hasTouch = ('ontouchstart' in window || navigator.maxTouchPoints > 0);
+  // 4. Bypassing Attempt Check (e.g., Mobile Phone faking Desktop client/viewport via "Desktop Site" mode)
+  // @ts-ignore
+  const hasTouch = ('ontouchstart' in window || navigator.maxTouchPoints > 1 || (navigator.msMaxTouchPoints && navigator.msMaxTouchPoints > 1));
   const isCoarsePointer = window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
   
+  // Coarse pointer AND touch support is a definitive mobile device indicator
+  if (hasTouch && isCoarsePointer) {
+    return 'mobile';
+  }
+
   const screenWidth = window.screen ? (window.screen.width || 0) : 0;
   const screenHeight = window.screen ? (window.screen.height || 0) : 0;
-  const isSmallScreenOrViewport = (
-    window.innerWidth <= 1024 || 
-    window.innerHeight <= 1024 || 
-    screenWidth <= 1024 || 
-    screenHeight <= 1024
-  );
+  
+  if (screenWidth > 0 && screenHeight > 0) {
+    const minPhysicalDim = Math.min(screenWidth, screenHeight);
+    
+    // Physical screen width or height under 1024 with touch is a mobile or tablet
+    if (hasTouch && minPhysicalDim < 1024) {
+      return 'mobile';
+    }
+  }
 
-  // If a device has touch capabilities, and either has a coarse pointer or presents small screen sizes,
-  // it is categorized as a mobile/tablet system to prevent desktop restriction bypasses
-  if (hasTouch && (isCoarsePointer || isSmallScreenOrViewport)) {
+  // 5. Classic Orientation Checks (Desktops do not support window.orientation, mobile browsers do)
+  const hasMobileOrientation = typeof window.orientation !== 'undefined';
+  if (hasMobileOrientation && hasTouch) {
     return 'mobile';
   }
 
@@ -170,15 +178,15 @@ export function getDetailedDeviceMetadata() {
   
   if (resolvedType === 'mobile') {
     const screenWidth = window.screen ? (window.screen.width || 0) : 0;
+    const screenHeight = window.screen ? (window.screen.height || 0) : 0;
+    const minPhysicalDim = Math.min(screenWidth, screenHeight);
+
     const isTabletUA = /ipad|tablet|playbook|silk/i.test(ua) || 
-                       (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+                       (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1) ||
+                       (minPhysicalDim >= 600 && minPhysicalDim < 1024);
     
     if (isTabletUA) {
       deviceType = 'Tablet';
-    } else if (screenWidth > 0 && screenWidth <= 640) {
-      deviceType = 'Mobile';
-    } else if (window.innerWidth <= 640) {
-      deviceType = 'Mobile';
     } else {
       deviceType = 'Mobile';
     }
@@ -322,6 +330,10 @@ export function truncateShiftToProductiveTime(shift: TMSShift, limitMs: number =
 export function getManagerOfManager(u: UserProfile, allUsers: UserProfile[]): string {
   if (!u) return 'N/A';
   
+  // Prefer explicit/stored managerOfManager mapping if present
+  if (u.managerOfManagerName) return u.managerOfManagerName;
+  if (u.mappedManagerOfManagerName) return u.mappedManagerOfManagerName;
+  
   // Find direct supervisor
   let directSupervisor: UserProfile | undefined = undefined;
   
@@ -431,7 +443,7 @@ const BREAK_OPTIONS = [
   'Bio Break'
 ];
 
-export default function TMSView({ user, allUsers, onRefreshAllData, externalTheme }: TMSViewProps) {
+export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, externalTheme }: TMSViewProps) {
   const { canView, canCreate, canEdit, canDelete, hasTmsPermission } = usePermission();
   
   // Dynamic granular permission bindings instead of monolithic role/module checks
@@ -731,7 +743,7 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
     // Shifts are managed in real-time via the useEffect's onSnapshot subscription
     // But we can trigger a manual re-fetch of users or just give feedback
     if (onRefreshAllData) {
-      onRefreshAllData();
+      onRefreshAllData(true);
     } else {
       toast.info('Synchronization pulse sent. Roster state is live.', {
         icon: <RefreshCw size={14} className="animate-spin" />
@@ -1200,6 +1212,7 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
     try {
       const nowISO = getLiveTimeISO();
       const currentDev = getDeviceType();
+      const meta = getDetailedDeviceMetadata();
       const updatedActivities = [...currentShift.activities];
       
       // Terminate last activity
@@ -1219,7 +1232,16 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
         ...currentShift,
         activities: updatedActivities,
         status: 'ACTIVE',
-        hasMobilePunches: currentShift.hasMobilePunches || currentDev === 'mobile'
+        hasMobilePunches: currentShift.hasMobilePunches || currentDev === 'mobile',
+        deviceType: meta.deviceType,
+        browser: meta.browser,
+        os: meta.os,
+        userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : currentShift.userAgent,
+        platform: typeof navigator !== 'undefined' ? navigator.platform : currentShift.platform,
+        maxTouchPoints: typeof navigator !== 'undefined' ? navigator.maxTouchPoints : currentShift.maxTouchPoints,
+        detectedDeviceType: meta.deviceType,
+        detectedBrowser: meta.browser,
+        detectedOS: meta.os
       });
 
       setSelectedProcessInput(targetProcess);
@@ -1261,6 +1283,7 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
     try {
       const nowISO = getLiveTimeISO();
       const currentDev = getDeviceType();
+      const meta = getDetailedDeviceMetadata();
       const updatedActivities = [...currentShift.activities];
       
       // Terminate last active segment
@@ -1280,7 +1303,22 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
         ...currentShift,
         activities: updatedActivities,
         status: 'BREAK',
-        hasMobilePunches: currentShift.hasMobilePunches || currentDev === 'mobile'
+        hasMobilePunches: currentShift.hasMobilePunches || currentDev === 'mobile',
+        deviceType: meta.deviceType,
+        browser: meta.browser,
+        os: meta.os,
+        userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : currentShift.userAgent,
+        platform: typeof navigator !== 'undefined' ? navigator.platform : currentShift.platform,
+        maxTouchPoints: typeof navigator !== 'undefined' ? navigator.maxTouchPoints : currentShift.maxTouchPoints,
+        detectedDeviceType: meta.deviceType,
+        detectedBrowser: meta.browser,
+        detectedOS: meta.os
+      });
+
+      // Update User Status to BREAK in users collection
+      const userRef = doc(db, 'users', user.uid);
+      await updateDoc(userRef, {
+        status: 'BREAK'
       });
 
       toast.success(`Break started: ${selectedBreakInput}`);
@@ -1326,6 +1364,7 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
     try {
       const nowISO = getLiveTimeISO();
       const currentDev = getDeviceType();
+      const meta = getDetailedDeviceMetadata();
       const updatedActivities = [...currentShift.activities];
       
       // Terminate break segment
@@ -1345,7 +1384,22 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
         ...currentShift,
         activities: updatedActivities,
         status: 'ACTIVE',
-        hasMobilePunches: currentShift.hasMobilePunches || currentDev === 'mobile'
+        hasMobilePunches: currentShift.hasMobilePunches || currentDev === 'mobile',
+        deviceType: meta.deviceType,
+        browser: meta.browser,
+        os: meta.os,
+        userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : currentShift.userAgent,
+        platform: typeof navigator !== 'undefined' ? navigator.platform : currentShift.platform,
+        maxTouchPoints: typeof navigator !== 'undefined' ? navigator.maxTouchPoints : currentShift.maxTouchPoints,
+        detectedDeviceType: meta.deviceType,
+        detectedBrowser: meta.browser,
+        detectedOS: meta.os
+      });
+
+      // Update User Status to ONLINE in users collection
+      const userRef = doc(db, 'users', user.uid);
+      await updateDoc(userRef, {
+        status: 'ONLINE'
       });
 
       setSelectedProcessInput(resumeProcess);
@@ -1580,7 +1634,11 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
     UserRole.TRAINER_TL, 
     UserRole.MANAGER, 
     UserRole.ADMIN, 
-    UserRole.MIS
+    UserRole.MIS,
+    UserRole.OPS_HEAD,
+    UserRole.HR,
+    UserRole.IT_MANAGER,
+    UserRole.SME
   ];
   const isDashboardUser = dashboardRoles.includes(user.role as UserRole);
 
@@ -1653,7 +1711,7 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
     let mappedUsers: any[] = [];
     
     // Use canActOn to filter who we can see in our report, excluding inactive users
-    mappedUsers = allUsers.filter(u => u.uid !== user.uid && u.status === 'Active' && canActOn(user, u, allUsers));
+    mappedUsers = allUsers.filter(u => u.uid !== user.uid && (!u.status || u.status.toLowerCase().trim() === 'active' || u.isActive === true) && canActOn(user, u, allUsers));
 
     console.log('--- TMS Dashboard Mapping Debug ---');
     console.log('Can View Reports:', canViewReports);
@@ -3086,9 +3144,22 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
 
                           return (
                             <tr key={sh.id} className="hover:bg-slate-50/50 transition-colors">
-                              <td className="p-4 pl-6 font-bold text-slate-800">
-                                <div>{sh.userName}</div>
-                                <div className="text-[10px] font-mono text-slate-400 font-medium leading-none mt-0.5">{sh.userEmail}</div>
+                              <td className="p-4 pl-6">
+                                <div className="flex items-center gap-3">
+                                  <div className="w-8 h-8 rounded-full overflow-hidden bg-slate-100 flex items-center justify-center font-bold text-[10px] text-slate-500 shrink-0 border border-slate-200">
+                                    {(() => {
+                                      const up = allUsers.find(u => u.uid === sh.userId || u.email === sh.userEmail);
+                                      if (up?.photoURL) {
+                                        return <img src={up.photoURL} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" />;
+                                      }
+                                      return sh.userName ? sh.userName.split(' ').map(n => n[0]).slice(0, 2).join('') : '??';
+                                    })()}
+                                  </div>
+                                  <div>
+                                    <div className="font-bold text-slate-800">{sh.userName}</div>
+                                    <div className="text-[10px] font-mono text-slate-400 font-medium leading-none mt-0.5">{sh.userEmail}</div>
+                                  </div>
+                                </div>
                               </td>
                               <td className="p-4">
                                 <div className="flex items-center gap-1.5">
@@ -3488,7 +3559,7 @@ export default function TMSView({ user, allUsers, onRefreshAllData, externalThem
 
     </div>
   );
-}
+});
 
 function LockIcon({ className, size }: { className?: string, size?: number }) {
   return (

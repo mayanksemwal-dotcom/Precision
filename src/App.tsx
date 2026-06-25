@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { 
   LayoutDashboard, 
   ClipboardCheck, 
@@ -13,6 +13,7 @@ import {
   ShieldAlert, 
   LogOut, 
   User as UserIcon,
+  Lock,
   Menu,
   X,
   FileUp,
@@ -22,7 +23,8 @@ import {
   Link2,
   FileText,
   Sun,
-  Moon
+  Moon,
+  LifeBuoy
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { UserRole, UserProfile, SamplingTask, AuditRecord, QAAlignment, ProductionRecord, WarningTicket, AgentKpiRecord } from './types';
@@ -33,13 +35,14 @@ import { OperationType } from './lib/firebase';
 import { onAuthStateChanged } from 'firebase/auth';
 import { doc, getDoc, getDocs, collection, query, where, orderBy, setDoc, updateDoc, deleteDoc, limit, onSnapshot } from 'firebase/firestore';
 import { Database, RefreshCw, Activity } from 'lucide-react';
-import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from './components/ui/dialog';
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogFooter } from './components/ui/dialog';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from './components/ui/table';
 // Removed fetchArchiveReports import
 
 // Views
 import AdminView from './views/AdminView';
 import LoginView from './views/LoginView';
+import MyProfileView from './views/MyProfileView';
 
 // UI Components
 import BergLogo from './components/BergLogo';
@@ -63,6 +66,7 @@ import PipView from './views/PipView';
 import ManageHistoricalRecordsView from './views/ManageHistoricalRecordsView';
 import ResourceHubView from './views/ResourceHubView';
 import AttendanceView from './views/AttendanceView';
+import ITHelpDeskView from './views/ITHelpDeskView';
 
 import { PermissionProvider, usePermission } from './components/PermissionContext';
 import { canActOn } from './lib/hierarchy';
@@ -72,14 +76,30 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState('tms');
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [viewAsRole, setViewAsRole] = useState<UserRole | null>(null);
+  const [viewAsRole, setViewAsRole] = useState<string | null>(null);
   const [tasks, setTasks] = useState<SamplingTask[]>([]);
   const [auditLogs, setAuditLogs] = useState<AuditRecord[]>([]);
   const [alignments, setAlignments] = useState<QAAlignment[]>(INITIAL_ALIGNMENTS);
   const [productions, setProductions] = useState<ProductionRecord[]>([]);
   const [warnings, setWarnings] = useState<WarningTicket[]>([]);
   const [allUsers, setAllUsers] = useState<UserProfile[]>([]);
+  const [employeeProfiles, setEmployeeProfiles] = useState<Record<string, any>>({});
   const [agentKpis, setAgentKpis] = useState<AgentKpiRecord[]>([]);
+
+  // Derive reactive current user from the synced allUsers and employeeProfiles source of truth
+  const allUsersWithPhotos = useMemo(() => {
+    return allUsers.map(u => {
+      const prof = employeeProfiles[u.uid] || {};
+      const photo = prof.profilePhotoUrl || u.profilePhotoUrl || u.photoURL || '';
+      return {
+        ...u,
+        photoURL: photo,
+        profilePhotoUrl: photo
+      };
+    });
+  }, [allUsers, employeeProfiles]);
+
+  const effectiveUser = allUsersWithPhotos.find(u => u.uid === user?.uid) || user;
   const [editingAudit, setEditingAudit] = useState<AuditRecord | null>(null);
 
   const [theme, setTheme] = useState<'light' | 'dark'>(() => {
@@ -338,7 +358,7 @@ export default function App() {
 
   const [isRefreshing, setIsRefreshing] = useState(false);
 
-  const fetchAllData = async () => {
+  const fetchAllData = async (isManual = false) => {
     if (!user) return;
     setIsRefreshing(true);
 
@@ -392,7 +412,9 @@ export default function App() {
       setAuditLogs([]);
       setTasks([]);
 
-      toast.success('All reports loaded/refreshed successfully');
+      if (isManual) {
+        toast.success('All reports loaded/refreshed successfully');
+      }
     } catch (error) {
       console.error('Data loading error:', error);
       handleFirestoreError(error, OperationType.LIST, 'all_data');
@@ -426,9 +448,12 @@ export default function App() {
         return {
           uid: doc.id,
           ...data,
-          // Normalize name across different possible field mappings
+          // Normalize name and email across different possible field mappings
           name: data.fullName || data.name || data.employeeName || '',
           fullName: data.fullName || data.name || data.employeeName || '',
+          email: (data.email || '').toLowerCase().trim(),
+          employeeId: data.employeeId || '',
+          photoURL: data.profilePhotoUrl || data.photoURL || '',
           role: (data.role || UserRole.AGENT).toUpperCase(),
           status: data.status || 'Active',
           teamLeadId: normalizedTLId,
@@ -447,6 +472,66 @@ export default function App() {
     return () => unsubscribe();
   }, [user]);
 
+  // Real-time Employee Profiles (documents containing uploaded profile photos) Listener
+  useEffect(() => {
+    if (!user) return;
+    const unsubscribe = onSnapshot(collection(db, 'employeeProfiles'), (snapshot) => {
+      const profiles: Record<string, any> = {};
+      snapshot.docs.forEach(doc => {
+        profiles[doc.id] = doc.data();
+      });
+      setEmployeeProfiles(profiles);
+    }, (err) => {
+      console.error('Employee profiles listener error:', err);
+    });
+    return () => unsubscribe();
+  }, [user]);
+
+  // Load roles dynamically from both 'roles' and 'role_permissions' collections
+  const [availableRoles, setAvailableRoles] = useState<string[]>([]);
+
+  useEffect(() => {
+    if (!user) return;
+    const unsubscribeRoles = onSnapshot(collection(db, 'roles'), (rolesSnap) => {
+      const rolesList = rolesSnap.docs.map(doc => (doc.data().name || doc.id).toUpperCase().trim());
+      
+      const qPermissions = query(collection(db, 'role_permissions'));
+      getDocs(qPermissions).then((permissionsSnap) => {
+        const permissionsRoles = permissionsSnap.docs.map(doc => (doc.data().role_name || '').toUpperCase().trim());
+        const combined = Array.from(new Set([...rolesList, ...permissionsRoles])).filter(Boolean).sort();
+        
+        if (combined.length > 0) {
+          setAvailableRoles(combined);
+        } else {
+          setAvailableRoles([
+            'ADMIN',
+            'MANAGER',
+            'STL',
+            'OPS_TL',
+            'SME',
+            'QTL',
+            'QA',
+            'TEAM_LEAD',
+            'TRAINER',
+            'TRAINER_TL',
+            'MIS',
+            'AGENT'
+          ]);
+        }
+      }).catch((err) => {
+        console.error('Error fetching role_permissions for preview dropdown:', err);
+        const combined = Array.from(new Set(rolesList)).filter(Boolean).sort();
+        if (combined.length > 0) {
+          setAvailableRoles(combined);
+        }
+      });
+    }, (err) => {
+      console.error('Error syncing roles:', err);
+    });
+
+    return () => unsubscribeRoles();
+  }, [user]);
+
   if (loading) {
     return (
       <div className="flex items-center justify-center min-h-screen bg-slate-50">
@@ -462,21 +547,22 @@ export default function App() {
   }
 
   return (
-    <PermissionProvider user={user} overriddenRole={viewAsRole || undefined}>
+    <PermissionProvider user={effectiveUser!} overriddenRole={viewAsRole || undefined}>
       <AppContent 
-        user={user}
+        user={effectiveUser}
         viewAsRole={viewAsRole}
         setViewAsRole={setViewAsRole}
         activeTab={activeTab}
         setActiveTab={setActiveTab}
         sidebarOpen={sidebarOpen}
         setSidebarOpen={setSidebarOpen}
-        allUsers={allUsers}
+        allUsers={allUsersWithPhotos}
         warnings={warnings}
         fetchAllData={fetchAllData}
         handleLogout={handleLogout}
         theme={theme}
         setTheme={setTheme}
+        availableRoles={availableRoles}
       />
     </PermissionProvider>
   );
@@ -484,16 +570,17 @@ export default function App() {
 
 interface AppContentProps {
   user: UserProfile | null;
-  viewAsRole: UserRole | null;
-  setViewAsRole: (r: UserRole | null) => void;
+  viewAsRole: string | null;
+  setViewAsRole: (r: string | null) => void;
   activeTab: string;
   setActiveTab: (t: string) => void;
   sidebarOpen: boolean;
   setSidebarOpen: (o: boolean) => void;
   allUsers: UserProfile[];
   warnings: WarningTicket[];
-  fetchAllData: () => Promise<void>;
+  fetchAllData: (isManual?: boolean) => Promise<void>;
   handleLogout: () => Promise<void>;
+  availableRoles: string[];
 }
 
 function AppContent({
@@ -509,9 +596,59 @@ function AppContent({
   fetchAllData,
   handleLogout,
   theme,
-  setTheme
+  setTheme,
+  availableRoles
 }: AppContentProps & { theme: 'light' | 'dark', setTheme: (t: 'light' | 'dark') => void }) {
   const { canView, canEdit, loading: permissionsLoading } = usePermission();
+
+  const [isChangePasswordOpen, setIsChangePasswordOpen] = useState(false);
+  const [oldPassword, setOldPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [passwordState, setPasswordState] = useState<'idle' | 'updating' | 'success' | 'error'>('idle');
+
+  const handleUpdatePassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newPassword || !oldPassword) {
+      toast.error('All fields are mandatory.');
+      return;
+    }
+    if (newPassword.length < 6) {
+      toast.error('The new password must be at least 6 characters long.');
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      toast.error('The passwords do not match.');
+      return;
+    }
+
+    setPasswordState('updating');
+    try {
+      const { EmailAuthProvider, reauthenticateWithCredential, updatePassword } = await import('firebase/auth');
+      const currentUser = auth.currentUser;
+      if (!currentUser || !currentUser.email) {
+        throw new Error('No verified user session exists.');
+      }
+
+      // Reauthenticate user
+      const credential = EmailAuthProvider.credential(currentUser.email, oldPassword);
+      await reauthenticateWithCredential(currentUser, credential);
+      
+      // Update Password
+      await updatePassword(currentUser, newPassword);
+      
+      toast.success('Your password has been changed securely.');
+      setIsChangePasswordOpen(false);
+      setOldPassword('');
+      setNewPassword('');
+      setConfirmPassword('');
+      setPasswordState('idle');
+    } catch (err: any) {
+      console.error(err);
+      toast.error(`Password update failed: ${err.message}`);
+      setPasswordState('error');
+    }
+  };
 
   const navItems = [
     { id: 'tms', label: 'Workforce TMS', icon: Clock },
@@ -519,6 +656,7 @@ function AppContent({
     { id: 'kpis_scorecard', label: 'KPI Scorecard', icon: Award },
     { id: 'warnings', label: 'Warnings', icon: ShieldAlert },
     { id: 'pips', label: 'PIP Management', icon: Activity },
+    { id: 'it_help_desk', label: 'IT Help Desk', icon: LifeBuoy },
     { id: 'historical', label: 'Historical Records', icon: History },
     { id: 'resources', label: 'Important Quality Links', icon: Link2 },
     { id: 'config', label: 'Console', icon: Settings },
@@ -535,7 +673,7 @@ function AppContent({
 
   return (
     <div className="flex flex-col h-screen overflow-hidden text-slate-900 dark:text-slate-100 font-sans bg-[#F8FAFC] dark:bg-slate-950">
-      <Toaster position="top-right" />
+      <Toaster position="top-center" />
       
       {viewAsRole && (
         <div className="bg-amber-500 text-slate-950 py-1.5 px-8 text-[11px] font-black flex items-center justify-between shadow-sm z-[1000] border-b border-amber-600 shrink-0">
@@ -620,8 +758,12 @@ function AppContent({
             <DropdownMenuTrigger
               render={
                 <button className="w-full flex items-center gap-3 p-2 rounded-lg hover:bg-[#1E293B] transition-colors group">
-                  <div className="w-8 h-8 rounded-full bg-[#1E293B] group-hover:bg-[#334155] border border-[#334155] flex items-center justify-center">
-                    <UserIcon size={16} className="text-[#CBD5E1]" />
+                  <div className="w-8 h-8 rounded-full bg-[#1E293B] group-hover:bg-[#334155] border border-[#334155] flex items-center justify-center overflow-hidden">
+                    {user?.photoURL ? (
+                      <img src={user.photoURL} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                    ) : (
+                      <UserIcon size={16} className="text-[#CBD5E1]" />
+                    )}
                   </div>
                   {sidebarOpen && (
                     <div className="flex-1 text-left">
@@ -635,6 +777,15 @@ function AppContent({
             <DropdownMenuContent side="right" align="end" sideOffset={8} className="w-56">
               <DropdownMenuGroup>
                 <DropdownMenuLabel>My Account</DropdownMenuLabel>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem onClick={() => setActiveTab('profile')} className="cursor-pointer font-medium flex items-center pr-4">
+                  <UserIcon size={16} className="mr-2 text-indigo-500" />
+                  My Profile
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => setIsChangePasswordOpen(true)} className="cursor-pointer font-medium flex items-center pr-4">
+                  <Lock size={16} className="mr-2 text-indigo-500" />
+                  Change Password
+                </DropdownMenuItem>
                 <DropdownMenuSeparator />
                 <DropdownMenuItem onClick={handleLogout} variant="destructive" className="text-red-600 dark:text-red-400 font-bold focus:bg-red-50 focus:text-red-750 cursor-pointer flex items-center pr-4">
                   <LogOut size={16} className="mr-2 text-red-600 dark:text-red-400 font-bold" />
@@ -669,17 +820,25 @@ function AppContent({
           </div>
           <div className="flex items-center gap-6">
              {(user?.role?.toUpperCase() === 'ADMIN' || user?.email?.toLowerCase().trim() === 'mayank.semwal@bergtechnologies.co.in' || viewAsRole !== null) && (
-               <div className="flex items-center gap-2 bg-slate-100 dark:bg-slate-800 p-1 rounded-lg border border-slate-200 dark:border-slate-700">
-                 <span className="text-[10px] font-bold text-slate-500 dark:text-slate-400 ml-2 uppercase">Preview as:</span>
-                 {[UserRole.ADMIN, UserRole.MANAGER, UserRole.TEAM_LEAD, UserRole.QA, UserRole.AGENT].map(r => (
-                   <button
-                     key={r}
-                     onClick={() => setViewAsRole(r === UserRole.ADMIN ? null : (r as UserRole))}
-                     className={`px-2 py-1 rounded text-[10px] font-black transition-all ${effectiveRole === r ? 'bg-blue-600 text-white shadow-sm' : 'text-slate-400 hover:text-slate-600'}`}
-                   >
-                     {r === UserRole.TEAM_LEAD ? 'TL' : r}
-                   </button>
-                 ))}
+               <div className="flex items-center gap-2 bg-slate-100 dark:bg-slate-800 py-1.5 px-3 rounded-xl border border-slate-200 dark:border-slate-700 shadow-sm hover:border-slate-300 transition-all duration-200">
+                 <span className="text-[10px] font-bold text-slate-500 dark:text-slate-400 ml-1 uppercase tracking-wider">Preview Role:</span>
+                 <select
+                   value={viewAsRole || ''}
+                   onChange={(e) => {
+                     const selected = e.target.value;
+                     setViewAsRole(selected === '' ? null : selected);
+                   }}
+                   className="bg-transparent text-xs font-black text-blue-600 dark:text-blue-400 border-none outline-none focus:ring-0 cursor-pointer pr-1 uppercase"
+                 >
+                   <option value="" className="bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-100 font-bold">
+                     Exit Preview ({user?.role})
+                   </option>
+                   {availableRoles.filter(r => r !== user?.role).map(r => (
+                     <option key={r} value={r} className="bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-100 font-bold">
+                       {r}
+                     </option>
+                   ))}
+                 </select>
                </div>
              )}
              <div className="flex items-center gap-4">
@@ -696,10 +855,41 @@ function AppContent({
                   {effectiveRole} {viewAsRole ? '(Preview)' : ''}
                 </div>
                 <div className="flex items-center gap-3">
-                   <span className="text-sm font-semibold text-[#1E293B] dark:text-white">{user.name}</span>
-                   <div className="w-8 h-8 rounded-full bg-[#E2E8F0] dark:bg-slate-800 border border-white dark:border-slate-700 shadow-sm flex items-center justify-center font-bold text-xs text-[#64748B] dark:text-slate-400">
-                     {user.name.split(' ').map(n => n[0]).join('')}
-                   </div>
+                  <DropdownMenu>
+                    <DropdownMenuTrigger
+                      render={
+                        <button className="flex items-center gap-2 px-2.5 py-1 hover:bg-slate-50 dark:hover:bg-slate-805 border border-slate-200/40 dark:border-slate-800 rounded-xl transition-all cursor-pointer group">
+                          <span className="text-xs font-bold text-[#1E293B] dark:text-slate-200 group-hover:text-indigo-500 transition-colors leading-none">{effectiveUser?.name}</span>
+                          <div className="w-8 h-8 rounded-full bg-[#E2E8F0] dark:bg-slate-800 border border-white dark:border-slate-700 shadow-sm flex items-center justify-center font-bold text-xs text-[#64748B] dark:text-slate-400 group-hover:scale-105 transition-transform overflow-hidden">
+                            {effectiveUser?.photoURL ? (
+                              <img src={effectiveUser.photoURL} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                            ) : (
+                              effectiveUser?.name.split(' ').map(n => n[0]).slice(0, 2).join('')
+                            )}
+                          </div>
+                        </button>
+                      }
+                    />
+                    <DropdownMenuContent side="bottom" align="end" sideOffset={8} className="w-52">
+                      <DropdownMenuGroup>
+                        <DropdownMenuLabel>My Account</DropdownMenuLabel>
+                        <DropdownMenuSeparator />
+                        <DropdownMenuItem onClick={() => setActiveTab('profile')} className="cursor-pointer font-medium flex items-center">
+                          <UserIcon size={14} className="mr-2 text-indigo-500" />
+                          My Profile
+                        </DropdownMenuItem>
+                        <DropdownMenuItem onClick={() => setIsChangePasswordOpen(true)} className="cursor-pointer font-medium flex items-center">
+                          <Lock size={14} className="mr-2 text-indigo-500" />
+                          Change Password
+                        </DropdownMenuItem>
+                        <DropdownMenuSeparator />
+                        <DropdownMenuItem onClick={handleLogout} variant="destructive" className="text-red-600 dark:text-red-400 font-bold cursor-pointer flex items-center">
+                          <LogOut size={14} className="mr-2" />
+                          Logout
+                        </DropdownMenuItem>
+                      </DropdownMenuGroup>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
                 </div>
              </div>
           </div>
@@ -729,7 +919,9 @@ function AppContent({
                 transition={{ duration: 0.12, ease: "easeOut" }}
                 className="max-w-7xl mx-auto h-full"
               >
-                {activeTab === 'tms' ? (
+                {activeTab === 'profile' ? (
+                  <MyProfileView user={effectiveUser!} allUsers={allUsers} externalTheme={theme} onRefreshAllData={fetchAllData} />
+                ) : activeTab === 'tms' ? (
                   <TMSView user={effectiveUser!} allUsers={allUsers} onRefreshAllData={fetchAllData} externalTheme={theme} />
                 ) : activeTab === 'attendance' ? (
                   <AttendanceView user={effectiveUser!} allUsers={allUsers} externalTheme={theme} />
@@ -739,6 +931,8 @@ function AppContent({
                   <WarningsView warnings={warnings} user={effectiveUser!} allUsers={allUsers} externalTheme={theme} />
                 ) : activeTab === 'pips' ? (
                   <PipView user={effectiveUser!} allUsers={allUsers} externalTheme={theme} />
+                ) : activeTab === 'it_help_desk' ? (
+                  <ITHelpDeskView user={effectiveUser!} allUsers={allUsers} externalTheme={theme} />
                 ) : activeTab === 'historical' ? (
                   <ManageHistoricalRecordsView user={effectiveUser!} />
                 ) : activeTab === 'resources' ? (
@@ -769,6 +963,75 @@ function AppContent({
           </AnimatePresence>
         </div>
       </main>
+
+      {/* Change Password Dialog */}
+      <Dialog open={isChangePasswordOpen} onOpenChange={setIsChangePasswordOpen}>
+        <DialogContent className="sm:max-w-md bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-6 rounded-2xl shadow-xl">
+          <DialogHeader>
+            <DialogTitle className="text-lg font-black text-slate-800 dark:text-slate-100 flex items-center gap-2">
+              <Lock size={18} className="text-indigo-500" /> Change Account Password
+            </DialogTitle>
+            <DialogDescription className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed">
+              Verify your identity by inputting current password credentials, then request password updates.
+            </DialogDescription>
+          </DialogHeader>
+
+          <form onSubmit={handleUpdatePassword} className="space-y-4 mt-3">
+            <div className="space-y-1">
+              <label className="block text-[10px] font-bold uppercase tracking-wider text-slate-400">Current Password</label>
+              <input
+                type="password"
+                required
+                value={oldPassword}
+                onChange={e => setOldPassword(e.target.value)}
+                placeholder="••••••••"
+                className="w-full text-xs p-2.5 rounded-lg border outline-none transition-all focus:ring-1 focus:ring-indigo-500 bg-slate-50 dark:bg-slate-950 border-slate-200 dark:border-slate-800 text-slate-800 dark:text-slate-100"
+              />
+            </div>
+
+            <div className="space-y-1">
+              <label className="block text-[10px] font-bold uppercase tracking-wider text-slate-400">New Desired Password</label>
+              <input
+                type="password"
+                required
+                value={newPassword}
+                onChange={e => setNewPassword(e.target.value)}
+                placeholder="•••••••• (Min 6 chars)"
+                className="w-full text-xs p-2.5 rounded-lg border outline-none transition-all focus:ring-1 focus:ring-indigo-500 bg-slate-50 dark:bg-slate-950 border-slate-200 dark:border-slate-800 text-slate-800 dark:text-slate-100"
+              />
+            </div>
+
+            <div className="space-y-1">
+              <label className="block text-[10px] font-bold uppercase tracking-wider text-slate-400">Confirm New Password</label>
+              <input
+                type="password"
+                required
+                value={confirmPassword}
+                onChange={e => setConfirmPassword(e.target.value)}
+                placeholder="••••••••"
+                className="w-full text-xs p-2.5 rounded-lg border outline-none transition-all focus:ring-1 focus:ring-indigo-500 bg-slate-50 dark:bg-slate-950 border-slate-200 dark:border-slate-800 text-slate-800 dark:text-slate-100"
+              />
+            </div>
+
+            <DialogFooter className="mt-4 gap-2 flex justify-end">
+              <button
+                type="button"
+                onClick={() => setIsChangePasswordOpen(false)}
+                className="px-4 py-2 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 text-slate-700 dark:text-slate-300 font-bold text-xs rounded-xl cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={passwordState === 'updating'}
+                className="px-5 py-2 bg-indigo-650 hover:bg-indigo-700 text-white font-black text-xs rounded-xl cursor-pointer flex items-center gap-1.5 shadow-md shadow-indigo-500/10 active:scale-95 transition-all"
+              >
+                {passwordState === 'updating' ? <RefreshCw size={12} className="animate-spin" /> : "Update Password"}
+              </button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
     </div>
   </div>
   );

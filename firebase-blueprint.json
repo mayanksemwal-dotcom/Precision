@@ -277,6 +277,44 @@
         "createdAt": { "type": "string" }
       },
       "required": ["id", "name"]
+    },
+    "EmployeeProfile": {
+      "title": "Employee Profile",
+      "description": "HRMS detailed employee self-service profile and identity information",
+      "type": "object",
+      "properties": {
+        "employeeId": { "type": "string" },
+        "employeeName": { "type": "string" },
+        "officialEmail": { "type": "string" },
+        "profilePhotoUrl": { "type": "string" },
+        "mobileNumber": { "type": "string" },
+        "alternateNumber": { "type": "string" },
+        "dateOfBirth": { "type": "string" },
+        "gender": { "type": "string" },
+        "bloodGroup": { "type": "string" },
+        "maritalStatus": { "type": "string" },
+        "currentAddress": { "type": "string" },
+        "permanentAddress": { "type": "string" },
+        "emergencyContact": {
+          "type": "object",
+          "properties": {
+            "name": { "type": "string" },
+            "relationship": { "type": "string" },
+            "number": { "type": "string" }
+          }
+        },
+        "panNumber": { "type": "string" },
+        "aadhaarNumber": { "type": "string" },
+        "passportNumber": { "type": "string" },
+        "skills": { "type": "array", "items": { "type": "string" } },
+        "certifications": { "type": "array", "items": { "type": "string" } },
+        "languages": { "type": "array", "items": { "type": "string" } },
+        "profileCompletionPercentage": { "type": "number" },
+        "lastUpdatedAt": { "type": "string" },
+        "updatedBy": { "type": "string" },
+        "documents": { "type": "array" }
+      },
+      "required": ["employeeId", "employeeName", "officialEmail"]
     }
   },
   "firestore": {
@@ -371,6 +409,10 @@
     "dashboardSummary/{id}": {
       "schema": { "type": "object" },
       "description": "Supervisor dashboard metrics cache"
+    },
+    "employeeProfiles/{employeeId}": {
+      "schema": "EmployeeProfile",
+      "description": "HRMS Employee Self-Service Profiles"
     }
   }
 }

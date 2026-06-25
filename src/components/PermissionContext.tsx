@@ -2,6 +2,7 @@ import React, { createContext, useContext, useState, useEffect, ReactNode } from
 import { db } from '../lib/firebase';
 import { collection, query, where, getDocs, onSnapshot } from 'firebase/firestore';
 import { UserProfile, UserRole } from '../types';
+import { normalizeRole } from '../lib/hierarchy';
 
 export interface TMSPermissions {
   // SELF SERVICE PERMISSIONS
@@ -40,18 +41,19 @@ export interface TMSPermissions {
 }
 
 export const getDefaultTmsPermissions = (roleName: string): TMSPermissions => {
-  const norm = (roleName || '').toUpperCase().trim();
+  const norm = normalizeRole(roleName);
   const isAdmin = norm === 'ADMIN';
-  const isManager = norm === 'MANAGER';
+  const isManager = ['MANAGER', 'OPS_HEAD', 'HR', 'IT_MANAGER'].includes(norm);
   const isTLOrSupervisor = [
     'TEAM_LEAD',
     'STL',
     'OPS_TL',
     'QTL',
-    'TRAINER_TL'
+    'TRAINER_TL',
+    'SME'
   ].includes(norm);
   const isMIS = norm === 'MIS';
-  const isAgentOrQA = ['AGENT', 'QA', 'SME', 'TRAINER'].includes(norm);
+  const isAgentOrQA = ['AGENT', 'QA', 'TRAINER'].includes(norm);
 
   const selfService = {
     view_self_service: !isMIS,
@@ -210,7 +212,8 @@ export const PermissionProvider: React.FC<PermissionProviderProps> = ({ children
         'Historical Records', 
         'Important Quality Links', 
         'Console',
-        'Attendance'
+        'Attendance',
+        'IT Help Desk'
       ];
       modules.forEach(mod => {
         permMap[mod] = {
@@ -245,7 +248,13 @@ export const PermissionProvider: React.FC<PermissionProviderProps> = ({ children
       setLoading(false);
     }
 
-    const uniqueRoles = Array.from(new Set([roleName, rawRole]));
+    const uniqueRoles = Array.from(new Set([
+      roleName,
+      rawRole,
+      normalizeRole(rawRole),
+      rawRole.toUpperCase(),
+      rawRole.toUpperCase().replace(/\s+/g, '_')
+    ])).filter(Boolean);
     const q = query(
       collection(db, 'role_permissions'),
       where('role_name', 'in', uniqueRoles)
@@ -260,9 +269,21 @@ export const PermissionProvider: React.FC<PermissionProviderProps> = ({ children
         permMap = getFullPermissions();
       }
 
-      snapshot.docs.forEach((doc) => {
-        const data = doc.data();
-        permMap[data.module_name] = {
+      snapshot.docs.forEach((docSnap) => {
+        const docId = docSnap.id;
+        const data = docSnap.data();
+        const m = data.module_name || '';
+        if (!m) return;
+
+        const expectedId = `${data.role_name}_${m}`;
+        const underscoreId = `${data.role_name}_${m.replace(/\s+/g, '_')}`;
+
+        // Skip legacy underscore-keyed duplicate items
+        if (docId === underscoreId && underscoreId !== expectedId) {
+          return;
+        }
+
+        permMap[m] = {
           can_view: !!data.can_view,
           can_create: !!data.can_create,
           can_edit: !!data.can_edit,
@@ -304,6 +325,31 @@ export const PermissionProvider: React.FC<PermissionProviderProps> = ({ children
     // Legacy support for 'Attendance System' -> 'Attendance'
     const targetModule = module === 'Attendance' ? 'Attendance' : module;
     const fallbackModule = module === 'Attendance' ? 'Attendance System' : module;
+    
+    if (module === 'IT Help Desk') {
+      return permissions[targetModule] || permissions[fallbackModule] || {
+        can_view: true,
+        can_create: true,
+        can_edit: false,
+        can_delete: false,
+        can_export: false,
+        can_approve: false,
+        view_team: false,
+        view_all: false,
+        assign: false,
+        override: false,
+        force_action: false,
+        manage_settings: false,
+        manage_masters: false,
+        audit_access: false,
+        email_trigger: false,
+        bulk_action: false,
+        reopen_records: false,
+        escalate: false,
+        comment: true,
+        view_sensitive_data: false,
+      };
+    }
     
     return permissions[targetModule] || permissions[fallbackModule] || {
       can_view: false,
