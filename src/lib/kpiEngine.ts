@@ -488,16 +488,7 @@ export async function runDynamicKPIEngine(reportingPeriod: string, allUsersPasse
     console.log(`Collection: kpi_uploads`);
     console.log(`Selected Period: ${cleanPeriod}`);
 
-    const allUploadsSnap = await getDocs(collection(db, 'kpi_uploads'));
-    const allUploads = allUploadsSnap.docs.map(d => d.data() as KpiUploadRow);
-    const availablePeriods = Array.from(new Set(allUploads.map(doc => doc.reportingPeriod)));
-    const availableProcesses = Array.from(new Set(allUploads.map(doc => doc.processName)));
-    const availableRoles = Array.from(new Set(allUploads.map(doc => doc.role)));
-
-    console.log(`Total KPI records in Firestore: ${allUploads.length}`);
-    console.log(`Available Periods: ${availablePeriods.join(', ')}`);
-    console.log(`Available Processes: ${availableProcesses.join(', ')}`);
-    console.log(`Available Roles: ${availableRoles.join(', ')}`);
+    // OPTIMIZED: Removed expensive full collection scan of kpi_uploads for diagnostics
     // --- DIAGNOSTICS END ---
 
     // Fetch up-to-date users list directly from Firebase 'users' collection to check register state
@@ -535,20 +526,17 @@ export async function runDynamicKPIEngine(reportingPeriod: string, allUsersPasse
       console.log(`[DEBUG KPI ENGINE] Firestore kpi_uploads sample records reportingPeriod:`, diagnosticSnap.docs.map(d => d.data().reportingPeriod));
     }
 
-    // --- TEMPORARY DIAGNOSTIC START ---
-    const allUploadsSnapTemp = await getDocs(uploadsCol);
-    const allUploadsDataTemp = allUploadsSnapTemp.docs.map(d => d.data() as KpiUploadRow);
-    const countsByWorkDate: Record<string, number> = {};
-    allUploadsDataTemp.forEach(u => {
-      const wd = u.workDate || 'unknown';
-      countsByWorkDate[wd] = (countsByWorkDate[wd] || 0) + 1;
-    });
-    console.log('[DIAGNOSTIC] Counts by Work Date in Full kpi_uploads collection:', countsByWorkDate);
-    // --- TEMPORARY DIAGNOSTIC END ---
+    // --- TEMPORARY DIAGNOSTIC REMOVED ---
+    // OPTIMIZED: Removed second expensive full collection scan of kpi_uploads
 
     // --- QUERY DIAGNOSTICS ---
     console.log(`Query Executed: where('reportingPeriod', '==', '${cleanPeriod}')`);
     console.log(`Returned Record Count: ${uploadsSnap.size}`);
+
+    if (uploadsSnap.empty) {
+      console.warn(`[KPI ENGINE] No uploads located for period "${cleanPeriod}". Scoring calculations skipped.`);
+      return { scorecardsCount: 0 };
+    }
 
     // Purge old scorecards for this period to prevent calculation duplicates
     const scorecardsCol = collection(db, 'scorecards');
@@ -570,11 +558,6 @@ export async function runDynamicKPIEngine(reportingPeriod: string, allUsersPasse
       const batch = writeBatch(db);
       leaderboardsSnap.docs.forEach(docSnap => batch.delete(docSnap.ref));
       await batch.commit();
-    }
-
-    if (uploadsSnap.empty) {
-      console.warn(`[KPI ENGINE] No uploads located for period "${cleanPeriod}". Scoring calculations skipped.`);
-      return { scorecardsCount: 0 };
     }
 
     const rawRows = uploadsSnap.docs.map(d => d.data() as KpiUploadRow);

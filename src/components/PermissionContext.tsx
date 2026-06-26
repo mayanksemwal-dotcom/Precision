@@ -318,7 +318,7 @@ export const PermissionProvider: React.FC<PermissionProviderProps> = ({ children
     });
 
     return () => unsubscribe();
-  }, [user, overriddenRole]);
+  }, [user?.uid, user?.role, user?.email, overriddenRole]);
 
   // Utility to get permissions for a module with fallback
   const getModPerms = (module: string): PermissionActions => {
@@ -349,6 +349,37 @@ export const PermissionProvider: React.FC<PermissionProviderProps> = ({ children
         comment: true,
         view_sensitive_data: false,
       };
+    }
+    
+    if (module === 'Employee Relations') {
+      const warningPerms = permissions['Warnings'];
+      const pipPerms = permissions['PIP Management'];
+      
+      // If they had access to either, give them access to Employee Relations
+      if ((warningPerms && warningPerms.can_view) || (pipPerms && pipPerms.can_view)) {
+        return {
+          can_view: true,
+          can_create: (warningPerms?.can_create || pipPerms?.can_create) || false,
+          can_edit: (warningPerms?.can_edit || pipPerms?.can_edit) || false,
+          can_delete: (warningPerms?.can_delete || pipPerms?.can_delete) || false,
+          can_export: (warningPerms?.can_export || pipPerms?.can_export) || false,
+          can_approve: (warningPerms?.can_approve || pipPerms?.can_approve) || false,
+          view_team: (warningPerms?.view_team || pipPerms?.view_team) || false,
+          view_all: (warningPerms?.view_all || pipPerms?.view_all) || false,
+          assign: false,
+          override: false,
+          force_action: false,
+          manage_settings: false,
+          manage_masters: false,
+          audit_access: false,
+          email_trigger: false,
+          bulk_action: false,
+          reopen_records: false,
+          escalate: false,
+          comment: false,
+          view_sensitive_data: false,
+        };
+      }
     }
     
     return permissions[targetModule] || permissions[fallbackModule] || {

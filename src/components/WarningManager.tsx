@@ -351,8 +351,9 @@ CC Checklist:
   };
 
   return (
-    <div className="space-y-6">
-      <div className="bg-red-50 border border-red-100 p-4 rounded-lg flex flex-col gap-3">
+    <div className="flex flex-col max-h-[80vh]">
+      <div className="space-y-6 overflow-y-auto pr-2 pb-2 flex-grow">
+        <div className="bg-red-50 border border-red-100 p-4 rounded-lg flex flex-col gap-3">
         <div className="flex gap-3">
           <ShieldAlert className="text-red-600 shrink-0" size={20} />
           <div>
@@ -502,8 +503,9 @@ CC Checklist:
           </Label>
         </div>
       </div>
+      </div>
 
-      <div className="flex justify-end gap-2 border-t pt-4">
+      <div className="flex justify-end gap-2 border-t pt-4 shrink-0 mt-4">
         <Button variant="ghost" className="font-bold text-slate-600 hover:bg-[#F1F5F9]" onClick={onClose}>Cancel</Button>
         <Button className="bg-red-600 hover:bg-red-700 text-white font-bold px-6 flex items-center gap-1.5" onClick={handleSubmit}>
           <Send size={14} /> Issue Ticket

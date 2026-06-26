@@ -315,6 +315,50 @@
         "documents": { "type": "array" }
       },
       "required": ["employeeId", "employeeName", "officialEmail"]
+    },
+    "ITTicket": {
+      "title": "IT Ticket",
+      "description": "IT help desk ticket",
+      "type": "object",
+      "properties": {
+        "ticketId": { "type": "string" },
+        "employeeId": { "type": "string" },
+        "employeeName": { "type": "string" },
+        "employeeEmail": { "type": "string" },
+        "category": { "type": "string" },
+        "priority": { "type": "string", "enum": ["Low", "Medium", "High", "Critical"] },
+        "subject": { "type": "string" },
+        "description": { "type": "string" },
+        "status": { "type": "string", "enum": ["New", "Assigned", "In Progress", "Waiting for User", "Resolved", "Closed", "Rejected"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ticketId", "employeeId", "category", "priority", "subject", "status"]
+    },
+    "ITAsset": {
+      "title": "IT Asset",
+      "description": "IT asset inventory item",
+      "type": "object",
+      "properties": {
+        "assetType": { "type": "string" },
+        "serialNumber": { "type": "string" },
+        "status": { "type": "string", "enum": ["Active", "In Maintenance", "Replaced", "Retired"] }
+      },
+      "required": ["assetType", "serialNumber", "status"]
+    },
+    "ITNotification": {
+      "title": "IT Notification",
+      "description": "In-app notification for IT help desk",
+      "type": "object",
+      "properties": {
+        "recipientId": { "type": "string" },
+        "title": { "type": "string" },
+        "body": { "type": "string" },
+        "ticketId": { "type": "string" },
+        "read": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["recipientId", "title", "body", "read", "createdAt"]
     }
   },
   "firestore": {
@@ -413,6 +457,18 @@
     "employeeProfiles/{employeeId}": {
       "schema": "EmployeeProfile",
       "description": "HRMS Employee Self-Service Profiles"
+    },
+    "itTickets/{ticketId}": {
+      "schema": "ITTicket",
+      "description": "IT help desk tickets"
+    },
+    "itAssets/{assetId}": {
+      "schema": "ITAsset",
+      "description": "IT asset inventory"
+    },
+    "itNotifications/{notifId}": {
+      "schema": "ITNotification",
+      "description": "In-app notifications for IT tickets"
     }
   }
 }

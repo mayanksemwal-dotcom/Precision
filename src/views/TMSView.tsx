@@ -22,7 +22,8 @@ import {
   MonitorOff,
   Laptop,
   Tablet,
-  Smartphone
+  Smartphone,
+  Monitor
 } from 'lucide-react';
 import ProcessSelector from '../components/ProcessSelector';
 import SupervisorDashboard from '../components/tms/SupervisorDashboard';
@@ -484,6 +485,7 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
   // Real-time user's shift state
   const [currentShift, setCurrentShift] = useState<TMSShift | null>(null);
   const [myPastShifts, setMyPastShifts] = useState<TMSShift[]>([]);
+  const attemptedHealsRef = useRef<Set<string>>(new Set());
   
   // Admin view variables
   const [allShifts, setAllShifts] = useState<TMSShift[]>([]);
@@ -576,7 +578,7 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
       console.warn('Failed to subscribe config/attendanceSettings in TMSView', err);
     });
     return () => unsub();
-  }, [user]);
+  }, [user?.uid]);
 
   // Fetch Processes Config in Real-time from config/tmsProcesses document
   useEffect(() => {
@@ -609,7 +611,7 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
       setProcesses(prev => prev.length > 0 ? prev : DEFAULT_PROCESSES);
     });
     return () => unsub();
-  }, [user]);
+  }, [user?.uid]);
 
   // Fetch User's Personal Shifts & Current Active Shift
   useEffect(() => {
@@ -629,12 +631,19 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
 
       // Find and heal duplicate active shifts
       const activeShiftsList = shifts.filter(s => s.status === 'ACTIVE' || s.status === 'BREAK');
-      if (activeShiftsList.length > 1) {
+      const filteredDuplicateClosingShifts = activeShiftsList.slice(1).filter(sh => {
+        if (!attemptedHealsRef.current.has(sh.id)) {
+          attemptedHealsRef.current.add(sh.id);
+          return true;
+        }
+        return false;
+      });
+
+      if (filteredDuplicateClosingShifts.length > 0) {
         // Find older duplicates to close
-        const duplicateClosingShifts = activeShiftsList.slice(1);
         const healBatch = writeBatch(db);
         const healNowISO = getLiveTimeISO();
-        duplicateClosingShifts.forEach(sh => {
+        filteredDuplicateClosingShifts.forEach(sh => {
           const updatedActivities = [...(sh.activities || [])];
           if (updatedActivities.length > 0) {
             const lastIndex = updatedActivities.length - 1;
@@ -642,13 +651,17 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
               updatedActivities[lastIndex].endTime = healNowISO;
             }
           }
-          healBatch.set(doc(db, 'tmsShifts', sh.id), {
+          const finalized = {
             ...sh,
             activities: updatedActivities,
             status: 'AUTO_CLOSED',
             clockOutTime: healNowISO,
             remarks: 'System Auto-Resolved Duplicate Active Shift (User Self-Healing)'
-          });
+          };
+          healBatch.set(doc(db, 'tmsShifts', sh.id), finalized);
+          
+          // Trigger attendance sync for each closed duplicate
+          syncShiftToAttendance(finalized).catch(e => console.error('Failed to sync duplicate shift attendance', e));
         });
         healBatch.commit().catch(e => console.error('Failed to auto-heal duplicate shifts for active user', e));
       }
@@ -660,25 +673,29 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
         const activeProductiveMs = getShiftProductiveMs(active, referenceTime);
         const TEN_HOURS_MS = 10 * 60 * 60 * 1000;
         if (activeProductiveMs >= TEN_HOURS_MS) {
-          const { activities: updatedActivities, clockOutTime } = truncateShiftToProductiveTime(active, TEN_HOURS_MS);
-          const finalizedShift = {
-            ...active,
-            activities: updatedActivities,
-            clockOutTime,
-            status: 'AUTO_CLOSED' as const,
-            remarks: 'Auto-clocked out after 10 hours productive time'
-          };
+          if (!attemptedHealsRef.current.has(active.id)) {
+            attemptedHealsRef.current.add(active.id);
 
-          saveShiftState(finalizedShift)
-            .then(() => syncShiftToAttendance({ id: active.id, ...finalizedShift }))
-            .then(() => {
-              const userRef = doc(db, 'users', user.uid);
-              return updateDoc(userRef, {
-                status: 'OFFLINE',
-                lastLogoutAt: clockOutTime
-              });
-            })
-            .catch(err => console.error('Error auto-clocking out shift:', err));
+            const { activities: updatedActivities, clockOutTime } = truncateShiftToProductiveTime(active, TEN_HOURS_MS);
+            const finalizedShift = {
+              ...active,
+              activities: updatedActivities,
+              clockOutTime,
+              status: 'AUTO_CLOSED' as const,
+              remarks: 'Auto-clocked out after 10 hours productive time'
+            };
+
+            saveShiftState(finalizedShift)
+              .then(() => syncShiftToAttendance({ id: active.id, ...finalizedShift }))
+              .then(() => {
+                const userRef = doc(db, 'users', user.uid);
+                return updateDoc(userRef, {
+                  status: 'OFFLINE',
+                  lastLogoutAt: clockOutTime
+                });
+              })
+              .catch(err => console.error('Error auto-clocking out shift:', err));
+          }
 
           setCurrentShift(null);
         } else {
@@ -699,7 +716,7 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
     });
 
     return () => unsubscribe();
-  }, [user]);
+  }, [user?.uid]);
 
   const getDateRange = (preset: string, customStart?: string, customEnd?: string) => {
     const now = new Date();
@@ -752,8 +769,9 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
   };
 
   useEffect(() => {
-    if (!user || !canViewReports) return;
-    const qAllShifts = query(collection(db, 'tmsShifts'), orderBy('clockInTime', 'desc'), limit(300));
+    // OPTIMIZED: Only fetch the massive 5000 shift list if NOT a dashboard user (who uses SupervisorDashboard's own optimized sync)
+    if (!user || !canViewReports || isDashboardUser) return;
+    const qAllShifts = query(collection(db, 'tmsShifts'), orderBy('clockInTime', 'desc'), limit(500));
     const unsubscribe = onSnapshot(qAllShifts, (snap) => {
       const shifts = snap.docs.map(doc => ({ id: doc.id, ...doc.data() } as TMSShift));
       setAllShifts(shifts);
@@ -2789,6 +2807,23 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
                 <div className="text-center">
                   <p className="text-[9px] font-black uppercase text-slate-400 tracking-wider text-amber-600">Total Breaks</p>
                   <p className="font-mono text-sm font-black text-amber-700 mt-1">{elapsedBreak}</p>
+                </div>
+              </div>
+
+              {/* Device Verification Status */}
+              <div className="flex items-center justify-between px-4 py-2.5 bg-slate-50/80 rounded-xl border border-slate-200 border-dashed">
+                <div className="flex items-center gap-2.5">
+                  <div className={`p-1.5 rounded-lg ${deviceType === 'Desktop' ? 'bg-emerald-50 text-emerald-600' : 'bg-fuchsia-50 text-fuchsia-600'}`}>
+                    {deviceType === 'Desktop' ? <Monitor size={14} /> : deviceType === 'Tablet' ? <Tablet size={14} /> : <Smartphone size={14} />}
+                  </div>
+                  <div>
+                    <p className="text-[9px] font-black uppercase text-slate-400 leading-none">Access Point</p>
+                    <p className="text-[11px] font-extrabold text-slate-700 mt-0.5 leading-none">{deviceType} Verified</p>
+                  </div>
+                </div>
+                <div className="text-right">
+                   <p className="text-[8px] font-black uppercase text-slate-400 leading-none">Platform OS</p>
+                   <p className="text-[10px] font-bold text-slate-500 mt-0.5 leading-none">{os}</p>
                 </div>
               </div>
 

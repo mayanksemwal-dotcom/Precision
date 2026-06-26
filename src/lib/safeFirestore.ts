@@ -7,6 +7,7 @@
  */
 
 import { FirestoreError } from 'firebase/firestore';
+import { firestoreLogger } from './firestoreLogger';
 
 const QUOTA_BLOCK_KEY = 'precision360_firestore_blocked';
 
@@ -18,7 +19,8 @@ export function isFirestoreBlocked(): boolean {
 }
 
 export function handleFirestoreError(error: any, op: string, collection: string) {
-  console.error(`Firestore Error [${op}] on [${collection}]:`, error);
+  const stats = firestoreLogger.getStats();
+  console.error(`Firestore Error [${op}] on [${collection}] (Cumulative Reads: ${stats.totalReads}, Writes: ${stats.totalWrites}):`, error);
 
   if (error instanceof FirestoreError) {
     if (error.code === 'resource-exhausted') {

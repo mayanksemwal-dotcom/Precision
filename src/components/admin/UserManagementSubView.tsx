@@ -435,15 +435,18 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
   const [dynamicRoles, setDynamicRoles] = useState<string[]>([]);
 
   useEffect(() => {
-    const unsubscribe = onSnapshot(collection(db, 'roles'), (snapshot) => {
-      const list = snapshot.docs.map(doc => doc.id.toUpperCase().trim());
-      const baselineRoles = Object.keys(UserRole);
-      const combined = Array.from(new Set([...baselineRoles, ...list]));
-      setDynamicRoles(combined);
-    }, (error) => {
-      console.error('Error listening to dynamic roles:', error);
-    });
-    return () => unsubscribe();
+    const fetchRegisteredRoles = async () => {
+      try {
+        const snapshot = await getDocs(collection(db, 'roles'));
+        const list = snapshot.docs.map(doc => doc.id.toUpperCase().trim());
+        const baselineRoles = Object.keys(UserRole);
+        const combined = Array.from(new Set([...baselineRoles, ...list]));
+        setDynamicRoles(combined);
+      } catch (error) {
+        console.error('Error fetching dynamic roles:', error);
+      }
+    };
+    fetchRegisteredRoles();
   }, []);
 
   useEffect(() => {

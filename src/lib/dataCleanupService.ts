@@ -60,18 +60,9 @@ export const performCascadeDeleteKpiUploads = async (records: any[], reason: str
         }
     }
 
-    // Post-deletion cascade recalculation
+    // Post-deletion: No longer automatically triggering recalculations to save on Firestore costs.
+    // Calculations must be manually triggered by administrators via the Scorecard Dashboard.
     if (deletedPeriods.length > 0) {
-        try {
-            console.log(`Cascade: Triggering engine recalculations for affected periods: ${deletedPeriods.join(', ')}`);
-            const usersSnap = await getDocs(collection(db, 'users'));
-            const allUsers = usersSnap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-            
-            for (const period of deletedPeriods) {
-                await runDynamicKPIEngine(period, allUsers);
-            }
-        } catch (e) {
-            console.error('Cascading update failed:', e);
-        }
+      console.log(`Cascade: ${deletedPeriods.length} periods affected. Administrator must manually re-calculate scorecards for: ${deletedPeriods.join(', ')}`);
     }
 }

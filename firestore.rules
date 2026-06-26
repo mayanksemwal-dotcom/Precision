@@ -141,12 +141,45 @@ service cloud.firestore {
       allow delete: if isManager() || isAdmin();
     }
 
+    function isITEngineer() {
+      return isVerified() && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isITEngineer == true;
+    }
+
+    match /itTickets/{ticketId} {
+      allow read: if isVerified() && (isAdmin() || isTL() || isQA() || isRole('MIS') || isITEngineer() || resource.data.employeeId == request.auth.uid || resource.data.createdBy == request.auth.uid);
+      allow create: if isVerified();
+      allow update: if isVerified() && (isAdmin() || isRole('MIS') || isITEngineer() || resource.data.employeeId == request.auth.uid || resource.data.createdBy == request.auth.uid);
+      allow delete: if isAdmin();
+    }
+
+    match /itAssets/{assetId} {
+      allow read: if isVerified() && (isAdmin() || isTL() || isRole('MIS') || isITEngineer() || resource.data.assignedUser == request.auth.uid);
+      allow write: if isAdmin() || isRole('MIS') || isITEngineer();
+    }
+
+    match /itNotifications/{notifId} {
+      allow read: if isVerified() && resource.data.recipientId == request.auth.uid;
+      allow create: if isVerified();
+      allow update: if isVerified() && resource.data.recipientId == request.auth.uid;
+      allow delete: if isVerified() && resource.data.recipientId == request.auth.uid;
+    }
+
+    match /itHelpDeskConfig/{configId} {
+      allow read: if isVerified();
+      allow write: if isAdmin() || isRole('MIS');
+    }
+
+    match /aggregates/{id} {
+      allow read: if isVerified();
+      allow write: if isAdmin() || isManager() || isTL();
+    }
+
     match /disciplinaryLogs/{logId} {
       allow read: if isVerified() && (isAdmin() || isTL() || isQA() || isOwner(existing().agentId));
       allow create: if isTL() && isValidWarning(incoming());
       allow update: if isVerified() && (isAdmin() ||
         (isOwner(existing().agentId) && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'acceptedAt', 'history'])) ||
-        (isTL() && incoming().diff(existing()).affectedKeys().hasOnly(['remarks', 'severity', 'level', 'status']))
+        (isTL() && incoming().diff(existing()).affectedKeys().hasOnly(['remarks', 'severity', 'level', 'status', 'isDeleted', 'deletedAt', 'deletedBy']))
       );
       allow delete: if isAdmin();
     }

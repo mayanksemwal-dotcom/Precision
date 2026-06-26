@@ -8,7 +8,8 @@ import {
   where, 
   writeBatch,
   getDoc,
-  addDoc
+  addDoc,
+  limit
 } from 'firebase/firestore';
 import { 
   DailyTarget, 
@@ -343,7 +344,7 @@ export async function bootstrapKpiHistoricalData(allUsers: UserProfile[], curren
       return;
     }
 
-    const testQuery = query(collection(db, 'dailyPerformanceUploads'));
+    const testQuery = query(collection(db, 'dailyPerformanceUploads'), limit(1));
     const testSnap = await getDocs(testQuery);
     if (!testSnap.empty) {
       console.log('Daily performance credentials database already seeded.');

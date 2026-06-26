@@ -9,6 +9,8 @@ import {
   User as UserIcon,
   Calendar,
   ChevronRight,
+  ChevronDown,
+  ChevronUp,
   TrendingUp,
   Search,
   Filter,
@@ -134,6 +136,12 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
   const [searchTerm, setSearchTerm] = useState('');
   const [isWarningOpen, setIsWarningOpen] = useState(false);
   const [statusFilter, setStatusFilter] = useState<string>('All');
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+  
+  // Custom modals to bypass iframe prompt/confirm blocks
+  const [ticketToEdit, setTicketToEdit] = useState<WarningTicket | null>(null);
+  const [editRemarks, setEditRemarks] = useState('');
+  const [ticketToDelete, setTicketToDelete] = useState<WarningTicket | null>(null);
 
   // Filter based on hierarchy, and exclude soft-deleted
   const filteredWarnings = warnings.filter(w => {
@@ -166,42 +174,57 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
   const canModifyWarning = canEdit('Warnings');
   const canDeleteWarning = canDelete('Warnings');
 
-  const handleDelete = async (ticket: WarningTicket) => {
-    if (confirm('Are you sure you want to soft-delete/cancel this warning ticket? It will be archived and logged.')) {
-        try {
-            const docRef = doc(db, 'disciplinaryLogs', ticket.id);
-            const nowISO = new Date().toISOString();
-            const performerName = `${user.fullName || user.name || user.email}`;
+  const executeDelete = async () => {
+    if (!ticketToDelete) return;
+    try {
+        const docRef = doc(db, 'disciplinaryLogs', ticketToDelete.id);
+        const nowISO = new Date().toISOString();
+        const performerName = `${user.fullName || user.name || user.email}`;
 
-            await updateDoc(docRef, {
-                isDeleted: true,
-                status: 'Deleted',
-                deletedAt: nowISO,
-                deletedBy: user.email
-            });
+        await updateDoc(docRef, {
+            isDeleted: true,
+            status: 'Deleted',
+            deletedAt: nowISO,
+            deletedBy: user.email
+        });
 
-            // Log tool audit event
-            await addDoc(collection(db, 'adminAuditLogs'), {
-              timestamp: nowISO,
-              action: 'Warning Closed',
-              performedBy: `${performerName} (${user.email})`,
-              affectedUser: `${ticket.agentName} (${ticket.agentEmail})`,
-              previousValue: ticket.status || 'Pending',
-              newValue: 'Deleted / Cancelled',
-              remarks: `Soft deleted warning ticket ${ticket.id}`,
-              details: {
-                ticketId: ticket.id,
-                level: ticket.level,
-                reason: ticket.remarks
-              }
-            });
+        // Log tool audit event
+        await addDoc(collection(db, 'adminAuditLogs'), {
+          timestamp: nowISO,
+          action: 'Warning Closed',
+          performedBy: `${performerName} (${user.email})`,
+          affectedUser: `${ticketToDelete.agentName} (${ticketToDelete.agentEmail})`,
+          previousValue: ticketToDelete.status || 'Pending',
+          newValue: 'Deleted / Cancelled',
+          remarks: `Soft deleted warning ticket ${ticketToDelete.id}`,
+          details: {
+            ticketId: ticketToDelete.id,
+            level: ticketToDelete.level,
+            reason: ticketToDelete.remarks
+          }
+        });
 
-            toast.success('Warning ticket successfully soft-deleted.');
-            if (onRefresh) onRefresh();
-        } catch (err: any) {
-             console.error('Deletion failure:', err);
-             toast.error(`Deletion failed: ${err.message || 'Permission denied'}`);
-        }
+        toast.success('Warning ticket successfully soft-deleted.');
+        setTicketToDelete(null);
+        if (onRefresh) onRefresh();
+    } catch (err: any) {
+         console.error('Deletion failure:', err);
+         toast.error(`Deletion failed: ${err.message || 'Permission denied'}`);
+    }
+  };
+
+  const executeEdit = async () => {
+    if (!ticketToEdit || !editRemarks || editRemarks === ticketToEdit.remarks) {
+      setTicketToEdit(null);
+      return;
+    }
+    try {
+      await updateDoc(doc(db, 'disciplinaryLogs', ticketToEdit.id), { remarks: editRemarks });
+      toast.success('Warning updated successfully');
+      setTicketToEdit(null);
+      if (onRefresh) onRefresh();
+    } catch (err: any) {
+      toast.error(`Update failed: ${err.message}`);
     }
   };
 
@@ -323,7 +346,7 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
                   </Button>
                 }
               />
-              <DialogContent className="sm:max-w-[500px] bg-white dark:bg-slate-900 shadow-2xl border border-slate-200 dark:border-slate-800 [id^='dialog-content-']">
+              <DialogContent className="sm:max-w-[500px] max-h-[90vh] overflow-y-auto bg-white dark:bg-slate-900 shadow-2xl border border-slate-200 dark:border-slate-800 [id^='dialog-content-']">
                 <DialogHeader>
                   <DialogTitle className="text-xl font-bold dark:text-white">Raise Disciplinary Action</DialogTitle>
                   <DialogDescription className="text-slate-500 dark:text-slate-400">
@@ -412,6 +435,7 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
               <Button 
                 variant="link" 
                 className="text-xs font-bold text-slate-500 dark:text-slate-400 flex items-center gap-1"
+                nativeButton={false}
                 render={
                   <a 
                     href="https://docs.google.com/document/d/1zAu2KCCUfOFBA8-nopnc1YRNycaDhCtRPfI7CIgFl7Y/edit?tab=t.ttcgryfeyu7#heading=h.ra63ci5w7hx3" 
@@ -487,7 +511,8 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
                     const agentDisplayEmpId = targetUser?.employeeId || ticket.employeeId || (targetUser?.uid ? `EMP-2026-${targetUser.uid.substring(0, 4).toUpperCase()}` : 'N/A');
 
                     return (
-                      <TableRow key={ticket.id} className="hover:bg-slate-50/50 dark:hover:bg-slate-800/50 border-slate-100 dark:border-slate-800 group transition-colors">
+                      <React.Fragment key={ticket.id}>
+                      <TableRow onClick={() => setExpandedId(expandedId === ticket.id ? null : ticket.id)} className="hover:bg-slate-50/50 dark:hover:bg-slate-800/50 border-slate-100 dark:border-slate-800 group transition-colors cursor-pointer">
                         <TableCell className="pl-6">
                           <Badge className={`border px-2 py-0.5 rounded-full font-extrabold text-[10px] shadow-sm ${getLevelColor(ticket.level)}`}>
                             {ticket.level} Notice
@@ -568,34 +593,31 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
                                 Accepted <CheckCircle size={12} />
                               </Button>
                             )}
-                            {canModifyWarning && (
+                            {(canModifyWarning || ticket.qaId === user.uid || user.role === 'ADMIN') && (
                                 <Button 
                                   size="sm" 
                                   variant="ghost" 
                                   className="text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800 h-8 w-8 p-0 cursor-pointer"
-                                  onClick={async () => {
-                                    const newRemarks = prompt('Edit warning remarks:', ticket.remarks);
-                                    if (newRemarks && newRemarks !== ticket.remarks) {
-                                      try {
-                                        const { doc, updateDoc } = await import('firebase/firestore');
-                                        await updateDoc(doc(db, 'disciplinaryLogs', ticket.id), { remarks: newRemarks });
-                                        toast.success('Warning updated successfully');
-                                        if (onRefresh) onRefresh();
-                                      } catch (err: any) {
-                                        toast.error(`Update failed: ${err.message}`);
-                                      }
-                                    }
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setTicketToEdit(ticket);
+                                    setEditRemarks(ticket.remarks);
                                   }}
+                                  nativeButton={true}
                                 >
                                   <Edit2 size={16} />
                                 </Button>
                             )}
-                            {canDeleteWarning && (
+                            {(canDeleteWarning || ticket.qaId === user.uid || user.role === 'ADMIN') && (
                                 <Button 
                                   size="sm" 
                                   variant="ghost" 
                                   className="text-red-500 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/30 h-8 w-8 p-0 cursor-pointer"
-                                  onClick={() => handleDelete(ticket)}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setTicketToDelete(ticket);
+                                  }}
+                                  nativeButton={true}
                                 >
                                   <Trash2 size={16} />
                                 </Button>
@@ -603,6 +625,48 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
                           </div>
                       </TableCell>
                       </TableRow>
+                      {expandedId === ticket.id && (
+                        <TableRow className="bg-slate-50/50 dark:bg-slate-800/20 hover:bg-slate-50/50 dark:hover:bg-slate-800/20 border-b-2 border-indigo-100 dark:border-indigo-900/30">
+                          <TableCell colSpan={6} className="p-0">
+                            <div className="p-6 grid grid-cols-2 gap-8 text-sm">
+                              <div>
+                                <h4 className="font-bold text-slate-800 dark:text-slate-200 mb-2 uppercase text-[10px] tracking-widest text-slate-500">Timeline & Details</h4>
+                                <div className="space-y-2 text-xs">
+                                  <p className="flex justify-between border-b border-slate-100 dark:border-slate-800 pb-1">
+                                    <span className="text-slate-500">Created At:</span>
+                                    <span className="font-medium">{formattedDate(ticket.createdAt)}</span>
+                                  </p>
+                                  <p className="flex justify-between border-b border-slate-100 dark:border-slate-800 pb-1">
+                                    <span className="text-slate-500">Raised By (User ID):</span>
+                                    <span className="font-medium font-mono">{ticket.qaId}</span>
+                                  </p>
+                                  {ticket.acceptedAt && (
+                                    <p className="flex justify-between border-b border-slate-100 dark:border-slate-800 pb-1">
+                                      <span className="text-slate-500">Accepted At:</span>
+                                      <span className="font-medium">{formattedDate(ticket.acceptedAt)}</span>
+                                    </p>
+                                  )}
+                                  <p className="flex justify-between border-b border-slate-100 dark:border-slate-800 pb-1">
+                                    <span className="text-slate-500">Current Status:</span>
+                                    <span className="font-medium">{ticket.status}</span>
+                                  </p>
+                                </div>
+                              </div>
+                              <div>
+                                <h4 className="font-bold text-slate-800 dark:text-slate-200 mb-2 uppercase text-[10px] tracking-widest text-slate-500">Resolution History</h4>
+                                <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-lg p-3 max-h-[150px] overflow-y-auto">
+                                  {ticket.history && (ticket.history as any[]).length > 0 ? (
+                                    <HistoryCell history={ticket.history as any[]} />
+                                  ) : (
+                                    <p className="text-xs text-slate-400 italic">No history logged yet.</p>
+                                  )}
+                                </div>
+                              </div>
+                            </div>
+                          </TableCell>
+                        </TableRow>
+                      )}
+                      </React.Fragment>
                     );
                   })}
                   
@@ -622,6 +686,26 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
           </Card>
         </div>
       </div>
+
+      <Dialog open={!!ticketToEdit} onOpenChange={(open) => !open && setTicketToEdit(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Edit Remark</DialogTitle>
+          </DialogHeader>
+          <Input value={editRemarks} onChange={(e) => setEditRemarks(e.target.value)} />
+          <Button onClick={executeEdit}>Save</Button>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={!!ticketToDelete} onOpenChange={(open) => !open && setTicketToDelete(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Delete Entry</DialogTitle>
+            <DialogDescription>Are you sure you want to delete this?</DialogDescription>
+          </DialogHeader>
+          <Button variant="destructive" onClick={executeDelete}>Delete</Button>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

@@ -55,7 +55,8 @@ import {
   where,
   limit,
   orderBy,
-  getCountFromServer
+  getCountFromServer,
+  onSnapshot
 } from 'firebase/firestore';
 import { 
   UserProfile, 
@@ -164,7 +165,6 @@ export default React.memo(function ScorecardView({ user, allUsers = [], onRefres
   const [selectedLeaderboardMgr, setSelectedLeaderboardMgr] = useState<string>('All');
   const [selectedDashboardProcess, setSelectedDashboardProcess] = useState<string>('All');
   const [isPeriodDropdownOpen, setIsPeriodDropdownOpen] = useState<boolean>(false);
-  const [isWorkDateDropdownOpen, setIsWorkDateDropdownOpen] = useState<boolean>(false);
 
   // Loading indicator states
   const [loading, setLoading] = useState<boolean>(false);
@@ -213,14 +213,14 @@ export default React.memo(function ScorecardView({ user, allUsers = [], onRefres
       setLoading(false);
     };
     initAndFetch();
-  }, [user]);
+  }, [user?.uid, user?.email]);
 
   // Sync default email filter based on logged-in user
   useEffect(() => {
     if (allUsers.length > 0 && !selectedEmail) {
       setSelectedEmail(user.email.toLowerCase().trim());
     }
-  }, [allUsers, selectedEmail, user]);
+  }, [allUsers, selectedEmail, user?.email]);
 
   // Synchronize dynamic leaderboard default selection with user's role if supported
   useEffect(() => {
@@ -231,9 +231,7 @@ export default React.memo(function ScorecardView({ user, allUsers = [], onRefres
         setSelectedLeaderboardRole(matched);
       }
     }
-  }, [user]);
-
-  const [selectedWorkDate, setSelectedWorkDate] = useState<string>('All');
+  }, [user?.role]);
 
   // Extract all unique available reporting periods from kpi_uploads and scorecards
   const availablePeriods = useMemo(() => {
@@ -266,40 +264,6 @@ export default React.memo(function ScorecardView({ user, allUsers = [], onRefres
     return Array.from(list).sort();
   }, [allRecentUploads, allScorecards]);
 
-  // Extract all unique available work dates from kpi_uploads and scorecards
-  const availableWorkDates = useMemo(() => {
-    const list = new Set<string>();
-    
-    allRecentUploads.forEach(row => {
-      if (row.workDate) {
-        let wd = row.workDate.trim();
-        if (/^\d{4}-\d{2}-\d{2}$/.test(wd)) {
-          list.add(wd);
-        }
-      } else if (row.reportingPeriod) {
-        let p = row.reportingPeriod.trim();
-        if (/^\d{4}-\d{2}-\d{2}$/.test(p)) {
-          list.add(p);
-        }
-      }
-    });
-
-    allScorecards.forEach(sc => {
-      if (sc.workDate) {
-        let wd = sc.workDate.trim();
-        if (/^\d{4}-\d{2}-\d{2}$/.test(wd)) {
-          list.add(wd);
-        }
-      } else if (sc.reportingPeriod) {
-        let p = sc.reportingPeriod.trim();
-        if (/^\d{4}-\d{2}-\d{2}$/.test(p)) {
-          list.add(p);
-        }
-      }
-    });
-
-    return Array.from(list).sort();
-  }, [allRecentUploads, allScorecards]);
 
   // Auto-default selectedPeriod to the latest available period when they change
   useEffect(() => {
@@ -312,41 +276,55 @@ export default React.memo(function ScorecardView({ user, allUsers = [], onRefres
   }, [availablePeriods, selectedPeriod]);
 
   /**
-   * Fetch templates, generated scorecards and counts from Firestore
+   * Real-time listeners for templates, generated scorecards and counts from Firestore
    */
-  const fetchAllKPIData = async () => {
-    try {
-      // 1. Fetch templates
-      const templatesSnap = await getDocs(collection(db, 'kpi_templates'));
+  useEffect(() => {
+    // 1. Listen to templates
+    const unsubTemplates = onSnapshot(collection(db, 'kpi_templates'), (templatesSnap) => {
       const fetchedTemplates = templatesSnap.docs.map(docSnap => docSnap.data() as KpiTemplate);
       setKpiTemplates(fetchedTemplates);
+    }, (error) => {
+      console.error('Template sync error: ', error);
+    });
 
-      // 2. Fetch scorecards
-      const scorecardsSnap = await getDocs(collection(db, 'scorecards'));
+    // 2. Listen to scorecards for the selected period
+    let scorecardsRef = collection(db, 'scorecards');
+    let scorecardsQ = selectedPeriod 
+      ? query(scorecardsRef, where('reportingPeriod', '==', selectedPeriod)) 
+      : query(scorecardsRef, limit(1000));
+      
+    const unsubScorecards = onSnapshot(scorecardsQ, (scorecardsSnap) => {
       const fetchedScorecards = scorecardsSnap.docs.map(docSnap => docSnap.data() as DynamicScorecard);
       setAllScorecards(fetchedScorecards);
+    }, (error) => {
+      console.error('Scorecard sync error: ', error);
+    });
 
-      // 3. Fetch count of raw uploads using getCountFromServer (lightweight metadata query, no docs downloaded!)
-      if (canManageKPIs) {
-        const uploadsCol = collection(db, 'kpi_uploads');
-        const countSnap = await getCountFromServer(uploadsCol);
-        setRawUploadsCount(countSnap.data().count);
-      }
-
-      // 4. Securely fetch up to 1000 raw uploaded records to populate dynamic discovery lists instantly
-      try {
-        const q = query(collection(db, 'kpi_uploads'), limit(10000));
-        const uploadsSnap = await getDocs(q);
+    // 3. Listen to raw uploaded records for the selected period
+    let unsubUploads = () => {};
+    if (canManageKPIs) {
+      let uploadsRef = collection(db, 'kpi_uploads');
+      let uploadsQ = selectedPeriod 
+        ? query(uploadsRef, where('reportingPeriod', '==', selectedPeriod), limit(2000))
+        : query(uploadsRef, limit(1000));
+        
+      unsubUploads = onSnapshot(uploadsQ, (uploadsSnap) => {
         setAllRecentUploads(uploadsSnap.docs.map(d => ({ ...d.data(), docId: d.id })));
-      } catch (errUpload) {
-        console.warn('Silent authorization fallback for kpi_uploads reads: ', errUpload);
-      }
-
-    } catch (err) {
-      console.error('Error fetching scorecard resources: ', err);
-      toast.error('Failed to sync Firestore KPI Scorecard system collections.');
-      handleFirestoreError(err, OperationType.LIST, 'kpi_scorecards');
+        setRawUploadsCount(uploadsSnap.size); // Dynamically update count based on size
+      }, (error) => {
+        console.warn('Silent authorization fallback for kpi_uploads reads: ', error);
+      });
     }
+
+    return () => {
+      unsubTemplates();
+      unsubScorecards();
+      unsubUploads();
+    };
+  }, [selectedPeriod, canManageKPIs]);
+
+  const fetchAllKPIData = async () => {
+    // Left empty for backwards compatibility with explicit refresh calls, since listeners handle updates
   };
 
   // Synchronize Template Designer when selected config role changes
@@ -377,8 +355,11 @@ export default React.memo(function ScorecardView({ user, allUsers = [], onRefres
 
   // Clean computed metrics for active selected scorecard
   const employeeScorecards = useMemo(() => {
-    const emailKey = selectedEmail.toLowerCase().trim();
-    let filtered = allScorecards.filter(sc => sc.employeeEmail.toLowerCase().trim() === emailKey);
+    if (!selectedEmail) return [];
+    const emailKey = (selectedEmail || '').toLowerCase().trim();
+    if (!emailKey) return [];
+    
+    let filtered = allScorecards.filter(sc => (sc.employeeEmail || '').toLowerCase().trim() === emailKey);
     
     filtered = filtered.filter(sc => ensureDateStr(sc.reportingPeriod) === ensureDateStr(selectedPeriod));
     
@@ -388,7 +369,7 @@ export default React.memo(function ScorecardView({ user, allUsers = [], onRefres
   const dashboardDailyRecordsList = useMemo(() => {
     return allRecentUploads.filter(row => {
       // 1. Match employee email
-      if (selectedEmail && row.employeeEmail.toLowerCase().trim() !== selectedEmail.toLowerCase().trim()) {
+      if (selectedEmail && (row.employeeEmail || '').toLowerCase().trim() !== (selectedEmail || '').toLowerCase().trim()) {
         return false;
       }
       // 2. Match reporting period
@@ -396,14 +377,7 @@ export default React.memo(function ScorecardView({ user, allUsers = [], onRefres
       const isPeriodMatch = (!selectedPeriod || pDate === ensureDateStr(selectedPeriod));
       if (!isPeriodMatch) return false;
 
-      // 3. Match work date if not 'All'
-      if (selectedWorkDate && selectedWorkDate !== 'All') {
-        if (row.workDate !== selectedWorkDate) {
-          return false;
-        }
-      }
-
-      // 4. Match dashboard process filter if not 'All'
+      // 3. Match dashboard process filter if not 'All'
       if (selectedDashboardProcess && selectedDashboardProcess !== 'All') {
         if (row.processName !== selectedDashboardProcess) {
           return false;
@@ -412,7 +386,7 @@ export default React.memo(function ScorecardView({ user, allUsers = [], onRefres
 
       return true;
     }).sort((a, b) => ensureDateStr(b.workDate || b.reportingPeriod).localeCompare(ensureDateStr(a.workDate || a.reportingPeriod)));
-  }, [allRecentUploads, selectedEmail, selectedPeriod, selectedWorkDate, selectedDashboardProcess]);
+  }, [allRecentUploads, selectedEmail, selectedPeriod, selectedDashboardProcess]);
 
   const dashboardAvailableProcesses = useMemo(() => {
     const list = new Set<string>();
@@ -823,16 +797,10 @@ export default React.memo(function ScorecardView({ user, allUsers = [], onRefres
     const record = allRecentUploads.find(u => u.docId === docId);
     const reportingPeriod = record?.reportingPeriod;
 
-    if (!confirm('Are you sure you want to delete this raw upload record? This will require a recalculation to update scorecards.')) return;
+    if (!confirm('Are you sure you want to delete this raw upload record? This will require a manual recalculation to update scorecards.')) return;
     try {
       await deleteDoc(doc(db, 'kpi_uploads', docId));
-      toast.success('Upload record deleted successfully.');
-
-      // Auto trigger recalculation for this period FIRST to ensure scorecards are in sync
-      if (reportingPeriod) {
-        toast.info(`Recalculating scorecards for period: ${reportingPeriod}`);
-        await runDynamicKPIEngine(reportingPeriod, allUsers);
-      }
+      toast.success('Upload record deleted successfully. Please click "Publish & Calculate Scorecards" to update rankings.');
       
       fetchRecentUploads();
       await fetchAllKPIData();
@@ -860,16 +828,10 @@ export default React.memo(function ScorecardView({ user, allUsers = [], onRefres
       delete (updateData as any).docId;
 
       await setDoc(ref, updateData, { merge: true });
-      toast.success('Historical record updated successfully.');
+      toast.success('Historical record updated. Please manually trigger calculation for the changes to reflect in scorecards.');
       setEditingHistoricalId(null);
       setEditHistoricalFields({});
       
-      // Auto trigger recalculation for this period FIRST
-      if (updateData.reportingPeriod) {
-        toast.info(`Recalculating scorecards for period: ${updateData.reportingPeriod}`);
-        await runDynamicKPIEngine(updateData.reportingPeriod, allUsers);
-      }
-
       fetchRecentUploads();
       await fetchAllKPIData();
     } catch (err) {
@@ -1050,27 +1012,15 @@ export default React.memo(function ScorecardView({ user, allUsers = [], onRefres
         });
         await batch.commit();
       }
-      toast.success(`Committed ${stagingData.length} records successfully to 'kpi_uploads' collection!`);
+      toast.success(`Committed ${stagingData.length} records successfully to 'kpi_uploads' collection! Use the "Publish & Calculate" button to generate scorecards.`);
 
-      // Extract unique reporting periods present
-      const uniquePeriods = Array.from(new Set(stagingData.map(r => r.reportingPeriod))) as string[];
-      
-      // Auto trigger recalculation for these periods to keep dashboard perfectly in sync
-      toast.info(`Triggering KPI calculation engine running for period(s): ${uniquePeriods.join(', ')}`);
-      for (const period of uniquePeriods) {
-        await runDynamicKPIEngine(period, allUsers);
-      }
-      
-      // Refresh all scorecards after engine completes
+      // Refresh all metadata counts
       await fetchAllKPIData();
       
       setStagingData([]);
       setStagingFileName('');
-      await fetchAllKPIData();
       
       if (onRefreshAllData) onRefreshAllData(true);
-      toast.success(`KPI calculations successfully loaded! All leaderboards & scorecards are updated.`);
-
     } catch (err) {
       console.error('Failed to commit uploads: ', err);
       toast.error('Failed to synchronize commits with Firestore database.');
@@ -1203,7 +1153,8 @@ export default React.memo(function ScorecardView({ user, allUsers = [], onRefres
 
   // Recharts Chart Dataset Setup
   const performanceChartData = useMemo(() => {
-    const group = allScorecards.filter(sc => sc.employeeEmail.toLowerCase().trim() === selectedEmail.toLowerCase().trim());
+    if (!selectedEmail) return [];
+    const group = allScorecards.filter(sc => (sc.employeeEmail || '').toLowerCase().trim() === (selectedEmail || '').toLowerCase().trim());
     return group.map(sc => ({
       period: sc.reportingPeriod,
       Score: sc.finalScore,
@@ -1241,7 +1192,7 @@ export default React.memo(function ScorecardView({ user, allUsers = [], onRefres
               variant="outline"
               className="border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700 h-9 px-3.5 font-bold text-xs gap-1.5 cursor-pointer"
             >
-              <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
+              <RefreshCw size={12} className={""} />
               Sync DB Indexes
             </Button>
             
@@ -1251,7 +1202,7 @@ export default React.memo(function ScorecardView({ user, allUsers = [], onRefres
                 disabled={processingRecalc || loading}
                 className="bg-indigo-600 hover:bg-indigo-700 text-white h-9 px-3.5 font-bold text-xs gap-1.5 shadow-none border-none cursor-pointer"
               >
-                <Sliders size={12} className={processingRecalc ? "animate-spin" : ""} />
+                <Sliders size={12} className={""} />
                 {processingRecalc ? 'Recalculating...' : 'Publish Scorecards'}
               </Button>
             )}
@@ -1315,54 +1266,6 @@ export default React.memo(function ScorecardView({ user, allUsers = [], onRefres
               </div>
             </div>
 
-            {/* Work Date Filter */}
-            <div className="space-y-3">
-              <label className="text-[10px] font-extrabold text-slate-500 dark:text-slate-400 uppercase tracking-wider">Work Date Filter</label>
-              <div className="relative">
-                <div 
-                  className="w-full text-xs font-bold h-10 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 cursor-pointer outline-none flex items-center justify-between group hover:border-indigo-300 dark:hover:border-indigo-500 transition-colors text-slate-900 dark:text-slate-100"
-                  onClick={() => setIsWorkDateDropdownOpen(!isWorkDateDropdownOpen)}
-                >
-                  <div className="flex items-center gap-2">
-                    <Clock size={14} className="text-slate-400 dark:text-slate-500" />
-                    <span className="truncate">{selectedWorkDate === 'All' ? 'All Work Dates' : selectedWorkDate}</span>
-                  </div>
-                  <ChevronDown size={14} className={cn("text-slate-400 dark:text-slate-500 transition-transform duration-200", isWorkDateDropdownOpen && "rotate-180")} />
-                </div>
-                
-                {isWorkDateDropdownOpen && (
-                  <>
-                    <div className="fixed inset-0 z-40" onClick={() => setIsWorkDateDropdownOpen(false)} />
-                    <div className="absolute top-full left-0 right-0 mt-1 z-50 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 shadow-xl rounded-lg max-h-60 overflow-y-auto w-full p-1 space-y-0.5 animate-in fade-in zoom-in-95 duration-150">
-                      <div
-                        className={`px-3 py-2.5 text-xs rounded-md cursor-pointer hover:bg-indigo-50 dark:hover:bg-indigo-900/50 flex items-center justify-between transition-colors ${selectedWorkDate === 'All' ? "bg-indigo-50 dark:bg-indigo-900/50 text-indigo-700 dark:text-indigo-400 font-bold" : "text-slate-700 dark:text-slate-300 font-medium"}`}
-                        onClick={() => {
-                          setSelectedWorkDate('All');
-                          setIsWorkDateDropdownOpen(false);
-                        }}
-                      >
-                        <span>All Work Dates</span>
-                        {selectedWorkDate === 'All' && <Check size={12} className="text-indigo-600 dark:text-indigo-400" />}
-                      </div>
-                      {availableWorkDates.map(d => (
-                        <div
-                          key={d}
-                          className={`px-3 py-2.5 text-xs rounded-md cursor-pointer hover:bg-indigo-50 dark:hover:bg-indigo-900/50 flex items-center justify-between transition-colors ${selectedWorkDate === d ? "bg-indigo-50 dark:bg-indigo-900/50 text-indigo-700 dark:text-indigo-400 font-bold" : "text-slate-700 dark:text-slate-300 font-medium"}`}
-                          onClick={() => {
-                            setSelectedWorkDate(d);
-                            setIsWorkDateDropdownOpen(false);
-                          }}
-                        >
-                          <span>{d}</span>
-                          {selectedWorkDate === d && <Check size={12} className="text-indigo-600 dark:text-indigo-400" />}
-                        </div>
-                      ))}
-                    </div>
-                  </>
-                )}
-              </div>
-            </div>
-
             {/* Dashboard specific Process filter (only when activeTab = dashboard) */}
             {activeTab === 'dashboard' && dashboardAvailableProcesses.length > 0 && (
               <div className="space-y-1.5 mt-4">
@@ -1388,8 +1291,8 @@ export default React.memo(function ScorecardView({ user, allUsers = [], onRefres
                 </div>
               ) : (
                 <UserPicker 
-                  onSelect={(u) => setSelectedEmail(u.email)}
-                  selectedUserId={allUsers.find(u => u.email === selectedEmail)?.uid}
+                  onSelect={(u) => setSelectedEmail(u?.email || '')}
+                  selectedUserId={allUsers.find(u => (u.email || '').toLowerCase() === (selectedEmail || '').toLowerCase())?.uid}
                   placeholder="Select or search employee..."
                   className="mt-1"
                 />
@@ -1688,7 +1591,7 @@ export default React.memo(function ScorecardView({ user, allUsers = [], onRefres
               ) : (
                 <Card className="border border-slate-150 p-8 rounded-2xl text-center space-y-4">
                   <div className="w-12 h-12 bg-indigo-50 rounded-full flex items-center justify-center mx-auto text-indigo-600">
-                    <Sliders size={20} className="animate-spin" />
+                    <Sliders size={20} />
                   </div>
                   <div>
                     <h3 className="text-md font-black text-slate-900">Scorecard Calculation Pending</h3>
@@ -1971,7 +1874,7 @@ export default React.memo(function ScorecardView({ user, allUsers = [], onRefres
                     {leaderboardRankings.map((sc, index) => (
                       <TableRow 
                         key={index} 
-                        className={`border-b border-slate-100 text-left hover:bg-slate-50/50 transition-colors ${sc.employeeEmail.toLowerCase() === user.email.toLowerCase() ? "bg-indigo-50/30 hover:bg-indigo-55/40" : ""}`}
+                        className={`border-b border-slate-100 text-left hover:bg-slate-50/50 transition-colors ${(sc.employeeEmail || '').toLowerCase() === (user.email || '').toLowerCase() ? "bg-indigo-50/30 hover:bg-indigo-55/40" : ""}`}
                       >
                         <TableCell className="text-center font-black text-xs text-slate-800">
                           {sc.rank === 1 ? (
@@ -1987,7 +1890,7 @@ export default React.memo(function ScorecardView({ user, allUsers = [], onRefres
                         <TableCell>
                           <div className="flex items-center gap-2">
                              {(() => {
-                               const ap = allUsers.find(u => u.email.toLowerCase().trim() === sc.employeeEmail.toLowerCase().trim());
+                               const ap = allUsers.find(u => (u.email || '').toLowerCase().trim() === (sc.employeeEmail || '').toLowerCase().trim());
                                return (
                                  <div className="w-7 h-7 rounded-full overflow-hidden bg-slate-100 flex items-center justify-center font-bold text-[10px] text-slate-400 border border-slate-200 shrink-0">
                                    {ap?.photoURL ? (
@@ -2001,7 +1904,7 @@ export default React.memo(function ScorecardView({ user, allUsers = [], onRefres
                              <div className="flex flex-col">
                                <span className="font-extrabold text-xs text-slate-900 flex items-center gap-1">
                                  {sc.employeeName}
-                                 {sc.employeeEmail.toLowerCase() === user.email.toLowerCase() && (
+                                 {(sc.employeeEmail || '').toLowerCase() === (user.email || '').toLowerCase() && (
                                    <Badge className="bg-indigo-600 h-4 text-[9px] font-bold text-white uppercase">Me</Badge>
                                  )}
                                </span>
@@ -2588,5 +2491,6 @@ export default React.memo(function ScorecardView({ user, allUsers = [], onRefres
       </div>
 
     </div>
-  );
-});
+  )
+}
+)

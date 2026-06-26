@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useDeferredValue } from 'react';
 import { 
   Users, 
   Clock, 
@@ -42,6 +42,7 @@ import {
   Cell 
 } from 'recharts';
 import { db, handleFirestoreError, OperationType } from '../../lib/firebase';
+import { firestoreLogger } from '../../lib/firestoreLogger';
 import { syncShiftToAttendance } from '../../services/attendanceSyncService';
 import { 
   doc, 
@@ -53,7 +54,8 @@ import {
   getDocs, 
   writeBatch,
   addDoc,
-  onSnapshot
+  onSnapshot,
+  limit
 } from 'firebase/firestore';
 import { UserProfile, UserRole } from '../../types';
 import { toast } from 'sonner';
@@ -63,6 +65,7 @@ import { MultiSelectDropdown } from '../ui/multi-select';
 import * as XLSX from 'xlsx';
 import { getManagerOfManager, getShiftProductiveMs, truncateShiftToProductiveTime, getDeviceType, getDetailedDeviceMetadata } from '../../views/TMSView';
 import { getLiveTime, getLiveTimeISO } from '../../lib/timeSync';
+import { AggregationService, AttendanceAggregate } from '../../lib/aggregationService';
 
 interface SupervisorDashboardProps {
   user: UserProfile;
@@ -110,6 +113,86 @@ interface TMSShift {
   detectedOS?: string;
 }
 
+const formatMs = (ms: number): string => {
+  const seconds = Math.floor((ms / 1000) % 60);
+  const minutes = Math.floor((ms / (1000 * 60)) % 60);
+  const hours = Math.floor(ms / (1000 * 60 * 60));
+  return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+};
+
+function SupervisorClockStrip({ myShift }: { myShift: TMSShift }) {
+  const [elapsedActive, setElapsedActive] = useState('00:00:00');
+  const [elapsedBreak, setElapsedBreak] = useState('00:00:00');
+  const [elapsedShift, setElapsedShift] = useState('00:00:00');
+
+  const { deviceType } = getDetailedDeviceMetadata();
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const startMs = new Date(myShift.clockInTime).getTime();
+      const now = getLiveTime().getTime();
+      const totalShiftMs = Math.max(0, now - startMs);
+
+      setElapsedShift(formatMs(totalShiftMs));
+
+      let activeMs = 0;
+      let breakMs = 0;
+
+      (myShift.activities || []).forEach(act => {
+        const start = new Date(act.startTime).getTime();
+        const end = act.endTime ? new Date(act.endTime).getTime() : now;
+        const duration = end - start;
+        const actName = (act.name || '').toLowerCase();
+        const isProductive = act.type === 'productive' || 
+                             actName.includes('meeting') || 
+                             actName.includes('coaching') || 
+                             actName.includes('training') || 
+                             actName.includes('alignment');
+        if (isProductive) {
+          activeMs += duration;
+        } else {
+          breakMs += duration;
+        }
+      });
+
+      setElapsedActive(formatMs(activeMs));
+      setElapsedBreak(formatMs(breakMs));
+    }, 1000);
+
+    return () => clearInterval(interval);
+  }, [myShift]);
+
+  return (
+    <div className="flex items-center gap-3 border border-indigo-100 dark:border-indigo-950/40 bg-indigo-50/40 dark:bg-indigo-950/20 px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all flex-wrap">
+      <div className="flex items-center gap-1">
+        <span className="text-[10px] text-slate-400 dark:text-slate-500 uppercase font-black font-sans">Shift:</span>
+        <span className="font-mono text-indigo-600 dark:text-indigo-400 font-extrabold">{elapsedShift}</span>
+      </div>
+      <div className="h-3 w-px bg-slate-200 dark:bg-slate-800" />
+      <div className="flex items-center gap-1">
+        <span className="text-[10px] text-slate-400 dark:text-slate-500 uppercase font-black font-sans">Active:</span>
+        <span className="font-mono text-emerald-600 dark:text-emerald-400 font-extrabold">{elapsedActive}</span>
+      </div>
+      <div className="h-3 w-px bg-slate-200 dark:bg-slate-800" />
+      <div className="flex items-center gap-1">
+        <span className="text-[10px] text-slate-400 dark:text-slate-500 uppercase font-black font-sans">Break:</span>
+        <span className="font-mono text-amber-600 dark:text-amber-500 font-extrabold">{elapsedBreak}</span>
+      </div>
+      <div className="h-3 w-px bg-slate-200 dark:bg-slate-800" />
+      <div className="flex items-center gap-1.5 px-1 py-0.5 rounded bg-white/50 dark:bg-slate-800/50 border border-slate-100 dark:border-slate-800">
+        {deviceType === 'Mobile' ? (
+          <Smartphone size={12} className="text-fuchsia-500" />
+        ) : deviceType === 'Tablet' ? (
+          <Tablet size={12} className="text-indigo-500" />
+        ) : (
+          <Monitor size={12} className="text-emerald-500" />
+        )}
+        <span className="text-[9px] font-black uppercase tracking-wider text-slate-600 dark:text-slate-400">{deviceType}</span>
+      </div>
+    </div>
+  );
+}
+
 export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, externalTheme }: SupervisorDashboardProps) {
   const { hasTmsPermission, permissions, loading: permissionsLoading } = usePermission();
   const isDark = document.documentElement.classList.contains('dark') || externalTheme === 'dark';
@@ -121,9 +204,25 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
   const [activeShifts, setActiveShifts] = useState<TMSShift[]>([]);
   const [isLoadingShifts, setIsLoadingShifts] = useState(false);
   const [lastRefreshed, setLastRefreshed] = useState<Date>(new Date());
-  const [countdown, setCountdown] = useState(20); // 20 seconds quick refresh cycle
   const [presentThreshold, setPresentThreshold] = useState<number>(480);
+
   const [expandedUserId, setExpandedUserId] = useState<string | null>(null);
+  const [searchTerm, setSearchTerm] = useState('');
+  const deferredSearchTerm = useDeferredValue(searchTerm);
+  const [selectedProcesses, setSelectedProcesses] = useState<string[]>([]);
+  
+  // Performance Optimization: Index Users and Shifts for O(1) lookup
+  const usersMap = useMemo(() => {
+    const map = new Map<string, UserProfile>();
+    allUsers.forEach(u => map.set(u.uid, u));
+    return map;
+  }, [allUsers]);
+
+  const activeShiftsMap = useMemo(() => {
+    const map = new Map<string, TMSShift>();
+    activeShifts.forEach(s => map.set(s.userId, s));
+    return map;
+  }, [activeShifts]);
 
   // Subscribe to attendance config
   useEffect(() => {
@@ -141,10 +240,6 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
     });
     return () => unsub();
   }, []);
-
-  // Filters state for control table
-  const [searchTerm, setSearchTerm] = useState('');
-  const [selectedProcesses, setSelectedProcesses] = useState<string[]>([]);
   const [shiftFilter, setShiftFilter] = useState('all'); // all, active, break, offline
   const [selectedTLs, setSelectedTLs] = useState<string[]>(() => {
     const roleNormalized = (user.role || '').toString().toUpperCase().trim();
@@ -280,7 +375,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
   // Hierarchy validation helper (checks if current supervisor is authorized to edit target)
   const canModifyTarget = (targetUid: string) => {
     if (user.uid === targetUid) return false;
-    const target = allUsers.find(u => u.uid === targetUid);
+    const target = usersMap.get(targetUid);
     if (!target) return false;
 
     // Check if the current user has TL profile or is manager/admin
@@ -301,6 +396,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
     return canActOn(user, target, allUsers);
   };
 
+
   // Mapped list of supervised agents based on hierarchy
   const mappedUsers = useMemo(() => {
     // ADMIN and MANAGER can see organization-wide; other roles filter by team hierarchy
@@ -317,18 +413,20 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
     if (isManagerOrAdmin || isTeamLeadOrSupervisor) {
       if (selectedTLs.length > 0) {
         const tlRefs = new Set<string>();
-        selectedTLs.forEach(tlName => {
-          const cleanName = tlName.toLowerCase().trim();
-          tlRefs.add(cleanName);
-          allUsers.forEach(candidate => {
-            const candName = (candidate.name || '').toLowerCase().trim();
-            const candFullName = (candidate.fullName || '').toLowerCase().trim();
-            if (candName === cleanName || candFullName === cleanName) {
-              if (candidate.uid) tlRefs.add(candidate.uid.toLowerCase().trim());
-              if (candidate.email) tlRefs.add(candidate.email.toLowerCase().trim());
-            }
-          });
+        const tlSearchLower = selectedTLs.map(tl => tl.toLowerCase().trim());
+        const tlSearchSet = new Set(tlSearchLower);
+
+        allUsers.forEach(candidate => {
+          const candName = (candidate.name || '').toLowerCase().trim();
+          const candFullName = (candidate.fullName || '').toLowerCase().trim();
+          if (tlSearchSet.has(candName) || tlSearchSet.has(candFullName)) {
+            if (candidate.uid) tlRefs.add(candidate.uid.toLowerCase().trim());
+            if (candidate.email) tlRefs.add(candidate.email.toLowerCase().trim());
+          }
         });
+        
+        // Add names directly too
+        tlSearchLower.forEach(n => tlRefs.add(n));
 
         return allUsers.filter(u => isActive(u) && (
           (u.teamLeadId && tlRefs.has(u.teamLeadId.toLowerCase().trim())) ||
@@ -343,6 +441,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
       }
       return allUsers.filter(u => isActive(u));
     }
+
     return allUsers.filter(u => isActive(u) && (u.uid === user.uid || canActOn(user, u, allUsers)));
   }, [allUsers, user, selectedTLs]);
 
@@ -350,12 +449,17 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
   const mappedUsersRef = React.useRef(mappedUsers);
   const allUsersRef = React.useRef(allUsers);
   
-  // Performance optimization: cache today's shift query results during massive real-time ticks
-  const lastTodayShiftsFetchTimeRef = React.useRef<number>(0);
-  const cachedTodayShiftsRef = React.useRef<any[]>([]);
-  const cachedTwoDaysShiftsRef = React.useRef<any[]>([]);
+  // Performance optimization: cache all historical shifts during massive real-time ticks
+  const lastHistoricalShiftsFetchTimeRef = React.useRef<number>(0);
+  const cachedAllHistoricalShiftsRef = React.useRef<any[]>([]);
+  const activeFetchPromiseRef = React.useRef<Promise<any[]> | null>(null);
+
+  const supervisorTeamUids = useMemo(() => {
+    return new Set(mappedUsers.map(u => u.uid));
+  }, [mappedUsers]);
 
   useEffect(() => {
+
     mappedUsersRef.current = mappedUsers;
     allUsersRef.current = allUsers;
   }, [mappedUsers, allUsers]);
@@ -363,25 +467,24 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
   // List of unique Team Leads who have members in mappedUsers or have a TL role
   const teamLeadsList = useMemo(() => {
     const leads = new Map<string, { name: string; role: string }>();
-    
-    // 1. Add anyone explicitly referenced as a team lead in any active user's profile
-    allUsers.forEach(u => {
-      if (u.teamLeadId && u.teamLeadName) {
-        // Find their actual role if exists, otherwise fallback to 'TEAM_LEAD'
-        const tlObj = allUsers.find(candidate => candidate.uid === u.teamLeadId);
-        const roleStr = tlObj ? (tlObj.role || 'TEAM_LEAD') : 'TEAM_LEAD';
-        leads.set(u.teamLeadId, { name: u.teamLeadName, role: String(roleStr) });
-      }
-    });
+    const tlRoles = new Set(['TEAM_LEAD', 'STL', 'OPS_TL', 'QTL', 'TRAINER_TL', 'TEAM LEAD', 'OPS TL', 'TRAINER TL', 'SME']);
 
-    // 2. Add anyone who holds a Team Lead/Supervisor-like role and has status = 'Active'
-    const tlRoles = ['TEAM_LEAD', 'STL', 'OPS_TL', 'QTL', 'TRAINER_TL', 'TEAM LEAD', 'OPS TL', 'TRAINER TL', 'SME'];
     allUsers.forEach(u => {
+      // 1. Add anyone explicitly referenced as a team lead in any active user's profile
+      if (u.teamLeadId && u.teamLeadName) {
+        if (!leads.has(u.teamLeadId)) {
+          const tlObj = usersMap.get(u.teamLeadId);
+          const roleStr = tlObj ? (tlObj.role || 'TEAM_LEAD') : 'TEAM_LEAD';
+          leads.set(u.teamLeadId, { name: u.teamLeadName, role: String(roleStr) });
+        }
+      }
+
+      // 2. Add anyone who holds a Team Lead/Supervisor-like role and has status = 'Active'
       const roleUpper = (u.role || '').toString().toUpperCase().trim();
       const statusActive = !u.status || u.status.toLowerCase().trim() === 'active' || u.isActive === true;
-      if (statusActive && tlRoles.includes(roleUpper)) {
+      if (statusActive && tlRoles.has(roleUpper)) {
         const tlName = u.fullName || u.name || u.employeeName;
-        if (tlName) {
+        if (tlName && !leads.has(u.uid)) {
           leads.set(u.uid, { name: tlName, role: String(u.role) });
         }
       }
@@ -407,7 +510,8 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
       if (b.id === user.uid) return 1;
       return a.name.localeCompare(b.name);
     });
-  }, [allUsers, user.uid]);
+  }, [allUsers, user.uid, usersMap]);
+
 
   // List of unique Managers
   const managersList = useMemo(() => {
@@ -421,17 +525,8 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
   // Read summary metrics or trigger recalculation when necessary
   const [summaryData, setSummaryData] = useState<any>(null);
 
-  // Function to calculate durations from millseconds
-  const formatMs = (ms: number): string => {
-    if (ms <= 0 || isNaN(ms)) return '00:00:00';
-    const totalSecs = Math.floor(ms / 1000);
-    const hrs = Math.floor(totalSecs / 3600);
-    const mins = Math.floor((totalSecs % 3600) / 60);
-    const secs = totalSecs % 60;
-    return `${hrs.toString().padStart(2, '0')}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
-  };
-
   // Core Shift math calculations
+
   const calculateShiftStatsObj = (shift: TMSShift) => {
     const endMs = shift.clockOutTime 
       ? new Date(shift.clockOutTime).getTime() 
@@ -492,10 +587,33 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
     };
   };
 
+  const lastRecalculationRef = useRef<number>(0);
+  const pendingRecalculationRef = useRef<boolean>(false);
+  const recalculationTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const attemptedHealsRef = useRef<Set<string>>(new Set());
+
   // FETCH & AGGREGATE CORE - Minimal reads & in-memory synced architecture
-  const loadAndRecomputeData = async (forceRecalculate = false, externalSnapshot?: any) => {
+  const loadAndRecomputeData = async (forceRecalculate = false, externalShifts?: TMSShift[]) => {
+    // Debouncing implementation to avoid CPU spikes during high-frequency snapshot updates
+    const nowTs = Date.now();
+    const DEBOUNCE_MS = 800; // Batch updates within 800ms
+    
+    if (!forceRecalculate && !externalShifts) {
+      // If no external shifts provided and not forced, check if we need to throttle
+      if (nowTs - lastRecalculationRef.current < DEBOUNCE_MS) {
+        if (recalculationTimeoutRef.current) return;
+        recalculationTimeoutRef.current = setTimeout(() => {
+          recalculationTimeoutRef.current = null;
+          loadAndRecomputeData(false);
+        }, DEBOUNCE_MS);
+        return;
+      }
+    }
+
+    lastRecalculationRef.current = nowTs;
     const currentAllUsers = allUsersRef.current;
-    const currentMappedUsers = mappedUsersRef.current;
+    const currentMappedUsers = mappedUsersRef.current || [];
+    const scopeIds = supervisorTeamUids;
     
     if (!currentAllUsers || currentAllUsers.length === 0) {
       console.log('Skipping recomputation as allUsers roster is not yet ready');
@@ -506,18 +624,20 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
       // Perform optimized fetch of ONLY active shifts
       let allActiveShifts: TMSShift[] = [];
       
-      if (externalSnapshot) {
-        allActiveShifts = externalSnapshot.docs.map((d: any) => ({ id: d.id, ...d.data() } as TMSShift));
+      if (externalShifts) {
+        allActiveShifts = externalShifts;
       } else {
         // Fetch all active shifts to ensure supervisor can see their own status and team's status
         const activeShiftsQuery = query(collection(db, 'tmsShifts'), where('status', 'in', ['ACTIVE', 'BREAK']));
         const snapshot = await getDocs(activeShiftsQuery);
+        firestoreLogger.trackRead('supervisor_active_shifts_fallback_getDocs', snapshot.size);
         allActiveShifts = snapshot.docs.map(d => ({ id: d.id, ...d.data() } as TMSShift));
       }
 
-      // Filter active shifts matching the team scope OR the current supervisor's own shift
-      const scopeIds = new Set(currentMappedUsers.map(u => u.uid));
-      const teamActiveShiftsRaw = allActiveShifts.filter(sh => scopeIds.has(sh.userId) || sh.userId === user.uid);
+
+      // Filter active shifts matching the team scope OR the current supervisor's own shift - OPTIMIZED: Use pre-calculated supervisorTeamUids
+      const teamActiveShiftsRaw = allActiveShifts.filter(sh => supervisorTeamUids.has(sh.userId) || sh.userId === user.uid);
+
 
       // Group active shifts by userId to identify and heal duplicates
       const shiftsByUser: { [userId: string]: TMSShift[] } = {};
@@ -538,7 +658,11 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
           userShifts.sort((a, b) => new Date(b.clockInTime).getTime() - new Date(a.clockInTime).getTime());
           primaryShift = userShifts[0];
           for (let i = 1; i < userShifts.length; i++) {
-            duplicateCloses.push(userShifts[i]);
+            const dupShift = userShifts[i];
+            if (!attemptedHealsRef.current.has(dupShift.id)) {
+              attemptedHealsRef.current.add(dupShift.id);
+              duplicateCloses.push(dupShift);
+            }
           }
         } else {
           primaryShift = userShifts[0];
@@ -549,103 +673,194 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
         const TEN_HOURS_MS = 10 * 60 * 60 * 1000;
 
         if (activeProductiveMs >= TEN_HOURS_MS) {
-          autoClockOuts.push(primaryShift);
+          if (!attemptedHealsRef.current.has(primaryShift.id)) {
+            attemptedHealsRef.current.add(primaryShift.id);
+            autoClockOuts.push(primaryShift);
+          } else {
+            // Keep it active locally so the shift doesn't vanish from the supervisor view if Firestore writes fail
+            teamActiveShifts.push(primaryShift);
+          }
         } else {
           teamActiveShifts.push(primaryShift);
         }
       });
 
-      // Heal the database synchronously by batch-closing older duplicates / 10h productive limit exceeders
+      // Heal the database asynchronously by batch-closing older duplicates / 10h productive limit exceeders
       if (duplicateCloses.length > 0 || autoClockOuts.length > 0) {
-        console.warn(`[DATA HEAL] Found duplicate shifts (${duplicateCloses.length}) and/or expired 10h productive shifts (${autoClockOuts.length}). Updating in Firestore...`);
-        const healBatch = writeBatch(db);
-        const healNowISO = new Date().toISOString();
-        
-        duplicateCloses.forEach(sh => {
-          const updatedActivities = [...(sh.activities || [])];
-          if (updatedActivities.length > 0) {
-            const lastIndex = updatedActivities.length - 1;
-            if (!updatedActivities[lastIndex].endTime) {
-              updatedActivities[lastIndex].endTime = healNowISO;
+        // Run healing in background to avoid blocking the UI thread for metrics
+        (async () => {
+          try {
+            console.warn(`[DATA HEAL] Found duplicate shifts (${duplicateCloses.length}) and/or expired 10h productive shifts (${autoClockOuts.length}). Running background heal...`);
+            const healBatch = writeBatch(db);
+            const healNowISO = new Date().toISOString();
+            
+            duplicateCloses.forEach(sh => {
+              const updatedActivities = [...(sh.activities || [])];
+              if (updatedActivities.length > 0) {
+                const lastIndex = updatedActivities.length - 1;
+                if (!updatedActivities[lastIndex].endTime) {
+                  updatedActivities[lastIndex].endTime = healNowISO;
+                }
+              }
+              healBatch.set(doc(db, 'tmsShifts', sh.id), {
+                ...sh,
+                activities: updatedActivities,
+                status: 'AUTO_CLOSED',
+                clockOutTime: healNowISO,
+                remarks: 'System Auto-Resolved Duplicate Active Shift (Supervisor Healing)'
+              }, { merge: true });
+            });
+
+            autoClockOuts.forEach(sh => {
+              const TEN_HOURS_MS = 10 * 60 * 60 * 1000;
+              const { activities: updatedActivities, clockOutTime } = truncateShiftToProductiveTime(sh as any, TEN_HOURS_MS);
+              const finalized = {
+                ...sh,
+                activities: updatedActivities,
+                status: 'AUTO_CLOSED',
+                clockOutTime,
+                remarks: 'Auto-clocked out after 10 hours productive time'
+              };
+              healBatch.set(doc(db, 'tmsShifts', sh.id), finalized, { merge: true });
+
+              const userRef = doc(db, 'users', sh.userId);
+              healBatch.update(userRef, {
+                status: 'OFFLINE',
+                lastLogoutAt: clockOutTime
+              });
+            });
+
+            await healBatch.commit();
+            console.log('[DATA HEAL] Successfully resolved shift inconsistencies.');
+
+            // Call attendance sync for all healed shifts
+            for (const sh of duplicateCloses) {
+              const healNowISO = new Date().toISOString();
+              const updatedActivities = [...(sh.activities || [])];
+              if (updatedActivities.length > 0) {
+                const lastIndex = updatedActivities.length - 1;
+                if (!updatedActivities[lastIndex].endTime) {
+                  updatedActivities[lastIndex].endTime = healNowISO;
+                }
+              }
+              await syncShiftToAttendance({
+                ...sh,
+                activities: updatedActivities,
+                status: 'AUTO_CLOSED',
+                clockOutTime: healNowISO
+              });
             }
+
+            for (const sh of autoClockOuts) {
+              const TEN_HOURS_MS = 10 * 60 * 60 * 1000;
+              const { activities: updatedActivities, clockOutTime } = truncateShiftToProductiveTime(sh as any, TEN_HOURS_MS);
+              await syncShiftToAttendance({
+                ...sh,
+                activities: updatedActivities,
+                status: 'AUTO_CLOSED',
+                clockOutTime
+              });
+            }
+          } catch (err) {
+            console.error('[DATA HEAL ERROR]', err);
           }
-          healBatch.set(doc(db, 'tmsShifts', sh.id), {
-            ...sh,
-            activities: updatedActivities,
-            status: 'AUTO_CLOSED',
-            clockOutTime: healNowISO,
-            remarks: 'System Auto-Resolved Duplicate Active Shift (Supervisor Healing)'
-          });
-        });
-
-        autoClockOuts.forEach(sh => {
-          const TEN_HOURS_MS = 10 * 60 * 60 * 1000;
-          const { activities: updatedActivities, clockOutTime } = truncateShiftToProductiveTime(sh as any, TEN_HOURS_MS);
-          healBatch.set(doc(db, 'tmsShifts', sh.id), {
-            ...sh,
-            activities: updatedActivities,
-            status: 'AUTO_CLOSED',
-            clockOutTime,
-            remarks: 'Auto-clocked out after 10 hours productive time'
-          });
-
-          const userRef = doc(db, 'users', sh.userId);
-          healBatch.update(userRef, {
-            status: 'OFFLINE',
-            lastLogoutAt: clockOutTime
-          });
-        });
-
-        await healBatch.commit().catch(err => console.error('Error healing active shifts:', err));
+        })();
       }
 
-      setActiveShifts(teamActiveShifts);
-
-      // Timezone-safe daily shifts retrieval with aggressive performance caching (20s) to fix lag issues
-      let todayShifts: any[] = [];
-      let twoDaysShifts: any[] = [];
-      const currentTimestampMs = Date.now();
-      const CACHE_EXPIRY_MS = 20000;
-      
-      const isCacheValid = cachedTodayShiftsRef.current.length > 0 && 
-                           (currentTimestampMs - lastTodayShiftsFetchTimeRef.current < CACHE_EXPIRY_MS) && 
-                           !forceRecalculate;
-
-      if (isCacheValid) {
-        todayShifts = cachedTodayShiftsRef.current;
-        twoDaysShifts = cachedTwoDaysShiftsRef.current || [];
-      } else {
-        // Go back 60 hours to cover last 2 days plus timezone offsets
-        const sixtyHoursMs = 60 * 3600000;
-        const startOfRangeQuery = new Date(currentTimestampMs - sixtyHoursMs);
-        const shiftsQuery = query(
-          collection(db, 'tmsShifts'),
-          where('clockInTime', '>=', startOfRangeQuery.toISOString())
-        );
-        const shiftsSnapshot = await getDocs(shiftsQuery);
-        const allFetchedShifts = shiftsSnapshot.docs.map(d => ({ id: d.id, ...d.data() } as any));
-        
-        // Filter in memory for supervisor's current calendar day (same local date) OR within last 24 hours
-        const nowLocalDateStr = new Date().toDateString();
-        todayShifts = allFetchedShifts.filter(sh => {
-          if (!scopeIds.has(sh.userId)) return false;
-          const shiftLocalDateStr = new Date(sh.clockInTime).toDateString();
-          const isTodayLocal = shiftLocalDateStr === nowLocalDateStr;
-          const within24h = (currentTimestampMs - new Date(sh.clockInTime).getTime()) < 24 * 60 * 60 * 1000;
-          return isTodayLocal || within24h;
-        });
-
-        // Filter for last 2 days (within 48 hours)
-        twoDaysShifts = allFetchedShifts.filter(sh => {
-          if (!scopeIds.has(sh.userId)) return false;
-          const within48h = (currentTimestampMs - new Date(sh.clockInTime).getTime()) < 48 * 60 * 60 * 1000;
-          return within48h;
-        });
-          
-        cachedTodayShiftsRef.current = todayShifts;
-        cachedTwoDaysShiftsRef.current = twoDaysShifts;
-        lastTodayShiftsFetchTimeRef.current = currentTimestampMs;
-      }
+       setActiveShifts(teamActiveShifts);
+ 
+       // Timezone-safe daily shifts retrieval with aggressive performance caching (5 mins) to fix lag issues
+       let todayShifts: any[] = [];
+       let twoDaysShifts: any[] = [];
+       const currentTimestampMs = Date.now();
+       const CACHE_EXPIRY_MS = 300000; // 5 Minutes
+       
+       const isCacheValid = cachedAllHistoricalShiftsRef.current.length > 0 && 
+                            (currentTimestampMs - lastHistoricalShiftsFetchTimeRef.current < CACHE_EXPIRY_MS) && 
+                            !forceRecalculate;
+ 
+       if (!isCacheValid) {
+         if (activeFetchPromiseRef.current) {
+           console.log('[TMS Performance Optimization] Reusing active historical shifts fetch promise...');
+           try {
+             await activeFetchPromiseRef.current;
+           } catch (e) {
+             console.error('[REUSED_FETCH_FAIL]', e);
+           }
+         } else {
+           const sixtyHoursMs = 24 * 3600000;
+           const startOfRangeMs = currentTimestampMs - sixtyHoursMs;
+           const startOfRangeISO = new Date(startOfRangeMs).toISOString();
+           const uidsInScope = Array.from(scopeIds);
+ 
+           const fetchPromise = (async () => {
+             let allFetchedShifts: any[] = [];
+             if (uidsInScope.length === 0) {
+               allFetchedShifts = [];
+             } else if (uidsInScope.length <= 40) {
+               console.log(`[TMS Performance Optimization] Performing ultra-fast parallel team-member queries for ${scopeIds.size} agents`);
+               const promises = uidsInScope.map(async (uid) => {
+                 const q = query(
+                   collection(db, 'tmsShifts'),
+                   where('userId', '==', uid),
+                   limit(15)
+                 );
+                 const snap = await getDocs(q);
+                 firestoreLogger.trackRead('supervisor_historical_shifts_parallel_agent_fetch', snap.size);
+                  return snap.docs.map(d => ({ id: d.id, ...d.data() } as any));
+               });
+               const results = await Promise.all(promises);
+               allFetchedShifts = results.flat();
+             } else {
+               console.log(`[TMS Performance Optimization] Performing organization-wide date-range fallback query`);
+               const shiftsQuery = query(
+                 collection(db, 'tmsShifts'),
+                 where('clockInTime', '>=', startOfRangeISO)
+               );
+               const shiftsSnapshot = await getDocs(shiftsQuery);
+              firestoreLogger.trackRead('supervisor_historical_shifts_org_fallback_fetch', shiftsSnapshot.size);
+               allFetchedShifts = shiftsSnapshot.docs.map(d => ({ id: d.id, ...d.data() } as any));
+             }
+ 
+             // Filter in-memory to keep only shifts within sixty hours to minimize cache size
+             return allFetchedShifts.filter(sh => {
+               if (!sh.clockInTime) return false;
+               return new Date(sh.clockInTime).getTime() >= startOfRangeMs;
+             });
+           })();
+ 
+           activeFetchPromiseRef.current = fetchPromise;
+ 
+           try {
+             const result = await fetchPromise;
+             cachedAllHistoricalShiftsRef.current = result;
+             lastHistoricalShiftsFetchTimeRef.current = currentTimestampMs;
+           } catch (err) {
+             console.error('[HISTORICAL_FETCH_ERROR]', err);
+           } finally {
+             activeFetchPromiseRef.current = null;
+           }
+         }
+       }
+ 
+       const allHistoricalShifts = cachedAllHistoricalShiftsRef.current || [];
+       const nowLocalDateStr = new Date().toDateString();
+ 
+       // Filter in memory for supervisor's current calendar day (same local date) OR within last 24 hours
+       todayShifts = allHistoricalShifts.filter(sh => {
+         if (!scopeIds.has(sh.userId)) return false;
+         const shiftLocalDateStr = new Date(sh.clockInTime).toDateString();
+         const isTodayLocal = shiftLocalDateStr === nowLocalDateStr;
+         const within24h = (currentTimestampMs - new Date(sh.clockInTime).getTime()) < 24 * 60 * 60 * 1000;
+         return isTodayLocal || within24h;
+       });
+ 
+       // Filter for last 2 days (within 48 hours)
+       twoDaysShifts = allHistoricalShifts.filter(sh => {
+         if (!scopeIds.has(sh.userId)) return false;
+         const within48h = (currentTimestampMs - new Date(sh.clockInTime).getTime()) < 48 * 60 * 60 * 1000;
+         return within48h;
+       });
 
       const teamAutoClosed = todayShifts.filter(sh => sh.status === 'AUTO_CLOSED' && (sh.remarks?.includes('10 hours') || sh.remarks?.includes('10H') || sh.remarks?.includes('10-Hour')));
 
@@ -840,28 +1055,45 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
     }
   };
 
-  // Run on mount, and schedule recurring pull when allUsers or selectedTLs changes
+  // Run on mount, and schedule recurring pull when selectedTLs or mappedUsers changes
   useEffect(() => {
-    loadAndRecomputeData(true);
-  }, [allUsers, selectedTLs]);
+    loadAndRecomputeData(false);
+  }, [selectedTLs, mappedUsers]);
 
   useEffect(() => {
     if (!user) return;
 
-    // Real-time reactive synchronization for active/break shifts
+    // Real-time reactive synchronization for active/break shifts - OPTIMIZED: Debounced execution
     const activeShiftsQuery = query(
       collection(db, 'tmsShifts'),
-      where('status', 'in', ['ACTIVE', 'BREAK'])
+      where('status', 'in', ['ACTIVE', 'BREAK']),
+      limit(2000)
     );
 
     const unsubscribe = onSnapshot(activeShiftsQuery, (snapshot) => {
-      loadAndRecomputeData(false, snapshot);
+      firestoreLogger.trackRead('supervisor_active_shifts_onSnapshot_update', snapshot.size);
+      const allActiveShiftsMapped = snapshot.docs.map(d => ({ id: d.id, ...d.data() } as TMSShift));
+      
+      // Update state immediately for instant UI responsiveness
+      setActiveShifts(allActiveShiftsMapped);
+      
+      // OPTIMIZED: Use a very small delay (50ms) to ensure instant UI updates while still batching synchronous bursts
+      if (recalculationTimeoutRef.current) {
+        clearTimeout(recalculationTimeoutRef.current);
+      }
+      recalculationTimeoutRef.current = setTimeout(() => {
+        recalculationTimeoutRef.current = null;
+        loadAndRecomputeData(false, allActiveShiftsMapped);
+      }, 50);
+      
     }, (error) => {
       console.warn('[REALTIME_SYNC_ERROR]', error);
     });
 
-    return () => unsubscribe();
-  }, [user.uid]);
+    return () => {
+      unsubscribe();
+    };
+  }, [user.uid, user.role]);
 
   // Filter & paginate the workforce controls list
   const filteredWorkforce = useMemo(() => {
@@ -883,16 +1115,15 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
 
     return mappedUsers.filter(u => {
       // search
-      const matchesSearch = !searchTerm 
+      const liveShift = activeShiftsMap.get(u.uid);
+      const matchesSearch = !deferredSearchTerm 
         ? true 
-        : (u.name.toLowerCase().includes(searchTerm.toLowerCase()) || 
-           u.email.toLowerCase().includes(searchTerm.toLowerCase()) || 
-           (u.employeeId && u.employeeId.toLowerCase().includes(searchTerm.toLowerCase())));
+        : (u.name.toLowerCase().includes(deferredSearchTerm.toLowerCase()) || 
+           u.email.toLowerCase().includes(deferredSearchTerm.toLowerCase()) || 
+           (u.employeeId && u.employeeId.toLowerCase().includes(deferredSearchTerm.toLowerCase())) ||
+           (liveShift?.deviceType && liveShift.deviceType.toLowerCase().includes(deferredSearchTerm.toLowerCase())));
 
       if (!matchesSearch) return false;
-
-      // active shift data link
-      const liveShift = activeShifts.find(s => s.userId === u.uid);
 
       // Status filters
       if (shiftFilter !== 'all') {
@@ -959,7 +1190,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
         if (!matchesTL) return false;
       }
 
-      // Manager filter (robust nested traversal across all possible schema fields)
+      // Manager filter (robust nested traversal across all possible schema fields) - OPTIMIZED: Use usersMap
       if (selectedManagers.length > 0) {
         const checkHierarchy = (uToCheck: UserProfile, visited: Set<string>): boolean => {
           if (!uToCheck) return false;
@@ -986,19 +1217,19 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
           visited.add(uToCheck.uid);
           
           if (uToCheck.teamLeadId) {
-            const tl = allUsers.find(usr => usr.uid === uToCheck.teamLeadId);
+            const tl = usersMap.get(uToCheck.teamLeadId);
             if (tl && checkHierarchy(tl, visited)) return true;
           }
           if (uToCheck.managerId) {
-            const mgr = allUsers.find(usr => usr.uid === uToCheck.managerId);
+            const mgr = usersMap.get(uToCheck.managerId);
             if (mgr && checkHierarchy(mgr, visited)) return true;
           }
           if (uToCheck.mappedManagerId) {
-            const mgr = allUsers.find(usr => usr.uid === uToCheck.mappedManagerId);
+            const mgr = usersMap.get(uToCheck.mappedManagerId);
             if (mgr && checkHierarchy(mgr, visited)) return true;
           }
           if ((uToCheck as any).mappedManagerUid) {
-            const mgr = allUsers.find(usr => usr.uid === (uToCheck as any).mappedManagerUid);
+            const mgr = usersMap.get((uToCheck as any).mappedManagerUid);
             if (mgr && checkHierarchy(mgr, visited)) return true;
           }
           return false;
@@ -1008,9 +1239,10 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
 
       return true;
     });
-  }, [mappedUsers, activeShifts, searchTerm, selectedProcesses, shiftFilter, selectedTLs, selectedManagers]);
+  }, [mappedUsers, activeShiftsMap, deferredSearchTerm, selectedProcesses, shiftFilter, selectedTLs, selectedManagers, usersMap]);
 
-  // Sorting
+
+  // Sorting - OPTIMIZED: Use Map
   const sortedWorkforce = useMemo(() => {
     const sorted = [...filteredWorkforce];
     sorted.sort((a,b) => {
@@ -1018,13 +1250,13 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
       let valB: any = b.name;
 
       if (sortKey === 'status') {
-        const sA = activeShifts.find(s => s.userId === a.uid)?.status || 'OFFLINE';
-        const sB = activeShifts.find(s => s.userId === b.uid)?.status || 'OFFLINE';
+        const sA = activeShiftsMap.get(a.uid)?.status || 'OFFLINE';
+        const sB = activeShiftsMap.get(b.uid)?.status || 'OFFLINE';
         valA = sA;
         valB = sB;
       } else if (sortKey === 'productive') {
-        const sA = activeShifts.find(s => s.userId === a.uid);
-        const sB = activeShifts.find(s => s.userId === b.uid);
+        const sA = activeShiftsMap.get(a.uid);
+        const sB = activeShiftsMap.get(b.uid);
         valA = sA ? calculateShiftStatsObj(sA).activeMs : 0;
         valB = sB ? calculateShiftStatsObj(sB).activeMs : 0;
       }
@@ -1034,7 +1266,8 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
       return 0;
     });
     return sorted;
-  }, [filteredWorkforce, sortKey, sortOrder, activeShifts]);
+  }, [filteredWorkforce, sortKey, sortOrder, activeShiftsMap]);
+
 
   // Paginated Results
   const totalPages = Math.ceil(sortedWorkforce.length / itemsPerPage);
@@ -1121,7 +1354,6 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
       toast.success(`Successfully terminated active session for ${logoutTargetName}`);
       setShowForceLogoutConfirm(false);
       loadAndRecomputeData(true);
-      if (onRefreshAllData) onRefreshAllData();
     } catch (err) {
       console.error('[FORCE_OUT_FAIL]', err);
       toast.error('Failed to terminate remote session');
@@ -1367,15 +1599,10 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
 
   // Dynamic live statistics to keep KPI tiles and distribution sync'd with selected filters
   const liveStats = useMemo(() => {
-    const total = filteredWorkforce.length;
-    const activeShiftList = filteredWorkforce.map(u => activeShifts.find(s => s.userId === u.uid)).filter(Boolean) as TMSShift[];
-    const loggedIn = activeShiftList.length;
-    const onBreak = activeShiftList.filter(s => s.status === 'BREAK').length;
-    const active = activeShiftList.filter(s => s.status === 'ACTIVE').length;
-    const offline = Math.max(0, total - loggedIn);
-    const attendancePercent = total > 0 ? Math.round((loggedIn / total) * 100) : 0;
+    // Session device tracking parameters computed locally for true real-time visibility
+    // Compute from activeShiftList (filtered by team/TL/Manager/Search/Device)
+    const activeShiftList = filteredWorkforce.map(u => activeShiftsMap.get(u.uid)).filter(Boolean) as TMSShift[];
     
-    // session device tracking parameters
     const activeDesktop = activeShiftList.filter(s => {
       const dtype = s.deviceType || (s.clockInDevice === 'mobile' ? 'Mobile' : 'Desktop');
       return dtype === 'Desktop';
@@ -1386,8 +1613,16 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
       return dtype === 'Mobile' || dtype === 'Tablet';
     }).length;
 
-    const mobileAccessPercent = loggedIn > 0 ? Math.round((activeMobile / loggedIn) * 100) : 0;
+    const totalActiveCount = activeShiftList.length;
+    const mobileAccessPercent = totalActiveCount > 0 ? Math.round((activeMobile / totalActiveCount) * 100) : 0;
 
+    const total = filteredWorkforce.length;
+    const loggedIn = activeShiftList.length;
+    const onBreak = activeShiftList.filter(s => s.status === 'BREAK').length;
+    const active = activeShiftList.filter(s => s.status === 'ACTIVE').length;
+    const offline = Math.max(0, total - loggedIn);
+    const attendancePercent = total > 0 ? Math.round((loggedIn / total) * 100) : 0;
+    
     // Calculate team average utilization for all logged-in users under current scope
     let totalUtil = 0;
     activeShiftList.forEach(sh => {
@@ -1410,11 +1645,11 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
       activeMobile,
       mobileAccessPercent
     };
-  }, [filteredWorkforce, activeShifts, presentThreshold]);
+  }, [filteredWorkforce, activeShiftsMap, activeShifts, searchTerm, selectedProcesses, selectedTLs, selectedManagers, shiftFilter]);
 
   const liveDistribution = useMemo(() => {
     const total = filteredWorkforce.length || 1;
-    const activeShiftList = filteredWorkforce.map(u => activeShifts.find(s => s.userId === u.uid)).filter(Boolean) as TMSShift[];
+    const activeShiftList = filteredWorkforce.map(u => activeShiftsMap.get(u.uid)).filter(Boolean) as TMSShift[];
     
     const active = activeShiftList.filter(s => s.status === 'ACTIVE').length;
     
@@ -1446,7 +1681,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
       meeting,
       offline
     };
-  }, [filteredWorkforce, activeShifts]);
+  }, [filteredWorkforce, activeShiftsMap]);
 
   // Helper navigate directly to exception user inside table
   const selectAndFocusUser = (targetName: string) => {
@@ -1475,29 +1710,30 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
           </div>
           <div>
             <h2 className="text-lg font-bold tracking-tight">Workforce Management Command</h2>
-            <p className="text-xs text-slate-500 dark:text-slate-400 font-sans mt-0.5">Separate controls for monitoring, supervision rosters, exceptions & live statistics.</p>
+            <div className="flex flex-wrap items-center gap-3 mt-0.5">
+              <p className="text-xs text-slate-500 dark:text-slate-400 font-sans">Separate controls for monitoring, supervision rosters, break exceeds & mobile logs & live statistics.</p>
+              <div className="h-3 w-px bg-slate-200 dark:bg-slate-800 hidden md:block" />
+              <div className="flex items-center gap-1.5 text-[10px] text-slate-400 dark:text-slate-500 font-bold uppercase tracking-wider">
+                <span>Updated: {lastRefreshed.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span>
+                <button 
+                  onClick={() => loadAndRecomputeData(true)} 
+                  disabled={isLoadingShifts}
+                  className="hover:text-indigo-500 transition-colors cursor-pointer p-1"
+                  title="Force Refresh Data"
+                >
+                  <RefreshCw size={10} className={isLoadingShifts ? 'animate-spin' : ''} />
+                </button>
+              </div>
+            </div>
           </div>
         </div>
 
         <div className="flex items-center gap-3 flex-wrap">
-          {activeShifts.find(s => s.userId === user.uid) && (
-            <div className="flex items-center gap-3 border border-indigo-100 dark:border-indigo-950/40 bg-indigo-50/40 dark:bg-indigo-950/20 px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all flex-wrap">
-              <div className="flex items-center gap-1">
-                <span className="text-[10px] text-slate-400 dark:text-slate-500 uppercase font-black font-sans">Shift:</span>
-                <span className="font-mono text-indigo-600 dark:text-indigo-400 font-extrabold">{elapsedShift}</span>
-              </div>
-              <div className="h-3 w-px bg-slate-200 dark:bg-slate-800" />
-              <div className="flex items-center gap-1">
-                <span className="text-[10px] text-slate-400 dark:text-slate-500 uppercase font-black font-sans">Active:</span>
-                <span className="font-mono text-emerald-600 dark:text-emerald-400 font-extrabold">{elapsedActive}</span>
-              </div>
-              <div className="h-3 w-px bg-slate-200 dark:bg-slate-800" />
-              <div className="flex items-center gap-1">
-                <span className="text-[10px] text-slate-400 dark:text-slate-500 uppercase font-black font-sans">Break:</span>
-                <span className="font-mono text-amber-600 dark:text-amber-500 font-extrabold">{elapsedBreak}</span>
-              </div>
-            </div>
-          )}
+          {(() => {
+            const myShift = activeShiftsMap.get(user.uid);
+            return myShift ? <SupervisorClockStrip myShift={myShift} /> : null;
+          })()}
+
           
           <div className="flex items-center gap-2">
             <button 
@@ -1705,7 +1941,9 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
             <div className="text-[8px] uppercase tracking-wider text-slate-400 font-bold">Active Desktop</div>
             <div className="text-base font-black text-sky-600 dark:text-sky-455 font-mono mt-0.5">{liveStats.activeDesktop || 0}</div>
           </div>
-          <div className="bg-white dark:bg-slate-900 border border-slate-200/60 dark:border-slate-800/80 px-4 py-2.5 rounded-xl text-center shadow-2xs min-w-28 sm:min-w-32">
+          <div 
+            className="bg-white dark:bg-slate-900 border border-slate-200/60 dark:border-slate-800/80 px-4 py-2.5 rounded-xl text-center shadow-2xs min-w-28 sm:min-w-32"
+          >
             <div className="text-[8px] uppercase tracking-wider text-slate-400 font-bold">Active Mobile</div>
             <div className="text-base font-black text-rose-500 font-mono mt-0.5">{liveStats.activeMobile || 0}</div>
           </div>
@@ -1757,7 +1995,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
         >
           <div className="flex items-center gap-1.5 font-black text-xs">
             <AlertTriangle size={14} className={activeTab === 'exceptions' ? 'text-white' : 'text-rose-500'} />
-            Audit & Exceptions
+            Break Exceeds & Mobile Logs
           </div>
           <span className={`text-[10px] font-medium ${activeTab === 'exceptions' ? 'text-rose-100' : 'text-slate-500 dark:text-slate-400'}`}>Monitor anomalies</span>
         </button>
@@ -2238,8 +2476,9 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
                 </thead>
                 <tbody className="divide-y divide-slate-100">
                   {paginatedWorkforce.map((u) => {
-                    const live = activeShifts.find(s => s.userId === u.uid);
+                    const live = activeShiftsMap.get(u.uid);
                     const stats = live ? calculateShiftStatsObj(live) : null;
+
                     const liveActs = live?.activities || [];
                     const lastAct = liveActs.length > 0 ? liveActs[liveActs.length - 1] : null;
 

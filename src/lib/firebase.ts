@@ -1,5 +1,6 @@
 import { initializeApp } from 'firebase/app';
 import { getStorage } from 'firebase/storage';
+import { firestoreLogger } from './firestoreLogger';
 import { 
   getAuth, 
   GoogleAuthProvider, 
@@ -178,6 +179,7 @@ export interface FirestoreErrorInfo {
 }
 
 export function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
+  const stats = firestoreLogger.getStats();
   const errInfo: FirestoreErrorInfo = {
     error: error instanceof Error ? error.message : String(error),
     authInfo: {
@@ -192,9 +194,9 @@ export function handleFirestoreError(error: unknown, operationType: OperationTyp
   
   // Log specific diagnostic for permission errors
   if (errInfo.error.includes('permission') || errInfo.error.includes('insufficient')) {
-    console.error('CRITICAL: Firestore Permission Denied!', JSON.stringify(errInfo));
+    console.error(`CRITICAL: Firestore Permission Denied! [Cumulative Reads: ${stats.totalReads}, Writes: ${stats.totalWrites}]`, JSON.stringify(errInfo));
   } else {
-    console.error('Firestore Error: ', JSON.stringify(errInfo));
+    console.error(`Firestore Error [Cumulative Reads: ${stats.totalReads}, Writes: ${stats.totalWrites}]:`, JSON.stringify(errInfo));
   }
   
   throw new Error(JSON.stringify(errInfo));

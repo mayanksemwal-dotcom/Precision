@@ -12,11 +12,12 @@ import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
 import { 
   collection, query, where, getDocs, onSnapshot, doc, setDoc, 
   addDoc, updateDoc, deleteDoc, serverTimestamp, writeBatch, getDoc,
-  orderBy, limit
+  orderBy, limit, getCountFromServer
 } from 'firebase/firestore';
 import { UserProfile, UserRole, ITTicket, ITTicketComment, ITAsset } from '../types';
 import { usePermission } from '../components/PermissionContext';
 import { toast } from 'sonner';
+import { AggregationService, ITHelpDeskAggregate } from '../lib/aggregationService';
 
 // Utility to parse Browser, OS, and Device info
 function getBrowserAndOS() {
@@ -85,6 +86,7 @@ export default function ITHelpDeskView({ user, allUsers, externalTheme }: { user
     'Low': 24
   });
   const [loading, setLoading] = useState(true);
+  const [aggregates, setAggregates] = useState<ITHelpDeskAggregate | null>(null);
 
   // Search and filter states
   const [searchQuery, setSearchQuery] = useState('');
@@ -273,12 +275,21 @@ export default function ITHelpDeskView({ user, allUsers, externalTheme }: { user
     return 'EMPLOYEE';
   }, [user, itEngineers]);
 
-  // Real-time listener for tickets
+  // Real-time listener for tickets - OPTIMIZED: Limited to last 50 tickets or only active ones for non-admins
   useEffect(() => {
     setLoading(true);
-    const ticketsQuery = query(collection(db, 'itTickets'), orderBy('createdAt', 'desc'));
+    let ticketsQ;
     
-    const unsubscribe = onSnapshot(ticketsQuery, (snapshot) => {
+    if (helpDeskRole === 'EMPLOYEE') {
+      // Employees only see their own tickets
+      // OPTIMIZED: Use employeeId consistently and match rules
+      ticketsQ = query(collection(db, 'itTickets'), where('employeeId', '==', user.uid), limit(50));
+    } else {
+      // Admins/TLs see everything but still limited for performance
+      ticketsQ = query(collection(db, 'itTickets'), orderBy('createdAt', 'desc'), limit(100));
+    }
+
+    const unsubscribe = onSnapshot(ticketsQ, (snapshot) => {
       const ticketList: ITTicket[] = [];
       snapshot.forEach((docSnap) => {
         const data = docSnap.data();
@@ -298,6 +309,11 @@ export default function ITHelpDeskView({ user, allUsers, externalTheme }: { user
       });
       setTickets(ticketList);
       setLoading(false);
+      
+      // Trigger background update of aggregates if admin
+      if (helpDeskRole === 'ADMIN') {
+        AggregationService.updateITSummary(ticketList);
+      }
     }, (error) => {
       console.error("Error loading tickets: ", error);
       toast.error("Failed to load IT tickets.");
@@ -305,20 +321,23 @@ export default function ITHelpDeskView({ user, allUsers, externalTheme }: { user
     });
 
     return () => unsubscribe();
-  }, []);
+  }, [helpDeskRole, user.uid]);
 
-  // Real-time listener for assets
+  // Use live listener for assets
   useEffect(() => {
-    const assetsQuery = collection(db, 'itAssets');
-    const unsubscribe = onSnapshot(assetsQuery, (snapshot) => {
-      const assetList: ITAsset[] = [];
-      snapshot.forEach((docSnap) => {
-        assetList.push({ id: docSnap.id, ...docSnap.data() } as ITAsset);
-      });
+    let assetsQ = query(collection(db, 'itAssets'), limit(100));
+    if (helpDeskRole === 'EMPLOYEE') {
+      assetsQ = query(collection(db, 'itAssets'), where('assignedUser', '==', user.uid));
+    }
+    const unsubscribe = onSnapshot(assetsQ, (snapshot) => {
+      const assetList: ITAsset[] = snapshot.docs.map(docSnap => ({ id: docSnap.id, ...docSnap.data() } as ITAsset));
       setAssets(assetList);
+    }, (error) => {
+      console.error("Asset fetch error:", error);
     });
+
     return () => unsubscribe();
-  }, []);
+  }, [helpDeskRole, user.uid]);
 
   // Real-time listener for SLA config and IT team
   useEffect(() => {
@@ -336,9 +355,17 @@ export default function ITHelpDeskView({ user, allUsers, externalTheme }: { user
       }
     });
 
+    // Listen to aggregates for metrics
+    const unsubAgg = onSnapshot(doc(db, 'aggregates', 'it_summary'), (snap) => {
+      if (snap.exists()) {
+        setAggregates(snap.data() as ITHelpDeskAggregate);
+      }
+    });
+
     return () => {
       unsubSla();
       unsubTeam();
+      unsubAgg();
     };
   }, [allUsers]);
 
@@ -476,7 +503,7 @@ export default function ITHelpDeskView({ user, allUsers, externalTheme }: { user
       }
     } catch (err: any) {
       console.error("Failed to create ticket: ", err);
-      toast.error("Failed to raise ticket.");
+      toast.error(`Failed to raise ticket: ${err.message || 'Internal Firestore Error'}`);
     } finally {
       setSubmittingTicket(false);
     }

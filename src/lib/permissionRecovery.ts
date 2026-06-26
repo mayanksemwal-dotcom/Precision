@@ -107,7 +107,7 @@ export const performPermissionRecovery = async () => {
 
   // 2. Role Permissions
   const modules = [
-    'Workforce TMS', 'KPI Scorecard', 'Warnings', 'PIP Management', 'Historical Records', 'Important Quality Links', 'Console'
+    'Workforce TMS', 'KPI Scorecard', 'Employee Relations', 'Historical Records', 'Important Quality Links', 'Console'
   ];
 
   const allRoleKeys = Array.from(new Set([...roles, ...upperRoles]));
@@ -146,14 +146,14 @@ export const performPermissionRecovery = async () => {
       }
       else if (['TEAM_LEAD', 'QTL', 'QA', 'SME', 'TRAINER'].includes(upperRole)) {
         perms.can_view = true;
-        if (mod === 'Warnings' || mod === 'PIP Management' || mod === 'Workforce TMS' || mod === 'KPI Scorecard') {
+        if (mod === 'Employee Relations' || mod === 'Workforce TMS' || mod === 'KPI Scorecard') {
             perms.can_create = true;
             perms.can_edit = true;
             perms.can_approve = true;
         }
       }
       else if (upperRole === 'AGENT') {
-        if (mod === 'Workforce TMS' || mod === 'KPI Scorecard' || mod === 'Warnings' || mod === 'PIP Management' || mod === 'Important Quality Links') {
+        if (mod === 'Workforce TMS' || mod === 'KPI Scorecard' || mod === 'Employee Relations' || mod === 'Important Quality Links') {
             perms.can_view = true;
         }
       }

@@ -40,7 +40,7 @@ import { UserRole, AuditRecord, DisputeStatus, DisputeHistory, UserProfile, QAAl
 import DisputeWorkflow from '../components/DisputeWorkflow';
 import { analyzePrecision } from '../services/geminiService';
 import { db, handleFirestoreError, OperationType } from '../lib/firebase';
-import { doc, getDoc, setDoc, updateDoc, collection, query, where, onSnapshot, orderBy, getDocs, limit } from 'firebase/firestore';
+import { doc, getDoc, setDoc, updateDoc, collection, query, where, onSnapshot, orderBy, getDocs, limit, getCountFromServer } from 'firebase/firestore';
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogTrigger } from '../components/ui/dialog';
 import WarningManager from '../components/WarningManager';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../components/ui/table';
@@ -545,8 +545,8 @@ export default function QAView({
         if (selectedAgent) {
           countQuery = query(countQuery, where('qvName', '==', selectedAgent));
         }
-        const countSnap = await getDocs(countQuery);
-        setTotalCount(countSnap.docs.length);
+        const countSnap = await getCountFromServer(countQuery);
+        setTotalCount(countSnap.data().count);
 
         let q = query(
           collection(db, 'tasks'),

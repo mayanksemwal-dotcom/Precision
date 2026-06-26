@@ -31,6 +31,7 @@ import { UserRole, UserProfile, SamplingTask, AuditRecord, QAAlignment, Producti
 import { INITIAL_ALIGNMENTS } from './lib/sample-data';
 import { auth, db, logout } from './lib/firebase';
 import { isFirestoreBlocked, handleFirestoreError } from './lib/safeFirestore';
+import { firestoreLogger } from './lib/firestoreLogger';
 import { OperationType } from './lib/firebase';
 import { onAuthStateChanged } from 'firebase/auth';
 import { doc, getDoc, getDocs, collection, query, where, orderBy, setDoc, updateDoc, deleteDoc, limit, onSnapshot } from 'firebase/firestore';
@@ -59,10 +60,9 @@ import {
   DropdownMenuGroup 
 } from './components/ui/dropdown-menu';
 
-import WarningsView from './views/WarningsView';
+import EmployeeRelationsView from './views/EmployeeRelationsView';
 import TMSView from './views/TMSView';
 import ScorecardView from './views/ScorecardView';
-import PipView from './views/PipView';
 import ManageHistoricalRecordsView from './views/ManageHistoricalRecordsView';
 import ResourceHubView from './views/ResourceHubView';
 import AttendanceView from './views/AttendanceView';
@@ -357,6 +357,57 @@ export default function App() {
   }, []);
 
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [availableRoles, setAvailableRoles] = useState<string[]>([]);
+
+  // Real-time Warnings Listener
+  useEffect(() => {
+    if (!user) return;
+    
+    const setupWarnings = async () => {
+      try {
+        const warningsDocId = `${user.role.toUpperCase()}_Warnings`;
+        const permissionsDoc = await getDoc(doc(db, 'role_permissions', warningsDocId));
+        firestoreLogger.trackRead('warnings_permissions_check', permissionsDoc.exists() ? 1 : 0);
+        let canSeeAllWarnings = false;
+        
+        if (permissionsDoc.exists()) {
+          const perms = permissionsDoc.data();
+          canSeeAllWarnings = !!perms.can_view || !!perms.can_edit || !!perms.can_delete || !!perms.can_approve;
+        } else {
+          canSeeAllWarnings = ['ADMIN', 'MANAGER', 'ASSISTANT_MANAGER', 'QA', 'TEAM_LEAD', 'STL', 'OPS_TL'].includes(user.role.toUpperCase());
+        }
+
+        let warningsQuery;
+        if (canSeeAllWarnings) {
+          warningsQuery = query(collection(db, 'disciplinaryLogs'), orderBy('createdAt', 'desc'), limit(25));
+        } else {
+          warningsQuery = query(collection(db, 'disciplinaryLogs'), where('agentId', '==', user.uid), orderBy('createdAt', 'desc'), limit(25));
+        }
+
+        const unsubWarnings = onSnapshot(warningsQuery, (snap) => {
+          firestoreLogger.trackRead('warnings_snapshot', snap.size);
+          setWarnings(snap.docs.map(doc => ({ id: doc.id, ...(doc.data() as any) } as WarningTicket)));
+        }, (err) => {
+          console.error("Warnings fetch error:", err);
+        });
+
+        return unsubWarnings;
+      } catch (e) {
+        console.error("Error setting up warnings:", e);
+      }
+    };
+
+    let unsubscribe: any = null;
+    setupWarnings().then(unsub => {
+      unsubscribe = unsub;
+    });
+
+    return () => {
+      if (unsubscribe && typeof unsubscribe === 'function') {
+        unsubscribe();
+      }
+    };
+  }, [user?.uid]);
 
   const fetchAllData = async (isManual = false) => {
     if (!user) return;
@@ -373,47 +424,15 @@ export default function App() {
         }
       };
 
-      // Create database query promises
-      let warningsQuery: any;
-      const warningsDocId = `${user.role.toUpperCase()}_Warnings`;
-      const permissionsDoc = await getDoc(doc(db, 'role_permissions', warningsDocId));
-      let canSeeAllWarnings = false;
-      
-      if (permissionsDoc.exists()) {
-        const perms = permissionsDoc.data();
-        canSeeAllWarnings = !!perms.can_view || !!perms.can_edit || !!perms.can_delete || !!perms.can_approve;
-      } else {
-        // Fallback standard roles
-        canSeeAllWarnings = ['ADMIN', 'MANAGER', 'ASSISTANT_MANAGER', 'QA', 'TEAM_LEAD', 'STL', 'OPS_TL'].includes(user.role.toUpperCase());
-      }
-
-      if (canSeeAllWarnings) {
-        warningsQuery = query(collection(db, 'disciplinaryLogs'), orderBy('createdAt', 'desc'), limit(25));
-      } else {
-        warningsQuery = query(collection(db, 'disciplinaryLogs'), where('agentId', '==', user.uid), orderBy('createdAt', 'desc'), limit(25));
-      }
-      const warningsPromise = getDocs(warningsQuery);
-
-      // Execute fetches in parallel
-      const [
-        warningsSnap
-      ] = await Promise.all([
-        safeFetch(warningsPromise, null, 'warnings')
-      ]);
-
       setAlignments(INITIAL_ALIGNMENTS);
-
-      if (warningsSnap) {
-        setWarnings(warningsSnap.docs.map(doc => ({ id: doc.id, ...(doc.data() as any) } as WarningTicket)));
-      }
-
       setProductions([]);
       setAgentKpis([]);
       setAuditLogs([]);
       setTasks([]);
 
+      // Refresh users if manual trigger
       if (isManual) {
-        toast.success('All reports loaded/refreshed successfully');
+        toast.success('All reports refreshed successfully');
       }
     } catch (error) {
       console.error('Data loading error:', error);
@@ -424,23 +443,27 @@ export default function App() {
   };
 
   useEffect(() => {
-    if (user) {
+    if (user?.uid) {
       setActiveTab('tms');
       fetchAllData();
     }
-  }, [user]);
+  }, [user?.uid]);
 
   const handleLogout = async () => {
     await logout();
     setUser(null);
   };
 
-  // Real-time Employee Master (Single Source of Truth) Listener
+  // Real-time Employee Master (Single Source of Truth)
   useEffect(() => {
     if (!user) return;
-    console.log('Synchronizing with User Profiles (Single Source of Truth)...');
+
+    console.log('Setting up real-time listener for User Profiles (Single Source of Truth)...');
+    
+    // Listen to users collection
     const masterQuery = collection(db, 'users');
-    const unsubscribe = onSnapshot(masterQuery, (snapshot) => {
+    const unsubUsers = onSnapshot(masterQuery, (snapshot) => {
+      firestoreLogger.trackRead('users_list_snapshot', snapshot.size);
       const usersList = snapshot.docs.map(doc => {
         const data = doc.data() as any;
         const normalizedTLId = data.teamLeadUid || data.teamLeadId || '';
@@ -448,13 +471,12 @@ export default function App() {
         return {
           uid: doc.id,
           ...data,
-          // Normalize name and email across different possible field mappings
           name: data.fullName || data.name || data.employeeName || '',
           fullName: data.fullName || data.name || data.employeeName || '',
-          email: (data.email || '').toLowerCase().trim(),
+          email: (data.email || '').toString().toLowerCase().trim(),
           employeeId: data.employeeId || '',
           photoURL: data.profilePhotoUrl || data.photoURL || '',
-          role: (data.role || UserRole.AGENT).toUpperCase(),
+          role: (data.role || UserRole.AGENT).toString().toUpperCase(),
           status: data.status || 'Active',
           teamLeadId: normalizedTLId,
           teamLeadUid: normalizedTLId,
@@ -464,73 +486,50 @@ export default function App() {
         } as UserProfile;
       });
       setAllUsers(usersList);
-      console.log(`User Database Sync: ${usersList.length} records normalized and loaded.`);
+      console.log(`User Database Realtime Sync: ${usersList.length} records loaded.`);
     }, (err) => {
-      console.error('User listener error:', err);
-      handleFirestoreError(err, OperationType.LIST, 'users_sync');
+      console.error('User fetch error:', err);
+      handleFirestoreError(err, OperationType.LIST, 'users_fetch');
     });
-    return () => unsubscribe();
-  }, [user]);
 
-  // Real-time Employee Profiles (documents containing uploaded profile photos) Listener
-  useEffect(() => {
-    if (!user) return;
-    const unsubscribe = onSnapshot(collection(db, 'employeeProfiles'), (snapshot) => {
+    // Listen to employee profiles collection
+    const unsubProfiles = onSnapshot(collection(db, 'employeeProfiles'), (profSnap) => {
+      firestoreLogger.trackRead('employee_profiles_snapshot', profSnap.size);
       const profiles: Record<string, any> = {};
-      snapshot.docs.forEach(doc => {
-        profiles[doc.id] = doc.data();
-      });
+      profSnap.forEach(d => { profiles[d.id] = d.data(); });
       setEmployeeProfiles(profiles);
     }, (err) => {
-      console.error('Employee profiles listener error:', err);
+      console.error('Employee Profile fetch error:', err);
     });
-    return () => unsubscribe();
-  }, [user]);
 
-  // Load roles dynamically from both 'roles' and 'role_permissions' collections
-  const [availableRoles, setAvailableRoles] = useState<string[]>([]);
+    return () => {
+      unsubUsers();
+      unsubProfiles();
+    };
+  }, [user?.uid]);
 
+  // Removed Employee Profiles and Roles collection-wide onSnapshot listeners
   useEffect(() => {
-    if (!user) return;
-    const unsubscribeRoles = onSnapshot(collection(db, 'roles'), (rolesSnap) => {
-      const rolesList = rolesSnap.docs.map(doc => (doc.data().name || doc.id).toUpperCase().trim());
-      
-      const qPermissions = query(collection(db, 'role_permissions'));
-      getDocs(qPermissions).then((permissionsSnap) => {
+    if (!user?.uid) return;
+    const fetchRoles = async () => {
+      try {
+        const rolesSnap = await getDocs(collection(db, 'roles'));
+        firestoreLogger.trackRead('roles_list_fetch', rolesSnap.size);
+        const rolesList = rolesSnap.docs.map(doc => (doc.data().name || doc.id).toUpperCase().trim());
+        const qPermissions = query(collection(db, 'role_permissions'));
+        const permissionsSnap = await getDocs(qPermissions);
+        firestoreLogger.trackRead('role_permissions_fetch', permissionsSnap.size);
         const permissionsRoles = permissionsSnap.docs.map(doc => (doc.data().role_name || '').toUpperCase().trim());
         const combined = Array.from(new Set([...rolesList, ...permissionsRoles])).filter(Boolean).sort();
-        
-        if (combined.length > 0) {
-          setAvailableRoles(combined);
-        } else {
-          setAvailableRoles([
-            'ADMIN',
-            'MANAGER',
-            'STL',
-            'OPS_TL',
-            'SME',
-            'QTL',
-            'QA',
-            'TEAM_LEAD',
-            'TRAINER',
-            'TRAINER_TL',
-            'MIS',
-            'AGENT'
-          ]);
-        }
-      }).catch((err) => {
-        console.error('Error fetching role_permissions for preview dropdown:', err);
-        const combined = Array.from(new Set(rolesList)).filter(Boolean).sort();
-        if (combined.length > 0) {
-          setAvailableRoles(combined);
-        }
-      });
-    }, (err) => {
-      console.error('Error syncing roles:', err);
-    });
-
-    return () => unsubscribeRoles();
-  }, [user]);
+        setAvailableRoles(combined.length > 0 ? combined : [
+          'ADMIN', 'MANAGER', 'STL', 'OPS_TL', 'SME', 'QTL', 'QA', 'TEAM_LEAD', 'TRAINER', 'TRAINER_TL', 'MIS', 'AGENT'
+        ]);
+      } catch (err) {
+        console.error('Error fetching roles:', err);
+      }
+    };
+    fetchRoles();
+  }, [user?.uid]);
 
   if (loading) {
     return (
@@ -654,8 +653,7 @@ function AppContent({
     { id: 'tms', label: 'Workforce TMS', icon: Clock },
     { id: 'attendance', label: 'Attendance', icon: FileText },
     { id: 'kpis_scorecard', label: 'KPI Scorecard', icon: Award },
-    { id: 'warnings', label: 'Warnings', icon: ShieldAlert },
-    { id: 'pips', label: 'PIP Management', icon: Activity },
+    { id: 'employee_relations', label: 'Employee Relations', icon: ShieldAlert },
     { id: 'it_help_desk', label: 'IT Help Desk', icon: LifeBuoy },
     { id: 'historical', label: 'Historical Records', icon: History },
     { id: 'resources', label: 'Important Quality Links', icon: Link2 },
@@ -927,10 +925,8 @@ function AppContent({
                   <AttendanceView user={effectiveUser!} allUsers={allUsers} externalTheme={theme} />
                 ) : activeTab === 'kpis_scorecard' ? (
                   <ScorecardView user={effectiveUser!} allUsers={allUsers} onRefreshAllData={fetchAllData} externalTheme={theme} />
-                ) : activeTab === 'warnings' ? (
-                  <WarningsView warnings={warnings} user={effectiveUser!} allUsers={allUsers} externalTheme={theme} />
-                ) : activeTab === 'pips' ? (
-                  <PipView user={effectiveUser!} allUsers={allUsers} externalTheme={theme} />
+                ) : activeTab === 'employee_relations' ? (
+                  <EmployeeRelationsView warnings={warnings} user={effectiveUser!} allUsers={allUsers} externalTheme={theme} />
                 ) : activeTab === 'it_help_desk' ? (
                   <ITHelpDeskView user={effectiveUser!} allUsers={allUsers} externalTheme={theme} />
                 ) : activeTab === 'historical' ? (

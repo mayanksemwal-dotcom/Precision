@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { db, auth } from '../../lib/firebase';
-import { collection, onSnapshot, query, orderBy, limit, addDoc } from 'firebase/firestore';
+import { collection, getDocs, query, orderBy, limit, addDoc } from 'firebase/firestore';
 import { triggerEmail } from '../../lib/emailTrigger';
 import { 
   Mail, Send, AlertTriangle, CheckCircle, Clock, Settings, RefreshCw, 
@@ -38,108 +38,88 @@ export const EmailDashboardSubView: React.FC<EmailDashboardSubViewProps> = ({ ad
 
   // Fetch email queue from both Firestore emails and mail collections
   useEffect(() => {
-    setLoading(true);
-    const qEmails = query(collection(db, 'emails'), orderBy('createdAt', 'desc'), limit(50));
-    const qMail = query(collection(db, 'mail'), orderBy('createdAt', 'desc'), limit(50));
-    
-    let emailsList: any[] = [];
-    let mailList: any[] = [];
-    let isMounted = true;
-    
-    const updateMergedList = (eList: any[], mList: any[]) => {
-      if (!isMounted) return;
-      const seen = new Set<string>();
-      const merged: any[] = [];
-      
-      const all = [
-        ...eList.map(item => ({ ...item, sourceCollection: item.sourceCollection || 'emails' })), 
-        ...mList.map(item => ({ ...item, sourceCollection: item.sourceCollection || 'mail' }))
-      ];
-                    
-      // Sort in-place by chronological creation time
-      all.sort((a, b) => {
-        const getTime = (val: any) => {
-          if (!val) return 0;
-          if (val.toMillis) return val.toMillis();
-          if (val.toDate) return val.toDate().getTime();
-          return new Date(val).getTime() || 0;
-        };
-        return getTime(b.createdAt || b.sentAt) - getTime(a.createdAt || a.sentAt);
-      });
-      
-      all.forEach(item => {
-        const toStr = String(item.to || item.message?.to || '').toLowerCase().trim();
-        const subjStr = String(item.subject || item.message?.subject || '').toLowerCase().trim();
+    const loadEmailData = async () => {
+      setLoading(true);
+      try {
+        const qEmails = query(collection(db, 'emails'), orderBy('createdAt', 'desc'), limit(50));
+        const qMail = query(collection(db, 'mail'), orderBy('createdAt', 'desc'), limit(50));
         
-        const getTime = (val: any) => {
-          if (!val) return 0;
-          if (val.toMillis) return val.toMillis();
-          if (val.toDate) return val.toDate().getTime();
-          return new Date(val).getTime() || 0;
-        };
-        const ms = getTime(item.createdAt);
+        const [snapEmails, snapMail] = await Promise.all([
+          getDocs(qEmails),
+          getDocs(qMail)
+        ]);
 
-        // Bucket within 5 seconds for deduplicating same dispatch logged to both collections
-        const hash = `${toStr}_${subjStr}_${Math.round(ms / 5000)}`;
+        const eList = snapEmails.docs.map(doc => ({ id: doc.id, ...doc.data(), sourceCollection: 'emails' } as any));
+        const mList = snapMail.docs.map(doc => ({ id: doc.id, ...doc.data(), sourceCollection: 'mail' } as any));
+
+        const seen = new Set<string>();
+        const merged: any[] = [];
         
-        if (!seen.has(hash)) {
-          seen.add(hash);
+        const all = [
+          ...eList.map(item => ({ ...item, sourceCollection: item.sourceCollection || 'emails' })), 
+          ...mList.map(item => ({ ...item, sourceCollection: item.sourceCollection || 'mail' }))
+        ];
+                      
+        // Sort in-place by chronological creation time
+        all.sort((a, b) => {
+          const getTime = (val: any) => {
+            if (!val) return 0;
+            if (val.toMillis) return val.toMillis();
+            if (val.toDate) return val.toDate().getTime();
+            return new Date(val).getTime() || 0;
+          };
+          return getTime(b.createdAt || b.sentAt) - getTime(a.createdAt || a.sentAt);
+        });
+        
+        all.forEach(item => {
+          const toStr = String(item.to || item.message?.to || '').toLowerCase().trim();
+          const subjStr = String(item.subject || item.message?.subject || '').toLowerCase().trim();
           
-          // Match and see if there's a corresponding document that has a richer 'delivery' state
-          const richerInstance = all.find(other => {
-            if (other.id === item.id) return false;
-            const otherToStr = String(other.to || other.message?.to || '').toLowerCase().trim();
-            const otherSubjStr = String(other.subject || other.message?.subject || '').toLowerCase().trim();
-            const otherMs = getTime(other.createdAt);
-            return otherToStr === toStr && otherSubjStr === subjStr && Math.abs(otherMs - ms) < 15000 && other.delivery;
-          });
+          const getTime = (val: any) => {
+            if (!val) return 0;
+            if (val.toMillis) return val.toMillis();
+            if (val.toDate) return val.toDate().getTime();
+            return new Date(val).getTime() || 0;
+          };
+          const ms = getTime(item.createdAt);
 
-          if (richerInstance) {
-            merged.push({ 
-              ...richerInstance, 
-              sourceCollection: item.sourceCollection !== richerInstance.sourceCollection 
-                ? `${item.sourceCollection}/${richerInstance.sourceCollection}` 
-                : item.sourceCollection 
+          // Bucket within 5 seconds for deduplicating same dispatch logged to both collections
+          const hash = `${toStr}_${subjStr}_${Math.round(ms / 5000)}`;
+          
+          if (!seen.has(hash)) {
+            seen.add(hash);
+            
+            // Match and see if there's a corresponding document that has a richer 'delivery' state
+            const richerInstance = all.find(other => {
+              if (other.id === item.id) return false;
+              const otherToStr = String(other.to || other.message?.to || '').toLowerCase().trim();
+              const otherSubjStr = String(other.subject || other.message?.subject || '').toLowerCase().trim();
+              const otherMs = getTime(other.createdAt);
+              return otherToStr === toStr && otherSubjStr === subjStr && Math.abs(otherMs - ms) < 15000 && other.delivery;
             });
-          } else {
-            merged.push(item);
+
+            if (richerInstance) {
+              merged.push({ 
+                ...richerInstance, 
+                sourceCollection: item.sourceCollection !== richerInstance.sourceCollection 
+                  ? `${item.sourceCollection}/${richerInstance.sourceCollection}` 
+                  : item.sourceCollection 
+              });
+            } else {
+              merged.push(item);
+            }
           }
-        }
-      });
-      
-      setEmails(merged.slice(0, 50));
-      setLoading(false);
+        });
+        
+        setEmails(merged.slice(0, 50));
+      } catch (error) {
+        console.warn('Error loading email queue:', error);
+      } finally {
+        setLoading(false);
+      }
     };
 
-    const unsubscribeEmails = onSnapshot(qEmails, (snapshot) => {
-      emailsList = [];
-      snapshot.forEach((doc) => {
-        emailsList.push({ id: doc.id, ...doc.data(), sourceCollection: 'emails' });
-      });
-      updateMergedList(emailsList, mailList);
-    }, (error) => {
-      console.warn('Silent fallback on emails collection permission:', error);
-      // If we failed to read emails, we can still load mail
-      updateMergedList(emailsList, mailList);
-    });
-
-    const unsubscribeMail = onSnapshot(qMail, (snapshot) => {
-      mailList = [];
-      snapshot.forEach((doc) => {
-        mailList.push({ id: doc.id, ...doc.data(), sourceCollection: 'mail' });
-      });
-      updateMergedList(emailsList, mailList);
-    }, (error) => {
-      console.warn('Silent fallback on mail collection permission:', error);
-      // If we failed to read mail, we can still load emails
-      updateMergedList(emailsList, mailList);
-    });
-
-    return () => {
-      isMounted = false;
-      unsubscribeEmails();
-      unsubscribeMail();
-    };
+    loadEmailData();
   }, []);
 
   // Fetch SMTP status from our custom server /api/smtp-status endpoint
