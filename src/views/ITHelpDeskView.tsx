@@ -8,6 +8,7 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { db, storage } from '../lib/firebase';
+import { firestoreLogger } from '../lib/firestoreLogger';
 import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
 import { 
   collection, query, where, getDocs, onSnapshot, doc, setDoc, 
@@ -290,6 +291,7 @@ export default function ITHelpDeskView({ user, allUsers, externalTheme }: { user
     }
 
     const unsubscribe = onSnapshot(ticketsQ, (snapshot) => {
+      firestoreLogger.trackRead('it_tickets_onSnapshot', snapshot.size);
       const ticketList: ITTicket[] = [];
       snapshot.forEach((docSnap) => {
         const data = docSnap.data();
@@ -330,6 +332,7 @@ export default function ITHelpDeskView({ user, allUsers, externalTheme }: { user
       assetsQ = query(collection(db, 'itAssets'), where('assignedUser', '==', user.uid));
     }
     const unsubscribe = onSnapshot(assetsQ, (snapshot) => {
+      firestoreLogger.trackRead('it_assets_onSnapshot', snapshot.size);
       const assetList: ITAsset[] = snapshot.docs.map(docSnap => ({ id: docSnap.id, ...docSnap.data() } as ITAsset));
       setAssets(assetList);
     }, (error) => {
@@ -339,32 +342,34 @@ export default function ITHelpDeskView({ user, allUsers, externalTheme }: { user
     return () => unsubscribe();
   }, [helpDeskRole, user.uid]);
 
-  // Real-time listener for SLA config and IT team
+  // One-time fetch for SLA config and IT team
   useEffect(() => {
-    const unsubSla = onSnapshot(doc(db, 'itHelpDeskConfig', 'sla'), (docSnap) => {
-      if (docSnap.exists()) {
-        setSlaConfigs(docSnap.data() as Record<string, number>);
+    const fetchConfigs = async () => {
+      const slaSnap = await getDoc(doc(db, 'itHelpDeskConfig', 'sla'));
+      firestoreLogger.trackRead('it_sla_config_getDoc', slaSnap.exists() ? 1 : 0);
+      if (slaSnap.exists()) {
+        setSlaConfigs(slaSnap.data() as Record<string, number>);
       }
-    });
-
-    const unsubTeam = onSnapshot(doc(db, 'itHelpDeskConfig', 'team'), (docSnap) => {
-      if (docSnap.exists()) {
-        const uids = docSnap.data().uids || [];
+      
+      const teamSnap = await getDoc(doc(db, 'itHelpDeskConfig', 'team'));
+      firestoreLogger.trackRead('it_team_config_getDoc', teamSnap.exists() ? 1 : 0);
+      if (teamSnap.exists()) {
+        const uids = teamSnap.data().uids || [];
         const engineers = allUsers.filter(u => uids.includes(u.uid));
         setItEngineers(engineers);
       }
-    });
+    };
+    fetchConfigs();
 
-    // Listen to aggregates for metrics
+    // Listen to aggregates for metrics (Operational, keep real-time)
     const unsubAgg = onSnapshot(doc(db, 'aggregates', 'it_summary'), (snap) => {
+      firestoreLogger.trackRead('it_summary_aggregate_onSnapshot', snap.exists() ? 1 : 0);
       if (snap.exists()) {
         setAggregates(snap.data() as ITHelpDeskAggregate);
       }
     });
 
     return () => {
-      unsubSla();
-      unsubTeam();
       unsubAgg();
     };
   }, [allUsers]);

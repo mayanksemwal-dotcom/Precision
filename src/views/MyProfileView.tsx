@@ -98,6 +98,7 @@ interface EmployeeProfileState {
   designation: string;
   employmentType: string;
   accountStatus: string;
+  location: string;
 }
 
 export default React.memo(function MyProfileView({ user, allUsers, externalTheme, onRefreshAllData }: MyProfileViewProps) {
@@ -152,7 +153,8 @@ export default React.memo(function MyProfileView({ user, allUsers, externalTheme
     department: '',
     designation: '',
     employmentType: 'Full-Time',
-    accountStatus: 'Active'
+    accountStatus: 'Active',
+    location: ''
   });
 
   // Dynamic tags states
@@ -269,7 +271,8 @@ export default React.memo(function MyProfileView({ user, allUsers, externalTheme
           department: uProfile.department || 'Operations',
           designation: uProfile.role || 'Agent',
           employmentType: data.employmentType || 'Full-Time',
-          accountStatus: computedStatus
+          accountStatus: computedStatus,
+          location: uProfile.location || data.location || ''
         };
 
         // Auto compute profile completion
@@ -284,7 +287,8 @@ export default React.memo(function MyProfileView({ user, allUsers, externalTheme
           data.designation !== merged.designation ||
           data.dateJoined !== merged.dateJoined ||
           data.reportingManager !== merged.reportingManager ||
-          data.accountStatus !== merged.accountStatus;
+          data.accountStatus !== merged.accountStatus ||
+          data.location !== merged.location;
 
         if (needsSync && inspectUserId) {
           const profileDocRef = doc(db, 'employeeProfiles', inspectUserId);
@@ -298,6 +302,7 @@ export default React.memo(function MyProfileView({ user, allUsers, externalTheme
             dateJoined: merged.dateJoined,
             reportingManager: merged.reportingManager,
             accountStatus: merged.accountStatus,
+            location: merged.location,
             lastUpdatedAt: new Date().toISOString(),
             updatedBy: 'System Auto-Sync'
           }, { merge: true }).catch(err => {
@@ -791,7 +796,7 @@ export default React.memo(function MyProfileView({ user, allUsers, externalTheme
                   <div className="text-[11px] text-indigo-400 font-mono tracking-wider font-bold">EMP ID: {profile.employeeId}</div>
                   <div className="text-xs text-slate-400 flex items-center gap-1.5 mt-1">
                     <Briefcase size={12} />
-                    <span>{profile.designation} — <strong className="text-slate-350">{profile.department}</strong></span>
+                    <span>{profile.designation} — <strong className="text-slate-350">{profile.department}</strong> {profile.location && <span className="ml-1 opacity-80 text-indigo-400">| <MapPin size={10} className="inline mb-0.5" /> <strong className="font-mono text-[10px]">{profile.location}</strong></span>}</span>
                   </div>
                   <div className="text-[10px] text-slate-450 mt-1">
                     Status: <span className={`font-black uppercase ${

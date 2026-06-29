@@ -43,10 +43,12 @@ import * as XLSX from 'xlsx';
 import { usePermission } from '../components/PermissionContext';
 import { canActOn } from '../lib/hierarchy';
 import { db, handleFirestoreError, OperationType } from '../lib/firebase';
+import { firestoreLogger } from '../lib/firestoreLogger';
 import { cn, convertExcelDate, convertExcelPeriod } from '../lib/utils';
 import { 
   collection, 
   getDocs, 
+  getDoc,
   setDoc, 
   doc, 
   deleteDoc,
@@ -151,9 +153,10 @@ export default React.memo(function ScorecardView({ user, allUsers = [], onRefres
   const canUploadKPIs = canCreate('KPI Scorecard');
   const canDeleteKPIs = canDelete('KPI Scorecard');
   const canViewReports = canView('KPI Scorecard');
+  const canPublishScorecards = ['ADMIN', 'MIS'].includes((user.role || '').toUpperCase());
 
   // Navigation Tabs
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'leaderboard' | 'uploads_desk' | 'templates_desk'>('dashboard');
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'leaderboard' | 'templates_desk'>('dashboard');
 
   // Universal Filter State
   const [selectedPeriod, setSelectedPeriod] = useState<string>('');
@@ -172,15 +175,22 @@ export default React.memo(function ScorecardView({ user, allUsers = [], onRefres
 
   // Firestore Data States
   const [allScorecards, setAllScorecards] = useState<DynamicScorecard[]>([]);
+
+  // Precomputed Leaderboards States
+  const [currentLeaderboard, setCurrentLeaderboard] = useState<any | null>(null);
+  const [globalLeaderboard, setGlobalLeaderboard] = useState<any | null>(null);
+
+  const getLeaderboardDocId = (period: string, type: string, key: string): string => {
+    const cleanKey = (key || '').trim().replace(/[\s\/]+/g, '_');
+    const cleanPeriod = (period || '').trim().replace(/[\s\/]+/g, '_');
+    if (type === 'role') {
+      return `${cleanPeriod}_${cleanKey}`;
+    }
+    return `${cleanPeriod}_${type}_${cleanKey}`;
+  };
   const [allRecentUploads, setAllRecentUploads] = useState<any[]>([]);
   const [kpiTemplates, setKpiTemplates] = useState<KpiTemplate[]>([]);
   const [rawUploadsCount, setRawUploadsCount] = useState<number>(0);
-
-  // Staging Uploader States for universal template
-  const [stagingData, setStagingData] = useState<KpiUploadRow[]>([]);
-  const [stagingFileName, setStagingFileName] = useState<string>('');
-  const [editingStagingId, setEditingStagingId] = useState<string | null>(null);
-  const [editRowFields, setEditRowFields] = useState<Partial<KpiUploadRow>>({});
 
   // Template Manager Edit States
   const [selectedConfigRole, setSelectedConfigRole] = useState<string>('QV');
@@ -275,57 +285,121 @@ export default React.memo(function ScorecardView({ user, allUsers = [], onRefres
     }
   }, [availablePeriods, selectedPeriod]);
 
-  /**
-   * Real-time listeners for templates, generated scorecards and counts from Firestore
-   */
-  useEffect(() => {
-    // 1. Listen to templates
-    const unsubTemplates = onSnapshot(collection(db, 'kpi_templates'), (templatesSnap) => {
+  const fetchAllKPIData = async () => {
+    if (!user) return;
+    try {
+      console.log('[KPI Billing Optimization] Performing one-time KPI data fetch...');
+      // 1. Fetch templates
+      const templatesSnap = await getDocs(collection(db, 'kpi_templates'));
+      firestoreLogger.trackRead('kpi_templates_getDocs', templatesSnap.size);
       const fetchedTemplates = templatesSnap.docs.map(docSnap => docSnap.data() as KpiTemplate);
       setKpiTemplates(fetchedTemplates);
-    }, (error) => {
-      console.error('Template sync error: ', error);
-    });
 
-    // 2. Listen to scorecards for the selected period
-    let scorecardsRef = collection(db, 'scorecards');
-    let scorecardsQ = selectedPeriod 
-      ? query(scorecardsRef, where('reportingPeriod', '==', selectedPeriod)) 
-      : query(scorecardsRef, limit(1000));
-      
-    const unsubScorecards = onSnapshot(scorecardsQ, (scorecardsSnap) => {
+      // 2. Fetch scorecards
+      let scorecardsRef = collection(db, 'scorecards');
+      const userEmail = (user.email || '').toLowerCase().trim();
+      const cleanSelectedEmail = (selectedEmail || '').toLowerCase().trim();
+      let scorecardsQ;
+      if (canManageKPIs) {
+        if (cleanSelectedEmail) {
+          scorecardsQ = query(
+            scorecardsRef, 
+            where('reportingPeriod', '==', selectedPeriod), 
+            where('employeeEmail', '==', cleanSelectedEmail)
+          );
+        } else {
+          scorecardsQ = query(
+            scorecardsRef, 
+            where('reportingPeriod', '==', selectedPeriod), 
+            where('employeeEmail', '==', userEmail)
+          );
+        }
+      } else {
+        scorecardsQ = query(
+          scorecardsRef, 
+          where('reportingPeriod', '==', selectedPeriod), 
+          where('employeeEmail', '==', userEmail)
+        );
+      }
+
+      const scorecardsSnap = await getDocs(scorecardsQ);
+      firestoreLogger.trackRead('scorecards_getDocs', scorecardsSnap.size);
       const fetchedScorecards = scorecardsSnap.docs.map(docSnap => docSnap.data() as DynamicScorecard);
       setAllScorecards(fetchedScorecards);
-    }, (error) => {
-      console.error('Scorecard sync error: ', error);
-    });
 
-    // 3. Listen to raw uploaded records for the selected period
-    let unsubUploads = () => {};
+    // 3. Fetch raw uploaded records
     if (canManageKPIs) {
       let uploadsRef = collection(db, 'kpi_uploads');
       let uploadsQ = selectedPeriod 
-        ? query(uploadsRef, where('reportingPeriod', '==', selectedPeriod), limit(2000))
-        : query(uploadsRef, limit(1000));
+        ? query(uploadsRef, where('reportingPeriod', '==', selectedPeriod))
+        : query(uploadsRef, orderBy('createdAt', 'desc'), limit(100));
         
-      unsubUploads = onSnapshot(uploadsQ, (uploadsSnap) => {
-        setAllRecentUploads(uploadsSnap.docs.map(d => ({ ...d.data(), docId: d.id })));
-        setRawUploadsCount(uploadsSnap.size); // Dynamically update count based on size
-      }, (error) => {
-        console.warn('Silent authorization fallback for kpi_uploads reads: ', error);
-      });
+      const uploadsSnap = await getDocs(uploadsQ);
+      firestoreLogger.trackRead('kpi_uploads_getDocs', uploadsSnap.size);
+      setAllRecentUploads(uploadsSnap.docs.map(d => ({ ...d.data(), docId: d.id })));
+      
+      // Calculate real total count efficiently without fetching all docs if possible
+      if (!selectedPeriod) {
+         setRawUploadsCount(uploadsSnap.size > 99 ? 100 : uploadsSnap.size); 
+      } else {
+         setRawUploadsCount(uploadsSnap.size);
+      }
     }
-
-    return () => {
-      unsubTemplates();
-      unsubScorecards();
-      unsubUploads();
-    };
-  }, [selectedPeriod, canManageKPIs]);
-
-  const fetchAllKPIData = async () => {
-    // Left empty for backwards compatibility with explicit refresh calls, since listeners handle updates
+    } catch (error) {
+      console.error('Error fetching KPI data: ', error);
+    }
   };
+
+  useEffect(() => {
+    if (user?.uid) {
+      fetchAllKPIData();
+    }
+  }, [selectedPeriod, canManageKPIs, selectedEmail, user?.uid]);
+
+  // REDESIGN: Fetch precomputed leaderboards on-selection based on dropdown selections
+  useEffect(() => {
+    if (!selectedPeriod) return;
+
+    const fetchLeaderboardDocs = async () => {
+      let key = '';
+      if (selectedLeaderboardType === 'role') key = selectedLeaderboardRole;
+      else if (selectedLeaderboardType === 'process') key = selectedLeaderboardProcess;
+      else if (selectedLeaderboardType === 'team_lead') key = selectedLeaderboardTL;
+      else if (selectedLeaderboardType === 'manager') key = selectedLeaderboardMgr;
+      else if (selectedLeaderboardType === 'global') key = 'global';
+
+      const currentDocId = getLeaderboardDocId(selectedPeriod, selectedLeaderboardType, key);
+      const globalDocId = `${selectedPeriod.trim().replace(/[\s\/]+/g, '_')}_global`;
+
+      try {
+        // 1. Fetch selected leaderboard doc
+        const currentRef = doc(db, 'leaderboards', currentDocId);
+        const currentSnap = await getDoc(currentRef);
+        firestoreLogger.trackRead('leaderboard_getDoc', currentSnap.exists() ? 1 : 0);
+        if (currentSnap.exists()) {
+          setCurrentLeaderboard(currentSnap.data());
+        } else {
+          setCurrentLeaderboard(null);
+        }
+
+        // 2. Fetch global leaderboard doc (for stats and available filter lists)
+        const globalRef = doc(db, 'leaderboards', globalDocId);
+        const globalSnap = await getDoc(globalRef);
+        firestoreLogger.trackRead('global_leaderboard_getDoc', globalSnap.exists() ? 1 : 0);
+        if (globalSnap.exists()) {
+          setGlobalLeaderboard(globalSnap.data());
+        } else {
+          setGlobalLeaderboard(null);
+        }
+      } catch (err) {
+        console.warn('Leaderboard fetch error: ', err);
+        setCurrentLeaderboard(null);
+        setGlobalLeaderboard(null);
+      }
+    };
+
+    fetchLeaderboardDocs();
+  }, [selectedPeriod, selectedLeaderboardType, selectedLeaderboardRole, selectedLeaderboardProcess, selectedLeaderboardTL, selectedLeaderboardMgr]);
 
   // Synchronize Template Designer when selected config role changes
   useEffect(() => {
@@ -348,7 +422,7 @@ export default React.memo(function ScorecardView({ user, allUsers = [], onRefres
 
   // Sync recent uploads for management
   useEffect(() => {
-    if (activeTab === 'uploads_desk' || activeTab === 'templates_desk') {
+    if (activeTab === 'templates_desk') {
       fetchRecentUploads();
     }
   }, [activeTab]);
@@ -521,57 +595,16 @@ export default React.memo(function ScorecardView({ user, allUsers = [], onRefres
 
   // Filter leaderboard rankings based on selections
   const leaderboardRankings = useMemo(() => {
-    let matches = allScorecards
-      .filter(sc => {
-        const pDate = ensureDateStr(sc.reportingPeriod);
-        const pMatch = (pDate === ensureDateStr(selectedPeriod));
-        return pMatch;
-      });
-
-    if (selectedLeaderboardType === 'role') {
-      matches = matches.filter(sc => sc.role.toUpperCase() === selectedLeaderboardRole.toUpperCase());
-    } else if (selectedLeaderboardType === 'process') {
-      if (selectedLeaderboardProcess !== 'All') {
-        matches = matches.filter(sc => sc.processName === selectedLeaderboardProcess);
-      }
-    } else if (selectedLeaderboardType === 'team_lead') {
-      if (selectedLeaderboardTL !== 'All') {
-        matches = matches.filter(sc => (sc.teamLeadName || '').toLowerCase().trim() === selectedLeaderboardTL.toLowerCase().trim());
-      }
-    } else if (selectedLeaderboardType === 'manager') {
-      if (selectedLeaderboardMgr !== 'All') {
-        matches = matches.filter(sc => {
-          const mName = (sc.mappedManagerName || sc.Manager || '').toLowerCase().trim();
-          return mName === selectedLeaderboardMgr.toLowerCase().trim();
-        });
-      }
-    }
-      
-    matches = matches.sort((a, b) => b.finalScore - a.finalScore);
-    
-    return matches.map((m, idx) => ({
-      rank: idx + 1,
-      employeeEmail: m.employeeEmail,
-      employeeName: m.employeeName,
-      finalScore: m.finalScore,
-      rating: m.rating,
-      kpis: m.kpiBreakdown || []
-    }));
-  }, [allScorecards, selectedPeriod, selectedLeaderboardRole, selectedLeaderboardProcess, selectedLeaderboardType, selectedLeaderboardTL, selectedLeaderboardMgr]);
+    if (!currentLeaderboard || !currentLeaderboard.rankings) return [];
+    return currentLeaderboard.rankings;
+  }, [currentLeaderboard]);
 
   const availableProcesses = useMemo(() => {
+    if (globalLeaderboard && globalLeaderboard.availableProcesses) {
+      return globalLeaderboard.availableProcesses;
+    }
     const list = new Set<string>();
     
-    // Extract process names from all scorecards globally across all roles & periods
-    allScorecards.forEach(sc => {
-      if (sc.processName && sc.processName.trim()) {
-        const pClean = sc.processName.trim();
-        if (pClean !== 'All' && pClean !== 'All / Mixed') {
-          list.add(pClean);
-        }
-      }
-    });
-
     // Extract process names from all uploads globally across all periods as a robust fallback
     allRecentUploads.forEach(row => {
       if (row.processName && row.processName.trim()) {
@@ -583,63 +616,47 @@ export default React.memo(function ScorecardView({ user, allUsers = [], onRefres
     });
 
     return Array.from(list).sort();
-  }, [allScorecards, allRecentUploads]);
+  }, [globalLeaderboard, allRecentUploads]);
 
   const availableTeamLeads = useMemo(() => {
+    if (globalLeaderboard && globalLeaderboard.availableTeamLeads) {
+      return globalLeaderboard.availableTeamLeads;
+    }
     const list = new Set<string>();
-    allScorecards.forEach(sc => {
-      if (sc.teamLeadName && sc.teamLeadName.trim()) {
-        list.add(sc.teamLeadName.trim());
+    allUsers.forEach(u => {
+      const role = (u.role || '').toUpperCase();
+      if (role.includes('TL') || role.includes('LEAD')) {
+        const name = u.employeeName || u.fullName || u.name;
+        if (name) list.add(name.trim());
       }
     });
     return Array.from(list).sort();
-  }, [allScorecards]);
+  }, [globalLeaderboard, allUsers]);
 
   const availableManagers = useMemo(() => {
+    if (globalLeaderboard && globalLeaderboard.availableManagers) {
+      return globalLeaderboard.availableManagers;
+    }
     const list = new Set<string>();
-    allScorecards.forEach(sc => {
-      const mName = sc.mappedManagerName || sc.Manager || '';
-      if (mName && mName.trim()) {
-        list.add(mName.trim());
+    allUsers.forEach(u => {
+      const role = (u.role || '').toUpperCase();
+      if (role.includes('MANAGER') || role.includes('ADMIN') || role.includes('OPS_HEAD') || role.includes('AM')) {
+        const name = u.employeeName || u.fullName || u.name;
+        if (name) list.add(name.trim());
       }
     });
     return Array.from(list).sort();
-  }, [allScorecards]);
+  }, [globalLeaderboard, allUsers]);
 
   // Compute stats specifically for the selected filters (Process KPI Dashboard)
   const processKpiDashboard = useMemo(() => {
-    let matches = allScorecards.filter(sc => {
-      const pDate = ensureDateStr(sc.reportingPeriod);
-      const pMatch = (pDate === ensureDateStr(selectedPeriod));
-      return pMatch;
-    });
+    let displayName = 'Global';
+    if (selectedLeaderboardType === 'process') displayName = selectedLeaderboardProcess === 'All' ? 'Global' : selectedLeaderboardProcess;
+    else if (selectedLeaderboardType === 'team_lead') displayName = selectedLeaderboardTL === 'All' ? 'Global' : `TL: ${selectedLeaderboardTL}`;
+    else if (selectedLeaderboardType === 'manager') displayName = selectedLeaderboardMgr === 'All' ? 'Global' : `Manager: ${selectedLeaderboardMgr}`;
+    else if (selectedLeaderboardType === 'role') displayName = `Role: ${selectedLeaderboardRole}`;
 
-    if (selectedLeaderboardType === 'role') {
-      matches = matches.filter(sc => sc.role.toUpperCase() === selectedLeaderboardRole.toUpperCase());
-    } else if (selectedLeaderboardType === 'process') {
-      if (selectedLeaderboardProcess !== 'All') {
-        matches = matches.filter(sc => sc.processName === selectedLeaderboardProcess);
-      }
-    } else if (selectedLeaderboardType === 'team_lead') {
-      if (selectedLeaderboardTL !== 'All') {
-        matches = matches.filter(sc => (sc.teamLeadName || '').toLowerCase().trim() === selectedLeaderboardTL.toLowerCase().trim());
-      }
-    } else if (selectedLeaderboardType === 'manager') {
-      if (selectedLeaderboardMgr !== 'All') {
-        matches = matches.filter(sc => {
-          const mName = (sc.mappedManagerName || sc.Manager || '').toLowerCase().trim();
-          return mName === selectedLeaderboardMgr.toLowerCase().trim();
-        });
-      }
-    }
-
-    if (matches.length === 0) {
-      let displayName = 'Global';
-      if (selectedLeaderboardType === 'process') displayName = selectedLeaderboardProcess;
-      else if (selectedLeaderboardType === 'team_lead') displayName = selectedLeaderboardTL;
-      else if (selectedLeaderboardType === 'manager') displayName = selectedLeaderboardMgr;
-      else if (selectedLeaderboardType === 'role') displayName = selectedLeaderboardRole;
-
+    if (!currentLeaderboard || !currentLeaderboard.stats) {
       return {
         processName: displayName,
         totalEmployees: 0,
@@ -654,74 +671,36 @@ export default React.memo(function ScorecardView({ user, allUsers = [], onRefres
       };
     }
 
-    // Sort to determine Top / Bottom performer
-    const sorted = [...matches].sort((a, b) => b.finalScore - a.finalScore);
-    const top = sorted[0];
-    const bottom = sorted[sorted.length - 1];
-
-    let qualitySum = 0, qualityCount = 0;
-    let productivitySum = 0, productivityCount = 0;
-    let attendanceSum = 0, attendanceCount = 0;
-
-    matches.forEach(sc => {
-      if (sc.kpiBreakdown) {
-        sc.kpiBreakdown.forEach(k => {
-          const kName = (k.name || '').toLowerCase().trim();
-          const pAch = k.achievementPct !== undefined ? k.achievementPct : 0;
-          
-          if (kName.includes('quality') || kName.includes('accuracy') || kName.includes('accura')) {
-            qualitySum += pAch;
-            qualityCount++;
-          }
-          if (kName.includes('productivity') || kName.includes('production') || kName.includes('throughput') || kName.includes('volume') || kName.includes('count') || kName.includes('speed') || kName.includes('efficiency') || kName.includes('output') || kName.includes('aht')) {
-            productivitySum += pAch;
-            productivityCount++;
-          }
-          if (kName.includes('attendance') || kName.includes('present') || kName.includes('absent') || kName.includes('shrinkage') || kName.includes('adherence') || kName.includes('leave')) {
-            attendanceSum += pAch;
-            attendanceCount++;
-          }
-        });
-      }
-    });
-
-    let headerName = 'Global';
-    if (selectedLeaderboardType === 'process') headerName = selectedLeaderboardProcess === 'All' ? 'Global' : selectedLeaderboardProcess;
-    else if (selectedLeaderboardType === 'team_lead') headerName = `TL: ${selectedLeaderboardTL}`;
-    else if (selectedLeaderboardType === 'manager') headerName = `Manager: ${selectedLeaderboardMgr}`;
-    else if (selectedLeaderboardType === 'role') headerName = `Role: ${selectedLeaderboardRole}`;
-
+    const s = currentLeaderboard.stats;
     return {
-      processName: headerName,
-      totalEmployees: matches.length,
-      averageScore: Math.round(matches.reduce((sum, s) => sum + s.finalScore, 0) / matches.length * 10) / 10,
-      averageQuality: qualityCount > 0 ? Math.round(qualitySum / qualityCount * 10) / 10 : 0,
-      averageProductivity: productivityCount > 0 ? Math.round(productivitySum / productivityCount * 10) / 10 : 0,
-      averageAttendance: attendanceCount > 0 ? Math.round(attendanceSum / attendanceCount * 10) / 10 : 0,
-      topPerformer: top ? top.employeeName : '-',
-      topPerformerScore: top ? top.finalScore : 0,
-      bottomPerformer: bottom ? bottom.employeeName : '-',
-      bottomPerformerScore: bottom ? bottom.finalScore : 0
+      processName: displayName,
+      totalEmployees: s.totalEmployees || 0,
+      averageScore: s.averageScore || 0,
+      averageQuality: s.averageQuality || 0,
+      averageProductivity: s.averageProductivity || 0,
+      averageAttendance: s.averageAttendance || 0,
+      topPerformer: s.topPerformer || '-',
+      topPerformerScore: s.topPerformerScore || 0,
+      bottomPerformer: s.bottomPerformer || '-',
+      bottomPerformerScore: s.bottomPerformerScore || 0
     };
-  }, [allScorecards, selectedPeriod, selectedLeaderboardRole, selectedLeaderboardProcess, selectedLeaderboardType, selectedLeaderboardTL, selectedLeaderboardMgr]);
+  }, [currentLeaderboard, selectedLeaderboardType, selectedLeaderboardRole, selectedLeaderboardProcess, selectedLeaderboardTL, selectedLeaderboardMgr]);
 
   // Simple statistics for selected period
   const periodStats = useMemo(() => {
-    const records = allScorecards.filter(sc => {
-      const pDate = ensureDateStr(sc.reportingPeriod);
-      return (pDate === ensureDateStr(selectedPeriod));
-    });
-    if (records.length === 0) return { totalUploaded: 0, averageScore: 0, outstandingCount: 0 };
-    
-    const sum = records.reduce((acc, c) => acc + c.finalScore, 0);
-    const outs = records.filter(sc => sc.finalScore >= 100).length;
-    
+    if (!globalLeaderboard || !globalLeaderboard.stats) {
+      return { totalUploaded: 0, averageScore: 0, outstandingCount: 0 };
+    }
+    const s = globalLeaderboard.stats;
+    const rankings = globalLeaderboard.rankings || [];
+    const outstandingCount = rankings.filter((r: any) => r.finalScore >= 100).length;
+
     return {
-      totalUploaded: records.length,
-      averageScore: Math.round((sum / records.length) * 10) / 10,
-      outstandingCount: outs
+      totalUploaded: s.totalEmployees || 0,
+      averageScore: s.averageScore || 0,
+      outstandingCount: outstandingCount
     };
-  }, [allScorecards, selectedPeriod]);
+  }, [globalLeaderboard]);
 
   // Auto-reset stuck process filters when available choices change
   useEffect(() => {
@@ -736,44 +715,7 @@ export default React.memo(function ScorecardView({ user, allUsers = [], onRefres
     }
   }, [availableProcesses, selectedLeaderboardProcess]);
 
-  // Download Universal Excel Template Handler
-  const downloadTemplate = () => {
-    const headers = [
-      'Reporting Period',
-      'Employee Email',
-      'Role',
-      'Process Name',
-      'KPI Name',
-      'Target',
-      'Actual',
-      'Bonus',
-      'Penalty',
-      'Comments'
-    ];
-    // Create practical sample rows matching QV, QA, SME, QTL
-    const sampleData = [
-      ['2026-06-01', 'agent1@company.com', 'QV', 'Safe Search', 'Productivity', 100, 105, 0, 0, 'Smashed targets'],
-      ['2026-06-01', 'agent1@company.com', 'QV', 'Safe Search', 'Quality', 98, 99, 0, 0, 'Zero QA flags'],
-      ['2026-06-01', 'agent1@company.com', 'QV', 'Safe Search', 'Attendance', 95, 96.5, 0, 0, 'Consistent presence'],
-      ['2026-06-01', 'agent1@company.com', 'QV', 'Safe Search', 'APT', 240, 210, 5, 0, 'Very fast handle times (Bonus applied)'],
-      
-      ['2026-06-01', 'qa1@company.com', 'QA', 'Quality', 'Audits Completed', 100, 115, 0, 0, 'Excellent volume'],
-      ['2026-06-01', 'qa1@company.com', 'QA', 'Quality', 'QA Accuracy', 98, 97.5, 0, 1, 'Single minor alignment variance'],
-      ['2026-06-01', 'qa1@company.com', 'QA', 'Quality', 'SLA Adherence', 100, 100, 0, 0, 'Standard on-time delivery'],
-      ['2026-06-01', 'qa1@company.com', 'QA', 'Quality', 'Feedback Sessions', 20, 22, 2, 0, 'Coaching sessions with agents (Bonus applied)'],
-      
-      ['2026-06-01', 'tl1@company.com', 'QTL', 'Safe Search', 'Audits Coached', 30, 32, 0, 0, 'Good feedback tracking'],
-      ['2026-06-01', 'tl1@company.com', 'QTL', 'Safe Search', 'Calibration Variance', 5, 3.2, 0, 0, 'Perfect team calibration'],
-      ['2026-06-01', 'tl1@company.com', 'QTL', 'Safe Search', 'Team Performance', 92, 94.5, 2, 0, 'Team achieved average 94.5%'],
-      ['2026-06-01', 'tl1@company.com', 'QTL', 'Safe Search', 'Attendance', 95, 95, 0, 0, 'Present']
-    ];
 
-    const ws = XLSX.utils.aoa_to_sheet([headers, ...sampleData]);
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, 'Precision360 Template');
-    XLSX.writeFile(wb, 'Precision360_Universal_KPI_Template.xlsx');
-    toast.success('Universal upload Excel template of size downloaded successfully.');
-  };
 
   // Excel Universal CSV Parser
   const fetchRecentUploads = async () => {
@@ -842,196 +784,8 @@ export default React.memo(function ScorecardView({ user, allUsers = [], onRefres
     }
   };
 
-  const handleExcelUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files && e.target.files[0]) {
-      const file = e.target.files[0];
-      const reader = new FileReader();
-
-      reader.onload = (evt) => {
-        try {
-          const bstr = evt.target?.result;
-          const wb = XLSX.read(bstr, { type: 'binary' });
-          const wsName = wb.SheetNames[0];
-          const ws = wb.Sheets[wsName];
-          const rawRows = XLSX.utils.sheet_to_json(ws) as any[];
-
-          if (rawRows.length === 0) {
-            toast.error("Spreadsheet appears empty. No rows parsed.");
-            return;
-          }
-
-          // Dynamic Column Normalization Maps
-          const parseList: KpiUploadRow[] = rawRows.map((r, index) => {
-            const keys = Object.keys(r);
-            const findCell = (keywords: string[], excludeKeywords: string[] = []) => {
-              for (const kw of keywords) {
-                const matchedKey = keys.find(k => {
-                  const normalizedKey = k.toLowerCase().replace(/[\s\-_]/g, '');
-                  const normalizedKw = kw.toLowerCase().replace(/[\s\-_]/g, '');
-                  
-                  const isExcluded = excludeKeywords.some(ex => 
-                    normalizedKey.includes(ex.toLowerCase().replace(/[\s\-_]/g, ''))
-                  );
-                  if (isExcluded) return false;
-                  
-                  return normalizedKey.includes(normalizedKw);
-                });
-                if (matchedKey !== undefined) {
-                  return r[matchedKey];
-                }
-              }
-              return undefined;
-            };
-
-            const rawPeriod = findCell(['period', 'reporting']) || r['Reporting Period'] || r['Period'] || '2026-06-01';
-            const rawDate = findCell(['workdate', 'date']) || r['Work Date'] || r['Date'];
-            
-            const normalizedPeriod = normalizeUploadDate(rawPeriod);
-            const normalizedDate = rawDate ? normalizeUploadDate(rawDate) : normalizedPeriod;
-            
-            const reportingPeriod = normalizedPeriod.reportingPeriod;
-            const workDate = normalizedDate.workDate;
-            const email = String(findCell(['email', 'employee', 'user']) || r['Employee Email'] || r['Email'] || '').toLowerCase().trim();
-            const role = String(findCell(['role']) || r['Role'] || 'QV').trim().toUpperCase();
-            const processName = String(findCell(['process', 'processname']) || r['Process Name'] || '').trim();
-            const kpi = String(findCell(['kpiname', 'kpi', 'metric', 'parameter']) || r['KPI Name'] || r['KPI'] || '').trim();
-            const target = Number(findCell(['target']) || r['Target'] || 0);
-            const actual = Number(findCell(['actual']) || r['Actual'] || 0);
-            const bonus = Number(findCell(['bonus']) || r['Bonus'] || 0);
-            const penalty = Number(findCell(['penalty']) || r['Penalty'] || 0);
-            const comments = String(findCell(['comment', 'remarks', 'feedback', 'comments']) || r['Comments'] || r['Comment'] || '').trim();
-
-            return {
-              id: `stg-${Date.now()}-${index}`,
-              reportingPeriod,
-              workDate,
-              employeeEmail: email,
-              role,
-              processName,
-              kpiName: kpi,
-              target,
-              actual,
-              bonus,
-              penalty,
-              comments,
-              hasMajorEscalation: false
-            };
-          }).filter(r => r.employeeEmail !== '' && r.kpiName !== '');
-
-          if (parseList.length === 0) {
-            toast.warning("No rows parsed correctly. Ensure your spreadsheet contains Email and KPI Name columns.");
-            return;
-          }
-          
-          // New Validation for Process Name
-          const missingProcess = parseList.find(r => !r.processName);
-          if (missingProcess) {
-            toast.error(`Upload rejected: Process Name is mandatory. Missing in row for ${missingProcess.employeeEmail}.`);
-            return;
-          }
-
-          setStagingData(parseList);
-          setStagingFileName(file.name);
-          toast.success(`Successfully parsed ${parseList.length} items to the staging desk!`);
-        } catch (err) {
-          toast.error("Spreadsheet format parser failed. Check alignment headers.");
-          console.error(err);
-        }
-      };
-
-      reader.readAsBinaryString(file);
-    }
-  };
-
-  // Staging Inline Inline Editor Helpers
-  const handleStartStagingEdit = (row: KpiUploadRow) => {
-    setEditingStagingId(row.id);
-    setEditRowFields({ ...row });
-  };
-
-  const handleSaveStagingRow = () => {
-    if (!editingStagingId) return;
-
-    setStagingData(prev => 
-      prev.map(row => {
-        if (row.id === editingStagingId) {
-          return {
-            ...row,
-            ...editRowFields,
-            employeeEmail: (editRowFields.employeeEmail || row.employeeEmail).toLowerCase().trim(),
-            role: (editRowFields.role || row.role).toUpperCase().trim()
-          } as KpiUploadRow;
-        }
-        return row;
-      })
-    );
-
-    setEditingStagingId(null);
-    setEditRowFields({});
-    toast.success("Row committed in memory!");
-  };
-
-  const handleRemoveStagingRow = (id: string) => {
-    setStagingData(prev => prev.filter(row => row.id !== id));
-    toast.info("Staged record deleted.");
-  };
-
   /**
-   * Commit Raw staging rows to 'kpi_uploads' Firestore collection,
-   * then auto-calculate scorecards for that period
-   */
-  const handleCommitUploadGrid = async () => {
-    if (stagingData.length === 0) {
-      toast.error("Staging desk is empty. No uploads found.");
-      return;
-    }
-
-    setLoading(true);
-    try {
-      const chunkArray = <T,>(arr: T[], size: number): T[][] =>
-        Array.from({ length: Math.ceil(arr.length / size) }, (v, i) =>
-          arr.slice(i * size, i * size + size)
-        );
-
-      const dataChunks = chunkArray<KpiUploadRow>(stagingData, 400);
-      
-      for (const chunk of dataChunks) {
-        const batch = writeBatch(db);
-        chunk.forEach((row: KpiUploadRow) => {
-          const safeProcess = (row.processName || 'Shared').replace(/[\s\/]+/g, '_');
-          const finalWorkDate = row.workDate || `${row.reportingPeriod}-01`;
-          const uniqueDocId = doc(collection(db, 'kpi_uploads')).id;
-          const ref = doc(db, 'kpi_uploads', uniqueDocId);
-          batch.set(ref, {
-            ...row,
-            id: uniqueDocId,
-            workDate: finalWorkDate,
-            uploadedAt: new Date().toISOString(),
-            uploadedBy: user.email
-          });
-        });
-        await batch.commit();
-      }
-      toast.success(`Committed ${stagingData.length} records successfully to 'kpi_uploads' collection! Use the "Publish & Calculate" button to generate scorecards.`);
-
-      // Refresh all metadata counts
-      await fetchAllKPIData();
-      
-      setStagingData([]);
-      setStagingFileName('');
-      
-      if (onRefreshAllData) onRefreshAllData(true);
-    } catch (err) {
-      console.error('Failed to commit uploads: ', err);
-      toast.error('Failed to synchronize commits with Firestore database.');
-      handleFirestoreError(err, OperationType.WRITE, 'kpi_uploads');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  /**
-   * Trigger Manual Calculation & Publishing for selected period
+   * KPI Template Manager Config Console Helpers
    */
   const handleRecalculatePeriodScorecards = async () => {
     // Validation: If no KPI records exist, show required error message
@@ -1131,12 +885,7 @@ export default React.memo(function ScorecardView({ user, allUsers = [], onRefres
     }
   };
 
-  // Clean staging shelf
-  const clearStagingShelf = () => {
-    setStagingData([]);
-    setStagingFileName('');
-    toast.info("Excel staging grid cleared.");
-  };
+
 
   const renderDataValue = (val: number, format?: string) => {
     if (format === 'percentage') return `${val}%`;
@@ -1196,7 +945,7 @@ export default React.memo(function ScorecardView({ user, allUsers = [], onRefres
               Sync DB Indexes
             </Button>
             
-            {canManageKPIs && (
+            {canPublishScorecards && (
               <Button 
                 onClick={handleRecalculatePeriodScorecards} 
                 disabled={processingRecalc || loading}
@@ -1366,16 +1115,7 @@ export default React.memo(function ScorecardView({ user, allUsers = [], onRefres
               Role Leaderboards
             </Button>
 
-            {canManageKPIs && (
-              <Button 
-                variant={activeTab === 'uploads_desk' ? 'default' : 'ghost'}
-                onClick={() => setActiveTab('uploads_desk')}
-                className={`w-full justify-start font-black text-xs h-10 gap-2.5 px-4 cursor-pointer rounded-lg ${activeTab === 'uploads_desk' ? 'bg-slate-900 text-white' : 'text-slate-600 hover:bg-slate-50'}`}
-              >
-                <FileSpreadsheet size={15} />
-                KPI Universal Upload Desk
-              </Button>
-            )}
+
 
             {canEdit('Console') && (
               <>
@@ -1599,7 +1339,7 @@ export default React.memo(function ScorecardView({ user, allUsers = [], onRefres
                       No scorecard has been generated for <strong>{selectedEmail}</strong> during period <strong>{selectedPeriod}</strong> yet.
                     </p>
                   </div>
-                  {canManageKPIs && (
+                  {canPublishScorecards && (
                     <Button 
                       onClick={handleRecalculatePeriodScorecards} 
                       disabled={processingRecalc}
@@ -1941,371 +1681,7 @@ export default React.memo(function ScorecardView({ user, allUsers = [], onRefres
             </Card>
           )}
 
-          {/* TAB 3: Universal upload sheet config console */}
-          {activeTab === 'uploads_desk' && canManageKPIs && (
-            <div className="space-y-6">
-              
-              {/* Instructions and File Uploader */}
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
-                
-                {/* Drag-and-drop Card */}
-                <Card className="border border-dashed border-slate-200 p-6 rounded-2xl bg-slate-50/40 text-center flex flex-col justify-between h-56">
-                  <div>
-                    <h3 className="text-xs font-black text-slate-900 uppercase tracking-wider mb-1 flex items-center justify-center gap-1.5">
-                      <FileSpreadsheet size={15} className="text-emerald-600" /> Universal Spreadsheet Upload
-                    </h3>
-                    <p className="text-[11px] text-slate-400 leading-normal max-w-xs mx-auto mb-4">
-                      Upload your compiled .xlsx or .csv employee records. The engine will map dynamic KPIs automatically.
-                    </p>
-                  </div>
 
-                  <div className="space-y-3">
-                    <Input 
-                      type="file" 
-                      accept=".xlsx, .xls, .csv" 
-                      onChange={handleExcelUpload} 
-                      className="w-full text-xs h-9 cursor-pointer opacity-90"
-                    />
-                    {stagingFileName && (
-                      <p className="text-[10px] text-emerald-600 font-semibold flex items-center justify-center gap-1">
-                        <Check size={12} /> Staged file: {stagingFileName}
-                      </p>
-                    )}
-                  </div>
-                </Card>
-
-                {/* Templates download & seed Card */}
-                <Card className="border border-slate-150 p-6 rounded-2xl flex flex-col justify-between h-56 bg-white shadow-sm">
-                  <div>
-                    <h3 className="text-xs font-black text-slate-900 uppercase tracking-wider mb-1">Upload Work Guidelines</h3>
-                    <p className="text-[11px] text-slate-400 leading-loose">
-                      The template supports columns: <strong className="text-slate-600">Reporting Period, Employee Email, Role, KPI Name, Target, Actual, Bonus, Penalty, and Comments</strong>. Use one single spreadsheet for ALL roles seamlessly!
-                    </p>
-                  </div>
-
-                  <div className="flex gap-2 w-full mt-4">
-                    <Button 
-                      variant="outline" 
-                      onClick={downloadTemplate}
-                      className="flex-1 text-xs font-black h-10 gap-1.5 border-slate-200 text-slate-700 cursor-pointer bg-white"
-                    >
-                      <Download size={13} />
-                      Download Template
-                    </Button>
-                    <Button 
-                      variant="outline" 
-                      onClick={clearStagingShelf}
-                      disabled={stagingData.length === 0}
-                      className="text-xs font-bold h-10 border-slate-200 text-rose-600 cursor-pointer bg-white"
-                      title="Clear memory"
-                    >
-                      Reset Shelf
-                    </Button>
-                  </div>
-                </Card>
-              </div>
-
-              {/* Parsed Staging Data Grid */}
-              {stagingData.length > 0 && (
-                <Card className="border border-indigo-150 bg-indigo-50/5 shadow-md rounded-2xl overflow-hidden">
-                  <CardHeader className="bg-indigo-50/40 p-4 border-b border-indigo-100 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-                    <div>
-                      <CardTitle className="text-xs font-black text-indigo-950 uppercase tracking-widest flex items-center gap-1">
-                        Parsed Rows Staging Deck ({stagingData.length} records ready)
-                      </CardTitle>
-                      <CardDescription className="text-[11px] text-slate-400 font-semibold">Review, edit, or resolve details before writing securely to the Firestore database</CardDescription>
-                    </div>
-
-                    <Button 
-                      onClick={handleCommitUploadGrid} 
-                      disabled={loading}
-                      className="bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold h-9 px-4 shrink-0 transition-all rounded-lg cursor-pointer"
-                    >
-                      <CheckCircle size={14} className="mr-1.5" />
-                      Approve & Save Uploads to DB
-                    </Button>
-                  </CardHeader>
-                  <div className="overflow-x-auto max-h-[420px]">
-                    <Table>
-                      <TableHeader className="bg-slate-50 font-black shrink-0 sticky top-0">
-                        <TableRow className="border-b border-indigo-100">
-                          <TableHead className="text-slate-600 text-xs font-black">Email</TableHead>
-                          <TableHead className="text-slate-600 text-xs font-black text-center">Period</TableHead>
-                          <TableHead className="text-slate-600 text-xs font-black text-center">Work Date</TableHead>
-                          <TableHead className="text-slate-600 text-xs font-black text-center">Process</TableHead>
-                          <TableHead className="text-slate-600 text-xs font-black text-center">Role</TableHead>
-                          <TableHead className="text-slate-600 text-xs font-black text-center">KPI Name</TableHead>
-                          <TableHead className="text-slate-600 text-xs font-black text-center">Target</TableHead>
-                          <TableHead className="text-slate-600 text-xs font-black text-center">Actual</TableHead>
-                          <TableHead className="text-slate-600 text-xs font-black text-center">Bonus/Penalty</TableHead>
-                          <TableHead className="text-slate-600 text-xs font-black text-center">Major Escalation</TableHead>
-                          <TableHead className="text-slate-600 text-xs font-black text-right pr-4">Action</TableHead>
-                        </TableRow>
-                      </TableHeader>
-                      <TableBody>
-                        {stagingData.map((row) => {
-                          const isEditing = editingStagingId === row.id;
-                          return (
-                            <TableRow key={row.id} className="border-b border-slate-100 hover:bg-slate-50 bg-white">
-                              <TableCell className="py-2.5">
-                                {isEditing ? (
-                                  <Input 
-                                    value={editRowFields.employeeEmail || ''} 
-                                    onChange={(e) => setEditRowFields({ ...editRowFields, employeeEmail: e.target.value })}
-                                    className="h-8 text-xs max-w-xs font-bold"
-                                  />
-                                ) : (
-                                  <span className="font-extrabold text-xs text-slate-800">{row.employeeEmail}</span>
-                                )}
-                              </TableCell>
-                              <TableCell className="text-center py-2.5">
-                                {isEditing ? (
-                                  <Input 
-                                    value={editRowFields.reportingPeriod || ''} 
-                                    onChange={(e) => setEditRowFields({ ...editRowFields, reportingPeriod: e.target.value })}
-                                    className="h-8 text-xs w-20 text-center"
-                                  />
-                                ) : (
-                                  <span className="font-semibold text-xs text-slate-500">{row.reportingPeriod}</span>
-                                )}
-                              </TableCell>
-                              <TableCell className="text-center py-2.5">
-                                {isEditing ? (
-                                  <Input 
-                                    value={editRowFields.workDate || ''} 
-                                    onChange={(e) => setEditRowFields({ ...editRowFields, workDate: e.target.value })}
-                                    className="h-8 text-xs w-24 text-center"
-                                  />
-                                ) : (
-                                  <span className="font-semibold text-xs text-slate-500">{row.workDate || '-'}</span>
-                                )}
-                              </TableCell>
-                              <TableCell className="text-center py-2.5">
-                                {isEditing ? (
-                                  <Input 
-                                    value={editRowFields.processName || ''} 
-                                    onChange={(e) => setEditRowFields({ ...editRowFields, processName: e.target.value })}
-                                    className="h-8 text-xs w-24 text-center"
-                                  />
-                                ) : (
-                                  <span className="font-semibold text-xs text-slate-500">{row.processName}</span>
-                                )}
-                              </TableCell>
-                              <TableCell className="text-center py-2.5">
-                                {isEditing ? (
-                                  <Input 
-                                    value={editRowFields.role || ''} 
-                                    onChange={(e) => setEditRowFields({ ...editRowFields, role: e.target.value })}
-                                    className="h-8 text-xs w-16 text-center"
-                                  />
-                                ) : (
-                                  <Badge className="bg-slate-100 text-slate-800 font-extrabold hover:bg-slate-100 text-[10px] uppercase">{row.role}</Badge>
-                                )}
-                              </TableCell>
-                              <TableCell className="text-center py-2.5">
-                                {isEditing ? (
-                                  <Input 
-                                    value={editRowFields.kpiName || ''} 
-                                    onChange={(e) => setEditRowFields({ ...editRowFields, kpiName: e.target.value })}
-                                    className="h-8 text-xs w-32"
-                                  />
-                                ) : (
-                                  <span className="font-bold text-xs text-slate-800">{row.kpiName}</span>
-                                )}
-                              </TableCell>
-                              <TableCell className="text-center py-2.5 font-bold text-xs">
-                                {isEditing ? (
-                                  <Input 
-                                    type="number"
-                                    value={editRowFields.target || 0} 
-                                    onChange={(e) => setEditRowFields({ ...editRowFields, target: Number(e.target.value) })}
-                                    className="h-8 text-xs w-16 text-center"
-                                  />
-                                ) : (
-                                  row.target
-                                )}
-                              </TableCell>
-                              <TableCell className="text-center py-2.5 font-bold text-xs text-indigo-950">
-                                {isEditing ? (
-                                  <Input 
-                                    type="number"
-                                    value={editRowFields.actual || 0} 
-                                    onChange={(e) => setEditRowFields({ ...editRowFields, actual: Number(e.target.value) })}
-                                    className="h-8 text-xs w-16 text-center"
-                                  />
-                                ) : (
-                                  row.actual
-                                )}
-                              </TableCell>
-                              <TableCell className="text-center py-2.5">
-                                {isEditing ? (
-                                  <div className="flex gap-1 items-center justify-center">
-                                    <Input 
-                                      type="number"
-                                      placeholder="Bonus"
-                                      value={editRowFields.bonus || 0} 
-                                      onChange={(e) => setEditRowFields({ ...editRowFields, bonus: Number(e.target.value) })}
-                                      className="h-8 text-xs w-14 text-center"
-                                    />
-                                    <Input 
-                                      type="number"
-                                      placeholder="Penalty"
-                                      value={editRowFields.penalty || 0} 
-                                      onChange={(e) => setEditRowFields({ ...editRowFields, penalty: Number(e.target.value) })}
-                                      className="h-8 text-xs w-14 text-center"
-                                    />
-                                  </div>
-                                ) : (
-                                  <span className="text-xs font-semibold text-slate-500">
-                                    {row.bonus > 0 && `+${row.bonus}B`} {row.penalty > 0 && `-${row.penalty}P`}
-                                    {row.bonus === 0 && row.penalty === 0 && '-'}
-                                  </span>
-                                )}
-                              </TableCell>
-                              <TableCell className="text-center py-2.5">
-                                <input 
-                                  type="checkbox"
-                                  checked={isEditing ? (editRowFields.hasMajorEscalation || false) : (row.hasMajorEscalation || false)}
-                                  disabled={!isEditing}
-                                  onChange={(e) => setEditRowFields({ ...editRowFields, hasMajorEscalation: e.target.checked })}
-                                  className="w-3.5 h-3.5 cursor-pointer accent-indigo-600 rounded"
-                                />
-                              </TableCell>
-                              <TableCell className="text-right py-2.5 pr-4 shrink-0">
-                                <div className="flex items-center justify-end gap-1.5">
-                                  {isEditing ? (
-                                    <Button 
-                                      onClick={handleSaveStagingRow}
-                                      size="sm"
-                                      className="bg-emerald-500 hover:bg-emerald-600 h-7 text-[10px] text-white p-2.5 cursor-pointer"
-                                    >
-                                      Save
-                                    </Button>
-                                  ) : (
-                                    <Button 
-                                      onClick={() => handleStartStagingEdit(row)}
-                                      size="sm"
-                                      variant="ghost"
-                                      className="hover:bg-slate-100 h-7 text-[10px] text-indigo-600 p-2 text-center"
-                                    >
-                                      Edit
-                                    </Button>
-                                  )}
-                                  <Button 
-                                    onClick={() => handleRemoveStagingRow(row.id)}
-                                    size="sm"
-                                    variant="ghost"
-                                    className="hover:bg-rose-50 text-rose-600 h-7 text-[10px] p-2"
-                                  >
-                                    Delete
-                                  </Button>
-                                </div>
-                              </TableCell>
-                            </TableRow>
-                          );
-                        })}
-                      </TableBody>
-                    </Table>
-                  </div>
-                </Card>
-              )}
-
-              {/* Manage Existing Data Section for Admin/Manager */}
-              <Card className="border border-slate-150 shadow-sm rounded-2xl overflow-hidden mt-8">
-                <CardHeader className="bg-slate-50/40 p-4 border-b border-slate-100 flex items-center justify-between">
-                  <div>
-                    <CardTitle className="text-xs font-black text-slate-900 uppercase tracking-widest leading-none mb-1">Manage Historical Records</CardTitle>
-                    <CardDescription className="text-[10px] text-slate-400 font-medium">Historical baseline: View raw performance metrics globally.</CardDescription>
-                  </div>
-                  <Button variant="ghost" size="sm" onClick={fetchRecentUploads} className="h-8 text-[10px] font-bold gap-1 text-indigo-600">
-                    <RefreshCw size={12} /> Sync Recent
-                  </Button>
-                </CardHeader>
-                <div className="overflow-x-auto max-h-[300px]">
-                  <Table>
-                    <TableHeader className="bg-slate-50/30 sticky top-0">
-                      <TableRow>
-                        <TableHead className="text-[10px] font-black uppercase text-slate-500">Email</TableHead>
-                        <TableHead className="text-[10px] font-black uppercase text-slate-500 text-center">Period</TableHead>
-                        <TableHead className="text-[10px] font-black uppercase text-slate-500 text-center">Work Date</TableHead>
-                        <TableHead className="text-[10px] font-black uppercase text-slate-500 text-center">Process</TableHead>
-                        <TableHead className="text-[10px] font-black uppercase text-slate-500 text-center">KPI</TableHead>
-                        <TableHead className="text-[10px] font-black uppercase text-slate-500 text-center">Actual</TableHead>
-                      </TableRow>
-                    </TableHeader>
-                    <TableBody>
-                      {filteredRecentUploads.length > 0 ? filteredRecentUploads.map((row) => {
-                        const isEditing = editingHistoricalId === row.docId;
-                        return (
-                          <TableRow key={row.docId} className="hover:bg-slate-50/50">
-                            <TableCell className="text-[11px] font-bold text-slate-700">
-                              {isEditing ? (
-                                <Input 
-                                  value={editHistoricalFields.employeeEmail || ''} 
-                                  onChange={(e) => setEditHistoricalFields({ ...editHistoricalFields, employeeEmail: e.target.value })}
-                                  className="h-7 text-[10px]"
-                                />
-                              ) : row.employeeEmail}
-                            </TableCell>
-                            <TableCell className="text-[11px] text-center font-bold text-slate-500">
-                              {isEditing ? (
-                                <Input 
-                                  value={editHistoricalFields.reportingPeriod || ''} 
-                                  onChange={(e) => setEditHistoricalFields({ ...editHistoricalFields, reportingPeriod: e.target.value })}
-                                  className="h-7 text-[10px] w-20 mx-auto"
-                                />
-                              ) : row.reportingPeriod}
-                            </TableCell>
-                            <TableCell className="text-[11px] text-center font-semibold text-slate-500">
-                              {isEditing ? (
-                                <Input 
-                                  value={editHistoricalFields.workDate || ''} 
-                                  onChange={(e) => setEditHistoricalFields({ ...editHistoricalFields, workDate: e.target.value })}
-                                  className="h-7 text-[10px] w-24 mx-auto text-center"
-                                />
-                              ) : (row.workDate || '-')}
-                            </TableCell>
-                            <TableCell className="text-[11px] text-center font-medium text-slate-500">
-                              {isEditing ? (
-                                <Input 
-                                  value={editHistoricalFields.processName || ''} 
-                                  onChange={(e) => setEditHistoricalFields({ ...editHistoricalFields, processName: e.target.value })}
-                                  className="h-7 text-[10px] w-24 mx-auto"
-                                />
-                              ) : row.processName}
-                            </TableCell>
-                            <TableCell className="text-[11px] text-center text-slate-600 font-medium">
-                              {isEditing ? (
-                                <Input 
-                                  value={editHistoricalFields.kpiName || ''} 
-                                  onChange={(e) => setEditHistoricalFields({ ...editHistoricalFields, kpiName: e.target.value })}
-                                  className="h-7 text-[10px] w-28 mx-auto"
-                                />
-                              ) : row.kpiName}
-                            </TableCell>
-                            <TableCell className="text-[11px] text-center font-bold text-indigo-600">
-                              {isEditing ? (
-                                <Input 
-                                  type="number"
-                                  value={editHistoricalFields.actual || 0} 
-                                  onChange={(e) => setEditHistoricalFields({ ...editHistoricalFields, actual: Number(e.target.value) })}
-                                  className="h-7 text-[10px] w-16 mx-auto"
-                                />
-                              ) : row.actual}
-                            </TableCell>
-                          </TableRow>
-                        );
-                      }) : (
-                        <TableRow>
-                          <TableCell colSpan={5} className="text-center py-8 text-xs text-slate-400 italic font-medium">No historical records synchronized for management yet.</TableCell>
-                        </TableRow>
-                      )}
-                    </TableBody>
-                  </Table>
-                </div>
-              </Card>
-            </div>
-          )}
 
           {/* TAB 4: Dynamic KPI Templates configure */}
           {activeTab === 'templates_desk' && canEdit('Console') && (

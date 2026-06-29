@@ -167,6 +167,7 @@ export function canActOn(actor: UserProfile, target: UserProfile, allUsers: User
     (target.teamLeadName && actorNameLower && target.teamLeadName.toLowerCase().trim() === actorNameLower) ||
     (target.teamLeadName && actorFullNameLower && target.teamLeadName.toLowerCase().trim() === actorFullNameLower) ||
     (target.mappedTL && target.mappedTL.toLowerCase().trim() === actorIdLower) ||
+    (target.teamLeadUid && target.teamLeadUid.toLowerCase().trim() === actorIdLower) ||
     
     // Manager mappings
     (target.mappedManagerId && target.mappedManagerId.toLowerCase().trim() === actorIdLower) ||
@@ -205,10 +206,20 @@ export function canActOn(actor: UserProfile, target: UserProfile, allUsers: User
       (targetTLIdLower && targetTLIdLower === tlEmailLower) ||
       (targetTLNameLower && tlNameLower && targetTLNameLower === tlNameLower) ||
       (targetTLNameLower && tlFullNameLower && targetTLNameLower === tlFullNameLower) ||
-      (target.mappedTL && target.mappedTL.toLowerCase().trim() === tlIdLower);
+      (target.mappedTL && target.mappedTL.toLowerCase().trim() === tlIdLower) ||
+      (target.teamLeadUid && target.teamLeadUid.toLowerCase().trim() === tlIdLower);
 
     return tlIsSubordinate && targetReportsToTL;
   });
+
+  // 4. Fallback for sandbox: If no hierarchy is defined in DB
+  if (!isDirectReport && !isIndirectReport) {
+    const isSandbox = !allUsers.some(u => 
+      !!u.teamLeadId || !!u.teamLeadEmail || !!u.teamLeadUid || !!u.mappedTL || 
+      !!u.mappedManagerId || !!u.managerId || !!u.teamLeadName || !!u.managerName
+    );
+    if (isSandbox) return true;
+  }
 
   return !!isDirectReport || isIndirectReport;
 }

@@ -5,12 +5,12 @@ import {
   ShieldCheck, 
   RefreshCw, 
   CheckCircle, 
-  Database,
   Briefcase,
-  AlertTriangle,
   UserCheck,
-  UserCheck2,
-  Calendar
+  Calendar,
+  Database,
+  ChevronDown,
+  ChevronUp
 } from 'lucide-react';
 import { 
   BarChart, 
@@ -19,22 +19,44 @@ import {
   YAxis, 
   CartesianGrid, 
   Tooltip, 
-  Legend, 
   ResponsiveContainer, 
   PieChart, 
   Pie, 
   Cell 
 } from 'recharts';
-import { db } from '../../lib/firebase';
-import { collection, getDocs, query, limit, orderBy } from 'firebase/firestore';
+import { firestoreLogger } from '../../lib/firestoreLogger';
 
 interface DashboardSubViewProps {
   allUsers: any[];
   adminTheme: 'light' | 'dark';
 }
 
+interface CollectionStats {
+  reads: number;
+  writes: number;
+  calls: number;
+}
+
+interface DashboardStats {
+  totalUsers: number;
+  activeUsers: number;
+  inactiveUsers: number;
+  agents: number;
+  qas: number;
+  smes: number;
+  teamLeads: number;
+  managers: number;
+  recordsToday: number;
+  lastSync: string;
+  firestoreReads: number;
+  firestoreWrites: number;
+  locationCounts: Record<string, number>;
+  statsBySource: Record<string, CollectionStats>;
+}
+
 export const DashboardSubView: React.FC<DashboardSubViewProps> = ({ allUsers, adminTheme }) => {
-  const [stats, setStats] = useState({
+  const [isFirestoreExpanded, setIsFirestoreExpanded] = useState(false);
+  const [stats, setStats] = useState<DashboardStats>({
     totalUsers: 0,
     activeUsers: 0,
     inactiveUsers: 0,
@@ -45,54 +67,65 @@ export const DashboardSubView: React.FC<DashboardSubViewProps> = ({ allUsers, ad
     managers: 0,
     recordsToday: 0,
     lastSync: 'Syncing...',
-    systemHealth: 'Optimal'
+    firestoreReads: 0,
+    firestoreWrites: 0,
+    locationCounts: {} as Record<string, number>,
+    statsBySource: {}
   });
 
-  const [recentActivities, setRecentActivities] = useState<any[]>([]);
-
   useEffect(() => {
-    // Calculative statistics from allUsers
-    const total = allUsers.length;
-    const active = allUsers.filter(u => u?.status?.toLowerCase() === 'active' || u?.isActive === true).length;
-    const inactive = total - active;
-    const agents = allUsers.filter(u => (u?.role || '').toUpperCase() === 'AGENT').length;
-    const qas = allUsers.filter(u => (u?.role || '').toUpperCase() === 'QA').length;
-    const smes = allUsers.filter(u => (u?.role || '').toUpperCase() === 'SME').length;
-    const tls = allUsers.filter(u => {
-      const r = (u?.role || '').toUpperCase();
-      return ['TEAM_LEAD', 'STL', 'OPS_TL', 'QTL', 'TRAINER_TL', 'TEAM LEAD', 'TRAINER TL', 'OPS TL'].includes(r);
-    }).length;
-    const mgrs = allUsers.filter(u => {
-      const r = (u?.role || '').toUpperCase();
-      return ['MANAGER', 'ASSISTANT_MANAGER', 'ADMIN', 'EXECUTIVE'].includes(r);
-    }).length;
+    // Initial stats fetch
+    const updateStats = () => {
+      const fsStats = firestoreLogger.getStats();
+      
+      const total = allUsers.length;
+      const active = allUsers.filter(u => u?.status?.toLowerCase() === 'active' || u?.isActive === true).length;
+      const inactive = total - active;
+      const agents = allUsers.filter(u => (u?.role || '').toUpperCase() === 'AGENT').length;
+      const qas = allUsers.filter(u => (u?.role || '').toUpperCase() === 'QA').length;
+      const smes = allUsers.filter(u => (u?.role || '').toUpperCase() === 'SME').length;
+      const tls = allUsers.filter(u => {
+        const r = (u?.role || '').toUpperCase();
+        return ['TEAM_LEAD', 'STL', 'OPS_TL', 'QTL', 'TRAINER_TL', 'TEAM LEAD', 'TRAINER TL', 'OPS TL'].includes(r);
+      }).length;
+      const mgrs = allUsers.filter(u => {
+        const r = (u?.role || '').toUpperCase();
+        return ['MANAGER', 'ASSISTANT_MANAGER', 'ADMIN', 'EXECUTIVE'].includes(r);
+      }).length;
 
-    setStats(prev => ({
-      ...prev,
-      totalUsers: total,
-      activeUsers: active,
-      inactiveUsers: inactive,
-      agents,
-      qas,
-      smes,
-      teamLeads: tls,
-      managers: mgrs,
-      lastSync: new Date().toLocaleTimeString()
-    }));
+      const locationCounts = allUsers.reduce((acc, u) => {
+        const loc = u.location || 'Unknown';
+        acc[loc] = (acc[loc] || 0) + 1;
+        return acc;
+      }, {} as Record<string, number>);
 
-    // Fetch administrative logs
-    const fetchLogs = async () => {
-      try {
-        const q = query(collection(db, 'adminAuditLogs'), orderBy('timestamp', 'desc'), limit(5));
-        const snap = await getDocs(q);
-        const list = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-        setRecentActivities(list);
-      } catch (err) {
-        console.warn('Could not fetch active audit logs for feed:', err);
-      }
+      setStats(prev => ({
+        ...prev,
+        totalUsers: total,
+        activeUsers: active,
+        inactiveUsers: inactive,
+        agents,
+        qas,
+        smes,
+        teamLeads: tls,
+        managers: mgrs,
+        lastSync: new Date().toLocaleTimeString(),
+        firestoreReads: fsStats.totalReads,
+        firestoreWrites: fsStats.totalWrites,
+        locationCounts,
+        statsBySource: fsStats.statsBySource
+      }));
     };
 
-    // Fetch counts of records processed today
+    updateStats();
+    
+    // Refresh periodically
+    const interval = setInterval(updateStats, 5000);
+    return () => clearInterval(interval);
+  }, [allUsers]);
+
+  // Fetch counts of records processed today
+  useEffect(() => {
     const fetchProcessedToday = async () => {
       try {
         const todayStr = new Date().toISOString().slice(0, 10);
@@ -111,7 +144,6 @@ export const DashboardSubView: React.FC<DashboardSubViewProps> = ({ allUsers, ad
       }
     };
 
-    fetchLogs();
     fetchProcessedToday();
   }, [allUsers]);
 
@@ -148,6 +180,13 @@ export const DashboardSubView: React.FC<DashboardSubViewProps> = ({ allUsers, ad
               <p className="text-[11px] text-emerald-500 font-semibold mt-1 flex items-center gap-0.5">
                 <UserCheck size={12} /> {stats.activeUsers} Active Profiles
               </p>
+              <div className="mt-3 grid grid-cols-2 gap-x-2 gap-y-1">
+                {Object.entries(stats.locationCounts).map(([loc, count]) => (
+                    <span key={loc} className="text-[10px] bg-slate-100 dark:bg-slate-700 px-1.5 py-0.5 rounded text-slate-600 dark:text-slate-300 font-medium">
+                        {loc}: {count}
+                    </span>
+                ))}
+              </div>
             </div>
             <div className={`p-3 rounded-full ${adminTheme === 'dark' ? 'bg-slate-700 text-teal-400' : 'bg-teal-50 text-teal-600'}`}>
               <Users size={22} />
@@ -155,7 +194,7 @@ export const DashboardSubView: React.FC<DashboardSubViewProps> = ({ allUsers, ad
           </div>
         </div>
 
-        {/* Roles KPI Summary */}
+        {/* Staff Profiles */}
         <div className={cardStyle}>
           <div className="flex justify-between items-center">
             <div>
@@ -175,39 +214,56 @@ export const DashboardSubView: React.FC<DashboardSubViewProps> = ({ allUsers, ad
           </div>
         </div>
 
-        {/* Action Counters */}
-        <div className={cardStyle}>
-          <div className="flex justify-between items-center">
-            <div>
-              <p className={`text-xs font-bold uppercase tracking-wider ${subTextStyle}`}>Operations Saved Today</p>
-              <h3 className="text-3xl font-extrabold mt-1">{stats.recordsToday}</h3>
-              <p className="text-[11px] text-teal-500 font-semibold mt-1 flex items-center gap-0.5">
-                <Activity size={12} /> Active transactions tallied
-              </p>
+        {/* Firestore Usage */}
+        <div className={`lg:col-span-2 ${cardStyle}`}>
+          <div className="flex flex-col h-full">
+            <div className="flex justify-between items-center mb-4">
+              <div className="flex items-center gap-2">
+                <button onClick={() => setIsFirestoreExpanded(!isFirestoreExpanded)} className="p-1 rounded hover:bg-slate-200 dark:hover:bg-slate-700">
+                  {isFirestoreExpanded ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
+                </button>
+                <p className={`text-xs font-bold uppercase tracking-wider ${subTextStyle}`}>Firestore Usage Breakdown</p>
+              </div>
+              <div className="flex gap-4">
+                <p className="text-sm font-semibold text-emerald-500">Total Reads: {stats.firestoreReads.toLocaleString()}</p>
+                <p className="text-sm font-semibold text-amber-500">Total Writes: {stats.firestoreWrites.toLocaleString()}</p>
+              </div>
             </div>
-            <div className={`p-3 rounded-full ${adminTheme === 'dark' ? 'bg-slate-700 text-sky-400' : 'bg-sky-50 text-sky-600'}`}>
-              <Activity size={22} />
-            </div>
-          </div>
-        </div>
+            
+            {isFirestoreExpanded && (
+              <>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-xs text-left">
+                    <thead>
+                      <tr className="border-b border-slate-200 dark:border-slate-700">
+                        <th className="py-2">Source / Collection</th>
+                        <th className="py-2 text-right">Reads</th>
+                        <th className="py-2 text-right">Writes</th>
+                        <th className="py-2 text-right">Calls</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {(Object.entries(stats.statsBySource) as [string, CollectionStats][]).map(([source, s]) => (
+                        <tr key={source} className="border-b border-slate-100 dark:border-slate-800">
+                          <td className="py-2 font-mono text-[10px]">{source}</td>
+                          <td className="py-2 text-right text-emerald-600">{s.reads.toLocaleString()}</td>
+                          <td className="py-2 text-right text-amber-600">{s.writes.toLocaleString()}</td>
+                          <td className="py-2 text-right text-slate-500">{s.calls.toLocaleString()}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                <p className="text-[10px] text-slate-500 mt-4 italic">
+                  Note: Historical data filtering is disabled to prevent additional Firestore costs. Displaying real-time session statistics only.
+                </p>
+              </>
+            )}
 
-        {/* Health state */}
-        <div className={cardStyle}>
-          <div className="flex justify-between items-center">
-            <div>
-              <p className={`text-xs font-bold uppercase tracking-wider ${subTextStyle}`}>System Status</p>
-              <h3 className="text-lg font-extrabold mt-1 text-emerald-500 flex items-center gap-1.5">
-                <ShieldCheck size={20} /> Healthy
-              </h3>
-              <p className={`text-[10px] mt-2 font-medium ${subTextStyle} flex items-center gap-1`}>
-                <RefreshCw size={10} className="animate-spin" /> Last Sync: {stats.lastSync}
-              </p>
-            </div>
-            <div className={`p-3 rounded-full ${adminTheme === 'dark' ? 'bg-slate-700 text-emerald-400' : 'bg-emerald-50 text-emerald-600'}`}>
-              <CheckCircle size={22} />
-            </div>
           </div>
         </div>
+        
+        {/* Locations (Removed) */}
       </div>
 
       {/* Visual Analytics Graphs */}
@@ -267,39 +323,6 @@ export const DashboardSubView: React.FC<DashboardSubViewProps> = ({ allUsers, ad
               </div>
             ))}
           </div>
-        </div>
-      </div>
-
-      {/* Recent Audit Activities logs */}
-      <div className={cardStyle}>
-        <div className="flex justify-between items-center border-b border-slate-150/10 pb-3 mb-4">
-          <h4 className="text-sm font-bold uppercase tracking-wider">Recent Portal Actions</h4>
-          <span className="text-xs px-2 py-0.5 rounded-full bg-indigo-500/10 text-indigo-400 font-mono">Live Logs</span>
-        </div>
-        <div className="space-y-3">
-          {recentActivities.length > 0 ? (
-            recentActivities.map((act) => (
-              <div 
-                key={act.id} 
-                className={`p-3 rounded-xl border flex flex-col md:flex-row md:items-center justify-between text-xs gap-2 ${
-                  adminTheme === 'dark' ? 'bg-slate-750 border-slate-700/50 hover:bg-slate-700' : 'bg-slate-50 border-slate-200/50 hover:bg-slate-100/50'
-                } transition-colors`}
-              >
-                <div>
-                  <span className="font-extrabold uppercase text-indigo-400 bg-indigo-500/10 px-2 py-0.5 rounded mr-2 inline-block md:inline">{act.action}</span>
-                  <span className="font-medium">Affected: <strong className={adminTheme === 'dark' ? 'text-slate-200' : 'text-slate-800'}>{act.affectedUser}</strong></span>
-                </div>
-                <div className="flex items-center gap-4 text-[10px] opacity-75">
-                  <span>Actor: <strong>{act.performedBy}</strong></span>
-                  <span className="flex items-center gap-1 font-mono uppercase"><Calendar size={12} /> {new Date(act.timestamp).toLocaleString()}</span>
-                </div>
-              </div>
-            ))
-          ) : (
-            <div className="py-8 text-center text-slate-400/80 font-medium">
-              No recent logs found. Administrative actions will render here.
-            </div>
-          )}
         </div>
       </div>
     </div>

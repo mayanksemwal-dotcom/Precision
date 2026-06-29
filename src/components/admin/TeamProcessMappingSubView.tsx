@@ -185,6 +185,14 @@ export const TeamProcessMappingSubView: React.FC<TeamProcessMappingSubViewProps>
           process: payload.process || u.process || '',
           lastUpdated: new Date().toISOString()
         }, { merge: true });
+
+        const pVal = payload.process || u.process || '';
+        if (pVal) {
+          batch.set(doc(db, 'live_sessions', u.uid), {
+            process: pVal,
+            currentProcess: pVal
+          }, { merge: true });
+        }
       });
 
       await batch.commit();
@@ -484,6 +492,14 @@ export const TeamProcessMappingSubView: React.FC<TeamProcessMappingSubViewProps>
           process: payload.process || u.process || '',
           lastUpdated: new Date().toISOString()
         }, { merge: true });
+
+        const pVal = payload.process || u.process || '';
+        if (pVal) {
+          batch.set(doc(db, 'live_sessions', u.uid), {
+            process: pVal,
+            currentProcess: pVal
+          }, { merge: true });
+        }
       });
 
       await batch.commit();

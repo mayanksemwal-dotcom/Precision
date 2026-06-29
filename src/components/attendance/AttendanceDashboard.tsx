@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo, useDeferredValue, useRef } from 'react';
 import { db, auth } from '../../lib/firebase';
 import { firestoreLogger } from '../../lib/firestoreLogger';
-import { collection, query, getDocs, doc, setDoc, writeBatch, where, orderBy, getDoc, addDoc, onSnapshot } from 'firebase/firestore';
+import { collection, query, getDocs, doc, setDoc, writeBatch, where, orderBy, getDoc, addDoc, onSnapshot, limit, startAfter } from 'firebase/firestore';
 import { UserProfile, UserRole } from '../../types';
 import { usePermission } from '../PermissionContext';
 import { toast } from 'sonner';
@@ -57,16 +57,19 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
   const [selectedProcesses, setSelectedProcesses] = useState<string[]>([]);
   const [selectedTLs, setSelectedTLs] = useState<string[]>([]);
   const [selectedManagers, setSelectedManagers] = useState<string[]>([]);
+  const [selectedLocations, setSelectedLocations] = useState<string[]>([]);
   const [selectedStatuses, setSelectedStatuses] = useState<string[]>([]);
   const [filterManualOnly, setFilterManualOnly] = useState(false);
   const [currentPage, setCurrentPage] = useState(1);
   const itemsPerPage = 50;
   const deferredSearchTerm = useDeferredValue(searchTerm);
 
-
   // Date Range state for Custom
   const [customStartDate, setCustomStartDate] = useState(new Date().toISOString().split('T')[0]);
   const [customEndDate, setCustomEndDate] = useState(new Date().toISOString().split('T')[0]);
+  const [lastDoc, setLastDoc] = useState<any>(null);
+  const [hasMore, setHasMore] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
   const initialFilterApplied = useRef(false);
 
   // Default filter for TLs
@@ -201,12 +204,16 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
       const matchesProcess = selectedProcesses.length === 0 || selectedProcesses.includes(r.process);
       const matchesTL = selectedTLs.length === 0 || selectedTLs.includes(r.mappedTL);
       const matchesManager = selectedManagers.length === 0 || selectedManagers.includes(r.mappedManager);
+      
+      const empLocation = (userLookup[r.userId]?.location || 'N/A').trim();
+      const matchesLocation = selectedLocations.length === 0 || selectedLocations.includes(empLocation);
+
       const matchesStatus = selectedStatuses.length === 0 || selectedStatuses.includes(r.attendanceStatus);
       const matchesManual = !filterManualOnly || !!r.isManuallyOverridden;
       
-      return matchesSearch && matchesProcess && matchesTL && matchesManager && matchesStatus && matchesManual;
+      return matchesSearch && matchesProcess && matchesTL && matchesManager && matchesLocation && matchesStatus && matchesManual;
     });
-  }, [enhancedRecords, searchTerm, selectedProcesses, selectedTLs, selectedManagers, selectedStatuses, filterManualOnly, isTopAdmin, isTLRole, user]);
+  }, [enhancedRecords, searchTerm, selectedProcesses, selectedLocations, selectedTLs, selectedManagers, selectedStatuses, filterManualOnly, isTopAdmin, isTLRole, user, userLookup]);
 
   const paginatedRecords = useMemo(() => {
     const start = (currentPage - 1) * itemsPerPage;
@@ -247,6 +254,15 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
     return list.sort();
   }, [allUsers, records]);
 
+  const availableLocations = useMemo(() => {
+    const list = new Set<string>();
+    list.add('Dehradun (DDN)');
+    list.add('Jammu (JMU)');
+    list.add('Bangalore (BLR)');
+    allUsers.forEach(u => u.location && list.add(u.location));
+    return Array.from(list).filter(Boolean).sort();
+  }, [allUsers]);
+
   const availableTLs = useMemo(() => {
     const fromUsers = allUsers.map(u => u.teamLeadName);
     const fromRecords = records.map(r => r.mappedTL);
@@ -279,96 +295,117 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
     allUsersRef.current = allUsers;
   }, [allUsers]);
 
-  useEffect(() => {
-    setLoading(true);
+  const fetchAttendanceRecords = async (isLoadMore = false) => {
+    if (isLoadMore) setLoadingMore(true);
+    else setLoading(true);
 
-    // 1. Listen to Config
-    const unsubConfig = onSnapshot(doc(db, 'config', 'attendanceSettings'), (confSnap) => {
-      firestoreLogger.trackRead('attendance_config_onSnapshot', confSnap.exists() ? 1 : 0);
-      let currConfig = { presentThreshold: 480, halfDayThreshold: 240, countBreakTime: false };
-      if (confSnap.exists()) {
-        const c = confSnap.data();
-        currConfig = {
-          presentThreshold: c.presentThreshold ?? 480,
-          halfDayThreshold: c.halfDayThreshold ?? 240,
-          countBreakTime: c.countBreakTime ?? false
-        };
+    try {
+      // 1. Fetch Config one-time
+      if (!isLoadMore) {
+        const configSnap = await getDoc(doc(db, 'config', 'attendanceSettings'));
+        firestoreLogger.trackRead('attendance_config_fetch_one_time', configSnap.exists() ? 1 : 0);
+        if (configSnap.exists()) {
+          const c = configSnap.data();
+          setConfig({
+            presentThreshold: c.presentThreshold ?? 480,
+            halfDayThreshold: c.halfDayThreshold ?? 240,
+            countBreakTime: c.countBreakTime ?? false
+          });
+        }
       }
-      setConfig(currConfig);
-    });
 
-    // 2. Compute date range
-    const getLocalDateString = (d: Date): string => {
-      const yyyy = d.getFullYear();
-      const mm = String(d.getMonth() + 1).padStart(2, '0');
-      const dd = String(d.getDate()).padStart(2, '0');
-      return `${yyyy}-${mm}-${dd}`;
-    };
+      // 2. Compute date range
+      const getLocalDateString = (d: Date): string => {
+        const yyyy = d.getFullYear();
+        const mm = String(d.getMonth() + 1).padStart(2, '0');
+        const dd = String(d.getDate()).padStart(2, '0');
+        return `${yyyy}-${mm}-${dd}`;
+      };
 
-    let startStr = '';
-    let endStr = '';
+      let startStr = '';
+      let endStr = '';
 
-    if (dateRange === 'today') {
-      const todayStr = getLocalDateString(new Date());
-      startStr = todayStr;
-      endStr = todayStr;
-    } else if (dateRange === 'yesterday') {
-      const d = new Date();
-      d.setDate(d.getDate() - 1);
-      const yesterdayStr = getLocalDateString(d);
-      startStr = yesterdayStr;
-      endStr = yesterdayStr;
-    } else if (dateRange === 'week') {
-      const d = new Date();
-      d.setDate(d.getDate() - 7);
-      startStr = getLocalDateString(d);
-      endStr = getLocalDateString(new Date());
-    } else if (dateRange === 'month') {
-      const d = new Date();
-      d.setDate(d.getDate() - 30);
-      startStr = getLocalDateString(d);
-      endStr = getLocalDateString(new Date());
-    } else if (dateRange === 'current_month') {
-      const d = new Date();
-      const firstDay = new Date(d.getFullYear(), d.getMonth(), 1);
-      startStr = getLocalDateString(firstDay);
-      endStr = getLocalDateString(d);
-    } else if (dateRange === 'previous_month') {
-      const d = new Date();
-      const firstDayOfPrev = new Date(d.getFullYear(), d.getMonth() - 1, 1);
-      const lastDayOfPrev = new Date(d.getFullYear(), d.getMonth(), 0);
-      startStr = getLocalDateString(firstDayOfPrev);
-      endStr = getLocalDateString(lastDayOfPrev);
-    } else if (dateRange === 'custom') {
-      startStr = customStartDate;
-      endStr = customEndDate;
-    }
+      if (dateRange === 'today') {
+        const todayStr = getLocalDateString(new Date());
+        startStr = todayStr;
+        endStr = todayStr;
+      } else if (dateRange === 'yesterday') {
+        const d = new Date();
+        d.setDate(d.getDate() - 1);
+        const yesterdayStr = getLocalDateString(d);
+        startStr = yesterdayStr;
+        endStr = yesterdayStr;
+      } else if (dateRange === 'week') {
+        const d = new Date();
+        d.setDate(d.getDate() - 7);
+        startStr = getLocalDateString(d);
+        endStr = getLocalDateString(new Date());
+      } else if (dateRange === 'month') {
+        const d = new Date();
+        d.setDate(d.getDate() - 30);
+        startStr = getLocalDateString(d);
+        endStr = getLocalDateString(new Date());
+      } else if (dateRange === 'current_month') {
+        const d = new Date();
+        const firstDay = new Date(d.getFullYear(), d.getMonth(), 1);
+        startStr = getLocalDateString(firstDay);
+        endStr = getLocalDateString(d);
+      } else if (dateRange === 'previous_month') {
+        const d = new Date();
+        const firstDayOfPrev = new Date(d.getFullYear(), d.getMonth() - 1, 1);
+        const lastDayOfPrev = new Date(d.getFullYear(), d.getMonth(), 0);
+        startStr = getLocalDateString(firstDayOfPrev);
+        endStr = getLocalDateString(lastDayOfPrev);
+      } else if (dateRange === 'custom') {
+        startStr = customStartDate;
+        endStr = customEndDate;
+      }
 
-    // 3. Listen to Records
-    const attRef = collection(db, 'attendanceSummary');
-    const q = query(attRef, where('attendanceDate', '>=', startStr), where('attendanceDate', '<=', endStr));
-    
-    const unsubRecords = onSnapshot(q, (snap) => {
-      firestoreLogger.trackRead('attendance_records_onSnapshot', snap.size);
+      // 3. Fetch Records with Cursor Pagination
+      const isStaff = isTopAdmin || isStrictAdminOrManager || isTLRole;
+      const attRef = collection(db, 'attendanceSummary');
+      
+      const PAGE_SIZE = 100;
+      let q = isStaff
+        ? query(attRef, where('attendanceDate', '>=', startStr), where('attendanceDate', '<=', endStr), orderBy('attendanceDate', 'desc'), limit(PAGE_SIZE))
+        : query(attRef, where('userId', '==', user.uid), where('attendanceDate', '>=', startStr), where('attendanceDate', '<=', endStr), orderBy('attendanceDate', 'desc'), limit(PAGE_SIZE));
+
+      if (isLoadMore && lastDoc) {
+        q = query(q, startAfter(lastDoc));
+      }
+
+      const snap = await getDocs(q);
+      firestoreLogger.trackRead('attendance_records_paged_getDocs', snap.size);
+      
       const attData = snap.docs.map(d => ({ ...d.data(), id: d.id } as AttendanceSummary));
-      attData.sort((a, b) => new Date(b.sessionStart).getTime() - new Date(a.sessionStart).getTime());
-      setRecords(attData);
-      setLoading(false);
-    }, (error) => {
+      
+      if (isLoadMore) {
+        setRecords(prev => [...prev, ...attData]);
+      } else {
+        setRecords(attData);
+      }
+
+      setLastDoc(snap.docs[snap.docs.length - 1] || null);
+      setHasMore(snap.size === PAGE_SIZE);
+      
+      if (!isLoadMore) setLoading(false);
+      else setLoadingMore(false);
+    } catch (error: any) {
       console.error('Error loading attendance records:', error);
       toast.error(`Failed to load attendance records: ${error.message || 'Unknown error'}`);
       setLoading(false);
-    });
+      setLoadingMore(false);
+    }
+  };
 
-    return () => {
-      unsubConfig();
-      unsubRecords();
-    };
-  }, [dateRange, customStartDate, customEndDate]);
+  useEffect(() => {
+    if (user?.uid) {
+      fetchAttendanceRecords(false);
+    }
+  }, [dateRange, customStartDate, customEndDate, user?.uid]);
 
   const loadData = async () => {
-    // Left empty or can be removed, but kept to avoid breaking references inside the file if they exist elsewhere (e.g., manual refresh buttons)
-    // Real-time listener handles the state updates
+    await fetchAttendanceRecords();
   };
 
   const calculateStatus = (productiveMins: number, thresholdConf: AttendanceConfig): 'Present' | 'Half Day' | 'Absent' => {
@@ -638,6 +675,12 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
           onToggle={(val) => setSelectedProcesses(prev => prev.includes(val) ? prev.filter(v => v !== val) : [...prev, val])}
           placeholder="All Processes"
         />
+        <MultiSelectDropdown 
+          options={availableLocations}
+          selectedValues={selectedLocations}
+          onToggle={(val) => setSelectedLocations(prev => prev.includes(val) ? prev.filter(v => v !== val) : [...prev, val])}
+          placeholder="All Locations"
+        />
         {isStrictAdminOrManager && (
           <>
             <MultiSelectDropdown 
@@ -682,7 +725,7 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
-                  {paginatedRecords.map(r => (
+                  {filteredRecords.map(r => (
                     <tr key={r.id} className="hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors">
                       <td className="py-1.5 px-3 pl-4">
                         <div className="flex items-center gap-2">
@@ -742,7 +785,7 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
                       )}
                     </tr>
                   ))}
-                  {paginatedRecords.length === 0 && (
+                  {filteredRecords.length === 0 && (
                     <tr>
                       <td colSpan={canModifyAttendance ? 6 : 5} className="py-6 text-center text-slate-400 text-xs">
                         No matching records found.
@@ -752,11 +795,15 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
                 </tbody>
               </table>
             </div>
-            {totalPages > 1 && (
-              <div className="flex justify-center gap-1.5 mt-2.5">
-                <button disabled={currentPage === 1} onClick={() => setCurrentPage(p => p - 1)} className="px-2 py-0.5 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors rounded text-[10px] font-bold disabled:opacity-40">Prev</button>
-                <span className="px-2 py-0.5 text-[10px] text-slate-500 dark:text-slate-400 font-bold flex items-center">Page {currentPage} of {totalPages}</span>
-                <button disabled={currentPage === totalPages} onClick={() => setCurrentPage(p => p + 1)} className="px-2 py-0.5 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors rounded text-[10px] font-bold disabled:opacity-40">Next</button>
+            {hasMore && (
+              <div className="flex justify-center mt-4">
+                <button 
+                  onClick={() => fetchAttendanceRecords(true)} 
+                  disabled={loadingMore}
+                  className="px-6 py-2 bg-indigo-600 text-white font-bold rounded-xl text-xs flex items-center gap-2 hover:bg-indigo-700 disabled:opacity-50 transition-all"
+                >
+                  {loadingMore ? <RefreshCw size={14} className="animate-spin" /> : 'Load More Records'}
+                </button>
               </div>
             )}
           </div>

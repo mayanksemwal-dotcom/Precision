@@ -29,7 +29,7 @@ import {
 import { motion, AnimatePresence } from 'motion/react';
 import { UserRole, UserProfile, SamplingTask, AuditRecord, QAAlignment, ProductionRecord, WarningTicket, AgentKpiRecord } from './types';
 import { INITIAL_ALIGNMENTS } from './lib/sample-data';
-import { auth, db, logout } from './lib/firebase';
+import { auth, db, logout, getDocsOptimized } from './lib/firebase';
 import { isFirestoreBlocked, handleFirestoreError } from './lib/safeFirestore';
 import { firestoreLogger } from './lib/firestoreLogger';
 import { OperationType } from './lib/firebase';
@@ -65,11 +65,12 @@ import TMSView from './views/TMSView';
 import ScorecardView from './views/ScorecardView';
 import ManageHistoricalRecordsView from './views/ManageHistoricalRecordsView';
 import ResourceHubView from './views/ResourceHubView';
-import AttendanceView from './views/AttendanceView';
 import ITHelpDeskView from './views/ITHelpDeskView';
+import AttendanceView from './views/AttendanceView';
 
 import { PermissionProvider, usePermission } from './components/PermissionContext';
 import { canActOn } from './lib/hierarchy';
+import { safeStorage } from './lib/safeStorage';
 
 export default function App() {
   const [user, setUser] = useState<UserProfile | null>(null);
@@ -104,9 +105,9 @@ export default function App() {
 
   const [theme, setTheme] = useState<'light' | 'dark'>(() => {
     if (typeof window !== 'undefined') {
-      const stored = localStorage.getItem('theme');
+      const stored = safeStorage.get<string>('theme');
       if (stored === 'light' || stored === 'dark') {
-        return stored;
+        return stored as 'light' | 'dark';
       }
       return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
     }
@@ -119,7 +120,7 @@ export default function App() {
     } else {
       document.documentElement.classList.remove('dark');
     }
-    localStorage.setItem('theme', theme);
+    safeStorage.set('theme', theme);
   }, [theme]);
 
   // Handle live changes to the browser system theme preference
@@ -128,7 +129,7 @@ export default function App() {
     const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
     const handleBrowserThemeChange = (e: MediaQueryListEvent) => {
       // Only transition theme if the user hasn't explicitly set their own manual preference
-      if (!localStorage.getItem('theme')) {
+      if (!safeStorage.get('theme')) {
         setTheme(e.matches ? 'dark' : 'light');
       }
     };
@@ -204,7 +205,7 @@ export default function App() {
               await setDoc(userDocRef, userProfile, { merge: true });
             } else {
               // Wait if registration is currently active in the client
-              const isRegistering = localStorage.getItem('is_registering') === 'true';
+              const isRegistering = safeStorage.get('is_registering') === 'true';
               let resolvedFromRegister = false;
               
               if (isRegistering) {
@@ -240,7 +241,7 @@ export default function App() {
                 console.log('New user detected or profile missing, checking pre-provisioning...');
                 const usersRef = collection(db, 'users');
                 const checkQuery = query(usersRef, where('email', '==', (firebaseUser.email || '').toLowerCase().trim()));
-                const querySnap = await getDocs(checkQuery);
+                const querySnap = await getDocsOptimized(checkQuery, 'pre_provision_check');
                 
                 if (!querySnap.empty) {
                   const matchedDoc = querySnap.docs[0];
@@ -359,10 +360,10 @@ export default function App() {
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [availableRoles, setAvailableRoles] = useState<string[]>([]);
 
-  // Real-time Warnings Listener
+  // Fetch disciplinary warning tickets (one-time fetch on mount/login)
   useEffect(() => {
-    if (!user) return;
-    
+    if (!user?.uid) return;
+
     const setupWarnings = async () => {
       try {
         const warningsDocId = `${user.role.toUpperCase()}_Warnings`;
@@ -379,35 +380,123 @@ export default function App() {
 
         let warningsQuery;
         if (canSeeAllWarnings) {
-          warningsQuery = query(collection(db, 'disciplinaryLogs'), orderBy('createdAt', 'desc'), limit(25));
+          warningsQuery = query(collection(db, 'disciplinaryLogs'), orderBy('createdAt', 'desc'));
         } else {
-          warningsQuery = query(collection(db, 'disciplinaryLogs'), where('agentId', '==', user.uid), orderBy('createdAt', 'desc'), limit(25));
+          warningsQuery = query(collection(db, 'disciplinaryLogs'), where('agentId', '==', user.uid));
         }
 
-        const unsubWarnings = onSnapshot(warningsQuery, (snap) => {
-          firestoreLogger.trackRead('warnings_snapshot', snap.size);
-          setWarnings(snap.docs.map(doc => ({ id: doc.id, ...(doc.data() as any) } as WarningTicket)));
-        }, (err) => {
-          console.error("Warnings fetch error:", err);
+        const unsub = onSnapshot(warningsQuery, (snap) => {
+          firestoreLogger.trackRead('warnings_onSnapshot', snap.size);
+          let docsList = snap.docs.map(doc => ({ id: doc.id, ...(doc.data() as any) } as WarningTicket));
+          if (!canSeeAllWarnings) {
+            docsList.sort((a, b) => {
+              const tA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+              const tB = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+              return tB - tA;
+            });
+          }
+          setWarnings(docsList);
+        }, (e) => {
+          console.error("Error setting up warnings:", e);
         });
-
-        return unsubWarnings;
+        return unsub;
       } catch (e) {
         console.error("Error setting up warnings:", e);
       }
     };
 
-    let unsubscribe: any = null;
-    setupWarnings().then(unsub => {
-      unsubscribe = unsub;
-    });
-
+    const unsubPromise = setupWarnings();
     return () => {
-      if (unsubscribe && typeof unsubscribe === 'function') {
-        unsubscribe();
-      }
+      unsubPromise.then(unsub => unsub && unsub());
     };
   }, [user?.uid]);
+
+let rosterFetchPromise: Promise<{ roster: any[], profiles: Record<string, any> }> | null = null;
+
+  const loadRosterWithCache = async (forceRefresh: boolean = false) => {
+    if (rosterFetchPromise && !forceRefresh) {
+      console.log('[TMS Billing Optimization] Re-using ongoing roster fetch promise...');
+      return rosterFetchPromise;
+    }
+
+    const fetchTask = async () => {
+      try {
+        const CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
+        const cachedTimestamp = safeStorage.get<string>('precision360_cache_timestamp');
+        const cachedRoster = safeStorage.get<any[]>('precision360_roster_cache');
+        const cachedProfiles = safeStorage.get<Record<string, any>>('precision360_profiles_cache');
+
+        const isCacheValid = cachedTimestamp && cachedRoster && cachedProfiles && 
+          (Date.now() - parseInt(cachedTimestamp, 10) < CACHE_TTL_MS);
+
+        if (isCacheValid && !forceRefresh) {
+          try {
+            const roster = cachedRoster;
+            const profiles = cachedProfiles;
+            if (Array.isArray(roster) && roster.length > 1) {
+              console.log('[TMS Billing Optimization] Loading roster and profiles from safeStorage cache...');
+              return { roster, profiles };
+            }
+            console.log('[TMS Billing Optimization] Cached roster has 1 or fewer users. Forcing bypass to fetch complete data...');
+          } catch (e) {
+            console.warn('[TMS Billing Optimization] Failed to parse cached roster, bypassing cache:', e);
+          }
+        }
+
+        console.log(`[TMS Billing Optimization] Cache expired or forceRefresh=${forceRefresh}. Fetching roster from Firestore...`);
+        const usersSnap = await getDocsOptimized(collection(db, 'users'), 'users_roster_refresh', forceRefresh);
+        firestoreLogger.trackRead('users_roster_refresh', usersSnap.size);
+        const roster = usersSnap.docs.map(doc => {
+          const data = doc.data() as any;
+          const normalizedTLId = data.teamLeadUid || data.teamLeadId || '';
+          const normalizedManagerId = data.mappedManagerUid || data.mappedManagerId || data.managerId || '';
+          return {
+            uid: doc.id,
+            ...data,
+            name: data.fullName || data.name || data.employeeName || '',
+            fullName: data.fullName || data.name || data.employeeName || '',
+            email: (data.email || '').toString().toLowerCase().trim(),
+            employeeId: data.employeeId || '',
+            photoURL: data.profilePhotoUrl || data.photoURL || '',
+            role: (data.role || UserRole.AGENT).toString().toUpperCase(),
+            status: data.status || 'Active',
+            teamLeadId: normalizedTLId,
+            teamLeadUid: normalizedTLId,
+            managerId: normalizedManagerId,
+            mappedManagerId: normalizedManagerId,
+            mappedManagerUid: normalizedManagerId
+          } as UserProfile;
+        });
+
+        const profilesSnap = await getDocsOptimized(collection(db, 'employeeProfiles'), 'profiles_roster_refresh', forceRefresh);
+        firestoreLogger.trackRead('profiles_roster_refresh', profilesSnap.size);
+        const profiles: Record<string, any> = {};
+        profilesSnap.forEach(d => { profiles[d.id] = d.data(); });
+
+        safeStorage.set('precision360_roster_cache', roster);
+        safeStorage.set('precision360_profiles_cache', profiles);
+        safeStorage.set('precision360_cache_timestamp', Date.now().toString());
+
+        return { roster, profiles };
+      } catch (err) {
+        console.error('[loadRosterWithCache] Error fetching/parsing roster:', err);
+        const cachedRoster = safeStorage.get<any[]>('precision360_roster_cache');
+        const cachedProfiles = safeStorage.get<Record<string, any>>('precision360_profiles_cache');
+        if (cachedRoster && cachedProfiles) {
+          return { roster: cachedRoster, profiles: cachedProfiles };
+        }
+        throw err;
+      } finally {
+        if (rosterFetchPromise === fetchTaskPromise) {
+          rosterFetchPromise = null;
+        }
+      }
+    };
+
+    const fetchTaskPromise = fetchTask();
+    rosterFetchPromise = fetchTaskPromise;
+    return fetchTaskPromise;
+  };
 
   const fetchAllData = async (isManual = false) => {
     if (!user) return;
@@ -430,7 +519,44 @@ export default function App() {
       setAuditLogs([]);
       setTasks([]);
 
-      // Refresh users if manual trigger
+      // Refresh staff roster if manual trigger
+      const userRole = (user.role || '').toUpperCase().trim();
+      const isStaff = ['ADMIN', 'MANAGER', 'TEAM_LEAD', 'STL', 'QTL', 'OPS_TL', 'TRAINER_TL', 'MIS', 'OPS_HEAD', 'HR', 'IT_MANAGER', 'QA', 'ASSISTANT_MANAGER', 'TRAINER', 'SME', 'TEAM LEAD', 'TRAINER TL', 'OPS TL'].includes(userRole);
+
+      if (isStaff) {
+        console.log('[TMS Billing Optimization] Loading staff roster...');
+        const { roster, profiles } = await loadRosterWithCache(isManual);
+        setAllUsers(roster);
+        setEmployeeProfiles(profiles);
+      }
+
+      // Re-fetch warning logs
+      const warningsDocId = `${user.role.toUpperCase()}_Warnings`;
+      const permissionsDoc = await getDoc(doc(db, 'role_permissions', warningsDocId));
+      let canSeeAllWarnings = false;
+      if (permissionsDoc.exists()) {
+        const perms = permissionsDoc.data();
+        canSeeAllWarnings = !!perms.can_view || !!perms.can_edit || !!perms.can_delete || !!perms.can_approve;
+      } else {
+        canSeeAllWarnings = ['ADMIN', 'MANAGER', 'ASSISTANT_MANAGER', 'QA', 'TEAM_LEAD', 'STL', 'OPS_TL'].includes(user.role.toUpperCase());
+      }
+      let warningsQuery;
+      if (canSeeAllWarnings) {
+        warningsQuery = query(collection(db, 'disciplinaryLogs'), orderBy('createdAt', 'desc'), limit(25));
+      } else {
+        warningsQuery = query(collection(db, 'disciplinaryLogs'), where('agentId', '==', user.uid), limit(25));
+      }
+      const warningsSnap = await getDocsOptimized(warningsQuery, 'warnings_manual_refresh');
+      let docsList = warningsSnap.docs.map(doc => ({ id: doc.id, ...(doc.data() as any) } as WarningTicket));
+      if (!canSeeAllWarnings) {
+        docsList.sort((a, b) => {
+          const tA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+          const tB = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+          return tB - tA;
+        });
+      }
+      setWarnings(docsList);
+
       if (isManual) {
         toast.success('All reports refreshed successfully');
       }
@@ -442,11 +568,35 @@ export default function App() {
     }
   };
 
+  //Consolidated Initialization path for roster & data
   useEffect(() => {
-    if (user?.uid) {
-      setActiveTab('tms');
+    if (!user?.uid) return;
+
+    console.log('[App] Initializing data for user:', user.uid);
+    setActiveTab('tms');
+    
+    const initializeData = async () => {
+      // 1. Fetch Roster & Profiles (Phase 5 Optimization)
+      const userRole = (user.role || '').toUpperCase().trim();
+      const isStaff = ['ADMIN', 'MANAGER', 'TEAM_LEAD', 'STL', 'QTL', 'OPS_TL', 'TRAINER_TL', 'MIS', 'OPS_HEAD', 'HR', 'IT_MANAGER', 'QA', 'ASSISTANT_MANAGER', 'TRAINER', 'SME', 'TEAM LEAD', 'TRAINER TL', 'OPS TL'].includes(userRole);
+      
+      if (isStaff) {
+        console.log('[TMS Billing Optimization] Loading staff roster...');
+        try {
+          const { roster, profiles } = await loadRosterWithCache(false);
+          setAllUsers(roster);
+          setEmployeeProfiles(profiles);
+        } catch (err) {
+          console.error('[ROSTER_FETCH_ERROR]', err);
+        }
+      }
+
+      // 2. Fetch other initial data
       fetchAllData();
-    }
+    };
+
+    initializeData();
+
   }, [user?.uid]);
 
   const handleLogout = async () => {
@@ -454,52 +604,65 @@ export default function App() {
     setUser(null);
   };
 
-  // Real-time Employee Master (Single Source of Truth)
+  // Real-time Employee Master (Single Source of Truth) - OPTIMIZED: One-time fetch for staff with current user real-time listener
   useEffect(() => {
     if (!user) return;
 
-    console.log('Setting up real-time listener for User Profiles (Single Source of Truth)...');
+    console.log('Setting up optimized subscription for current user profile...');
     
-    // Listen to users collection
-    const masterQuery = collection(db, 'users');
-    const unsubUsers = onSnapshot(masterQuery, (snapshot) => {
-      firestoreLogger.trackRead('users_list_snapshot', snapshot.size);
-      const usersList = snapshot.docs.map(doc => {
-        const data = doc.data() as any;
-        const normalizedTLId = data.teamLeadUid || data.teamLeadId || '';
-        const normalizedManagerId = data.mappedManagerUid || data.mappedManagerId || data.managerId || '';
-        return {
-          uid: doc.id,
-          ...data,
-          name: data.fullName || data.name || data.employeeName || '',
-          fullName: data.fullName || data.name || data.employeeName || '',
-          email: (data.email || '').toString().toLowerCase().trim(),
-          employeeId: data.employeeId || '',
-          photoURL: data.profilePhotoUrl || data.photoURL || '',
-          role: (data.role || UserRole.AGENT).toString().toUpperCase(),
-          status: data.status || 'Active',
-          teamLeadId: normalizedTLId,
-          teamLeadUid: normalizedTLId,
-          managerId: normalizedManagerId,
-          mappedManagerId: normalizedManagerId,
-          mappedManagerUid: normalizedManagerId
-        } as UserProfile;
-      });
-      setAllUsers(usersList);
-      console.log(`User Database Realtime Sync: ${usersList.length} records loaded.`);
+    const userRole = (user.role || '').toUpperCase().trim();
+    const isStaff = ['ADMIN', 'MANAGER', 'TEAM_LEAD', 'STL', 'QTL', 'OPS_TL', 'TRAINER_TL', 'MIS', 'OPS_HEAD', 'HR', 'IT_MANAGER', 'QA', 'ASSISTANT_MANAGER', 'TRAINER', 'SME', 'TEAM LEAD', 'TRAINER TL', 'OPS TL'].includes(userRole);
+
+    const mapDocToUserProfile = (d: any) => {
+      const data = d.data() as any;
+      const normalizedTLId = data.teamLeadUid || data.teamLeadId || '';
+      const normalizedManagerId = data.mappedManagerUid || data.mappedManagerId || data.managerId || '';
+      return {
+        uid: d.id,
+        ...data,
+        name: data.fullName || data.name || data.employeeName || '',
+        fullName: data.fullName || data.name || data.employeeName || '',
+        email: (data.email || '').toString().toLowerCase().trim(),
+        employeeId: data.employeeId || '',
+        photoURL: data.profilePhotoUrl || data.photoURL || '',
+        role: (data.role || UserRole.AGENT).toString().toUpperCase(),
+        status: data.status || 'Active',
+        teamLeadId: normalizedTLId,
+        teamLeadUid: normalizedTLId,
+        managerId: normalizedManagerId,
+        mappedManagerId: normalizedManagerId,
+        mappedManagerUid: normalizedManagerId
+      } as UserProfile;
+    };
+
+    // Realtime listener for personal user document
+    const personalUserQuery = query(collection(db, 'users'), where('__name__', '==', user.uid));
+    const unsubUsers = onSnapshot(personalUserQuery, (snapshot) => {
+      firestoreLogger.trackRead('personal_user_snapshot', snapshot.size);
+      if (!snapshot.empty) {
+        const myProfile = mapDocToUserProfile(snapshot.docs[0]);
+        setAllUsers(prev => {
+          const filtered = prev.filter(u => u.uid !== user.uid);
+          return [myProfile, ...filtered];
+        });
+      }
     }, (err) => {
-      console.error('User fetch error:', err);
-      handleFirestoreError(err, OperationType.LIST, 'users_fetch');
+      console.error('Personal user fetch error:', err);
     });
 
-    // Listen to employee profiles collection
-    const unsubProfiles = onSnapshot(collection(db, 'employeeProfiles'), (profSnap) => {
-      firestoreLogger.trackRead('employee_profiles_snapshot', profSnap.size);
-      const profiles: Record<string, any> = {};
-      profSnap.forEach(d => { profiles[d.id] = d.data(); });
-      setEmployeeProfiles(profiles);
+    // Realtime listener for personal employee profile document
+    const personalProfileQuery = query(collection(db, 'employeeProfiles'), where('__name__', '==', user.uid));
+    const unsubProfiles = onSnapshot(personalProfileQuery, (profSnap) => {
+      firestoreLogger.trackRead('personal_profile_snapshot', profSnap.size);
+      if (!profSnap.empty) {
+        const myData = profSnap.docs[0].data();
+        setEmployeeProfiles(prev => ({
+          ...prev,
+          [user.uid]: myData
+        }));
+      }
     }, (err) => {
-      console.error('Employee Profile fetch error:', err);
+      console.error('Personal profile fetch error:', err);
     });
 
     return () => {
@@ -513,13 +676,13 @@ export default function App() {
     if (!user?.uid) return;
     const fetchRoles = async () => {
       try {
-        const rolesSnap = await getDocs(collection(db, 'roles'));
+        const rolesSnap = await getDocsOptimized(collection(db, 'roles'), 'roles_list_fetch');
         firestoreLogger.trackRead('roles_list_fetch', rolesSnap.size);
-        const rolesList = rolesSnap.docs.map(doc => (doc.data().name || doc.id).toUpperCase().trim());
+        const rolesList = rolesSnap.docs.map(doc => (((doc.data() as any).name || doc.id) as string).toUpperCase().trim());
         const qPermissions = query(collection(db, 'role_permissions'));
-        const permissionsSnap = await getDocs(qPermissions);
+        const permissionsSnap = await getDocsOptimized(qPermissions, 'role_permissions_fetch');
         firestoreLogger.trackRead('role_permissions_fetch', permissionsSnap.size);
-        const permissionsRoles = permissionsSnap.docs.map(doc => (doc.data().role_name || '').toUpperCase().trim());
+        const permissionsRoles = permissionsSnap.docs.map(doc => (((doc.data() as any).role_name || '') as string).toUpperCase().trim());
         const combined = Array.from(new Set([...rolesList, ...permissionsRoles])).filter(Boolean).sort();
         setAvailableRoles(combined.length > 0 ? combined : [
           'ADMIN', 'MANAGER', 'STL', 'OPS_TL', 'SME', 'QTL', 'QA', 'TEAM_LEAD', 'TRAINER', 'TRAINER_TL', 'MIS', 'AGENT'
@@ -605,6 +768,7 @@ function AppContent({
   const [newPassword, setNewPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
   const [passwordState, setPasswordState] = useState<'idle' | 'updating' | 'success' | 'error'>('idle');
+  const [tmsExpanded, setTmsExpanded] = useState(true);
 
   const handleUpdatePassword = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -651,7 +815,6 @@ function AppContent({
 
   const navItems = [
     { id: 'tms', label: 'Workforce TMS', icon: Clock },
-    { id: 'attendance', label: 'Attendance', icon: FileText },
     { id: 'kpis_scorecard', label: 'KPI Scorecard', icon: Award },
     { id: 'employee_relations', label: 'Employee Relations', icon: ShieldAlert },
     { id: 'it_help_desk', label: 'IT Help Desk', icon: LifeBuoy },
@@ -729,19 +892,63 @@ function AppContent({
             </div>
           )}
           {!permissionsLoading && filteredNav.map((item) => (
-            <button
-              key={item.id}
-              id={`nav-${item.id}`}
-              onClick={() => setActiveTab(item.id)}
-              className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-lg transition-all duration-200 group text-[13px] ${
-                activeTab === item.id 
-                  ? 'bg-[#38BDF8] text-[#0F172A] font-bold shadow-md shadow-sky-500/10' 
-                  : 'hover:bg-[#1E293B] hover:text-white'
-              }`}
-            >
-              <item.icon size={18} className={activeTab === item.id ? 'text-[#0F172A]' : 'text-[#64748B] group-hover:text-white'} />
-              {sidebarOpen && <span>{item.label}</span>}
-            </button>
+            <React.Fragment key={item.id}>
+              <button
+                id={`nav-${item.id}`}
+                onClick={() => {
+                  if (item.id === 'tms') {
+                    setTmsExpanded(!tmsExpanded);
+                  }
+                  setActiveTab(item.id);
+                }}
+                className={`w-full flex items-center justify-between gap-3 px-4 py-2.5 rounded-lg transition-all duration-200 group text-[13px] ${
+                  activeTab === item.id 
+                    ? 'bg-[#38BDF8] text-[#0F172A] font-bold shadow-md shadow-sky-500/10' 
+                    : 'hover:bg-[#1E293B] hover:text-white'
+                }`}
+              >
+                <div className="flex items-center gap-3">
+                  <item.icon size={18} className={activeTab === item.id ? 'text-[#0F172A]' : 'text-[#64748B] group-hover:text-white'} />
+                  {sidebarOpen && <span>{item.label}</span>}
+                </div>
+                {item.id === 'tms' && sidebarOpen && (
+                  <motion.div
+                    animate={{ rotate: tmsExpanded ? 180 : 0 }}
+                    transition={{ duration: 0.2 }}
+                  >
+                    <svg width="10" height="6" viewBox="0 0 10 6" fill="none" xmlns="http://www.w3.org/2000/svg">
+                      <path d="M1 1L5 5L9 1" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+                    </svg>
+                  </motion.div>
+                )}
+              </button>
+              {item.id === 'tms' && tmsExpanded && sidebarOpen && (
+                <div className="ml-9 mt-1 space-y-1 border-l border-slate-800 pl-3">
+                  <button
+                    onClick={() => setActiveTab('tms')}
+                    className={`w-full flex items-center gap-2.5 px-3 py-1.5 rounded-md text-[12px] transition-colors ${
+                      activeTab === 'tms' 
+                        ? 'text-sky-400 font-bold' 
+                        : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    <Clock size={14} />
+                    TMS Dashboard
+                  </button>
+                  <button
+                    onClick={() => setActiveTab('attendance')}
+                    className={`w-full flex items-center gap-2.5 px-3 py-1.5 rounded-md text-[12px] transition-colors ${
+                      activeTab === 'attendance' 
+                        ? 'text-sky-400 font-bold' 
+                        : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    <ClipboardCheck size={14} />
+                    Attendance
+                  </button>
+                </div>
+              )}
+            </React.Fragment>
           ))}
           {filteredNav.length === 0 && !permissionsLoading && (
             <div className="p-4 text-center text-xs text-rose-400 bg-rose-950/20 border border-rose-900/30 rounded-xl m-2 select-none">
@@ -930,7 +1137,7 @@ function AppContent({
                 ) : activeTab === 'it_help_desk' ? (
                   <ITHelpDeskView user={effectiveUser!} allUsers={allUsers} externalTheme={theme} />
                 ) : activeTab === 'historical' ? (
-                  <ManageHistoricalRecordsView user={effectiveUser!} />
+                  <ManageHistoricalRecordsView user={effectiveUser!} allUsers={allUsers} onRefreshAllData={fetchAllData} />
                 ) : activeTab === 'resources' ? (
                   <ResourceHubView user={effectiveUser!} />
                 ) : activeTab === 'config' ? (

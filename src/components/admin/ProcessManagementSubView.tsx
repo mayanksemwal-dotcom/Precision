@@ -12,10 +12,11 @@ import {
 } from 'lucide-react';
 import { 
   doc, 
-  onSnapshot,
+  getDoc,
   setDoc
 } from 'firebase/firestore';
 import { db } from '../../lib/firebase';
+import { firestoreLogger } from '../../lib/firestoreLogger';
 import { UserProfile } from '../../types';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '../ui/card';
 import { Button } from '../ui/button';
@@ -53,35 +54,39 @@ export const ProcessManagementSubView = ({ user, adminTheme }: ProcessManagement
   const [editIndex, setEditIndex] = useState<number | null>(null);
   const [formName, setFormName] = useState('');
 
-  // Fetch from config/tmsProcesses in real-time
+  // Fetch from config/tmsProcesses
   useEffect(() => {
-    const unsub = onSnapshot(doc(db, 'config', 'tmsProcesses'), (snap) => {
-      if (snap.exists()) {
-        const data = snap.data();
-        let loaded: MiniProcess[] = [];
-        if (Array.isArray(data.processes) && data.processes.length > 0) {
-          loaded = data.processes;
-        } else if (Array.isArray(data.list) && data.list.length > 0) {
-          loaded = data.list.map((name: string) => ({
-            name,
-            status: 'Active' as const
-          }));
+    const fetchData = async () => {
+      try {
+        const snap = await getDoc(doc(db, 'config', 'tmsProcesses'));
+        firestoreLogger.trackRead('config_tmsProcesses_getDoc', snap.exists() ? 1 : 0);
+        if (snap.exists()) {
+          const data = snap.data();
+          let loaded: MiniProcess[] = [];
+          if (Array.isArray(data.processes) && data.processes.length > 0) {
+            loaded = data.processes;
+          } else if (Array.isArray(data.list) && data.list.length > 0) {
+            loaded = data.list.map((name: string) => ({
+              name,
+              status: 'Active' as const
+            }));
+          } else {
+            // Only use defaults if document has no data whatsoever
+            loaded = DEFAULT_PROCESSES;
+          }
+          setProcesses(loaded);
         } else {
-          // Only use defaults if document has no data whatsoever
-          loaded = DEFAULT_PROCESSES;
+          const initial = DEFAULT_PROCESSES;
+          setProcesses(initial);
         }
-        setProcesses(loaded);
-      } else {
-        const initial = DEFAULT_PROCESSES;
-        setProcesses(initial);
+      } catch (err) {
+        console.error('Failed to fetch processes config', err);
+        toast.error('Failed to load process list');
+      } finally {
+        setLoading(false);
       }
-      setLoading(false);
-    }, (err) => {
-      console.error('Failed to subscribe to processes config', err);
-      toast.error('Failed to sync process list in real time');
-      setLoading(false);
-    });
-    return () => unsub();
+    };
+    fetchData();
   }, []);
 
   // Save both structured and clean array format for backward compatibility

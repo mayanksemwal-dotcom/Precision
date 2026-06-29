@@ -27,7 +27,10 @@ import {
   Smartphone,
   Monitor,
   Laptop,
-  Tablet
+  Tablet,
+  Bell,
+  AlertCircle,
+  Play
 } from 'lucide-react';
 import { 
   BarChart, 
@@ -41,7 +44,7 @@ import {
   Pie, 
   Cell 
 } from 'recharts';
-import { db, handleFirestoreError, OperationType } from '../../lib/firebase';
+import { db, handleFirestoreError, OperationType, getDocsOptimized } from '../../lib/firebase';
 import { firestoreLogger } from '../../lib/firestoreLogger';
 import { syncShiftToAttendance } from '../../services/attendanceSyncService';
 import { 
@@ -55,23 +58,34 @@ import {
   writeBatch,
   addDoc,
   onSnapshot,
-  limit
+  limit,
+  getDocsFromCache,
+  deleteDoc,
+  updateDoc
 } from 'firebase/firestore';
 import { UserProfile, UserRole } from '../../types';
 import { toast } from 'sonner';
 import { canActOn } from '../../lib/hierarchy';
 import { usePermission } from '../PermissionContext';
+import { useRoster } from './useRoster';
+import { useLiveShifts } from './useLiveShifts';
+import { useHistoricalShifts } from './useHistoricalShifts';
+import { useAlerts } from './useAlerts';
 import { MultiSelectDropdown } from '../ui/multi-select';
 import * as XLSX from 'xlsx';
 import { getManagerOfManager, getShiftProductiveMs, truncateShiftToProductiveTime, getDeviceType, getDetailedDeviceMetadata } from '../../views/TMSView';
 import { getLiveTime, getLiveTimeISO } from '../../lib/timeSync';
+import { useSharedTimer } from '../../lib/sharedTimer';
+import { isManagerRole, isTLRole } from '../../lib/roles';
 import { AggregationService, AttendanceAggregate } from '../../lib/aggregationService';
 
 interface SupervisorDashboardProps {
-  user: UserProfile;
-  allUsers: UserProfile[];
+  user?: UserProfile;
+  currentUser?: UserProfile;
+  allUsers?: UserProfile[];
   onRefreshAllData?: () => void;
   externalTheme?: 'light' | 'dark';
+  processes?: string[];
 }
 
 interface ShiftActivity {
@@ -87,6 +101,7 @@ interface TMSShift {
   userId: string;
   userName: string;
   userEmail: string;
+  teamLeadUid?: string;
   mappedTL?: string;
   mappedManager?: string;
   clockInTime: string;
@@ -121,46 +136,37 @@ const formatMs = (ms: number): string => {
 };
 
 function SupervisorClockStrip({ myShift }: { myShift: TMSShift }) {
-  const [elapsedActive, setElapsedActive] = useState('00:00:00');
-  const [elapsedBreak, setElapsedBreak] = useState('00:00:00');
-  const [elapsedShift, setElapsedShift] = useState('00:00:00');
-
+  const now = useSharedTimer();
   const { deviceType } = getDetailedDeviceMetadata();
 
-  useEffect(() => {
-    const interval = setInterval(() => {
-      const startMs = new Date(myShift.clockInTime).getTime();
-      const now = getLiveTime().getTime();
-      const totalShiftMs = Math.max(0, now - startMs);
+  const startMs = new Date(myShift.clockInTime).getTime();
+  const nowMs = now.getTime();
+  const totalShiftMs = Math.max(0, nowMs - startMs);
 
-      setElapsedShift(formatMs(totalShiftMs));
+  const elapsedShift = formatMs(totalShiftMs);
 
-      let activeMs = 0;
-      let breakMs = 0;
+  let activeMs = 0;
+  let breakMs = 0;
 
-      (myShift.activities || []).forEach(act => {
-        const start = new Date(act.startTime).getTime();
-        const end = act.endTime ? new Date(act.endTime).getTime() : now;
-        const duration = end - start;
-        const actName = (act.name || '').toLowerCase();
-        const isProductive = act.type === 'productive' || 
-                             actName.includes('meeting') || 
-                             actName.includes('coaching') || 
-                             actName.includes('training') || 
-                             actName.includes('alignment');
-        if (isProductive) {
-          activeMs += duration;
-        } else {
-          breakMs += duration;
-        }
-      });
+  (myShift.activities || []).forEach(act => {
+    const start = new Date(act.startTime).getTime();
+    const end = act.endTime ? new Date(act.endTime).getTime() : nowMs;
+    const duration = end - start;
+    const actName = (act.name || '').toLowerCase();
+    const isProductive = act.type === 'productive' || 
+                         actName.includes('meeting') || 
+                         actName.includes('coaching') || 
+                         actName.includes('training') || 
+                         actName.includes('alignment');
+    if (isProductive) {
+      activeMs += duration;
+    } else {
+      breakMs += duration;
+    }
+  });
 
-      setElapsedActive(formatMs(activeMs));
-      setElapsedBreak(formatMs(breakMs));
-    }, 1000);
-
-    return () => clearInterval(interval);
-  }, [myShift]);
+  const elapsedActive = formatMs(activeMs);
+  const elapsedBreak = formatMs(breakMs);
 
   return (
     <div className="flex items-center gap-3 border border-indigo-100 dark:border-indigo-950/40 bg-indigo-50/40 dark:bg-indigo-950/20 px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all flex-wrap">
@@ -182,8 +188,6 @@ function SupervisorClockStrip({ myShift }: { myShift: TMSShift }) {
       <div className="flex items-center gap-1.5 px-1 py-0.5 rounded bg-white/50 dark:bg-slate-800/50 border border-slate-100 dark:border-slate-800">
         {deviceType === 'Mobile' ? (
           <Smartphone size={12} className="text-fuchsia-500" />
-        ) : deviceType === 'Tablet' ? (
-          <Tablet size={12} className="text-indigo-500" />
         ) : (
           <Monitor size={12} className="text-emerald-500" />
         )}
@@ -193,24 +197,625 @@ function SupervisorClockStrip({ myShift }: { myShift: TMSShift }) {
   );
 }
 
-export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, externalTheme }: SupervisorDashboardProps) {
-  const { hasTmsPermission, permissions, loading: permissionsLoading } = usePermission();
-  const isDark = document.documentElement.classList.contains('dark') || externalTheme === 'dark';
-  
-  // Tab control
-  const [activeTab, setActiveTab] = useState<'monitoring' | 'controls' | 'exceptions' | 'hierarchy'>('monitoring');
-  
-  // Real-time active shifts & audit logs status loaded locally for performance
-  const [activeShifts, setActiveShifts] = useState<TMSShift[]>([]);
-  const [isLoadingShifts, setIsLoadingShifts] = useState(false);
-  const [lastRefreshed, setLastRefreshed] = useState<Date>(new Date());
-  const [presentThreshold, setPresentThreshold] = useState<number>(480);
+// Persistent Global Cache across mount/unmount of SupervisorDashboard removed in favor of useHistoricalShifts and useLiveShifts
+let globalCacheUserId = '';
+
+export default function SupervisorDashboard({ user: propUser, currentUser, allUsers: propAllUsers, onRefreshAllData, externalTheme, processes }: SupervisorDashboardProps) {
+  const user = propUser || currentUser;
+  const allUsers = propAllUsers || [];
+
+  if (user && globalCacheUserId !== user.uid) {
+    globalCacheUserId = user.uid;
+  }
+
+  if (!user) return null;
 
   const [expandedUserId, setExpandedUserId] = useState<string | null>(null);
   const [searchTerm, setSearchTerm] = useState('');
   const deferredSearchTerm = useDeferredValue(searchTerm);
-  const [selectedProcesses, setSelectedProcesses] = useState<string[]>([]);
+  const [selectedActivities, setSelectedActivities] = useState<string[]>([]);
+  const [selectedLocations, setSelectedLocations] = useState<string[]>([]);
+
+  const isManagerOrLead = isManagerRole(user?.role);
+  const isTeamLeadOrSME = isTLRole(user?.role);
+
+  const { hasTmsPermission, permissions, loading: permissionsLoading } = usePermission();
+  const isDark = document.documentElement.classList.contains('dark') || externalTheme === 'dark';
   
+  // Phase 1: Identify team members for optimized monitoring
+  const teamMemberUids = useMemo(() => {
+    if (!user || !propAllUsers || propAllUsers.length === 0) return [];
+    
+    const roleNormalized = (user.role || '').toUpperCase().trim();
+    const isAdmin = roleNormalized === 'ADMIN' || roleNormalized === 'MANAGER' || roleNormalized === 'OPS_HEAD';
+    
+    // Admins/Managers still see most data but for 1200 users we should still scope if possible
+    // For now, if Admin, we don't scope by "team" unless they want to.
+    // However, the requirement says "supervisors should only monitor members belonging to their reporting hierarchy"
+    
+    const team = propAllUsers.filter(target => canActOn(user, target, propAllUsers));
+    return team.map(u => u.uid);
+  }, [user, propAllUsers]);
+
+  // Tab control
+  const [activeTab, setActiveTab] = useState<'controls' | 'hierarchy' | 'alerts'>('controls');
+  
+  // Tab-specific loading states
+  const [isTrackingEnabled, setIsTrackingEnabled] = useState(true);
+  const [isHistoryEnabled, setIsHistoryEnabled] = useState(true);
+  
+  const handleTabChange = (tab: 'controls' | 'hierarchy' | 'alerts') => {
+    setActiveTab(tab);
+    if (tab === 'alerts' && !isHistoryEnabled) {
+      setIsHistoryEnabled(true);
+    }
+  };
+
+  const [activeShifts, setActiveShifts] = useState<TMSShift[]>([]);
+  const [localSuperOwnShift, setLocalSuperOwnShift] = useState<TMSShift | null | undefined>(undefined);
+  const { shifts: liveShifts, loading: loadingLiveShifts, fetchLiveShifts } = useLiveShifts(
+    user?.uid, 
+    user?.role, 
+    teamMemberUids,
+    selectedActivities.length > 0
+  );
+  const { 
+    shifts: paginatedShifts, 
+    loading: loadingHistorical, 
+    hasMore, 
+    fetchNextPage,
+    refresh: refreshHistoricalShifts
+  } = useHistoricalShifts(user?.uid, user?.role, 50, isHistoryEnabled, teamMemberUids);
+
+  const alerts = useAlerts(liveShifts, paginatedShifts);
+
+  useEffect(() => {
+    if (isTrackingEnabled) {
+      let finalShifts = [...liveShifts];
+      const myId = user.uid;
+
+      if (localSuperOwnShift !== undefined) {
+        if (localSuperOwnShift === null) {
+          // Optimistically clocked out. Filter out our own shift.
+          finalShifts = finalShifts.filter(s => s.userId !== myId);
+          // If the server also shows we are clocked out, clear the override lock.
+          const serverHasMe = liveShifts.some(s => s.userId === myId);
+          if (!serverHasMe) {
+            setLocalSuperOwnShift(undefined);
+          }
+        } else if (localSuperOwnShift) {
+          // Optimistically clocked in / changed state. Replace or add our shift.
+          finalShifts = finalShifts.filter(s => s.userId !== myId);
+          finalShifts.push(localSuperOwnShift);
+
+          // Once the server matches our local status, process, and activities size, clear override.
+          const serverShift = liveShifts.find(s => s.userId === myId);
+          if (serverShift) {
+            const serverLastAct = serverShift.activities?.[serverShift.activities.length - 1];
+            const localLastAct = localSuperOwnShift.activities?.[localSuperOwnShift.activities.length - 1];
+            const statusMatches = serverShift.status === localSuperOwnShift.status;
+            const processMatches = serverLastAct?.name === localLastAct?.name;
+            const countMatches = serverShift.activities?.length === localSuperOwnShift.activities?.length;
+
+            if (statusMatches && processMatches && countMatches) {
+              setLocalSuperOwnShift(undefined);
+            }
+          }
+        }
+      }
+
+      setActiveShifts(finalShifts);
+    } else {
+      setActiveShifts([]);
+    }
+  }, [liveShifts, isTrackingEnabled, localSuperOwnShift, user.uid]);
+
+  const [isLoadingShifts, setIsLoadingShifts] = useState(false);
+  const [lastRefreshed, setLastRefreshed] = useState<Date>(new Date());
+  const [presentThreshold, setPresentThreshold] = useState<number>(480);
+
+  // Supervisor own clock journey states & options
+  const SUPERVISOR_BREAK_OPTIONS = useMemo(() => [
+    'Lunch',
+    'Short Break',
+    'Tea Break',
+    'Meeting',
+    'Coaching',
+    'Training',
+    'Alignment',
+    'System Issue',
+    'SME Support',
+    'Client Call',
+    'Emergency Break'
+  ], []);
+
+  const [showSuperClockInConfirm, setShowSuperClockInConfirm] = useState(false);
+  const [showSuperClockOutConfirm, setShowSuperClockOutConfirm] = useState(false);
+  const [superSelectedProcess, setSuperSelectedProcess] = useState(user?.lastUsedProcess || '');
+  const [superSelectedBreak, setSuperSelectedBreak] = useState('Lunch');
+
+  const supervisorProcesses = useMemo(() => {
+    if (processes && processes.length > 0) return processes;
+    return ['HITL', 'MPQC', 'OQC', 'SOP Training', 'QA Review', 'Team Alignment', 'Admin', 'Support', 'Quality Check'];
+  }, [processes]);
+
+  useEffect(() => {
+    if (user?.lastUsedProcess) {
+      setSuperSelectedProcess(user.lastUsedProcess);
+    } else if (supervisorProcesses.length > 0 && !superSelectedProcess) {
+      setSuperSelectedProcess(supervisorProcesses[0]);
+    }
+  }, [user?.lastUsedProcess, supervisorProcesses, superSelectedProcess]);
+
+  const performSuperClockIn = async (targetProcess: string) => {
+    if (!targetProcess) {
+      toast.error('Please select a process before Clocking In.');
+      return;
+    }
+    const currentDev = getDeviceType();
+    const meta = getDetailedDeviceMetadata();
+    const nowISO = getLiveTimeISO();
+    
+    const uaVal = typeof navigator !== 'undefined' ? navigator.userAgent : 'N/A';
+    const platVal = typeof navigator !== 'undefined' ? navigator.platform : 'N/A';
+    const touchVal = typeof navigator !== 'undefined' ? navigator.maxTouchPoints : 0;
+    const swVal = typeof window !== 'undefined' && window.screen ? window.screen.width : 0;
+    const shVal = typeof window !== 'undefined' && window.screen ? window.screen.height : 0;
+
+    // Generate client-side document reference for tmsShifts to avoid waiting for server ID assignment
+    const tmsShiftRef = doc(collection(db, 'tmsShifts'));
+    const generatedId = tmsShiftRef.id;
+
+    const newShift: TMSShift = {
+      id: generatedId,
+      userId: user.uid,
+      userName: user.name,
+      userEmail: user.email,
+      teamLeadUid: (user as any).teamLeadUid || (user as any).teamLeadId || '',
+      mappedTL: (user as any).teamLeadEmail || (user as any).mappedTL || 'N/A',
+      mappedManager: (user as any).mappedManagerEmail || (user as any).mappedManager || 'N/A',
+      clockInTime: nowISO,
+      activities: [{ type: 'productive', name: targetProcess, startTime: nowISO, device: currentDev }],
+      status: 'ACTIVE',
+      clockInDevice: currentDev,
+      hasMobilePunches: currentDev === 'mobile',
+      deviceType: meta.deviceType,
+      browser: meta.browser,
+      os: meta.os,
+      loginTimestamp: meta.loginTimestamp,
+      userAgent: uaVal,
+      platform: platVal,
+      maxTouchPoints: touchVal,
+      screenWidth: swVal,
+      screenHeight: shVal,
+      detectedDeviceType: meta.deviceType,
+      detectedBrowser: meta.browser,
+      detectedOS: meta.os
+    } as any;
+
+    // 1. Close modal and set state immediately (Optimistic Update)
+    setShowSuperClockInConfirm(false);
+    setLocalSuperOwnShift(newShift);
+    setActiveShifts(prev => {
+      const filtered = prev.filter(s => s.userId !== user.uid);
+      return [newShift, ...filtered];
+    });
+
+    try {
+      const userRef = doc(db, 'users', user.uid);
+      const lsRef = doc(db, 'live_sessions', user.uid);
+
+      // 2. Perform database writes concurrently in parallel
+      await Promise.all([
+        setDoc(tmsShiftRef, newShift),
+        updateDoc(userRef, {
+          status: 'ONLINE',
+          lastLoginAt: nowISO,
+          lastUsedProcess: targetProcess
+        }),
+        setDoc(lsRef, {
+          uid: user.uid,
+          employeeId: user.uid,
+          employeeName: user.name,
+          role: user.role || 'SUPERVISOR',
+          process: targetProcess,
+          currentProcess: targetProcess,
+          managerId: (user as any).mappedManagerId || (user as any).managerId || '',
+          tlId: (user as any).teamLeadId || (user as any).teamLeadUid || '',
+          status: 'ACTIVE',
+          sessionStatus: 'ACTIVE',
+          currentActivity: targetProcess,
+          currentActivityStartTime: nowISO,
+          breakType: null,
+          productiveSeconds: 0,
+          breakSeconds: 0,
+          activities: newShift.activities,
+          location: (user as any).location || 'Unknown',
+          clockInTime: newShift.clockInTime,
+          deviceName: newShift.deviceType || 'Unknown',
+          platform: newShift.os || 'Unknown',
+          lastHeartbeat: nowISO
+        }, { merge: true })
+      ]);
+
+      toast.success(`Clocked in successfully under Process: ${targetProcess}`);
+      setTimeout(() => recomputeMetrics(true), 500);
+    } catch (err: any) {
+      console.error('Clock-in failed:', err);
+      toast.error('Failed to complete clock in on server: ' + err.message);
+      // Revert optimistic state on error
+      setLocalSuperOwnShift(undefined);
+      setActiveShifts(prev => prev.filter(s => s.userId !== user.uid));
+    }
+  };
+
+  const performSuperClockOut = async () => {
+    const myShift = activeShifts.find(s => s.userId === user.uid);
+    if (!myShift) return;
+
+    const currentDev = getDeviceType();
+    const myShiftId = myShift.id;
+    const nowISO = getLiveTimeISO();
+    
+    const updatedActivities = [...(myShift.activities || [])];
+    if (updatedActivities.length > 0) {
+      const lastIndex = updatedActivities.length - 1;
+      if (!updatedActivities[lastIndex].endTime) {
+        updatedActivities[lastIndex].endTime = nowISO;
+      }
+    }
+    
+    const finalShift = {
+      ...myShift,
+      activities: updatedActivities,
+      status: 'COMPLETED' as const,
+      clockOutTime: nowISO,
+      clockOutDevice: currentDev,
+      hasMobilePunches: myShift.hasMobilePunches || currentDev === 'mobile'
+    };
+
+    // 1. Close modal and update state optimistically
+    setShowSuperClockOutConfirm(false);
+    setLocalSuperOwnShift(null);
+    setActiveShifts(prev => prev.filter(s => s.userId !== user.uid));
+
+    try {
+      const userRef = doc(db, 'users', user.uid);
+      const liveSessionRef = doc(db, 'live_sessions', finalShift.userId);
+
+      // 2. Perform DB updates concurrently
+      await Promise.all([
+        setDoc(doc(db, 'tmsShifts', myShiftId), finalShift),
+        updateDoc(userRef, {
+          status: 'OFFLINE',
+          lastLogoutAt: nowISO
+        }),
+        deleteDoc(liveSessionRef),
+        syncShiftToAttendance(finalShift)
+      ]);
+
+      toast.success('Shift completed successfully. Clocked out.');
+      setTimeout(() => recomputeMetrics(true), 500);
+    } catch (err: any) {
+      console.error('Clock-out failed:', err);
+      toast.error('Failed to complete clock-out on server: ' + err.message);
+      // Revert optimistic state on error
+      setLocalSuperOwnShift(myShift);
+      setActiveShifts(prev => {
+        if (!prev.some(s => s.userId === user.uid)) {
+          return [myShift, ...prev];
+        }
+        return prev;
+      });
+    }
+  };
+
+  const handleSuperBreakAction = async (breakName: string) => {
+    const myShift = activeShifts.find(s => s.userId === user.uid);
+    if (!myShift) return;
+
+    const nowISO = getLiveTimeISO();
+    const currentDev = getDeviceType();
+    const updatedActivities = [...(myShift.activities || [])];
+    const lastActivity = updatedActivities[updatedActivities.length - 1];
+
+    if (myShift.status === 'ACTIVE') {
+      // Start Break
+      if (lastActivity && !lastActivity.endTime) {
+        lastActivity.endTime = nowISO;
+      }
+      updatedActivities.push({ type: 'break', name: breakName, startTime: nowISO, device: currentDev });
+      const updatedShift = { 
+        ...myShift, 
+        activities: updatedActivities, 
+        status: 'BREAK' as const,
+        hasMobilePunches: myShift.hasMobilePunches || currentDev === 'mobile'
+      };
+
+      // 1. Optimistic Update
+      setLocalSuperOwnShift(updatedShift);
+      setActiveShifts(prev => {
+        const idx = prev.findIndex(s => s.id === myShift.id);
+        if (idx === -1) return prev;
+        const next = [...prev];
+        next[idx] = updatedShift;
+        return next;
+      });
+
+      try {
+        const userRef = doc(db, 'users', user.uid);
+        const lsRef = doc(db, 'live_sessions', user.uid);
+
+        // 2. Parallel concurrent writes
+        await Promise.all([
+          setDoc(doc(db, 'tmsShifts', myShift.id), updatedShift),
+          updateDoc(userRef, { status: 'BREAK' }),
+          setDoc(lsRef, {
+            status: 'BREAK',
+            sessionStatus: 'BREAK',
+            currentActivity: breakName,
+            currentActivityStartTime: nowISO,
+            breakType: breakName,
+            activities: updatedActivities,
+            lastHeartbeat: nowISO
+          }, { merge: true })
+        ]);
+
+        toast.success(`Break [${breakName}] started successfully`);
+        setTimeout(() => recomputeMetrics(true), 500);
+      } catch (err: any) {
+        console.error('Start break failed:', err);
+        toast.error('Failed to start break on server: ' + err.message);
+        // Revert on error
+        setLocalSuperOwnShift(myShift);
+        setActiveShifts(prev => {
+          const idx = prev.findIndex(s => s.id === myShift.id);
+          if (idx === -1) return prev;
+          const next = [...prev];
+          next[idx] = myShift;
+          return next;
+        });
+      }
+    }
+  };
+
+  const handleSuperResumeAction = async (resumeProcess: string) => {
+    const myShift = activeShifts.find(s => s.userId === user.uid);
+    if (!myShift) return;
+
+    const nowISO = getLiveTimeISO();
+    const currentDev = getDeviceType();
+    const updatedActivities = [...(myShift.activities || [])];
+    const lastActivity = updatedActivities[updatedActivities.length - 1];
+
+    if (myShift.status === 'BREAK') {
+      // End Break and Resume Work
+      if (lastActivity && !lastActivity.endTime) {
+        lastActivity.endTime = nowISO;
+      }
+      updatedActivities.push({ type: 'productive', name: resumeProcess, startTime: nowISO, device: currentDev });
+      const updatedShift = { 
+        ...myShift, 
+        activities: updatedActivities, 
+        status: 'ACTIVE' as const,
+        hasMobilePunches: myShift.hasMobilePunches || currentDev === 'mobile'
+      };
+
+      // 1. Optimistic Update
+      setLocalSuperOwnShift(updatedShift);
+      setActiveShifts(prev => {
+        const idx = prev.findIndex(s => s.id === myShift.id);
+        if (idx === -1) return prev;
+        const next = [...prev];
+        next[idx] = updatedShift;
+        return next;
+      });
+
+      try {
+        const userRef = doc(db, 'users', user.uid);
+        const lsRef = doc(db, 'live_sessions', user.uid);
+
+        // 2. Parallel concurrent writes
+        await Promise.all([
+          setDoc(doc(db, 'tmsShifts', myShift.id), updatedShift),
+          updateDoc(userRef, {
+            status: 'ONLINE',
+            lastUsedProcess: resumeProcess
+          }),
+          setDoc(lsRef, {
+            status: 'ACTIVE',
+            sessionStatus: 'ACTIVE',
+            process: resumeProcess,
+            currentProcess: resumeProcess,
+            currentActivity: resumeProcess,
+            currentActivityStartTime: nowISO,
+            breakType: null,
+            activities: updatedActivities,
+            lastHeartbeat: nowISO
+          }, { merge: true })
+        ]);
+
+        toast.success(`Resumed work on process: ${resumeProcess}`);
+        setTimeout(() => recomputeMetrics(true), 500);
+      } catch (err: any) {
+        console.error('Resume failed:', err);
+        toast.error('Failed to resume on server: ' + err.message);
+        // Revert on error
+        setLocalSuperOwnShift(myShift);
+        setActiveShifts(prev => {
+          const idx = prev.findIndex(s => s.id === myShift.id);
+          if (idx === -1) return prev;
+          const next = [...prev];
+          next[idx] = myShift;
+          return next;
+        });
+      }
+    }
+  };
+
+  const handleSuperSwitchProcess = async (newProcess: string) => {
+    if (!newProcess) return;
+    const myShift = activeShifts.find(s => s.userId === user.uid);
+    if (!myShift) return;
+
+    if (myShift.status !== 'ACTIVE') {
+      toast.error('You must be in an active work status to switch processes.');
+      return;
+    }
+
+    const nowISO = getLiveTimeISO();
+    const currentDev = getDeviceType();
+    const updatedActivities = [...(myShift.activities || [])];
+    const lastActivity = updatedActivities[updatedActivities.length - 1];
+
+    if (lastActivity && !lastActivity.endTime) {
+      lastActivity.endTime = nowISO;
+    }
+    updatedActivities.push({ type: 'productive', name: newProcess, startTime: nowISO, device: currentDev });
+    const updatedShift = { 
+      ...myShift, 
+      activities: updatedActivities, 
+      status: 'ACTIVE' as const,
+      hasMobilePunches: myShift.hasMobilePunches || currentDev === 'mobile'
+    };
+
+    // 1. Optimistic Update
+    setLocalSuperOwnShift(updatedShift);
+    setActiveShifts(prev => {
+      const idx = prev.findIndex(s => s.id === myShift.id);
+      if (idx === -1) return prev;
+      const next = [...prev];
+      next[idx] = updatedShift;
+      return next;
+    });
+
+    try {
+      const userRef = doc(db, 'users', user.uid);
+      const lsRef = doc(db, 'live_sessions', user.uid);
+
+      // 2. Parallel concurrent writes
+      await Promise.all([
+        setDoc(doc(db, 'tmsShifts', myShift.id), updatedShift),
+        updateDoc(userRef, {
+          lastUsedProcess: newProcess
+        }),
+        setDoc(lsRef, {
+          process: newProcess,
+          currentProcess: newProcess,
+          currentActivity: newProcess,
+          currentActivityStartTime: nowISO,
+          activities: updatedActivities,
+          lastHeartbeat: nowISO
+        }, { merge: true })
+      ]);
+
+      toast.success(`Successfully switched to process: ${newProcess}`);
+      setTimeout(() => recomputeMetrics(true), 500);
+    } catch (err: any) {
+      console.error('Process switch failed:', err);
+      toast.error('Failed to switch process on server: ' + err.message);
+      // Revert on error
+      setLocalSuperOwnShift(myShift);
+      setActiveShifts(prev => {
+        const idx = prev.findIndex(s => s.id === myShift.id);
+        if (idx === -1) return prev;
+        const next = [...prev];
+        next[idx] = myShift;
+        return next;
+      });
+    }
+  };
+
+  // One-time auto-sync to fix legacy live_sessions missing activities and timestamps
+  useEffect(() => {
+    let isMounted = true;
+    const performLegacySync = async () => {
+      try {
+        const q = query(
+          collection(db, 'tmsShifts'),
+          where('status', 'in', ['ACTIVE', 'BREAK'])
+        );
+        const snap = await getDocs(q);
+        const now = new Date().getTime();
+        
+        for (const d of snap.docs) {
+          if (!isMounted) break;
+          const shiftData = d.data() as any;
+          
+          const productiveMs = getShiftProductiveMs(shiftData, now);
+          const breakMs = (shiftData.activities || [])
+            .filter((act: any) => act.type === 'break' && act.name.toLowerCase() !== 'offline' && !act.name.toLowerCase().includes('meeting') && !act.name.toLowerCase().includes('coaching') && !act.name.toLowerCase().includes('training') && !act.name.toLowerCase().includes('alignment'))
+            .reduce((sum: number, act: any) => sum + (act.endTime ? new Date(act.endTime).getTime() : now) - new Date(act.startTime).getTime(), 0);
+
+          const lastAct = shiftData.activities && shiftData.activities.length > 0 
+            ? shiftData.activities[shiftData.activities.length - 1] 
+            : null;
+
+          const currentActivity = lastAct && !lastAct.endTime ? lastAct.name : 'In Transition';
+          const breakType = shiftData.status === 'BREAK' && lastAct && !lastAct.endTime ? lastAct.name : null;
+          const currentActivityStartTime = lastAct ? lastAct.startTime : new Date().toISOString();
+
+          const lsRef = doc(db, 'live_sessions', shiftData.userId);
+          
+          const userRef = doc(db, 'users', shiftData.userId);
+          const userSnap = await getDoc(userRef);
+          const userData = userSnap.exists() ? userSnap.data() : {};
+
+          const liveSessionData = {
+            uid: shiftData.userId,
+            employeeId: shiftData.userId,
+            employeeName: shiftData.userName,
+            role: userData.role || 'AGENT',
+            process: userData.team || 'N/A',
+            currentProcess: userData.team || 'N/A',
+            managerId: userData.mappedManagerId || userData.managerId || '',
+            tlId: userData.teamLeadId || userData.teamLeadUid || '',
+            status: shiftData.status,
+            sessionStatus: shiftData.status,
+            currentActivity,
+            currentActivityStartTime,
+            breakType,
+            productiveSeconds: Math.floor(productiveMs / 1000),
+            breakSeconds: Math.floor(breakMs / 1000),
+            activities: shiftData.activities || [],
+            location: shiftData.location || userData.location || 'Unknown',
+            clockInTime: shiftData.clockInTime,
+            deviceName: shiftData.deviceType || 'Unknown',
+            platform: shiftData.os || 'Unknown',
+            lastHeartbeat: new Date().toISOString()
+          };
+          await setDoc(lsRef, liveSessionData, { merge: true });
+        }
+        console.log('[LegacySync] Completed sync for active users');
+      } catch (err) {
+        console.error('Legacy live_sessions sync failed', err);
+      }
+    };
+    
+    // Only run if the user is a manager or supervisor and has permission to see everything
+    if (user && isManagerOrLead) {
+      performLegacySync();
+    }
+    return () => { isMounted = false; };
+  }, [user, isManagerOrLead]);
+
+  const recomputeMetrics = async (force = false) => {
+    if (force) {
+      setIsLoadingShifts(true);
+      try {
+        await Promise.all([
+          fetchLiveShifts(true),
+          refreshHistoricalShifts()
+        ]);
+        setLastRefreshed(new Date());
+      } catch (err) {
+        console.error("Manual refresh failed:", err);
+      } finally {
+        setIsLoadingShifts(false);
+      }
+    }
+  };
+
   // Performance Optimization: Index Users and Shifts for O(1) lookup
   const usersMap = useMemo(() => {
     const map = new Map<string, UserProfile>();
@@ -227,6 +832,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
   // Subscribe to attendance config
   useEffect(() => {
     const unsub = onSnapshot(doc(db, 'config', 'attendanceSettings'), (snap) => {
+      firestoreLogger.trackRead('config_attendanceSettings_onSnapshot', snap.exists() ? 1 : 0);
       if (snap.exists()) {
         const data = snap.data();
         if (typeof data.presentThreshold === 'number') {
@@ -251,8 +857,8 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
     return [];
   });
   const [selectedManagers, setSelectedManagers] = useState<string[]>(() => {
-    const isOnlyManager = ['MANAGER', 'OPS_HEAD', 'HR', 'IT_MANAGER'].includes((user.role || '').toString().toUpperCase());
-    return isOnlyManager ? [user.fullName || user.name] : [];
+    const isManager = ['ADMIN', 'MANAGER', 'OPS_HEAD', 'HR', 'IT_MANAGER', 'TEAM_LEAD', 'STL', 'OPS_TL'].includes((user.role || '').toUpperCase());
+    return isManager ? [user.name] : [];
   });
   const [sortKey, setSortKey] = useState<'name' | 'productive' | 'status'>('name');
   const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('asc');
@@ -263,9 +869,6 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
 
   // Modals / Actions states
   const [isExporting, setIsExporting] = useState(false);
-  const [showLogsModal, setShowLogsModal] = useState(false);
-  const [adminLogs, setAdminLogs] = useState<any[]>([]);
-  const [isLoadingLogs, setIsLoadingLogs] = useState(false);
 
   // Force Logout Confirm States
   const [showForceLogoutConfirm, setShowForceLogoutConfirm] = useState(false);
@@ -284,54 +887,6 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
   const [exportCustomStart, setExportCustomStart] = useState('');
   const [exportCustomEnd, setExportCustomEnd] = useState('');
   const [exportReportType, setExportReportType] = useState<'summary' | 'chrono' | 'both'>('both');
-
-  // Supervisor personal shift timers
-  const [elapsedActive, setElapsedActive] = useState('00:00:00');
-  const [elapsedBreak, setElapsedBreak] = useState('00:00:00');
-  const [elapsedShift, setElapsedShift] = useState('00:00:00');
-
-  useEffect(() => {
-    const myShift = activeShifts.find(s => s.userId === user.uid);
-    if (!myShift) {
-      setElapsedActive('00:00:00');
-      setElapsedBreak('00:00:00');
-      setElapsedShift('00:00:00');
-      return;
-    }
-
-    const interval = setInterval(() => {
-      const startMs = new Date(myShift.clockInTime).getTime();
-      const now = getLiveTime().getTime();
-      const totalShiftMs = Math.max(0, now - startMs);
-
-      setElapsedShift(formatMs(totalShiftMs));
-
-      let activeMs = 0;
-      let breakMs = 0;
-
-      (myShift.activities || []).forEach(act => {
-        const start = new Date(act.startTime).getTime();
-        const end = act.endTime ? new Date(act.endTime).getTime() : now;
-        const duration = end - start;
-        const actName = (act.name || '').toLowerCase();
-        const isProductive = act.type === 'productive' || 
-                             actName.includes('meeting') || 
-                             actName.includes('coaching') || 
-                             actName.includes('training') || 
-                             actName.includes('alignment');
-        if (isProductive) {
-          activeMs += duration;
-        } else {
-          breakMs += duration;
-        }
-      });
-
-      setElapsedActive(formatMs(activeMs));
-      setElapsedBreak(formatMs(breakMs));
-    }, 1000);
-
-    return () => clearInterval(interval);
-  }, [activeShifts, user.uid]);
   const [exportFormat, setExportFormat] = useState<'excel' | 'csv'>('excel');
 
   // Searchable Dropdowns States & Refs
@@ -380,7 +935,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
 
     // Check if the current user has TL profile or is manager/admin
     const roleNormalized = (user.role || '').toUpperCase();
-    const isTL = ['TEAM_LEAD', 'STL', 'QTL', 'OPS_TL', 'TRAINER_TL', 'SME'].includes(roleNormalized);
+    const isTL = ['TEAM_LEAD', 'STL', 'QTL', 'OPS_TL', 'TRAINER_TL', 'SME', 'TEAM LEAD', 'TRAINER TL', 'OPS TL'].includes(roleNormalized);
     const isManagerOrAdmin = ['ADMIN', 'MANAGER', 'OPS_HEAD', 'HR', 'IT_MANAGER'].includes(roleNormalized);
 
     // Allow TLs to force-out users of other team members
@@ -399,18 +954,18 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
 
   // Mapped list of supervised agents based on hierarchy
   const mappedUsers = useMemo(() => {
-    // ADMIN and MANAGER can see organization-wide; other roles filter by team hierarchy
+    // ADMIN and OPS_HEAD can see organization-wide; other roles filter by team hierarchy or process
     const roleNormalized = (user.role || '').toUpperCase();
-    const isManagerOrAdmin = ['ADMIN', 'MANAGER', 'OPS_HEAD', 'HR', 'IT_MANAGER'].includes(roleNormalized);
-    const isTeamLeadOrSupervisor = ['TEAM_LEAD', 'STL', 'QTL', 'OPS_TL', 'TRAINER_TL', 'SME'].includes(roleNormalized);
+    const isGlobalAdmin = ['ADMIN', 'OPS_HEAD'].includes(roleNormalized);
+    const userProcess = (user.process || '').toLowerCase().trim();
     
     // Status normalization (only filter out deactivated/inactive accounts, so offline agents show up in roster)
-    const isActive = (u: UserProfile) => {
+    const isActiveAccount = (u: UserProfile) => {
       const s = (u.status || '').toLowerCase();
       return s !== 'inactive';
     };
 
-    if (isManagerOrAdmin || isTeamLeadOrSupervisor) {
+    if (isGlobalAdmin) {
       if (selectedTLs.length > 0) {
         const tlRefs = new Set<string>();
         const tlSearchLower = selectedTLs.map(tl => tl.toLowerCase().trim());
@@ -428,7 +983,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
         // Add names directly too
         tlSearchLower.forEach(n => tlRefs.add(n));
 
-        return allUsers.filter(u => isActive(u) && (
+        return allUsers.filter(u => isActiveAccount(u) && (
           (u.teamLeadId && tlRefs.has(u.teamLeadId.toLowerCase().trim())) ||
           (u.teamLeadUid && tlRefs.has(u.teamLeadUid.toLowerCase().trim())) ||
           (u.teamLeadName && tlRefs.has(u.teamLeadName.toLowerCase().trim())) ||
@@ -439,30 +994,28 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
           (u.fullName && tlRefs.has(u.fullName.toLowerCase().trim()))
         ));
       }
-      return allUsers.filter(u => isActive(u));
+      return allUsers.filter(u => isActiveAccount(u));
     }
 
-    return allUsers.filter(u => isActive(u) && (u.uid === user.uid || canActOn(user, u, allUsers)));
-  }, [allUsers, user, selectedTLs]);
+    // For Managers, TLs, etc. - Restricted view
+    return allUsers.filter(u => {
+      if (!isActiveAccount(u)) return false;
+      
+      // Rule 1: Own mapped team members (via hierarchy)
+      const isMyTeam = u.uid === user.uid || canActOn(user, u, allUsers);
+      if (isMyTeam) return true;
 
-  // Keep a ref of the latest mappedUsers and dependencies so the snapshot closure doesn't become stale
-  const mappedUsersRef = React.useRef(mappedUsers);
-  const allUsersRef = React.useRef(allUsers);
-  
-  // Performance optimization: cache all historical shifts during massive real-time ticks
-  const lastHistoricalShiftsFetchTimeRef = React.useRef<number>(0);
-  const cachedAllHistoricalShiftsRef = React.useRef<any[]>([]);
-  const activeFetchPromiseRef = React.useRef<Promise<any[]> | null>(null);
+      // Rule 2: Users working on the same process (even if from different team)
+      const targetProcess = (u.process || '').toLowerCase().trim();
+      if (userProcess && targetProcess && userProcess === targetProcess) return true;
+
+      return false;
+    });
+  }, [allUsers, user, selectedTLs]);
 
   const supervisorTeamUids = useMemo(() => {
     return new Set(mappedUsers.map(u => u.uid));
   }, [mappedUsers]);
-
-  useEffect(() => {
-
-    mappedUsersRef.current = mappedUsers;
-    allUsersRef.current = allUsers;
-  }, [mappedUsers, allUsers]);
 
   // List of unique Team Leads who have members in mappedUsers or have a TL role
   const teamLeadsList = useMemo(() => {
@@ -523,7 +1076,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
 
 
   // Read summary metrics or trigger recalculation when necessary
-  const [summaryData, setSummaryData] = useState<any>(null);
+  // Removed legacy summaryData state in favor of optimized useMemo based hooks
 
   // Core Shift math calculations
 
@@ -534,25 +1087,42 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
     const startMs = new Date(shift.clockInTime).getTime();
     const totalShiftMs = Math.max(0, endMs - startMs);
     
-    let activeMs = 0;
-    let breakMs = 0;
+    let activeMs = (shift as any).productiveMs || 0;
+    let breakMs = (shift as any).breakMs || 0;
 
-    (shift.activities || []).forEach(act => {
-      const aStart = new Date(act.startTime).getTime();
-      const aEnd = act.endTime ? new Date(act.endTime).getTime() : endMs;
-      const duration = Math.max(0, aEnd - aStart);
-      const actName = (act.name || '').toLowerCase();
-      const isProductive = act.type === 'productive' || 
-                           actName.includes('meeting') || 
-                           actName.includes('coaching') || 
-                           actName.includes('training') || 
-                           actName.includes('alignment');
-      if (isProductive) {
-        activeMs += duration;
-      } else {
-        breakMs += duration;
+    if (shift.activities && shift.activities.length > 0) {
+      activeMs = 0;
+      breakMs = 0;
+      (shift.activities || []).forEach(act => {
+        const aStart = new Date(act.startTime).getTime();
+        const aEnd = act.endTime ? new Date(act.endTime).getTime() : endMs;
+        const duration = Math.max(0, aEnd - aStart);
+        const actName = (act.name || '').toLowerCase();
+        const isProductive = act.type === 'productive' || 
+                             actName.includes('meeting') || 
+                             actName.includes('coaching') || 
+                             actName.includes('training') || 
+                             actName.includes('alignment');
+        if (isProductive) {
+          activeMs += duration;
+        } else {
+          breakMs += duration;
+        }
+      });
+    } else if ((shift as any).currentActivityStartTime && shift.status !== ('OFFLINE' as any)) {
+      const tickingMs = Math.max(0, endMs - new Date((shift as any).currentActivityStartTime).getTime());
+      const actName = ((shift as any).currentActivity || '').toLowerCase();
+      // Infer productive vs break for ticking time if activities array is missing
+      const isProductive = actName !== 'in transition' && actName !== 'lunch' && !actName.includes('break') && actName !== 'offline' && actName !== 'bio';
+      
+      if (actName !== 'in transition') {
+        if (isProductive) {
+          activeMs += tickingMs;
+        } else {
+          breakMs += tickingMs;
+        }
       }
-    });
+    }
 
     const activeMins = activeMs / 60000;
     const threshold = presentThreshold > 0 ? presentThreshold : 480;
@@ -587,517 +1157,13 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
     };
   };
 
-  const lastRecalculationRef = useRef<number>(0);
-  const pendingRecalculationRef = useRef<boolean>(false);
-  const recalculationTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-  const attemptedHealsRef = useRef<Set<string>>(new Set());
-
-  // FETCH & AGGREGATE CORE - Minimal reads & in-memory synced architecture
-  const loadAndRecomputeData = async (forceRecalculate = false, externalShifts?: TMSShift[]) => {
-    // Debouncing implementation to avoid CPU spikes during high-frequency snapshot updates
-    const nowTs = Date.now();
-    const DEBOUNCE_MS = 800; // Batch updates within 800ms
-    
-    if (!forceRecalculate && !externalShifts) {
-      // If no external shifts provided and not forced, check if we need to throttle
-      if (nowTs - lastRecalculationRef.current < DEBOUNCE_MS) {
-        if (recalculationTimeoutRef.current) return;
-        recalculationTimeoutRef.current = setTimeout(() => {
-          recalculationTimeoutRef.current = null;
-          loadAndRecomputeData(false);
-        }, DEBOUNCE_MS);
-        return;
-      }
-    }
-
-    lastRecalculationRef.current = nowTs;
-    const currentAllUsers = allUsersRef.current;
-    const currentMappedUsers = mappedUsersRef.current || [];
-    const scopeIds = supervisorTeamUids;
-    
-    if (!currentAllUsers || currentAllUsers.length === 0) {
-      console.log('Skipping recomputation as allUsers roster is not yet ready');
-      return;
-    }
-    setIsLoadingShifts(true);
-    try {
-      // Perform optimized fetch of ONLY active shifts
-      let allActiveShifts: TMSShift[] = [];
-      
-      if (externalShifts) {
-        allActiveShifts = externalShifts;
-      } else {
-        // Fetch all active shifts to ensure supervisor can see their own status and team's status
-        const activeShiftsQuery = query(collection(db, 'tmsShifts'), where('status', 'in', ['ACTIVE', 'BREAK']));
-        const snapshot = await getDocs(activeShiftsQuery);
-        firestoreLogger.trackRead('supervisor_active_shifts_fallback_getDocs', snapshot.size);
-        allActiveShifts = snapshot.docs.map(d => ({ id: d.id, ...d.data() } as TMSShift));
-      }
-
-
-      // Filter active shifts matching the team scope OR the current supervisor's own shift - OPTIMIZED: Use pre-calculated supervisorTeamUids
-      const teamActiveShiftsRaw = allActiveShifts.filter(sh => supervisorTeamUids.has(sh.userId) || sh.userId === user.uid);
-
-
-      // Group active shifts by userId to identify and heal duplicates
-      const shiftsByUser: { [userId: string]: TMSShift[] } = {};
-      teamActiveShiftsRaw.forEach(sh => {
-        if (!shiftsByUser[sh.userId]) {
-          shiftsByUser[sh.userId] = [];
-        }
-        shiftsByUser[sh.userId].push(sh);
-      });
-
-      const teamActiveShifts: TMSShift[] = [];
-      const duplicateCloses: TMSShift[] = [];
-      const autoClockOuts: TMSShift[] = [];
-
-      Object.entries(shiftsByUser).forEach(([userId, userShifts]) => {
-        let primaryShift: TMSShift;
-        if (userShifts.length > 1) {
-          userShifts.sort((a, b) => new Date(b.clockInTime).getTime() - new Date(a.clockInTime).getTime());
-          primaryShift = userShifts[0];
-          for (let i = 1; i < userShifts.length; i++) {
-            const dupShift = userShifts[i];
-            if (!attemptedHealsRef.current.has(dupShift.id)) {
-              attemptedHealsRef.current.add(dupShift.id);
-              duplicateCloses.push(dupShift);
-            }
-          }
-        } else {
-          primaryShift = userShifts[0];
-        }
-
-        const referenceTime = new Date().getTime();
-        const activeProductiveMs = getShiftProductiveMs(primaryShift as any, referenceTime);
-        const TEN_HOURS_MS = 10 * 60 * 60 * 1000;
-
-        if (activeProductiveMs >= TEN_HOURS_MS) {
-          if (!attemptedHealsRef.current.has(primaryShift.id)) {
-            attemptedHealsRef.current.add(primaryShift.id);
-            autoClockOuts.push(primaryShift);
-          } else {
-            // Keep it active locally so the shift doesn't vanish from the supervisor view if Firestore writes fail
-            teamActiveShifts.push(primaryShift);
-          }
-        } else {
-          teamActiveShifts.push(primaryShift);
-        }
-      });
-
-      // Heal the database asynchronously by batch-closing older duplicates / 10h productive limit exceeders
-      if (duplicateCloses.length > 0 || autoClockOuts.length > 0) {
-        // Run healing in background to avoid blocking the UI thread for metrics
-        (async () => {
-          try {
-            console.warn(`[DATA HEAL] Found duplicate shifts (${duplicateCloses.length}) and/or expired 10h productive shifts (${autoClockOuts.length}). Running background heal...`);
-            const healBatch = writeBatch(db);
-            const healNowISO = new Date().toISOString();
-            
-            duplicateCloses.forEach(sh => {
-              const updatedActivities = [...(sh.activities || [])];
-              if (updatedActivities.length > 0) {
-                const lastIndex = updatedActivities.length - 1;
-                if (!updatedActivities[lastIndex].endTime) {
-                  updatedActivities[lastIndex].endTime = healNowISO;
-                }
-              }
-              healBatch.set(doc(db, 'tmsShifts', sh.id), {
-                ...sh,
-                activities: updatedActivities,
-                status: 'AUTO_CLOSED',
-                clockOutTime: healNowISO,
-                remarks: 'System Auto-Resolved Duplicate Active Shift (Supervisor Healing)'
-              }, { merge: true });
-            });
-
-            autoClockOuts.forEach(sh => {
-              const TEN_HOURS_MS = 10 * 60 * 60 * 1000;
-              const { activities: updatedActivities, clockOutTime } = truncateShiftToProductiveTime(sh as any, TEN_HOURS_MS);
-              const finalized = {
-                ...sh,
-                activities: updatedActivities,
-                status: 'AUTO_CLOSED',
-                clockOutTime,
-                remarks: 'Auto-clocked out after 10 hours productive time'
-              };
-              healBatch.set(doc(db, 'tmsShifts', sh.id), finalized, { merge: true });
-
-              const userRef = doc(db, 'users', sh.userId);
-              healBatch.update(userRef, {
-                status: 'OFFLINE',
-                lastLogoutAt: clockOutTime
-              });
-            });
-
-            await healBatch.commit();
-            console.log('[DATA HEAL] Successfully resolved shift inconsistencies.');
-
-            // Call attendance sync for all healed shifts
-            for (const sh of duplicateCloses) {
-              const healNowISO = new Date().toISOString();
-              const updatedActivities = [...(sh.activities || [])];
-              if (updatedActivities.length > 0) {
-                const lastIndex = updatedActivities.length - 1;
-                if (!updatedActivities[lastIndex].endTime) {
-                  updatedActivities[lastIndex].endTime = healNowISO;
-                }
-              }
-              await syncShiftToAttendance({
-                ...sh,
-                activities: updatedActivities,
-                status: 'AUTO_CLOSED',
-                clockOutTime: healNowISO
-              });
-            }
-
-            for (const sh of autoClockOuts) {
-              const TEN_HOURS_MS = 10 * 60 * 60 * 1000;
-              const { activities: updatedActivities, clockOutTime } = truncateShiftToProductiveTime(sh as any, TEN_HOURS_MS);
-              await syncShiftToAttendance({
-                ...sh,
-                activities: updatedActivities,
-                status: 'AUTO_CLOSED',
-                clockOutTime
-              });
-            }
-          } catch (err) {
-            console.error('[DATA HEAL ERROR]', err);
-          }
-        })();
-      }
-
-       setActiveShifts(teamActiveShifts);
- 
-       // Timezone-safe daily shifts retrieval with aggressive performance caching (5 mins) to fix lag issues
-       let todayShifts: any[] = [];
-       let twoDaysShifts: any[] = [];
-       const currentTimestampMs = Date.now();
-       const CACHE_EXPIRY_MS = 300000; // 5 Minutes
-       
-       const isCacheValid = cachedAllHistoricalShiftsRef.current.length > 0 && 
-                            (currentTimestampMs - lastHistoricalShiftsFetchTimeRef.current < CACHE_EXPIRY_MS) && 
-                            !forceRecalculate;
- 
-       if (!isCacheValid) {
-         if (activeFetchPromiseRef.current) {
-           console.log('[TMS Performance Optimization] Reusing active historical shifts fetch promise...');
-           try {
-             await activeFetchPromiseRef.current;
-           } catch (e) {
-             console.error('[REUSED_FETCH_FAIL]', e);
-           }
-         } else {
-           const sixtyHoursMs = 24 * 3600000;
-           const startOfRangeMs = currentTimestampMs - sixtyHoursMs;
-           const startOfRangeISO = new Date(startOfRangeMs).toISOString();
-           const uidsInScope = Array.from(scopeIds);
- 
-           const fetchPromise = (async () => {
-             let allFetchedShifts: any[] = [];
-             if (uidsInScope.length === 0) {
-               allFetchedShifts = [];
-             } else if (uidsInScope.length <= 40) {
-               console.log(`[TMS Performance Optimization] Performing ultra-fast parallel team-member queries for ${scopeIds.size} agents`);
-               const promises = uidsInScope.map(async (uid) => {
-                 const q = query(
-                   collection(db, 'tmsShifts'),
-                   where('userId', '==', uid),
-                   limit(15)
-                 );
-                 const snap = await getDocs(q);
-                 firestoreLogger.trackRead('supervisor_historical_shifts_parallel_agent_fetch', snap.size);
-                  return snap.docs.map(d => ({ id: d.id, ...d.data() } as any));
-               });
-               const results = await Promise.all(promises);
-               allFetchedShifts = results.flat();
-             } else {
-               console.log(`[TMS Performance Optimization] Performing organization-wide date-range fallback query`);
-               const shiftsQuery = query(
-                 collection(db, 'tmsShifts'),
-                 where('clockInTime', '>=', startOfRangeISO)
-               );
-               const shiftsSnapshot = await getDocs(shiftsQuery);
-              firestoreLogger.trackRead('supervisor_historical_shifts_org_fallback_fetch', shiftsSnapshot.size);
-               allFetchedShifts = shiftsSnapshot.docs.map(d => ({ id: d.id, ...d.data() } as any));
-             }
- 
-             // Filter in-memory to keep only shifts within sixty hours to minimize cache size
-             return allFetchedShifts.filter(sh => {
-               if (!sh.clockInTime) return false;
-               return new Date(sh.clockInTime).getTime() >= startOfRangeMs;
-             });
-           })();
- 
-           activeFetchPromiseRef.current = fetchPromise;
- 
-           try {
-             const result = await fetchPromise;
-             cachedAllHistoricalShiftsRef.current = result;
-             lastHistoricalShiftsFetchTimeRef.current = currentTimestampMs;
-           } catch (err) {
-             console.error('[HISTORICAL_FETCH_ERROR]', err);
-           } finally {
-             activeFetchPromiseRef.current = null;
-           }
-         }
-       }
- 
-       const allHistoricalShifts = cachedAllHistoricalShiftsRef.current || [];
-       const nowLocalDateStr = new Date().toDateString();
- 
-       // Filter in memory for supervisor's current calendar day (same local date) OR within last 24 hours
-       todayShifts = allHistoricalShifts.filter(sh => {
-         if (!scopeIds.has(sh.userId)) return false;
-         const shiftLocalDateStr = new Date(sh.clockInTime).toDateString();
-         const isTodayLocal = shiftLocalDateStr === nowLocalDateStr;
-         const within24h = (currentTimestampMs - new Date(sh.clockInTime).getTime()) < 24 * 60 * 60 * 1000;
-         return isTodayLocal || within24h;
-       });
- 
-       // Filter for last 2 days (within 48 hours)
-       twoDaysShifts = allHistoricalShifts.filter(sh => {
-         if (!scopeIds.has(sh.userId)) return false;
-         const within48h = (currentTimestampMs - new Date(sh.clockInTime).getTime()) < 48 * 60 * 60 * 1000;
-         return within48h;
-       });
-
-      const teamAutoClosed = todayShifts.filter(sh => sh.status === 'AUTO_CLOSED' && (sh.remarks?.includes('10 hours') || sh.remarks?.includes('10H') || sh.remarks?.includes('10-Hour')));
-
-      // Compute statistics and variables in memory without database scans
-      const totalAssigned = currentMappedUsers.length;
-      const loggedInCount = teamActiveShifts.length;
-      const onBreakCount = teamActiveShifts.filter(s => s.status === 'BREAK').length;
-      const activeSessionsCount = teamActiveShifts.filter(s => s.status === 'ACTIVE').length;
-      const offlineCount = Math.max(0, totalAssigned - loggedInCount);
-      const attendancePercent = totalAssigned > 0 ? Math.round((loggedInCount / totalAssigned) * 100) : 0;
-
-      // Group workforce distribution categories
-      let lunchCount = 0;
-      let meetingCount = 0;
-      let otherBreakCount = 0;
-
-      teamActiveShifts.forEach(sh => {
-        if (sh.status === 'BREAK') {
-          const shActs = sh.activities || [];
-          const lastActivity = shActs.length > 0 ? shActs[shActs.length - 1]?.name || '' : '';
-          if (lastActivity.toLowerCase().includes('lunch')) {
-            lunchCount++;
-          } else if (lastActivity.toLowerCase().includes('meeting') || lastActivity.toLowerCase().includes('coaching') || lastActivity.toLowerCase().includes('training') || lastActivity.toLowerCase().includes('alignment')) {
-            meetingCount++;
-          } else {
-            otherBreakCount++;
-          }
-        }
-      });
-
-      // Audit and Validation diagnostics calculations
-      const nowMs = new Date().getTime();
-      const bioBreaks: any[] = [];
-      const lunchBreaks: any[] = [];
-      const shortBreaks: any[] = [];
-      const mobilePunchesList: any[] = [];
-
-      // 1. Calculate segmented break exceptions from teamActiveShifts
-      teamActiveShifts.forEach(sh => {
-        const clockInMs = new Date(sh.clockInTime).getTime();
-        const shActs = sh.activities || [];
-        const lastActObj = shActs.length > 0 ? shActs[shActs.length - 1] : null;
-        const lastActTime = lastActObj ? new Date(lastActObj.startTime).getTime() : clockInMs;
-
-        if (sh.status === 'BREAK' && lastActObj && !lastActObj.endTime) {
-          const breakDurationMins = (nowMs - lastActTime) / (60 * 1000);
-          const breakNameLower = (lastActObj.name || '').toLowerCase();
-          const durationMins = Math.round(breakDurationMins);
-
-          const exceptionItem = {
-            userId: sh.userId,
-            userName: sh.userName,
-            email: sh.userEmail,
-            breakName: lastActObj.name,
-            startTime: lastActObj.startTime,
-            durationMins,
-            shiftId: sh.id
-          };
-
-          if (breakNameLower.includes('bio')) {
-            if (breakDurationMins > 5) {
-              bioBreaks.push(exceptionItem);
-            }
-          } else if (breakNameLower.includes('lunch') || breakNameLower.includes('dinner') || breakNameLower.includes('meal')) {
-            if (breakDurationMins > 45) {
-              lunchBreaks.push(exceptionItem);
-            }
-          } else {
-            if (breakDurationMins > 20) {
-              shortBreaks.push(exceptionItem);
-            }
-          }
-        }
-      });
-
-      // 2. Scan last 2 days' shifts for used mobile punches
-      twoDaysShifts.forEach(sh => {
-        const hasMobile = sh.hasMobilePunches === true || 
-                          sh.clockInDevice === 'mobile' || 
-                          sh.clockOutDevice === 'mobile' || 
-                          (sh.activities || []).some((act: any) => act.device === 'mobile');
-        if (hasMobile) {
-          const mobilePunchesCount = (sh.clockInDevice === 'mobile' ? 1 : 0) + 
-                                     (sh.clockOutDevice === 'mobile' ? 1 : 0) + 
-                                     (sh.activities || []).filter((act: any) => act.device === 'mobile').length;
-          
-          mobilePunchesList.push({
-            userId: sh.userId,
-            userName: sh.userName,
-            email: sh.userEmail,
-            shiftId: sh.id,
-            clockInTime: sh.clockInTime,
-            clockOutTime: sh.clockOutTime || null,
-            status: sh.status,
-            mobilePunchesCount,
-            activities: sh.activities || [],
-            clockInDevice: sh.clockInDevice,
-            clockOutDevice: sh.clockOutDevice
-          });
-        }
-      });
-
-      // Team Inconsistencies Scan
-      const inconsistencies: any[] = [];
-      currentMappedUsers.forEach(u => {
-        if (!u.teamLeadId && u.role === 'AGENT') {
-          inconsistencies.push({
-            userId: u.uid,
-            userName: u.name,
-            issue: 'Missing designated Team Lead alignment'
-          });
-        }
-      });
-
-      // Attendance Exceptions (scheduled but no shifts today)
-      const clockedAgentIds = new Set(teamActiveShifts.map(s => s.userId));
-      const attendanceExceptions: any[] = [];
-      currentMappedUsers.forEach(u => {
-        if (!clockedAgentIds.has(u.uid) && !teamAutoClosed.some(c => c.userId === u.uid)) {
-          attendanceExceptions.push({
-            userId: u.uid,
-            userName: u.name,
-            email: u.email,
-            reason: 'Resource has not reported/clocked-in today'
-          });
-        }
-      });
-
-
-      // Counts discrepancies
-      const countMismatches: any[] = [];
-      const actualActiveInDb = teamActiveShifts.filter(s => s.status === 'ACTIVE').length;
-      if (activeSessionsCount !== actualActiveInDb) {
-        countMismatches.push({
-          metric: 'Active Sessions count',
-          systemValue: activeSessionsCount,
-          actualValue: actualActiveInDb
-        });
-      }
-
-      // Compiled local summary block
-      const computedSummary = {
-        lastUpdated: new Date().toISOString(),
-        totalAssigned,
-        loggedInCount,
-        activeCount: activeSessionsCount,
-        onBreakCount,
-        offlineCount,
-        attendancePercent,
-        activeSessionsCount,
-        distribution: {
-          active: activeSessionsCount,
-          break: otherBreakCount,
-          lunch: lunchCount,
-          meeting: meetingCount,
-          offline: offlineCount
-        },
-        exceptionCounts: {
-          autoClosed: teamAutoClosed.length,
-          attendanceExceptions: attendanceExceptions.length,
-          bioBreaks: bioBreaks.length,
-          lunchBreaks: lunchBreaks.length,
-          shortBreaks: shortBreaks.length,
-          mobilePunches: mobilePunchesList.length
-        },
-        exceptionsList: {
-          autoClosed: teamAutoClosed,
-          attendanceExceptions,
-          bioBreaks,
-          lunchBreaks,
-          shortBreaks,
-          mobilePunches: mobilePunchesList
-        },
-        validationReport: {
-          activeAfterClockOut: [], // Profiles mark as active somewhere but clocked out
-          teamInconsistencies: inconsistencies,
-          countMismatches
-        },
-        activeShiftsList: teamActiveShifts
-      };
-
-      setSummaryData(computedSummary);
-      setLastRefreshed(new Date());
-
-    } catch (err: any) {
-      console.error('[SUPERVISOR COMPILATION RECALC FAIL]', err);
-      // Log more specific error info if available
-      const errorMsg = err?.message || err?.code || 'Unknown Error';
-      toast.error(`Failed to run diagnostics and metrics compilation: ${errorMsg}`);
-    } finally {
-      setIsLoadingShifts(false);
-    }
-  };
-
-  // Run on mount, and schedule recurring pull when selectedTLs or mappedUsers changes
-  useEffect(() => {
-    loadAndRecomputeData(false);
-  }, [selectedTLs, mappedUsers]);
-
-  useEffect(() => {
-    if (!user) return;
-
-    // Real-time reactive synchronization for active/break shifts - OPTIMIZED: Debounced execution
-    const activeShiftsQuery = query(
-      collection(db, 'tmsShifts'),
-      where('status', 'in', ['ACTIVE', 'BREAK']),
-      limit(2000)
-    );
-
-    const unsubscribe = onSnapshot(activeShiftsQuery, (snapshot) => {
-      firestoreLogger.trackRead('supervisor_active_shifts_onSnapshot_update', snapshot.size);
-      const allActiveShiftsMapped = snapshot.docs.map(d => ({ id: d.id, ...d.data() } as TMSShift));
-      
-      // Update state immediately for instant UI responsiveness
-      setActiveShifts(allActiveShiftsMapped);
-      
-      // OPTIMIZED: Use a very small delay (50ms) to ensure instant UI updates while still batching synchronous bursts
-      if (recalculationTimeoutRef.current) {
-        clearTimeout(recalculationTimeoutRef.current);
-      }
-      recalculationTimeoutRef.current = setTimeout(() => {
-        recalculationTimeoutRef.current = null;
-        loadAndRecomputeData(false, allActiveShiftsMapped);
-      }, 50);
-      
-    }, (error) => {
-      console.warn('[REALTIME_SYNC_ERROR]', error);
-    });
-
-    return () => {
-      unsubscribe();
-    };
-  }, [user.uid, user.role]);
-
   // Filter & paginate the workforce controls list
   const filteredWorkforce = useMemo(() => {
     const tlRefs = new Set<string>();
+    const managerRefs = new Set<string>();
+    
+    const searchLower = deferredSearchTerm?.toLowerCase() || '';
+
     if (selectedTLs.length > 0) {
       selectedTLs.forEach(tlName => {
         const cleanName = tlName.toLowerCase().trim();
@@ -1113,15 +1179,37 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
       });
     }
 
-    return mappedUsers.filter(u => {
-      // search
+    if (selectedManagers.length > 0) {
+      selectedManagers.forEach(mgrName => {
+        const cleanName = mgrName.toLowerCase().trim();
+        managerRefs.add(cleanName);
+        allUsers.forEach(candidate => {
+          const candName = (candidate.name || '').toLowerCase().trim();
+          const candFullName = (candidate.fullName || '').toLowerCase().trim();
+          if (candName === cleanName || candFullName === cleanName) {
+            if (candidate.uid) managerRefs.add(candidate.uid.toLowerCase().trim());
+            if (candidate.email) managerRefs.add(candidate.email.toLowerCase().trim());
+          }
+        });
+      });
+    }
+
+    const sourceUsers = (selectedActivities.length > 0)
+      ? allUsers.filter(u => (u.status || '').toLowerCase() !== 'inactive')
+      : mappedUsers;
+
+    return sourceUsers.filter(u => {
       const liveShift = activeShiftsMap.get(u.uid);
-      const matchesSearch = !deferredSearchTerm 
+      
+      // Do not push offline users at front-end Live Operational Supervisor Table
+      if (!liveShift) return false;
+
+      const matchesSearch = !searchLower 
         ? true 
-        : (u.name.toLowerCase().includes(deferredSearchTerm.toLowerCase()) || 
-           u.email.toLowerCase().includes(deferredSearchTerm.toLowerCase()) || 
-           (u.employeeId && u.employeeId.toLowerCase().includes(deferredSearchTerm.toLowerCase())) ||
-           (liveShift?.deviceType && liveShift.deviceType.toLowerCase().includes(deferredSearchTerm.toLowerCase())));
+        : (u.name.toLowerCase().includes(searchLower) || 
+           u.email.toLowerCase().includes(searchLower) || 
+           (u.employeeId && u.employeeId.toLowerCase().includes(searchLower)) ||
+           (liveShift?.deviceType && liveShift.deviceType.toLowerCase().includes(searchLower)));
 
       if (!matchesSearch) return false;
 
@@ -1160,15 +1248,17 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
       }
 
       // Process filters
-      if (selectedProcesses.length > 0) {
+      if (selectedActivities.length > 0) {
         const uProc = (u.process || '').trim();
-        const matchesUserProc = selectedProcesses.includes(uProc);
+        const matchesUserProc = selectedActivities.includes(uProc);
         
         let matchesLiveProc = false;
         if (liveShift) {
           const liveShiftActs = liveShift.activities || [];
-          const currentProc = liveShiftActs.length > 0 ? liveShiftActs[liveShiftActs.length - 1]?.name || '' : '';
-          matchesLiveProc = selectedProcesses.includes(currentProc);
+          const lastActivityName = liveShiftActs.length > 0 ? (liveShiftActs[liveShiftActs.length - 1]?.name || '').trim() : '';
+          const currentActivityField = ((liveShift as any).currentActivity || '').trim();
+          const activeProcess = lastActivityName || currentActivityField;
+          matchesLiveProc = selectedActivities.includes(activeProcess);
         }
         
         if (!matchesUserProc && !matchesLiveProc) {
@@ -1176,8 +1266,16 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
         }
       }
 
+      // Location filters
+      if (selectedLocations.length > 0) {
+        const uLoc = (u.location || '').trim();
+        if (!selectedLocations.includes(uLoc)) {
+          return false;
+        }
+      }
+
       // TL filter
-      if (selectedTLs.length > 0) {
+      if (selectedTLs.length > 0 && selectedActivities.length === 0) {
         const matchesTL = 
           (u.teamLeadId && tlRefs.has(u.teamLeadId.toLowerCase().trim())) ||
           (u.teamLeadUid && tlRefs.has(u.teamLeadUid.toLowerCase().trim())) ||
@@ -1190,26 +1288,32 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
         if (!matchesTL) return false;
       }
 
-      // Manager filter (robust nested traversal across all possible schema fields) - OPTIMIZED: Use usersMap
-      if (selectedManagers.length > 0) {
+      // Manager filter (robust nested traversal across all possible schema fields)
+      if (selectedManagers.length > 0 && selectedActivities.length === 0) {
         const checkHierarchy = (uToCheck: UserProfile, visited: Set<string>): boolean => {
           if (!uToCheck) return false;
           
           // Match direct manager name, email or IDs from user fields
+          const uNameLower = (uToCheck.name || '').toLowerCase().trim();
+          const uFullNameLower = (uToCheck.fullName || '').toLowerCase().trim();
+          const uEmailLower = (uToCheck.email || '').toLowerCase().trim();
+          const uUidLower = (uToCheck.uid || '').toLowerCase().trim();
+          const uMgrIdLower = (uToCheck.managerId || '').toLowerCase().trim();
+          const uMappedMgrIdLower = (uToCheck.mappedManagerId || '').toLowerCase().trim();
+          const uMappedMgrUidLower = ((uToCheck as any).mappedManagerUid || '').toLowerCase().trim();
+          const uMgrNameLower = (uToCheck.managerName || uToCheck.mappedManagerName || uToCheck.Manager || '').toLowerCase().trim();
+          const uMgrEmailLower = (uToCheck.managerEmail || uToCheck.mappedManagerEmail || '').toLowerCase().trim();
+
           const possibleManagerMatch = 
-            selectedManagers.includes(uToCheck.uid) ||
-            selectedManagers.includes(uToCheck.managerId || '') ||
-            selectedManagers.includes(uToCheck.mappedManagerId || '') ||
-            selectedManagers.includes((uToCheck as any).mappedManagerUid || '') ||
-            selectedManagers.includes(uToCheck.managerName || '') ||
-            selectedManagers.includes(uToCheck.mappedManagerName || '') ||
-            selectedManagers.includes(uToCheck.Manager || '') ||
-            selectedManagers.includes(uToCheck.fullName || '') ||
-            selectedManagers.includes(uToCheck.name || '') ||
-            selectedManagers.includes(uToCheck.employeeName || '') ||
-            (uToCheck.managerEmail && selectedManagers.some(m => m.toLowerCase() === uToCheck.managerEmail!.toLowerCase())) ||
-            (uToCheck.mappedManagerEmail && selectedManagers.some(m => m.toLowerCase() === uToCheck.mappedManagerEmail!.toLowerCase())) ||
-            (uToCheck.email && selectedManagers.some(m => m.toLowerCase() === uToCheck.email.toLowerCase()));
+            managerRefs.has(uUidLower) ||
+            managerRefs.has(uMgrIdLower) ||
+            managerRefs.has(uMappedMgrIdLower) ||
+            managerRefs.has(uMappedMgrUidLower) ||
+            managerRefs.has(uMgrNameLower) ||
+            managerRefs.has(uNameLower) ||
+            managerRefs.has(uFullNameLower) ||
+            managerRefs.has(uEmailLower) ||
+            managerRefs.has(uMgrEmailLower);
 
           if (possibleManagerMatch) return true;
 
@@ -1239,7 +1343,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
 
       return true;
     });
-  }, [mappedUsers, activeShiftsMap, deferredSearchTerm, selectedProcesses, shiftFilter, selectedTLs, selectedManagers, usersMap]);
+  }, [mappedUsers, activeShiftsMap, deferredSearchTerm, selectedActivities, selectedLocations, shiftFilter, selectedTLs, selectedManagers, usersMap, allUsers]);
 
 
   // Sorting - OPTIMIZED: Use Map
@@ -1284,7 +1388,27 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
     return sortedWorkforce.slice(start, start + itemsPerPage);
   }, [sortedWorkforce, currentPage, itemsPerPage]);
 
-  const uniqueActiveProcesses = useMemo(() => {
+  const uniqueActiveActivities = useMemo(() => {
+    if (isTeamLeadOrSME) {
+      // For TL/SME, we might still need to restrict by their assigned process
+      // if that's the business requirement, but if they want "Current Activity",
+      // we should probably still look at the shifts of their mapped users.
+      // Given the previous code, let's keep the restriction but fix the source.
+      
+      const list = new Set<string>();
+      activeShifts.forEach(sh => {
+        // Only consider shifts for users in this TL's team
+        if (sh.userEmail && mappedUsers.some(u => u.email === sh.userEmail)) {
+           const shActs = sh.activities || [];
+           const act = shActs.length > 0 ? shActs[shActs.length - 1] : null;
+           if (act) {
+             list.add(act.name.trim());
+           }
+        }
+      });
+      return Array.from(list).filter(Boolean);
+    }
+
     const list = new Set<string>();
     // 1. Add processes from currently active/live shifts' current active activity
     activeShifts.forEach(sh => {
@@ -1295,7 +1419,20 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
       }
     });
     return Array.from(list).filter(Boolean);
-  }, [activeShifts]);
+  }, [activeShifts, mappedUsers, user, isTeamLeadOrSME]);
+
+  const uniqueLocations = useMemo(() => {
+    const list = new Set<string>();
+    list.add('Dehradun (DDN)');
+    list.add('Jammu (JMU)');
+    list.add('Bangalore (BLR)');
+    mappedUsers.forEach(u => {
+      if (u.location) {
+        list.add(u.location);
+      }
+    });
+    return Array.from(list).filter(Boolean);
+  }, [mappedUsers]);
 
   // Chart Allocations Data
   const roleChartData = useMemo(() => {
@@ -1353,26 +1490,10 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
 
       toast.success(`Successfully terminated active session for ${logoutTargetName}`);
       setShowForceLogoutConfirm(false);
-      loadAndRecomputeData(true);
+      recomputeMetrics(true);
     } catch (err) {
       console.error('[FORCE_OUT_FAIL]', err);
       toast.error('Failed to terminate remote session');
-    }
-  };
-
-  // Fetch log records for audits
-  const openAuditLogsModal = async () => {
-    setShowLogsModal(true);
-    setIsLoadingLogs(true);
-    try {
-      const snap = await getDocs(collection(db, 'adminAuditLogs'));
-      const list = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-      list.sort((a: any, b: any) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
-      setAdminLogs(list.slice(0, 50)); // display top 50
-    } catch (err) {
-      console.warn('Could not read admin audit trail', err);
-    } finally {
-      setIsLoadingLogs(false);
     }
   };
 
@@ -1410,8 +1531,8 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
         where('clockInTime', '>=', start.toISOString()),
         where('clockInTime', '<=', end.toISOString())
       );
-      const snap = await getDocs(q);
-      const shifts = snap.docs.map(d => ({ id: d.id, ...d.data() } as TMSShift));
+      const snap = await getDocsOptimized(q, 'export_shifts');
+      const shifts = snap.docs.map(d => ({ id: d.id, ...(d.data() as any) } as TMSShift));
       
       // Filter for team scope
       const scopeIds = new Set(mappedUsers.map(u => u.uid));
@@ -1428,7 +1549,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
       // 1. Utilization Summary
       if (exportReportType === 'summary' || exportReportType === 'both') {
         const summaryHeaders = [
-          'Emp ID', 'Employee Name', 'Email', 'Role', 'Department', 'Process / Segment', 'Team Lead', 'Manager', 'Manager of Manager',
+          'Emp ID', 'Employee Name', 'Email', 'Role', 'Department', 'Location', 'Process / Segment', 'Team Lead', 'Manager', 'Manager of Manager',
           'Date', 'Clock In', 'Clock Out', 'Shift Status',
           'Prod Minutes', 'Break Minutes', 'Total Minutes', 'Utilization %'
         ];
@@ -1447,6 +1568,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
             u?.email || sh.userEmail,
             u?.role || 'N/A',
             u?.department || 'Operations',
+            u?.location || 'N/A',
             u?.process || 'N/A',
             u?.teamLeadName || 'Unassigned',
             u?.mappedManagerName || u?.managerName || 'Unassigned',
@@ -1469,7 +1591,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
       // 2. Chronological Log
       if (exportReportType === 'chrono' || exportReportType === 'both') {
         const chronoHeaders = [
-          'Emp ID', 'Employee Name', 'Email', 'Manager of Manager', 'Date', 'Sequence', 'Type', 'Activity', 'Start Time', 'End Time', 'Duration (Min)'
+          'Emp ID', 'Employee Name', 'Email', 'Location', 'Manager of Manager', 'Date', 'Sequence', 'Type', 'Activity', 'Start Time', 'End Time', 'Duration (Min)'
         ];
 
         const chronoRows: any[] = [];
@@ -1480,6 +1602,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
             (user.email && sh.userEmail && user.email.toLowerCase().trim() === sh.userEmail.toLowerCase().trim())
           );
           const empId = u?.employeeId || (u as any).empID || 'N/A';
+          const loc = u?.location || 'N/A';
           const mom = u ? getManagerOfManager(u, allUsers) : 'N/A';
 
           (sh.activities || []).forEach((act, idx) => {
@@ -1493,6 +1616,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
               empId,
               sh.userName,
               sh.userEmail,
+              loc,
               mom,
               dateStr,
               idx + 1,
@@ -1588,7 +1712,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
 
       toast.success(`Successfully logged out ${count} active users.`);
       setShowBulkLogoutModal(false);
-      loadAndRecomputeData(true);
+      recomputeMetrics(true);
     } catch (err) {
       console.error('Bulk Logout Error:', err);
       toast.error('Failed to perform bulk logout');
@@ -1616,7 +1740,29 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
     const totalActiveCount = activeShiftList.length;
     const mobileAccessPercent = totalActiveCount > 0 ? Math.round((activeMobile / totalActiveCount) * 100) : 0;
 
-    const total = filteredWorkforce.length;
+    const assignedWorkforce = mappedUsers.filter(u => {
+      const searchLower = deferredSearchTerm?.toLowerCase() || '';
+      const matchesSearch = !searchLower 
+        ? true 
+        : (u.name.toLowerCase().includes(searchLower) || 
+           u.email.toLowerCase().includes(searchLower) || 
+           (u.employeeId && u.employeeId.toLowerCase().includes(searchLower)));
+
+      if (!matchesSearch) return false;
+
+      // Location & Current Activity filters
+      const liveShift = activeShiftsMap[u.uid];
+      const lastActivity = liveShift && liveShift.activities && liveShift.activities.length > 0 
+          ? liveShift.activities[liveShift.activities.length - 1].name.trim()
+          : 'Offline';
+          
+      const matchesActivity = selectedActivities.length === 0 || selectedActivities.includes(lastActivity);
+      const matchesLocation = selectedLocations.length === 0 || selectedLocations.includes(u.location || '');
+      
+      return matchesActivity && matchesLocation;
+    });
+
+    const total = assignedWorkforce.length;
     const loggedIn = activeShiftList.length;
     const onBreak = activeShiftList.filter(s => s.status === 'BREAK').length;
     const active = activeShiftList.filter(s => s.status === 'ACTIVE').length;
@@ -1645,7 +1791,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
       activeMobile,
       mobileAccessPercent
     };
-  }, [filteredWorkforce, activeShiftsMap, activeShifts, searchTerm, selectedProcesses, selectedTLs, selectedManagers, shiftFilter]);
+  }, [filteredWorkforce, activeShiftsMap, activeShifts, searchTerm, selectedActivities, selectedTLs, selectedManagers, shiftFilter]);
 
   const liveDistribution = useMemo(() => {
     const total = filteredWorkforce.length || 1;
@@ -1699,6 +1845,102 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
     toast.info(`Filtering user management view for matching state: ${filterLabel}`);
   };
 
+  // Filter alerts to show only for mapped users under this supervisor's team
+  const teamAlerts = useMemo(() => {
+    const scopeIds = new Set(mappedUsers.map(u => u.uid));
+    return alerts.filter(alert => scopeIds.has(alert.userId));
+  }, [alerts, mappedUsers]);
+
+  // Bifurcate teamAlerts into three categories: break exceeds, Mobile Logs & Auto-Logouts
+  const breakExceedsAlerts = useMemo(() => {
+    return teamAlerts.filter(a => a.type === 'excessive_break' || a.type === 'long_idle');
+  }, [teamAlerts]);
+
+  const mobileLogsAlerts = useMemo(() => {
+    return teamAlerts.filter(a => a.type === 'mobile_punch');
+  }, [teamAlerts]);
+
+  const autoLogoutsAlerts = useMemo(() => {
+    return teamAlerts.filter(a => a.type === 'stale_session' || a.type === 'missed_clock_out');
+  }, [teamAlerts]);
+
+  const renderAlertCard = (alert: any, category: 'break' | 'mobile' | 'logout') => {
+    let cardBgBorderClass = 'bg-slate-50 dark:bg-slate-800/20 border-slate-100 dark:border-slate-700';
+    let badgeClass = 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300';
+    let iconBgClass = 'bg-slate-100 text-slate-500';
+    
+    if (category === 'break') {
+      cardBgBorderClass = alert.severity === 'high' 
+        ? 'bg-amber-500/[0.03] dark:bg-amber-550/[0.02] border-amber-200/50 dark:border-amber-900/30' 
+        : 'bg-amber-500/[0.01] dark:bg-amber-550/[0.01] border-amber-100/50 dark:border-amber-950/20';
+      badgeClass = alert.severity === 'high' 
+        ? 'bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300 border border-amber-200/40' 
+        : 'bg-amber-50 text-amber-700 dark:bg-amber-950/70 dark:text-amber-400';
+      iconBgClass = 'bg-amber-100/70 text-amber-600 dark:bg-amber-400/20';
+    } else if (category === 'mobile') {
+      cardBgBorderClass = 'bg-sky-500/[0.02] dark:bg-sky-550/[0.02] border-sky-100 dark:border-sky-900/30';
+      badgeClass = 'bg-sky-100 text-sky-850 dark:bg-sky-950 dark:text-sky-300 border border-sky-200/40';
+      iconBgClass = 'bg-sky-100/70 text-sky-600 dark:bg-sky-400/20';
+    } else if (category === 'logout') {
+      cardBgBorderClass = alert.severity === 'high' 
+        ? 'bg-rose-500/[0.03] dark:bg-rose-550/[0.02] border-rose-200/50 dark:border-rose-900/30' 
+        : 'bg-rose-500/[0.01] dark:bg-rose-550/[0.01] border-rose-100/50 dark:border-rose-950/20';
+      badgeClass = alert.severity === 'high' 
+        ? 'bg-rose-100 text-rose-800 dark:bg-rose-950 dark:text-rose-300 border border-rose-200/40' 
+        : 'bg-rose-50 text-rose-700 dark:bg-rose-950/70 dark:text-rose-400';
+      iconBgClass = 'bg-rose-100/70 text-rose-600 dark:bg-rose-400/20';
+    }
+
+    return (
+      <div 
+        key={alert.id} 
+        className={`p-4 rounded-2xl border transition-all hover:shadow-md flex flex-col ${cardBgBorderClass}`}
+      >
+        <div className="flex items-start justify-between gap-2 mb-2">
+          <div className={`p-2 rounded-lg shrink-0 ${iconBgClass}`}>
+            {category === 'break' ? <Coffee size={14} /> : category === 'mobile' ? <Smartphone size={14} /> : <AlertTriangle size={14} />}
+          </div>
+          <div className="text-right">
+            <span className={`text-[8px] font-black px-1.5 py-0.5 rounded uppercase tracking-wider ${badgeClass}`}>
+              {alert.severity}
+            </span>
+            <p className="text-[8px] text-slate-400 mt-0.5 font-mono font-bold uppercase">{new Date(alert.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</p>
+          </div>
+        </div>
+        
+        <div className="mb-2">
+          <h4 className="font-black text-slate-800 dark:text-slate-100 text-xs leading-tight">{alert.userName}</h4>
+          <p className="text-[9px] text-slate-400 dark:text-slate-500 truncate">{alert.email}</p>
+          <div className="p-2 bg-white/50 dark:bg-slate-900/40 rounded border border-slate-100 dark:border-slate-800/30 mt-1">
+            <p className="text-[10px] text-slate-700 dark:text-slate-300 leading-snug font-medium">{alert.message}</p>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-1.5 mt-auto pt-2 border-t border-slate-100 dark:border-slate-800/30">
+          <button 
+            onClick={() => selectAndFocusUser(alert.userName)}
+            className="flex-1 py-1.5 rounded bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-[9px] font-black uppercase text-slate-500 dark:text-slate-400 transition-colors cursor-pointer"
+          >
+            Investigate
+          </button>
+          <button 
+            onClick={() => {
+              setLogoutTargetUid(alert.userId);
+              setLogoutTargetName(alert.userName);
+              setLogoutReason(`Automated Alert: ${alert.message}`);
+              const sh = activeShifts.find(s => s.userId === alert.userId);
+              if (sh) setLogoutShiftId(sh.id);
+              setShowForceLogoutConfirm(true);
+            }}
+            className="flex-1 py-1.5 rounded bg-rose-50 hover:bg-rose-100 text-rose-600 border border-rose-200/40 dark:bg-rose-950/50 dark:hover:bg-rose-900/60 dark:text-rose-400 dark:border-rose-900/40 text-[9px] font-black uppercase transition-colors cursor-pointer"
+          >
+            Force Out
+          </button>
+        </div>
+      </div>
+    );
+  };
+
   return (
     <div className="space-y-6">
       
@@ -1716,7 +1958,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
               <div className="flex items-center gap-1.5 text-[10px] text-slate-400 dark:text-slate-500 font-bold uppercase tracking-wider">
                 <span>Updated: {lastRefreshed.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span>
                 <button 
-                  onClick={() => loadAndRecomputeData(true)} 
+                  onClick={() => recomputeMetrics(true)} 
                   disabled={isLoadingShifts}
                   className="hover:text-indigo-500 transition-colors cursor-pointer p-1"
                   title="Force Refresh Data"
@@ -1730,193 +1972,127 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
 
         <div className="flex items-center gap-3 flex-wrap">
           {(() => {
-            const myShift = activeShiftsMap.get(user.uid);
-            return myShift ? <SupervisorClockStrip myShift={myShift} /> : null;
+            const myShift = activeShifts.find(s => s.userId === user.uid);
+            if (myShift) {
+              const lastAct = myShift.activities && myShift.activities.length > 0 
+                ? myShift.activities[myShift.activities.length - 1] 
+                : null;
+              const currentProc = lastAct && !lastAct.endTime ? lastAct.name : 'N/A';
+              
+              return (
+                <div className="flex flex-col sm:flex-row sm:items-center gap-3 flex-wrap">
+                  {/* Real-time Tickers */}
+                  <SupervisorClockStrip myShift={myShift} />
+
+                  <div className="flex items-center gap-2 flex-wrap">
+                    {myShift.status === 'ACTIVE' ? (
+                      <>
+                        {/* Switch Process Control */}
+                        <div className="flex items-center gap-1.5 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg px-2 py-1">
+                          <span className="text-[10px] font-black uppercase text-slate-400">Process:</span>
+                          <select
+                            className="bg-transparent border-none text-[11px] font-bold text-slate-700 dark:text-slate-200 focus:outline-none cursor-pointer p-0"
+                            value={currentProc}
+                            onChange={(e) => handleSuperSwitchProcess(e.target.value)}
+                          >
+                            <option value="" disabled>Switch...</option>
+                            {supervisorProcesses.map(p => (
+                              <option key={p} value={p}>{p}</option>
+                            ))}
+                          </select>
+                        </div>
+
+                        {/* Punch Break Control */}
+                        <div className="flex items-center gap-1.5 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg px-2 py-1">
+                          <span className="text-[10px] font-black uppercase text-slate-400">Break:</span>
+                          <select
+                            className="bg-transparent border-none text-[11px] font-bold text-slate-700 dark:text-slate-200 focus:outline-none cursor-pointer p-0"
+                            value={superSelectedBreak}
+                            onChange={(e) => setSuperSelectedBreak(e.target.value)}
+                          >
+                            {SUPERVISOR_BREAK_OPTIONS.map(b => (
+                              <option key={b} value={b}>{b}</option>
+                            ))}
+                          </select>
+                          <button
+                            onClick={() => handleSuperBreakAction(superSelectedBreak)}
+                            className="bg-amber-500 hover:bg-amber-600 text-white text-[10px] px-1.5 py-0.5 rounded font-bold cursor-pointer transition-colors"
+                          >
+                            Punch
+                          </button>
+                        </div>
+                      </>
+                    ) : (
+                      /* Break Resume Control */
+                      <div className="flex items-center gap-2 bg-amber-50 dark:bg-amber-950/20 border border-amber-200/40 rounded-lg px-2.5 py-1 text-xs text-amber-800 dark:text-amber-400">
+                        <Coffee size={12} className="animate-bounce" />
+                        <span className="font-bold">On Break ({currentProc})</span>
+                        <div className="h-3 w-px bg-amber-200 dark:bg-amber-800" />
+                        <button
+                          onClick={() => {
+                            const lastProductive = [...(myShift.activities || [])]
+                              .reverse()
+                              .find(act => act.type === 'productive');
+                            const resumeProc = lastProductive?.name || user.process || supervisorProcesses[0] || 'HITL';
+                            handleSuperResumeAction(resumeProc);
+                          }}
+                          className="bg-amber-500 hover:bg-amber-600 text-white text-[10px] px-2 py-1 rounded font-bold cursor-pointer transition-colors shadow-sm flex items-center gap-1"
+                        >
+                          <Play size={10} />
+                          <span>Resume Work</span>
+                        </button>
+                      </div>
+                    )}
+
+                    {/* Clock Out Button */}
+                    <button
+                      onClick={() => setShowSuperClockOutConfirm(true)}
+                      className="bg-rose-600 hover:bg-rose-700 text-white px-3 py-1.5 rounded-lg text-xs font-bold cursor-pointer transition-colors flex items-center gap-1 shadow-sm"
+                    >
+                      <LogOut size={12} />
+                      <span>Clock Out</span>
+                    </button>
+                  </div>
+                </div>
+              );
+            } else {
+              /* Clocked Out Banner */
+              return (
+                <div className="flex items-center gap-3">
+                  <div className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
+                  <span className="text-[11px] font-bold text-slate-500 dark:text-slate-400">You are clocked out.</span>
+                  <button
+                    onClick={() => setShowSuperClockInConfirm(true)}
+                    className="bg-emerald-600 hover:bg-emerald-700 text-white px-3 py-1.5 rounded-lg text-xs font-bold cursor-pointer transition-all flex items-center gap-1 shadow-sm hover:scale-[1.01]"
+                  >
+                    <Play size={11} />
+                    <span>Clock In</span>
+                  </button>
+                </div>
+              );
+            }
           })()}
-
-          
-          <div className="flex items-center gap-2">
-            <button 
-              onClick={() => {
-                // Clock-In/Out logic for supervisor
-                const myShift = activeShifts.find(s => s.userId === user.uid);
-                const currentDev = getDeviceType();
-                const meta = getDetailedDeviceMetadata();
-                
-                const uaVal = typeof navigator !== 'undefined' ? navigator.userAgent : 'N/A';
-                const platVal = typeof navigator !== 'undefined' ? navigator.platform : 'N/A';
-                const touchVal = typeof navigator !== 'undefined' ? navigator.maxTouchPoints : 0;
-                const swVal = typeof window !== 'undefined' && window.screen ? window.screen.width : 0;
-                const shVal = typeof window !== 'undefined' && window.screen ? window.screen.height : 0;
-
-                if (myShift) {
-                  // Clock Out logic - Perform standard end of work
-                  const myShiftId = myShift.id;
-                  const nowISO = getLiveTimeISO();
-                  
-                  const updatedActivities = [...(myShift.activities || [])];
-                  if (updatedActivities.length > 0) {
-                    const lastIndex = updatedActivities.length - 1;
-                    if (!updatedActivities[lastIndex].endTime) {
-                      updatedActivities[lastIndex].endTime = nowISO;
-                    }
-                  }
-                  
-                  const finalShift = {
-                    ...myShift,
-                    activities: updatedActivities,
-                    status: 'COMPLETED' as const,
-                    clockOutTime: nowISO,
-                    clockOutDevice: currentDev,
-                    hasMobilePunches: myShift.hasMobilePunches || currentDev === 'mobile'
-                  };
-                  
-                  setDoc(doc(db, 'tmsShifts', myShiftId), finalShift).then(() => {
-                    syncShiftToAttendance(finalShift);
-                    toast.success('Shift completed successfully');
-                    loadAndRecomputeData(true);
-                  });
-                } else {
-                  // Clock In logic - create new shift record
-                  const nowISO = getLiveTimeISO();
-                  const newShift: Omit<TMSShift, 'id'> = {
-                    userId: user.uid,
-                    userName: user.name,
-                    userEmail: user.email,
-                    mappedTL: (user as any).teamLeadEmail || (user as any).mappedTL || 'N/A',
-                    mappedManager: (user as any).mappedManagerEmail || (user as any).mappedManager || 'N/A',
-                    clockInTime: nowISO,
-                    activities: [{ type: 'productive', name: 'Work Start', startTime: nowISO, device: currentDev }],
-                    status: 'ACTIVE',
-                    clockInDevice: currentDev,
-                    hasMobilePunches: currentDev === 'mobile',
-                    deviceType: meta.deviceType,
-                    browser: meta.browser,
-                    os: meta.os,
-                    loginTimestamp: meta.loginTimestamp,
-                    userAgent: uaVal,
-                    platform: platVal,
-                    maxTouchPoints: touchVal,
-                    screenWidth: swVal,
-                    screenHeight: shVal,
-                    detectedDeviceType: meta.deviceType,
-                    detectedBrowser: meta.browser,
-                    detectedOS: meta.os
-                  };
-                  addDoc(collection(db, 'tmsShifts'), newShift).then((docRef) => {
-                    toast.success('Clocked in successfully');
-                    // Optimistic update to UI state
-                    const shiftWithId = { ...newShift, id: docRef.id };
-                    setActiveShifts(prev => {
-                      // Remove any existing for same user just in case
-                      const filtered = prev.filter(s => s.userId !== user.uid);
-                      return [shiftWithId, ...filtered];
-                    });
-                    // Refresh data fully
-                    setTimeout(() => loadAndRecomputeData(true), 500);
-                  }).catch(err => {
-                    console.error('Clock-in failed:', err);
-                    toast.error('Failed to clock in: ' + err.message);
-                  });
-                }
-              }}
-              className={`flex items-center gap-1.5 ${activeShifts.find(s => s.userId === user.uid) ? 'bg-amber-600 hover:bg-amber-700' : 'bg-emerald-600 hover:bg-emerald-700'} text-white px-3.5 py-1.5 rounded-xl text-xs font-bold cursor-pointer transition-colors`}
-            >
-              <Clock size={13} />
-              <span>{activeShifts.find(s => s.userId === user.uid) ? 'Clock Out' : 'Clock In'}</span>
-            </button>
-            
-            {activeShifts.find(s => s.userId === user.uid) && (
-              <button
-                onClick={() => {
-                  const myShift = activeShifts.find(s => s.userId === user.uid);
-                  if (!myShift) return;
-                  
-                  const nowISO = getLiveTimeISO();
-                  const currentDev = getDeviceType();
-                  const updatedActivities = [...(myShift.activities || [])];
-                  const lastActivity = updatedActivities[updatedActivities.length - 1];
-                  
-                  if (myShift.status === 'ACTIVE') {
-                    // Start Break
-                    if (lastActivity && !lastActivity.endTime) {
-                      lastActivity.endTime = nowISO;
-                    }
-                    updatedActivities.push({ type: 'break', name: 'Break', startTime: nowISO, device: currentDev });
-                    setDoc(doc(db, 'tmsShifts', myShift.id), { 
-                      ...myShift, 
-                      activities: updatedActivities, 
-                      status: 'BREAK',
-                      hasMobilePunches: myShift.hasMobilePunches || currentDev === 'mobile'
-                    })
-                      .then(() => { toast.success('Break started'); loadAndRecomputeData(true); });
-                  } else if (myShift.status === 'BREAK') {
-                    // End Break
-                    if (lastActivity && !lastActivity.endTime) {
-                      lastActivity.endTime = nowISO;
-                    }
-                    updatedActivities.push({ type: 'productive', name: 'Work Resumed', startTime: nowISO, device: currentDev });
-                    setDoc(doc(db, 'tmsShifts', myShift.id), { 
-                      ...myShift, 
-                      activities: updatedActivities, 
-                      status: 'ACTIVE',
-                      hasMobilePunches: myShift.hasMobilePunches || currentDev === 'mobile'
-                    })
-                      .then(() => { toast.success('Break ended'); loadAndRecomputeData(true); });
-                  }
-                }}
-                className="flex items-center gap-1.5 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 px-3.5 py-1.5 rounded-xl text-xs font-bold cursor-pointer transition-colors"
-              >
-                <Coffee size={13} />
-                <span>{activeShifts.find(s => s.userId === user.uid)?.status === 'BREAK' ? 'End Break' : 'Punch Break'}</span>
-              </button>
-            )}
-          </div>
         </div>
       </div>
 
       {/* CORE STATS KPI TILES (TOP SUMMARY CARDS - REACTIVE TO ACTIVE FILTERS) */}
-      <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-7 gap-2.5">
-          <div className="bg-white dark:bg-slate-900 border-2 border-indigo-200 dark:border-indigo-900/50 p-2.5 rounded-xl shadow-sm text-center">
-          <span className="text-[9px] font-black uppercase tracking-widest text-indigo-600 dark:text-indigo-400 leading-none">Total Assigned</span>
-          <h3 className="text-xl font-black text-slate-900 dark:text-white mt-0.5">{liveStats.total}</h3>
-          <p className="text-[8px] text-slate-500 dark:text-slate-400 font-bold mt-0.5 leading-none">Roster Mapped</p>
-        </div>
-
-        <div className="bg-white dark:bg-slate-900 border border-emerald-250 dark:border-emerald-950/30 p-2.5 rounded-xl shadow-xs text-center">
-          <span className="text-[9px] font-black uppercase tracking-widest text-emerald-600 dark:text-emerald-400 leading-none">Logged In Now</span>
-          <h3 className="text-xl font-black text-emerald-600 dark:text-emerald-400 mt-0.5">{liveStats.loggedIn}</h3>
-          <p className="text-[8px] text-emerald-500 dark:text-emerald-500/85 font-bold mt-0.5 leading-none">On-Duty Shifts</p>
+      <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5 max-w-2xl">
+        <div className="bg-white dark:bg-slate-900 border border-indigo-250 dark:border-indigo-950/30 p-2.5 rounded-xl shadow-xs text-center">
+          <span className="text-[9px] font-black uppercase tracking-widest text-indigo-600 dark:text-indigo-400 leading-none">Active Work</span>
+          <h3 className="text-xl font-black text-indigo-600 dark:text-indigo-400 mt-0.5">{liveStats.active}</h3>
+          <p className="text-[8px] text-indigo-500 dark:text-indigo-505/85 font-bold mt-0.5 leading-none">Productive Timers</p>
         </div>
 
         <div className="bg-white dark:bg-slate-900 border border-amber-250 dark:border-amber-950/30 p-2.5 rounded-xl shadow-xs text-center">
           <span className="text-[9px] font-black uppercase tracking-widest text-amber-600 dark:text-amber-400 leading-none">On Break</span>
           <h3 className="text-xl font-black text-amber-500 dark:text-amber-400 mt-0.5">{liveStats.onBreak}</h3>
-          <p className="text-[8px] text-amber-500 dark:text-amber-500/85 font-bold mt-0.5 leading-none">Rest Periods</p>
-        </div>
-
-          <div className="bg-white dark:bg-slate-900 border-2 border-slate-300 dark:border-slate-700 p-2.5 rounded-xl shadow-sm text-center">
-          <span className="text-[9px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-500 leading-none">Offline</span>
-          <h3 className="text-xl font-black text-slate-500 dark:text-slate-300 mt-0.5">{liveStats.offline}</h3>
-          <p className="text-[8px] text-slate-400 dark:text-slate-500 font-bold mt-0.5 leading-none">Off-Duty staff</p>
-        </div>
-
-        <div className="bg-white dark:bg-slate-900 border border-sky-250 dark:border-sky-950/30 p-2.5 rounded-xl shadow-xs text-center">
-          <span className="text-[9px] font-black uppercase tracking-widest text-sky-600 dark:text-sky-400 leading-none">Attendance %</span>
-          <h3 className="text-xl font-black text-sky-600 dark:text-sky-400 mt-0.5">{liveStats.attendancePercent}%</h3>
-          <p className="text-[8px] text-sky-500 dark:text-sky-500/85 font-bold mt-0.5 leading-none">Team Rate</p>
+          <p className="text-[8px] text-amber-500 dark:text-amber-505/85 font-bold mt-0.5 leading-none">Rest Periods</p>
         </div>
 
         <div className="bg-white dark:bg-slate-900 border border-teal-250 dark:border-teal-950/30 p-2.5 rounded-xl shadow-xs text-center">
           <span className="text-[9px] font-black uppercase tracking-widest text-teal-600 dark:text-teal-400 leading-none">Team Avg Util</span>
           <h3 className="text-xl font-black text-teal-600 dark:text-teal-400 mt-0.5">{liveStats.teamAvgUtilization}%</h3>
           <p className="text-[8px] text-teal-550 dark:text-teal-500 font-bold mt-0.5 leading-none">Target: {presentThreshold}m</p>
-        </div>
-
-        <div className="bg-white dark:bg-slate-900 border border-indigo-250 dark:border-indigo-950/30 p-2.5 rounded-xl shadow-xs text-center">
-          <span className="text-[9px] font-black uppercase tracking-widest text-indigo-600 dark:text-indigo-400 leading-none">Active Work</span>
-          <h3 className="text-xl font-black text-indigo-600 dark:text-indigo-400 mt-0.5">{liveStats.active}</h3>
-          <p className="text-[8px] text-indigo-500 dark:text-indigo-505/85 font-bold mt-0.5 leading-none">Productive Timers</p>
         </div>
       </div>
 
@@ -1954,24 +2130,22 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
         </div>
       </div>
 
+        {/* EXPORT BUTTON */}
+        <div className="flex justify-end mb-4">
+            <button 
+              onClick={handleSpreadsheetExport}
+              disabled={isExporting}
+              className="bg-emerald-600 hover:bg-emerald-700 text-white p-3 rounded-xl flex items-center justify-center gap-2 text-xs font-extrabold transition-colors cursor-pointer"
+            >
+              <FileSpreadsheet size={15} /> Export Utilization Report
+            </button>
+        </div>
+
       {/* DASHBOARD TABS */}
       <div className="flex gap-3 border-b border-slate-200 dark:border-slate-800 pb-2 overflow-x-auto scrollbar-none">
+
         <button 
-          onClick={() => setActiveTab('monitoring')}
-          className={`flex flex-col items-start gap-1 px-5 py-3 rounded-xl text-left transition-all cursor-pointer border shadow-sm select-none ${
-            activeTab === 'monitoring' 
-              ? 'bg-indigo-600 border-indigo-600 text-white dark:bg-indigo-600 dark:border-indigo-600' 
-              : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50 hover:border-slate-300 dark:bg-slate-900 dark:border-slate-800 dark:text-slate-300 dark:hover:bg-slate-850'
-          }`}
-        >
-          <div className="flex items-center gap-1.5 font-black text-xs">
-            <Activity size={14} className={activeTab === 'monitoring' ? 'text-white' : 'text-indigo-600'} />
-            Workforce Monitoring
-          </div>
-          <span className={`text-[10px] font-medium ${activeTab === 'monitoring' ? 'text-indigo-100' : 'text-slate-500 dark:text-slate-400'}`}>Live dashboard & statistics</span>
-        </button>
-        <button 
-          onClick={() => setActiveTab('controls')}
+          onClick={() => handleTabChange('controls')}
           className={`flex flex-col items-start gap-1 px-5 py-3 rounded-xl text-left transition-all cursor-pointer border shadow-sm select-none ${
             activeTab === 'controls' 
               ? 'bg-indigo-600 border-indigo-600 text-white dark:bg-indigo-600 dark:border-indigo-600' 
@@ -1980,46 +2154,150 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
         >
           <div className="flex items-center gap-1.5 font-black text-xs">
             <Users size={14} className={activeTab === 'controls' ? 'text-white' : 'text-indigo-600'} />
-            Workforce Controls
+            {['ADMIN', 'MANAGER', 'OPS_HEAD', 'HR', 'IT_MANAGER'].includes((user.role || '').toUpperCase()) ? 'Live Floor Controls' : 'Live Team Controls'}
           </div>
           <span className={`text-[10px] font-medium ${activeTab === 'controls' ? 'text-indigo-100' : 'text-slate-500 dark:text-slate-400'}`}>Clock out, edit shift logs & filters</span>
         </button>
 
         <button 
-          onClick={() => setActiveTab('exceptions')}
+          onClick={() => handleTabChange('alerts')}
           className={`flex flex-col items-start gap-1 px-5 py-3 rounded-xl text-left transition-all cursor-pointer border shadow-sm select-none ${
-            activeTab === 'exceptions' 
-              ? 'bg-rose-600 border-rose-600 text-white dark:bg-rose-600 dark:border-rose-600' 
+            activeTab === 'alerts' 
+              ? 'bg-rose-50/70 border-rose-200 text-rose-700 dark:bg-rose-950/40 dark:border-rose-900/40 dark:text-rose-300' 
               : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50 hover:border-slate-300 dark:bg-slate-900 dark:border-slate-800 dark:text-slate-300 dark:hover:bg-slate-850'
           }`}
         >
           <div className="flex items-center gap-1.5 font-black text-xs">
-            <AlertTriangle size={14} className={activeTab === 'exceptions' ? 'text-white' : 'text-rose-500'} />
-            Break Exceeds & Mobile Logs
+            <Bell size={14} className={activeTab === 'alerts' ? 'text-rose-500' : 'text-rose-400/60'} />
+            Alerts & Violations
           </div>
-          <span className={`text-[10px] font-medium ${activeTab === 'exceptions' ? 'text-rose-100' : 'text-slate-500 dark:text-slate-400'}`}>Monitor anomalies</span>
+          <span className={`text-[10px] font-medium ${activeTab === 'alerts' ? 'text-rose-600/80 dark:text-rose-400/80' : 'text-slate-500 dark:text-slate-400'}`}>Exceeded breaks & stale sessions</span>
         </button>
 
-        {['ADMIN', 'MANAGER', 'OPS_HEAD', 'HR', 'IT_MANAGER'].includes((user.role || '').toUpperCase()) && (
-          <button 
-            onClick={() => setActiveTab('hierarchy')}
-            className={`flex flex-col items-start gap-1 px-5 py-3 rounded-xl text-left transition-all cursor-pointer border shadow-sm select-none ${
-              activeTab === 'hierarchy' 
-                ? 'bg-indigo-600 border-indigo-600 text-white dark:bg-indigo-600 dark:border-indigo-600' 
-                : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50 hover:border-slate-300 dark:bg-slate-900 dark:border-slate-800 dark:text-slate-300 dark:hover:bg-slate-850'
-            }`}
-          >
-            <div className="flex items-center gap-1.5 font-black text-xs">
-              <Shield size={14} className={activeTab === 'hierarchy' ? 'text-white' : 'text-indigo-650'} />
-              Diagnostics
-            </div>
-            <span className={`text-[10px] font-medium ${activeTab === 'hierarchy' ? 'text-indigo-100' : 'text-slate-500 dark:text-slate-400'}`}>Check database sync state</span>
-          </button>
-        )}
       </div>
 
       {/* RENDER SELECTED TAB VIEWS */}
       <div className="space-y-6">
+
+        {/* TAB: ALERTS & VIOLATIONS */}
+        {activeTab === 'alerts' && (
+          <div className="space-y-6 animate-in fade-in slide-in-from-bottom-2 duration-300">
+            <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-6 shadow-sm">
+              <div className="flex items-center justify-between mb-6">
+                <div>
+                  <h3 className="text-sm font-black text-slate-900 dark:text-white uppercase tracking-wider flex items-center gap-1.5">
+                    <ShieldAlert className="text-rose-400" size={16} />
+                    Integrity Alerts & Threshold Violations
+                  </h3>
+                  <p className="text-[10px] text-slate-500 dark:text-slate-400 font-sans mt-0.5">Real-time detection of break overruns, stale sessions, and mobile device activity for mapped team members.</p>
+                </div>
+                <div className="flex items-center gap-1.5">
+                   <div className="px-2 py-1 rounded bg-slate-50 dark:bg-slate-950/30 text-slate-600 dark:text-slate-400 text-[9px] font-black uppercase border border-slate-100 dark:border-slate-900/40">
+                     {teamAlerts.length} Active Team Alerts
+                   </div>
+                   <button 
+                     onClick={() => recomputeMetrics(true)}
+                     className="p-1.5 rounded bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-400 hover:bg-slate-100 transition-colors cursor-pointer"
+                   >
+                     <RefreshCw size={12} className={isLoadingShifts ? 'animate-spin' : ''} />
+                   </button>
+                </div>
+              </div>
+
+              {teamAlerts.length === 0 ? (
+                <div className="py-10 flex flex-col items-center justify-center text-center space-y-2">
+                  <div className="p-4 bg-slate-50 dark:bg-slate-800/50 rounded-full">
+                    <CheckCircle size={32} className="text-emerald-500" />
+                  </div>
+                  <div>
+                    <h4 className="text-xs font-bold text-slate-900 dark:text-white">All Clear</h4>
+                    <p className="text-[10px] text-slate-500 dark:text-slate-400">No active threshold violations detected under your team.</p>
+                  </div>
+                </div>
+              ) : (
+                <div className="space-y-8">
+                  {/* CATEGORY 1: BREAK EXCEEDS */}
+                  <div className="space-y-3">
+                    <div className="flex items-center gap-2 border-b border-amber-100 dark:border-amber-950/40 pb-2">
+                      <div className="p-1.5 rounded-lg bg-amber-50 dark:bg-amber-950/30 text-amber-500">
+                        <Coffee size={14} />
+                      </div>
+                      <div>
+                        <h4 className="text-xs font-black text-slate-800 dark:text-slate-200 uppercase tracking-wider flex items-center gap-1.5">
+                          Break Exceeds
+                          <span className="px-1.5 py-0.5 rounded-full bg-amber-50 text-amber-700 dark:bg-amber-950 dark:text-amber-400 text-[10px] font-black border border-amber-100 dark:border-amber-900/30">
+                            {breakExceedsAlerts.length}
+                          </span>
+                        </h4>
+                        <p className="text-[9px] text-slate-400 dark:text-slate-500 font-medium">Agents currently exceeding bio, short, or lunch break duration limits.</p>
+                      </div>
+                    </div>
+
+                    {breakExceedsAlerts.length === 0 ? (
+                      <p className="text-[10px] text-slate-400 dark:text-slate-500 italic px-2 py-1">No active break violations.</p>
+                    ) : (
+                      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+                        {breakExceedsAlerts.map((alert) => renderAlertCard(alert, 'break'))}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* CATEGORY 2: MOBILE LOGS */}
+                  <div className="space-y-3">
+                    <div className="flex items-center gap-2 border-b border-sky-100 dark:border-sky-950/40 pb-2">
+                      <div className="p-1.5 rounded-lg bg-sky-50 dark:bg-sky-950/30 text-sky-500">
+                        <Smartphone size={14} />
+                      </div>
+                      <div>
+                        <h4 className="text-xs font-black text-slate-800 dark:text-slate-200 uppercase tracking-wider flex items-center gap-1.5">
+                          Mobile Logs
+                          <span className="px-1.5 py-0.5 rounded-full bg-sky-50 text-sky-700 dark:bg-sky-950 dark:text-sky-450 text-[10px] font-black border border-sky-100 dark:border-sky-900/30">
+                            {mobileLogsAlerts.length}
+                          </span>
+                        </h4>
+                        <p className="text-[9px] text-slate-400 dark:text-slate-500 font-medium">Shifts flagged for using a mobile device interface to punch.</p>
+                      </div>
+                    </div>
+
+                    {mobileLogsAlerts.length === 0 ? (
+                      <p className="text-[10px] text-slate-400 dark:text-slate-500 italic px-2 py-1">No mobile device punches detected.</p>
+                    ) : (
+                      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+                        {mobileLogsAlerts.map((alert) => renderAlertCard(alert, 'mobile'))}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* CATEGORY 3: AUTO-LOGOUTS / STALE SESSIONS */}
+                  <div className="space-y-3">
+                    <div className="flex items-center gap-2 border-b border-rose-100 dark:border-rose-950/40 pb-2">
+                      <div className="p-1.5 rounded-lg bg-rose-50 dark:bg-rose-950/30 text-rose-450">
+                        <LogOut size={14} />
+                      </div>
+                      <div>
+                        <h4 className="text-xs font-black text-slate-800 dark:text-slate-200 uppercase tracking-wider flex items-center gap-1.5">
+                          Auto-Logouts & Stale Sessions
+                          <span className="px-1.5 py-0.5 rounded-full bg-rose-50 text-rose-700 dark:bg-rose-950 dark:text-rose-400 text-[10px] font-black border border-rose-100 dark:border-rose-900/30">
+                            {autoLogoutsAlerts.length}
+                          </span>
+                        </h4>
+                        <p className="text-[9px] text-slate-400 dark:text-slate-500 font-medium">Active sessions exceeding 10 productive hours requiring force out or audit.</p>
+                      </div>
+                    </div>
+
+                    {autoLogoutsAlerts.length === 0 ? (
+                      <p className="text-[10px] text-slate-400 dark:text-slate-500 italic px-2 py-1">No stale active sessions.</p>
+                    ) : (
+                      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+                        {autoLogoutsAlerts.map((alert) => renderAlertCard(alert, 'logout'))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
         
         {/* TAB 4: HIERARCHY VALIDATION REPORT (ADMIN ONLY) */}
         {activeTab === 'hierarchy' && ['ADMIN', 'MANAGER', 'OPS_HEAD', 'HR', 'IT_MANAGER'].includes((user.role || '').toUpperCase()) && (
@@ -2174,139 +2452,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
           </div>
         )}
 
-        {/* TAB 1: WORKFORCE MONITORING (ANALYTICS & DISTRIBUTION VISUALS) */}
-        {activeTab === 'monitoring' && (
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-            
-            {/* Live Distribution Board */}
-            <div className="lg:col-span-4 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-5 shadow-sm space-y-4">
-              <div>
-                <h4 className="text-xs font-extrabold text-slate-800 dark:text-slate-200 uppercase tracking-widest flex items-center gap-1.5">
-                  <Sparkles size={14} className="text-amber-500" /> Live Workforce Distribution
-                </h4>
-                <p className="text-[10px] text-slate-500 dark:text-slate-400 mt-1">💡 Click any category below to immediately filter matching agents inside Workforce Controls.</p>
-              </div>
-              
-              <div className="space-y-1.5 pt-1">
-                <button
-                  type="button"
-                  onClick={() => handleDistributionClick('active', '🟢 Active Workflow')}
-                  className="group cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-800/40 p-2 rounded-xl transition-all border border-transparent hover:border-slate-100 dark:hover:border-slate-800/60 focus:outline-none w-full text-left"
-                >
-                  <div className="flex justify-between text-xs font-bold text-slate-600 dark:text-slate-400 mb-1 leading-none">
-                    <span className="group-hover:text-indigo-600 dark:group-hover:text-indigo-400 font-black transition-colors">🟢 Active Workflow</span>
-                    <span className="text-indigo-600 dark:text-indigo-400 bg-indigo-50 dark:bg-indigo-950/40 px-1.5 py-0.5 rounded-md font-extrabold text-[10px]">{liveDistribution.active}</span>
-                  </div>
-                  <div className="w-full bg-slate-100 dark:bg-slate-800 h-2 rounded-full overflow-hidden">
-                    <div className="bg-indigo-600 dark:bg-indigo-500 h-full rounded-full transition-all duration-300" style={{ width: `${(liveDistribution.active / (liveStats.total || 1)) * 100}%` }} />
-                  </div>
-                  <span className="text-[9px] text-slate-400 group-hover:text-indigo-500 font-bold hidden group-block mt-1 leading-none transition-colors">Click to filter controls view &rarr;</span>
-                </button>
 
-                <button
-                  type="button"
-                  onClick={() => handleDistributionClick('break_tea', '☕ Tea / Short Break')}
-                  className="group cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-800/40 p-2 rounded-xl transition-all border border-transparent hover:border-slate-100 dark:hover:border-slate-800/60 focus:outline-none w-full text-left"
-                >
-                  <div className="flex justify-between text-xs font-bold text-slate-600 dark:text-slate-400 mb-1 leading-none">
-                    <span className="group-hover:text-amber-500 font-black transition-colors">☕ Break & Tea</span>
-                    <span className="text-amber-500 bg-amber-50 dark:bg-amber-955/20 px-1.5 py-0.5 rounded-md font-extrabold text-[10px]">{liveDistribution.break}</span>
-                  </div>
-                  <div className="w-full bg-slate-100 dark:bg-slate-800 h-2 rounded-full overflow-hidden">
-                    <div className="bg-amber-500 h-full rounded-full transition-all duration-300" style={{ width: `${(liveDistribution.break / (liveStats.total || 1)) * 100}%` }} />
-                  </div>
-                  <span className="text-[9px] text-slate-400 group-hover:text-amber-500 font-bold hidden group-block mt-1 leading-none transition-colors">Click to filter controls view &rarr;</span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => handleDistributionClick('lunch', '🍱 Lunch Interval')}
-                  className="group cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-800/40 p-2 rounded-xl transition-all border border-transparent hover:border-slate-100 dark:hover:border-slate-800/60 focus:outline-none w-full text-left"
-                >
-                  <div className="flex justify-between text-xs font-bold text-slate-600 dark:text-slate-400 mb-1 leading-none">
-                    <span className="group-hover:text-orange-600 dark:group-hover:text-orange-400 font-black transition-colors">🍱 Lunch Interval</span>
-                    <span className="text-[#D97706] bg-amber-50 dark:bg-amber-955/20 px-1.5 py-0.5 rounded-md font-extrabold text-[10px]">{liveDistribution.lunch}</span>
-                  </div>
-                  <div className="w-full bg-slate-100 dark:bg-slate-800 h-2 rounded-full overflow-hidden">
-                    <div className="bg-[#D97706] h-full rounded-full transition-all duration-300" style={{ width: `${(liveDistribution.lunch / (liveStats.total || 1)) * 100}%` }} />
-                  </div>
-                  <span className="text-[9px] text-slate-400 group-hover:text-orange-550 font-bold hidden group-block mt-1 leading-none transition-colors">Click to filter controls view &rarr;</span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => handleDistributionClick('meeting', '🤝 Meeting / Coaching')}
-                  className="group cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-800/40 p-2 rounded-xl transition-all border border-transparent hover:border-slate-100 dark:hover:border-slate-800/60 focus:outline-none w-full text-left"
-                >
-                  <div className="flex justify-between text-xs font-bold text-slate-600 dark:text-slate-400 mb-1 leading-none">
-                    <span className="group-hover:text-purple-600 dark:group-hover:text-purple-400 font-black transition-colors">🤝 Meeting / Coaching</span>
-                    <span className="text-purple-600 dark:text-purple-400 bg-purple-50 dark:bg-purple-950/20 px-1.5 py-0.5 rounded-md font-extrabold text-[10px]">{liveDistribution.meeting}</span>
-                  </div>
-                  <div className="w-full bg-slate-100 dark:bg-slate-800 h-2 rounded-full overflow-hidden">
-                    <div className="bg-purple-600 h-full rounded-full transition-all duration-300" style={{ width: `${(liveDistribution.meeting / (liveStats.total || 1)) * 100}%` }} />
-                  </div>
-                  <span className="text-[9px] text-slate-400 group-hover:text-purple-500 font-bold hidden group-block mt-1 leading-none transition-colors">Click to filter controls view &rarr;</span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => handleDistributionClick('offline', '⚪ Offline Staff')}
-                  className="group cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-800/40 p-2 rounded-xl transition-all border border-transparent hover:border-slate-100 dark:hover:border-slate-800/60 focus:outline-none w-full text-left"
-                >
-                  <div className="flex justify-between text-xs font-bold text-slate-600 dark:text-slate-400 mb-1 leading-none">
-                    <span className="group-hover:text-slate-600 dark:group-hover:text-slate-300 font-black transition-colors">⚪ Offline / Off-Duty</span>
-                    <span className="text-slate-400 bg-slate-50 dark:bg-slate-900/50 px-1.5 py-0.5 rounded-md font-extrabold text-[10px]">{liveDistribution.offline}</span>
-                  </div>
-                  <div className="w-full bg-slate-100 dark:bg-slate-800 h-2 rounded-full overflow-hidden">
-                    <div className="bg-slate-300 dark:bg-slate-700 h-full rounded-full transition-all duration-300" style={{ width: `${(liveDistribution.offline / (liveStats.total || 1)) * 100}%` }} />
-                  </div>
-                  <span className="text-[9px] text-slate-400 group-hover:text-slate-500 font-bold hidden group-block mt-1 leading-none transition-colors">Click to filter controls view &rarr;</span>
-                </button>
-              </div>
-            </div>
-
-            {/* Role Dispersion Graph */}
-            <div className="lg:col-span-8 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-5 shadow-sm space-y-4">
-              <h4 className="text-xs font-extrabold text-slate-800 dark:text-white uppercase tracking-widest">
-                Team Role Allocation Mapping
-              </h4>
-              <div className="h-[210px] w-full pt-2">
-                <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={roleChartData}>
-                    <CartesianGrid strokeDasharray="3 3" opacity={0.1} />
-                    <XAxis dataKey="name" stroke={isDark ? '#94A3B8' : '#64748B'} fontSize={11} />
-                    <YAxis stroke={isDark ? '#94A3B8' : '#64748B'} fontSize={11} />
-                    <Tooltip contentStyle={{ 
-                      borderRadius: '12px', 
-                      fontSize: '12px',
-                      backgroundColor: isDark ? '#1e293b' : '#ffffff',
-                      borderColor: isDark ? '#334155' : '#e2e8f0',
-                      color: isDark ? '#ffffff' : '#0f172a'
-                    }} />
-                    <Bar dataKey="count" fill="#6366F1" radius={[6, 6, 0, 0]} maxBarSize={35} />
-                  </BarChart>
-                </ResponsiveContainer>
-              </div>
-            </div>
-
-            {/* QUICK SUPERVISOR TOOLS RAIL */}
-            <div className="lg:col-span-12 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-5 shadow-sm">
-              <h4 className="text-xs font-extrabold text-slate-800 dark:text-white uppercase tracking-widest mb-4">
-                Operational Short-cuts & Quick Actions
-              </h4>
-              <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3">
-                <button 
-                  onClick={handleSpreadsheetExport}
-                  disabled={isExporting}
-                  className="bg-emerald-600 hover:bg-emerald-700 text-white p-3 rounded-xl flex items-center justify-center gap-2 text-xs font-extrabold transition-colors cursor-pointer w-full"
-                >
-                  <FileSpreadsheet size={15} /> Export Utilization Report
-                </button>
-              </div>
-            </div>
-
-          </div>
-        )}
 
         {/* TAB 2: ROSTER WORKFORCE CONTROLS (ADVANCED FILTERS & POWER LIST) */}
         {activeTab === 'controls' && (
@@ -2366,8 +2512,7 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
                         { val: 'break_tea', label: '☕ Tea / Short Break' },
                         { val: 'lunch', label: '🍱 Lunch Interval' },
                         { val: 'meeting', label: '🤝 Meeting / Coaching' },
-                        { val: 'break', label: '🟠 All Rest Breaks' },
-                        { val: 'offline', label: '⚪ Offline Staff' }
+                        { val: 'break', label: '🟠 All Rest Breaks' }
                       ].map(opt => (
                         <button
                           key={opt.val}
@@ -2390,35 +2535,39 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
                   )}
                 </div>
 
-                <div className="relative">
-                  <label className="block text-[10px] uppercase font-bold text-slate-400 mb-1">Process Filter</label>
-                  <MultiSelectDropdown
-                    options={uniqueActiveProcesses}
-                    selectedValues={selectedProcesses}
-                    onToggle={(val) => {
-                      setSelectedProcesses(prev => 
-                        prev.includes(val) ? prev.filter(p => p !== val) : [...prev, val]
-                      );
-                      setCurrentPage(1);
-                    }}
-                    placeholder="🚀 Process: All"
-                  />
-                </div>
+                {(isManagerOrLead || isTeamLeadOrSME) && (
+                  <div className="relative">
+                    <label className="block text-[10px] uppercase font-bold text-slate-400 mb-1">Current Activity Filter</label>
+                    <MultiSelectDropdown
+                      options={uniqueActiveActivities}
+                      selectedValues={selectedActivities}
+                      onToggle={(val) => {
+                        setSelectedActivities(prev => 
+                          prev.includes(val) ? prev.filter(p => p !== val) : [...prev, val]
+                        );
+                        setCurrentPage(1);
+                      }}
+                      placeholder="🚀 Activity: All"
+                    />
+                  </div>
+                )}
 
-                <div className="relative">
-                  <label className="block text-[10px] uppercase font-bold text-slate-400 mb-1">Team Lead Mapped</label>
-                  <MultiSelectDropdown
-                    options={teamLeadsList.map(tl => tl.name)}
-                    selectedValues={selectedTLs}
-                    onToggle={(val) => {
-                      setSelectedTLs(prev => 
-                        prev.includes(val) ? prev.filter(p => p !== val) : [...prev, val]
-                      );
-                      setCurrentPage(1);
-                    }}
-                    placeholder="🗺️ Team Leads: All"
-                  />
-                </div>
+                {isManagerOrLead && (
+                  <div className="relative">
+                    <label className="block text-[10px] uppercase font-bold text-slate-400 mb-1">Location Filter</label>
+                    <MultiSelectDropdown
+                      options={uniqueLocations}
+                      selectedValues={selectedLocations}
+                      onToggle={(val) => {
+                        setSelectedLocations(prev => 
+                          prev.includes(val) ? prev.filter(p => p !== val) : [...prev, val]
+                        );
+                        setCurrentPage(1);
+                      }}
+                      placeholder="📍 Location: All"
+                    />
+                  </div>
+                )}
 
                 {['ADMIN', 'MANAGER', 'OPS_HEAD', 'HR', 'IT_MANAGER'].includes((user.role || '').toUpperCase()) ? (
                   <div className="relative">
@@ -2441,7 +2590,8 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
                   <button 
                     onClick={() => {
                       setSearchTerm('');
-                      setSelectedProcesses([]);
+                      setSelectedActivities([]);
+                      setSelectedLocations([]);
                       setShiftFilter('all');
                       setSelectedTLs([]);
                       setSelectedManagers(() => {
@@ -2465,12 +2615,13 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
                   <tr className="bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 font-black text-[9px] uppercase tracking-wider select-none border-b border-slate-200 dark:border-slate-700">
                     <th className="p-4 pl-6 cursor-pointer" onClick={() => { setSortKey('name'); setSortOrder(prev => prev === 'asc' ? 'desc' : 'asc'); }}>Employee Name</th>
                     <th className="p-4">Process Mapping</th>
+                    <th className="p-4">Location</th>
                     <th className="p-4">Current Activity</th>
                     <th className="p-4">Log In Time</th>
                     <th className="p-4">Device</th>
                     <th className="p-4 cursor-pointer" onClick={() => { setSortKey('productive'); setSortOrder(prev => prev === 'asc' ? 'desc' : 'asc'); }}>Productive Duration</th>
+                    <th className="p-4">Break Duration</th>
                     <th className="p-4 text-center">Utilization</th>
-                    <th className="p-4">Operational Status</th>
                     <th className="p-4 text-center">Action</th>
                   </tr>
                 </thead>
@@ -2481,6 +2632,8 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
 
                     const liveActs = live?.activities || [];
                     const lastAct = liveActs.length > 0 ? liveActs[liveActs.length - 1] : null;
+                    const currentActivityName = lastAct?.name || (live as any)?.currentActivity || 'In transition';
+                    const breakStartTime = lastAct?.startTime || (live as any)?.currentActivityStartTime;
 
                     return (
                       <React.Fragment key={u.uid}>
@@ -2518,16 +2671,13 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
                           <td className="p-4">
                             <span className="bg-slate-150/60 font-semibold px-2 py-0.5 rounded text-slate-700">{u.process || 'General'}</span>
                           </td>
+                          <td className="p-4">
+                            <span className="bg-indigo-50 font-bold px-2 py-0.5 rounded text-indigo-700 border border-indigo-200/40">{u.location || 'N/A'}</span>
+                          </td>
                           <td className="p-4 font-semibold text-slate-800">
                             {live ? (
                               <div className="flex flex-col gap-0.5">
-                                <span>{lastAct?.name || 'In transition'}</span>
-                                {live.status === 'BREAK' && lastAct && (
-                                  <span className="text-[10px] font-bold text-amber-600 dark:text-amber-400 animate-pulse flex items-center gap-1 font-mono">
-                                    <Clock3 size={11} className="inline text-amber-500" />
-                                    <span>Break time: {formatMs(Math.max(0, new Date().getTime() - new Date(lastAct.startTime).getTime()))}</span>
-                                  </span>
-                                )}
+                                <span>{currentActivityName}</span>
                               </div>
                             ) : <span className="text-slate-400">-</span>}
                           </td>
@@ -2560,6 +2710,9 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
                           </td>
                           <td className="p-4 font-bold text-teal-600 font-mono">
                             {stats ? stats.activeStr : <span className="text-slate-400 font-normal font-sans text-xs">Offline</span>}
+                          </td>
+                          <td className="p-4 font-bold text-amber-600 font-mono">
+                            {stats ? stats.breakStr : <span className="text-slate-400 font-normal font-sans text-xs">00:00:00</span>}
                           </td>
                           <td className="p-4 text-center relative group/util">
                             {stats ? (
@@ -2618,22 +2771,6 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
                               </>
                             ) : (
                               <span className="text-slate-400 font-normal">-</span>
-                            )}
-                          </td>
-                          <td className="p-4">
-                            {live ? (
-                              <div className="flex flex-col gap-1">
-                                <span className={`w-fit px-2.5 py-0.5 rounded-full text-[9px] font-black uppercase ${live.status === 'BREAK' ? 'bg-amber-150 text-amber-800' : 'bg-emerald-150 text-emerald-800'}`}>
-                                  {live.status}
-                                </span>
-                                {live.status === 'BREAK' && lastAct && (
-                                  <span className="text-[9px] font-medium font-mono text-amber-600 dark:text-amber-450 leading-none">
-                                    Duration: {formatMs(Math.max(0, getLiveTime().getTime() - new Date(lastAct.startTime).getTime()))}
-                                  </span>
-                                )}
-                              </div>
-                            ) : (
-                              <span className="bg-slate-150 text-slate-450 px-2.5 py-0.5 rounded-full text-[9px] font-black uppercase select-none">Offline</span>
                             )}
                           </td>
                           <td className="p-4 text-center space-x-1.5 shrink-0 flex items-center justify-center">
@@ -2765,233 +2902,6 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
                   </button>
                 </div>
               )}
-            </div>
-
-          </div>
-        )}
-
-        {/* TAB 3: AUDITS & EXCEPTIONS (EXCEPTION CENTER / DATA VALIDATION REPORTS) */}
-        {activeTab === 'exceptions' && (
-          <div className="space-y-6">
-            
-            {/* Actionable Exception Center Cards Grid */}
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-              
-              {/* Active Breaks Threshold Compliance */}
-              <div className="relative bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-6 shadow-xs hover:shadow-md hover:-translate-y-0.5 transition-all duration-300 col-span-1 lg:col-span-2">
-                <div className="absolute top-0 bottom-0 left-0 w-1 bg-rose-500 rounded-l-2xl" />
-                <div className="flex items-center justify-between border-b border-rose-50 dark:border-slate-850 pb-3 mb-4">
-                  <h4 className="text-xs font-extrabold text-slate-800 dark:text-slate-200 uppercase tracking-widest flex items-center gap-2 leading-none">
-                    <Coffee size={15} className="text-rose-500" /> Active Breaks Threshold Compliance
-                  </h4>
-                  <span className="bg-rose-50 dark:bg-rose-950/40 text-rose-700 dark:text-rose-400 text-[10px] font-black px-2.5 py-1 rounded-full leading-none font-mono">
-                    {(summaryData?.exceptionsList?.bioBreaks?.length || 0) + 
-                     (summaryData?.exceptionsList?.lunchBreaks?.length || 0) + 
-                     (summaryData?.exceptionsList?.shortBreaks?.length || 0)} total exceeded
-                  </span>
-                </div>
-                
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-                  {/* Segment 1: Bio Breaks Exceeded */}
-                  <div className="space-y-3">
-                    <div className="flex items-center justify-between border-b border-fuchsia-100 dark:border-fuchsia-950 pb-1.5">
-                      <span className="text-[10px] font-black text-fuchsia-600 dark:text-fuchsia-400 uppercase tracking-widest flex items-center gap-1.5">
-                        <span className="w-1.5 h-1.5 rounded-full bg-fuchsia-500" /> Bio Breaks &gt; 5 Mins
-                      </span>
-                      <span className="bg-fuchsia-50 dark:bg-fuchsia-950 text-fuchsia-700 dark:text-fuchsia-300 text-[9px] font-bold px-1.5 py-0.5 rounded">
-                        {summaryData?.exceptionsList?.bioBreaks?.length || 0}
-                      </span>
-                    </div>
-                    <div className="space-y-2 max-h-52 overflow-y-auto pr-1">
-                      {summaryData?.exceptionsList?.bioBreaks?.map((item: any, idx: number) => (
-                        <div key={idx} className="flex justify-between items-start text-xs bg-fuchsia-50/20 dark:bg-fuchsia-950/10 p-2.5 rounded-xl border border-fuchsia-100/40 dark:border-fuchsia-950/20">
-                          <div className="min-w-0 flex-1">
-                            <div className="font-bold text-slate-800 dark:text-slate-200 truncate leading-tight">{item.userName}</div>
-                            <div className="text-[9px] text-fuchsia-600 dark:text-fuchsia-400 font-extrabold uppercase mt-1">🚨 Bio: {item.durationMins}m</div>
-                          </div>
-                          <button 
-                            onClick={() => selectAndFocusUser(item.userName)}
-                            className="bg-fuchsia-100 hover:bg-fuchsia-200 dark:bg-fuchsia-950 dark:text-fuchsia-300 text-fuchsia-800 text-[9px] font-extrabold px-2 py-1 rounded cursor-pointer shrink-0 ml-1 transition-colors"
-                          >
-                            Focus
-                          </button>
-                        </div>
-                      ))}
-                      {(!summaryData?.exceptionsList?.bioBreaks || summaryData.exceptionsList.bioBreaks.length === 0) && (
-                        <div className="text-center py-4 text-[10px] text-slate-400 dark:text-slate-500 font-bold uppercase tracking-wider">
-                          ✅ Compliant
-                        </div>
-                      )}
-                    </div>
-                  </div>
-
-                  {/* Segment 2: Short Breaks Exceeded */}
-                  <div className="space-y-3">
-                    <div className="flex items-center justify-between border-b border-amber-100 dark:border-amber-950 pb-1.5">
-                      <span className="text-[10px] font-black text-amber-600 dark:text-amber-400 uppercase tracking-widest flex items-center gap-1.5">
-                        <span className="w-1.5 h-1.5 rounded-full bg-amber-500" /> Short Breaks &gt; 20 Mins
-                      </span>
-                      <span className="bg-amber-50 dark:bg-amber-950 text-amber-700 dark:text-amber-300 text-[9px] font-bold px-1.5 py-0.5 rounded">
-                        {summaryData?.exceptionsList?.shortBreaks?.length || 0}
-                      </span>
-                    </div>
-                    <div className="space-y-2 max-h-52 overflow-y-auto pr-1">
-                      {summaryData?.exceptionsList?.shortBreaks?.map((item: any, idx: number) => (
-                        <div key={idx} className="flex justify-between items-start text-xs bg-amber-50/20 dark:bg-amber-950/10 p-2.5 rounded-xl border border-amber-100/40 dark:border-amber-950/20">
-                          <div className="min-w-0 flex-1">
-                            <div className="font-bold text-slate-800 dark:text-slate-200 truncate leading-tight">{item.userName}</div>
-                            <div className="text-[9px] text-amber-600 dark:text-amber-400 font-extrabold uppercase mt-1">⚠️ Exceeded: {item.durationMins}m</div>
-                          </div>
-                          <button 
-                            onClick={() => selectAndFocusUser(item.userName)}
-                            className="bg-amber-100 hover:bg-amber-200 dark:bg-amber-950 dark:text-amber-300 text-amber-800 text-[9px] font-extrabold px-2 py-1 rounded cursor-pointer shrink-0 ml-1 transition-colors"
-                          >
-                            Focus
-                          </button>
-                        </div>
-                      ))}
-                      {(!summaryData?.exceptionsList?.shortBreaks || summaryData.exceptionsList.shortBreaks.length === 0) && (
-                        <div className="text-center py-4 text-[10px] text-slate-400 dark:text-slate-500 font-bold uppercase tracking-wider">
-                          ✅ Compliant
-                        </div>
-                      )}
-                    </div>
-                  </div>
-
-                  {/* Segment 3: Lunch Breaks Exceeded */}
-                  <div className="space-y-3">
-                    <div className="flex items-center justify-between border-b border-rose-100 dark:border-rose-950 pb-1.5">
-                      <span className="text-[10px] font-black text-rose-600 dark:text-rose-400 uppercase tracking-widest flex items-center gap-1.5">
-                        <span className="w-1.5 h-1.5 rounded-full bg-rose-500" /> Lunch Breaks &gt; 45 Mins
-                      </span>
-                      <span className="bg-rose-50 dark:bg-rose-950 text-rose-700 dark:text-rose-300 text-[9px] font-bold px-1.5 py-0.5 rounded">
-                        {summaryData?.exceptionsList?.lunchBreaks?.length || 0}
-                      </span>
-                    </div>
-                    <div className="space-y-2 max-h-52 overflow-y-auto pr-1">
-                      {summaryData?.exceptionsList?.lunchBreaks?.map((item: any, idx: number) => (
-                        <div key={idx} className="flex justify-between items-start text-xs bg-rose-50/20 dark:bg-rose-950/10 p-2.5 rounded-xl border border-rose-100/40 dark:border-rose-950/20">
-                          <div className="min-w-0 flex-1">
-                            <div className="font-bold text-slate-800 dark:text-slate-200 truncate leading-tight">{item.userName}</div>
-                            <div className="text-[9px] text-rose-600 dark:text-rose-400 font-extrabold uppercase mt-1">🔥 Breach: {item.durationMins}m</div>
-                          </div>
-                          <button 
-                            onClick={() => selectAndFocusUser(item.userName)}
-                            className="bg-rose-100 hover:bg-rose-200 dark:bg-rose-950 dark:text-rose-300 text-rose-800 text-[9px] font-extrabold px-2 py-1 rounded cursor-pointer shrink-0 ml-1 transition-colors"
-                          >
-                            Focus
-                          </button>
-                        </div>
-                      ))}
-                      {(!summaryData?.exceptionsList?.lunchBreaks || summaryData.exceptionsList.lunchBreaks.length === 0) && (
-                        <div className="text-center py-4 text-[10px] text-slate-400 dark:text-slate-500 font-bold uppercase tracking-wider">
-                          ✅ Compliant
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                </div>
-              </div>
-
-              {/* Automatic Logouts (Auto-Closed Shifts) */}
-              <div className="relative bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-6 shadow-xs hover:shadow-md hover:-translate-y-0.5 transition-all duration-300">
-                <div className="absolute top-0 bottom-0 left-0 w-1 bg-sky-500 rounded-l-2xl" />
-                <div className="flex items-center justify-between border-b border-slate-50 dark:border-slate-850 pb-3 mb-4">
-                  <h4 className="text-xs font-extrabold text-[#D97706] dark:text-amber-400 uppercase tracking-widest flex items-center gap-2 leading-none">
-                    <UserX size={15} className="text-sky-500" /> Automatic Logouts
-                  </h4>
-                  <span className="bg-amber-50 dark:bg-amber-950/40 text-[#D97706] dark:text-amber-400 text-[10px] font-black px-2.5 py-1 rounded-full leading-none font-mono">
-                    {(summaryData?.exceptionsList?.autoClosed?.length || 0)} anomalies
-                  </span>
-                </div>
-
-                <div className="space-y-3.5 max-h-80 overflow-y-auto">
-                  {summaryData?.exceptionsList?.autoClosed?.map((item: any, idx: number) => (
-                    <div key={idx} className="flex justify-between items-center text-xs bg-amber-50/10 dark:bg-amber-950/5 p-3 rounded-xl border border-amber-100/10 dark:border-amber-955/10 font-sans">
-                      <div className="flex items-center gap-2.5 min-w-0">
-                        <div className="w-8 h-8 rounded-full bg-amber-50 dark:bg-amber-955 text-amber-700 dark:text-amber-400 flex items-center justify-center font-extrabold text-[11px] uppercase shrink-0">
-                          {item.userName ? item.userName.charAt(0) : 'U'}
-                        </div>
-                        <div className="min-w-0">
-                          <div className="font-extrabold text-slate-800 dark:text-slate-200 leading-tight truncate">{item.userName}</div>
-                          <div className="text-[10px] text-amber-600 dark:text-amber-400 font-bold mt-0.5 leading-none">Auto-clocked out after 10 hours productive time</div>
-                        </div>
-                      </div>
-                      <button 
-                      onClick={() => selectAndFocusUser(item.userName)}
-                        className="bg-amber-100 hover:bg-amber-150 dark:bg-amber-950 dark:text-amber-300 dark:hover:bg-amber-900/60 text-amber-850 text-[10px] font-extrabold px-3 py-1.5 rounded-lg shrink-0 cursor-pointer transition-colors"
-                      >
-                        Audit Profile
-                      </button>
-                    </div>
-                  ))}
-
-                  {(!summaryData?.exceptionsList?.autoClosed || summaryData.exceptionsList.autoClosed.length === 0) && (
-                    <div className="text-center py-8">
-                      <p className="text-xs text-slate-400 dark:text-slate-500 font-bold uppercase tracking-widest leading-none">
-                        ✅ No automatic logouts today
-                      </p>
-                    </div>
-                  )}
-                </div>
-              </div>
-
-              {/* Mobile Phone Devices Log Audit */}
-              <div className="relative bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-6 shadow-xs hover:shadow-md hover:-translate-y-0.5 transition-all duration-300">
-                <div className="absolute top-0 bottom-0 left-0 w-1 bg-fuchsia-500 rounded-l-2xl" />
-                <div className="flex items-center justify-between border-b border-rose-50 dark:border-slate-850 pb-3 mb-4">
-                  <h4 className="text-xs font-extrabold text-fuchsia-700 dark:text-fuchsia-400 uppercase tracking-widest flex items-center gap-2 leading-none">
-                    <Smartphone size={15} className="text-fuchsia-500" /> Mobile Access &amp; Punches Log
-                  </h4>
-                  <span className="bg-fuchsia-50 dark:bg-fuchsia-950/40 text-fuchsia-700 dark:text-fuchsia-400 text-[10px] font-black px-2.5 py-1 rounded-full leading-none font-mono">
-                    {summaryData?.exceptionsList?.mobilePunches?.length || 0} device logs
-                  </span>
-                </div>
-
-                <div className="space-y-3.5 max-h-80 overflow-y-auto">
-                  {Object.values((summaryData?.exceptionsList?.mobilePunches || []).reduce((acc: any, item: any) => {
-                    if (!acc[item.userName]) acc[item.userName] = { ...item, logs: [item] };
-                    else {
-                      acc[item.userName].mobilePunchesCount += item.mobilePunchesCount;
-                      acc[item.userName].logs.push(item);
-                    }
-                    return acc;
-                  }, {})).map((item: any, idx: number) => {
-                    return (
-                      <div key={idx} className="text-xs bg-fuchsia-50/10 dark:bg-fuchsia-950/5 p-3.5 rounded-xl border border-fuchsia-100/10 dark:border-fuchsia-955/10 font-sans space-y-2">
-                        <div className="flex justify-between items-center">
-                          <div className="flex items-center gap-2 min-w-0">
-                            <div className="w-7 h-7 rounded-full bg-fuchsia-100 dark:bg-fuchsia-950 text-fuchsia-700 dark:text-fuchsia-400 flex items-center justify-center font-extrabold text-[10px] uppercase shrink-0">
-                              {item.userName ? item.userName.charAt(0) : 'M'}
-                            </div>
-                            <div className="min-w-0">
-                              <div className="font-extrabold text-slate-800 dark:text-slate-200 leading-tight truncate">{item.userName}</div>
-                              <div className="text-[9px] text-slate-500 dark:text-slate-400">Total Mobile Action count: <span className="text-fuchsia-600 font-extrabold">{item.mobilePunchesCount}</span></div>
-                            </div>
-                          </div>
-                          <button 
-                            onClick={() => {
-                              setSelectedInvestigateLogs(item.logs);
-                              setShowInvestigateModal(true);
-                            }}
-                            className="bg-fuchsia-100 hover:bg-fuchsia-200 dark:bg-fuchsia-950 dark:text-fuchsia-300 text-fuchsia-850 text-[9px] font-extrabold px-2.5 py-1.5 rounded-lg shrink-0 cursor-pointer transition-colors"
-                          >
-                            Investigate
-                          </button>
-                        </div>
-                      </div>
-                    );
-                  })}
-
-                  {(!summaryData?.exceptionsList?.mobilePunches || summaryData.exceptionsList.mobilePunches.length === 0) && (
-                    <div className="text-center py-10">
-                      <p className="text-xs text-slate-400 dark:text-slate-500 font-bold uppercase tracking-widest leading-none">
-                        📱 Desktop access compliant. No mobile devices reported today.
-                      </p>
-                    </div>
-                  )}
-                </div>
-              </div>
 
             </div>
 
@@ -3103,53 +3013,6 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
               >
                 Force Close Session
               </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* MODAL 3: VIEW AUDIT LOGS */}
-      {showLogsModal && (
-        <div className="fixed inset-0 bg-slate-900/55 backdrop-blur-sm flex items-center justify-center z-[99999] p-4 text-slate-800 animate-in fade-in duration-200">
-          <div className="bg-white rounded-2xl w-full max-w-2xl p-6 border border-slate-200 shadow-2xl space-y-4">
-            <div className="flex items-center justify-between border-b pb-3.5">
-              <div className="flex items-center gap-3">
-                <div className="p-2.5 bg-slate-100 text-slate-650 rounded-xl">
-                  <Calendar size={20} />
-                </div>
-                <div className="text-left">
-                  <h4 className="font-extrabold text-slate-900 text-sm">System Administration Audit Trail</h4>
-                  <p className="text-slate-450 text-[10px] font-bold">Supervisor and management log action sequence</p>
-                </div>
-              </div>
-              <button 
-                onClick={() => setShowLogsModal(false)}
-                className="text-slate-400 hover:text-slate-600 font-extrabold text-xs pr-2 cursor-pointer"
-              >
-                Close
-              </button>
-            </div>
-
-            <div className="max-h-96 overflow-y-auto space-y-3.5 text-xs">
-              {isLoadingLogs ? (
-                <p className="text-slate-400 py-20 text-center font-bold">Scanning audit tables...</p>
-              ) : adminLogs.map((log) => (
-                <div key={log.id} className="p-3 bg-slate-50 border border-slate-150 rounded-xl space-y-1">
-                  <div className="flex justify-between items-center text-[11px]">
-                    <span className="font-black text-indigo-600 uppercase bg-indigo-50 px-2 py-0.5 rounded leading-none">{log.action}</span>
-                    <span className="font-mono text-slate-400 font-bold">{new Date(log.timestamp).toLocaleString()}</span>
-                  </div>
-                  <div className="font-medium text-slate-700 pt-1 leading-none">
-                    Performed by: <strong className="text-slate-900">{log.performedBy}</strong>
-                  </div>
-                  <div className="font-medium text-slate-700 pt-1 leading-none">
-                    Target affected: <strong className="text-slate-900">{log.affectedUser}</strong>
-                  </div>
-                  <div className="text-[10px] text-slate-450 font-bold leading-normal pt-1 flex gap-2">
-                    <span>Val: {log.newValue}</span>
-                  </div>
-                </div>
-              ))}
             </div>
           </div>
         </div>
@@ -3294,6 +3157,86 @@ export default function SupervisorDashboard({ user, allUsers, onRefreshAllData, 
               >
                 {isExporting ? <RefreshCw size={14} className="animate-spin" /> : <FileSpreadsheet size={16} />}
                 {isExporting ? 'Generating...' : 'Confirm & Export'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Supervisor Clock-In Confirmation Overlay Modal */}
+      {showSuperClockInConfirm && (
+        <div className="fixed inset-0 bg-slate-900/55 backdrop-blur-sm flex items-center justify-center z-[99999] p-4 animate-in fade-in zoom-in-95 duration-200">
+          <div className="bg-white rounded-2xl max-w-sm w-full p-6 shadow-2xl border border-slate-100 space-y-5 text-left">
+            <div className="flex items-center gap-4 text-emerald-600 border-b border-slate-50 pb-4">
+              <div className="w-12 h-12 rounded-full bg-emerald-50 flex items-center justify-center shrink-0">
+                <Clock size={24} />
+              </div>
+              <div className="flex-1">
+                <h4 className="font-black text-slate-900 text-sm uppercase tracking-tight">Supervisor Shift Start</h4>
+                <p className="text-slate-500 text-[10px] font-bold mt-0.5 leading-tight">Verification required before punch</p>
+              </div>
+            </div>
+            
+            <div className="space-y-2">
+              <label className="text-[10px] uppercase font-black text-slate-400 tracking-widest block">Choose Process</label>
+              <select
+                className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 text-sm font-bold focus:outline-none focus:ring-2 focus:ring-indigo-500/20 text-slate-800 transition-all cursor-pointer"
+                value={superSelectedProcess}
+                onChange={(e) => setSuperSelectedProcess(e.target.value)}
+              >
+                {supervisorProcesses.map(p => (
+                  <option key={p} value={p}>{p}</option>
+                ))}
+              </select>
+            </div>
+
+            <div className="flex flex-col gap-2 pt-2">
+              <button 
+                className="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-black text-xs h-11 rounded-xl shadow-lg shadow-emerald-100 flex items-center justify-center gap-2 cursor-pointer transition-colors"
+                onClick={() => performSuperClockIn(superSelectedProcess)}
+              >
+                <Play size={14} />
+                CONFIRM & START SHIFT
+              </button>
+              <button 
+                className="w-full text-slate-500 hover:text-slate-800 hover:bg-slate-100 font-bold text-xs h-10 rounded-xl cursor-pointer transition-colors"
+                onClick={() => setShowSuperClockInConfirm(false)}
+              >
+                CANCEL
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Supervisor Clock-Out Confirmation Overlay Modal */}
+      {showSuperClockOutConfirm && (
+        <div className="fixed inset-0 bg-slate-900/55 backdrop-blur-sm flex items-center justify-center z-[99999] p-4 animate-in fade-in duration-200">
+          <div className="bg-white rounded-2xl max-w-sm w-full p-6 shadow-xl border border-slate-200 space-y-4 text-left">
+            <div className="flex items-center gap-3 text-red-600">
+              <div className="w-10 h-10 rounded-full bg-red-50 flex items-center justify-center shrink-0">
+                <AlertCircle size={20} />
+              </div>
+              <div className="text-left">
+                <h4 className="font-bold text-slate-900 text-sm">Clock Out Confirmation</h4>
+                <p className="text-slate-500 text-xs mt-1">Are you sure you want to Clock Out and finalise your shift logs?</p>
+              </div>
+            </div>
+            <div className="flex justify-end gap-2 text-xs font-bold pt-2 border-t">
+              <button 
+                onClick={() => setShowSuperClockOutConfirm(false)} 
+                className="px-4 py-2 hover:bg-slate-50 text-slate-500 font-bold rounded-lg cursor-pointer transition-colors"
+              >
+                Cancel
+              </button>
+              <button 
+                className="bg-red-600 hover:bg-red-700 text-white font-bold px-4 py-2 rounded-lg cursor-pointer transition-colors" 
+                onClick={() => {
+                  setShowSuperClockOutConfirm(false);
+                  performSuperClockOut();
+                }}
+              >
+                Confirm Clock Out
               </button>
             </div>
           </div>

@@ -12,7 +12,7 @@ import {
   createUserWithEmailAndPassword,
   updateProfile
 } from 'firebase/auth';
-import { getFirestore, doc, getDoc, setDoc, updateDoc, deleteDoc, collection, query, where, onSnapshot, getDocs, getDocFromServer } from 'firebase/firestore';
+import { getFirestore, doc, getDoc, setDoc, updateDoc, deleteDoc, collection, query, where, onSnapshot, getDocs, getDocFromServer, enableIndexedDbPersistence, getDocsFromCache, getDocsFromServer } from 'firebase/firestore';
 import firebaseConfig from '../../firebase-applet-config.json';
 
 if (!firebaseConfig || !firebaseConfig.apiKey) {
@@ -26,6 +26,21 @@ export const auth = getAuth(app);
 export const db = (firebaseConfig as any).firestoreDatabaseId 
   ? getFirestore(app, (firebaseConfig as any).firestoreDatabaseId)
   : getFirestore(app);
+
+// Enable offline persistence to reduce redundant network reads/billing
+enableIndexedDbPersistence(db).then(() => {
+  console.log("Firestore offline persistence enabled successfully.");
+}).catch((err) => {
+  if (err.code === 'failed-precondition') {
+    // Multiple tabs open, persistence can only be enabled in one tab at a time.
+    console.warn("Firestore persistence failed: Multiple tabs open. Local caching works on active tab.");
+  } else if (err.code === 'unimplemented') {
+    // The current browser does not support all of the features required to enable persistence
+    console.warn("Firestore persistence failed: Browser does not support offline storage.");
+  } else {
+    console.error("Firestore persistence error:", err);
+  }
+});
 
 export const storage = getStorage(app);
 
@@ -216,6 +231,36 @@ async function testConnection() {
   }
 }
 testConnection();
+
+export async function getDocsOptimized(q: any, logPrefix?: string, forceServer: boolean = false) {
+  if (forceServer) {
+    const snap = await getDocsFromServer(q);
+    if (logPrefix) {
+      console.log(`[SERVER FETCH (FORCED)] ${logPrefix}: ${snap.size} documents fetched from Firestore server.`);
+    }
+    return snap;
+  }
+
+  try {
+    const snap = await getDocsFromServer(q);
+    if (logPrefix) {
+      console.log(`[SERVER FETCH] ${logPrefix}: ${snap.size} documents fetched from Firestore server.`);
+    }
+    return snap;
+  } catch (err) {
+    console.warn(`[SERVER FETCH FAILED] ${logPrefix || 'Query'} - falling back to offline cache...`, err);
+    try {
+      const snap = await getDocsFromCache(q);
+      if (logPrefix) {
+        console.log(`[CACHE FALLBACK] ${logPrefix}: ${snap.size} documents loaded from offline cache.`);
+      }
+      return snap;
+    } catch (cacheErr) {
+      console.error(`[CACHE FALLBACK FAILED] ${logPrefix || 'Query'}:`, cacheErr);
+      throw err; // Throw the original server error if cache fallback also fails
+    }
+  }
+}
 
 
 

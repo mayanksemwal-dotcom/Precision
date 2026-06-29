@@ -56,6 +56,7 @@ export interface UserProfile {
   lastUpdated?: string;
   photoURL?: string;
   profilePhotoUrl?: string;
+  location?: string;
 }
 
 export enum DisputeStatus {

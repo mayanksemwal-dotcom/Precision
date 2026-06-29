@@ -33,12 +33,13 @@ service cloud.firestore {
 
     function isManager() { 
       let role = getUserRole().upper();
-      return isAdmin() || role == 'MANAGER' || role == 'ASSISTANT_MANAGER' || role == 'EXECUTIVE';
+      let managerRoles = ['MANAGER', 'ASSISTANT_MANAGER', 'EXECUTIVE', 'OPS_HEAD', 'OPS HEAD', 'HR', 'HR MANAGER', 'IT_MANAGER', 'IT MANAGER'];
+      return isAdmin() || role in managerRoles;
     }
     function isQA() { return isRole('QA') || isManager(); }
     function isTL() { 
       let role = getUserRole().upper();
-      let tlRoles = ['TEAM_LEAD', 'STL', 'OPS_TL', 'QTL', 'TRAINER_TL', 'TRAINER', 'MIS', 'SME', 'MANAGER', 'ASSISTANT_MANAGER', 'ADMIN', 'TEAM LEAD', 'TRAINER TL', 'OPS TL'];
+      let tlRoles = ['TEAM_LEAD', 'STL', 'OPS_TL', 'QTL', 'TRAINER_TL', 'TRAINER', 'MIS', 'SME', 'MANAGER', 'ASSISTANT_MANAGER', 'ADMIN', 'TEAM LEAD', 'TRAINER TL', 'OPS TL', 'OPS_HEAD', 'OPS HEAD', 'HR', 'HR MANAGER', 'IT_MANAGER', 'IT MANAGER'];
       return isAdmin() || role in tlRoles || isManager(); 
     }
     function isAgent() { return isRole('AGENT') || isTL() || isQA(); }
@@ -54,7 +55,7 @@ service cloud.firestore {
       return data.keys().hasAll(['uid', 'email', 'role']) &&
              data.uid is string &&
              data.email is string &&
-             data.role in ['ADMIN', 'MANAGER', 'ASSISTANT_MANAGER', 'QA', 'TEAM_LEAD', 'STL', 'OPS_TL', 'SME', 'QTL', 'TRAINER_TL', 'TRAINER', 'MIS', 'AGENT', 'TEAM LEAD', 'TRAINER TL', 'OPS TL'];
+             data.role in ['ADMIN', 'MANAGER', 'ASSISTANT_MANAGER', 'QA', 'TEAM_LEAD', 'STL', 'OPS_TL', 'SME', 'QTL', 'TRAINER_TL', 'TRAINER', 'MIS', 'AGENT', 'TEAM LEAD', 'TRAINER TL', 'OPS TL', 'HR', 'IT_MANAGER', 'OPS_HEAD', 'EXECUTIVE', 'HR MANAGER', 'IT MANAGER', 'OPS HEAD'];
     }
 
     function isValidAudit(data) {
@@ -142,7 +143,10 @@ service cloud.firestore {
     }
 
     function isITEngineer() {
-      return isVerified() && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isITEngineer == true;
+      let role = getUserRole().upper();
+      let isEng = exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
+                  get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isITEngineer == true;
+      return isVerified() && (role == 'IT_MANAGER' || role == 'IT MANAGER' || role == 'IT_ENGINEER' || isEng);
     }
 
     match /itTickets/{ticketId} {
@@ -284,16 +288,27 @@ service cloud.firestore {
     }
 
     match /tmsShifts/{shiftId} {
-      allow read: if isVerified() && (isTL() || isAdmin() || (resource != null && isOwner(resource.data.userId)));
-      allow write: if isVerified() && (isTL() || isAdmin() || isOwner(incoming().userId) || (resource != null && isOwner(resource.data.userId)));
+      allow read: if isVerified() && (isTL() || isAdmin() || isOwner(existing().userId));
+      allow write: if isVerified() && (isTL() || isAdmin() || isOwner(incoming().userId) || isOwner(existing().userId));
       allow delete: if isAdmin();
     }
 
+    match /live_sessions/{uid} {
+      allow read: if isVerified() && (
+        isOwner(uid) || 
+        isAdmin() || 
+        existing().managerId == request.auth.uid || 
+        existing().tlId == request.auth.uid
+      );
+      allow write: if isVerified() && (isOwner(uid) || isAdmin());
+      allow delete: if isVerified() && (isOwner(uid) || isAdmin());
+    }
+
     match /attendanceSummary/{id} {
-      allow get: if isVerified() && (isTL() || isAdmin() || (resource != null && isOwner(resource.data.userId)));
+      allow get: if isVerified() && (isTL() || isAdmin() || isOwner(existing().userId));
       allow list: if isVerified();
       allow create: if isVerified(); 
-      allow update: if isVerified() && (isTL() || isAdmin() || (resource != null && isOwner(resource.data.userId)));
+      allow update: if isVerified() && (isTL() || isAdmin() || isOwner(existing().userId));
       allow delete: if isAdmin();
     }
 

@@ -47,7 +47,8 @@ const Textarea = React.forwardRef<HTMLTextAreaElement, TextareaProps>(
 Textarea.displayName = "Textarea";
 
 import { db, handleFirestoreError, OperationType } from '../lib/firebase';
-import { doc, setDoc, updateDoc, collection, addDoc, onSnapshot, query, where, orderBy, getDocs, serverTimestamp, getDoc } from 'firebase/firestore';
+import { firestoreLogger } from '../lib/firestoreLogger';
+import { doc, setDoc, updateDoc, collection, addDoc, onSnapshot, query, where, orderBy, getDocs, serverTimestamp, getDoc, limit, startAfter } from 'firebase/firestore';
 import { toast } from 'sonner';
 import { usePermission } from '../components/PermissionContext';
 import { canActOn, normalizeRole } from '../lib/hierarchy';
@@ -124,24 +125,96 @@ export default function PipView({ user, allUsers = [], externalTheme }: PipViewP
   const [agentComment, setAgentComment] = useState('');
   const [submittingAcknowledge, setSubmittingAcknowledge] = useState(false);
 
-  // Read real-time subscriptions for PIP Records
-  useEffect(() => {
-    setLoading(true);
-    let q = query(collection(db, 'pips'), orderBy('createdAt', 'desc'));
-    
-    // For regular agents, filter initially or do client-side filtering. Let's do client-side to keep rule setups simple or use queries
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const records = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as PipRecord));
-      setPips(records);
-      setLoading(false);
-    }, (error) => {
-      console.error("Firestore listening error for pips:", error);
-      handleFirestoreError(error, OperationType.LIST, 'pips');
-      setLoading(false);
-    });
+  const [currentPage, setCurrentPage] = useState(1);
+  const [pageCursors, setPageCursors] = useState<any[]>([]);
+  const [hasMore, setHasMore] = useState(false);
+  const PAGE_LIMIT = 10;
 
-    return () => unsubscribe();
-  }, []);
+  // Read subscriptions for PIP Records - OPTIMIZED: Paginated on-demand fetches
+  useEffect(() => {
+    let active = true;
+    const fetchPips = async () => {
+      setLoading(true);
+      try {
+        const actorRole = normalizeRole(user.role);
+        const isSupervisor = [
+          UserRole.ADMIN,
+          UserRole.MANAGER,
+          UserRole.OPS_HEAD,
+          UserRole.HR,
+          UserRole.IT_MANAGER,
+          UserRole.TEAM_LEAD,
+          UserRole.OPS_TL,
+          UserRole.QTL,
+          UserRole.STL,
+          UserRole.TRAINER_TL,
+          UserRole.SME
+        ].includes(actorRole);
+
+        let q;
+        if (isSupervisor) {
+          q = query(collection(db, 'pips'), orderBy('createdAt', 'desc'));
+        } else {
+          q = query(collection(db, 'pips'), where('agentId', '==', user.uid));
+        }
+
+        // Fetch PAGE_LIMIT + 1 documents to determine if there is a next page
+        let qLimit = query(q, limit(PAGE_LIMIT + 1));
+        if (currentPage > 1 && pageCursors[currentPage - 2]) {
+          qLimit = query(q, startAfter(pageCursors[currentPage - 2]), limit(PAGE_LIMIT + 1));
+        }
+
+        const snap = await getDocs(qLimit);
+        if (!active) return;
+        firestoreLogger.trackRead('pips_paginated_getDocs', snap.size);
+
+        let docs = snap.docs;
+        const moreExist = docs.length > PAGE_LIMIT;
+        if (moreExist) {
+          docs = docs.slice(0, PAGE_LIMIT);
+        }
+        setHasMore(moreExist);
+
+        // Save last document cursor for the next page
+        if (docs.length > 0) {
+          const lastDoc = docs[docs.length - 1];
+          setPageCursors(prev => {
+            const nextCursors = [...prev];
+            nextCursors[currentPage - 1] = lastDoc;
+            return nextCursors;
+          });
+        }
+
+        let records = docs.map(doc => ({ id: doc.id, ...(doc.data() as any) } as PipRecord));
+        
+        // Local sort for agents who are queried without orderBy to avoid needing composite indexes
+        if (!isSupervisor) {
+          records.sort((a, b) => {
+            const dateA = a.createdAt?.toDate ? a.createdAt.toDate() : new Date(a.createdAt || 0);
+            const dateB = b.createdAt?.toDate ? b.createdAt.toDate() : new Date(b.createdAt || 0);
+            return dateB.getTime() - dateA.getTime();
+          });
+        }
+        
+        setPips(records);
+      } catch (error: any) {
+        console.error("Firestore loading error for pips:", error);
+        handleFirestoreError(error, OperationType.LIST, 'pips');
+      } finally {
+        if (active) setLoading(false);
+      }
+    };
+
+    fetchPips();
+    return () => {
+      active = false;
+    };
+  }, [user.uid, user.role, currentPage]);
+
+  useEffect(() => {
+    setCurrentPage(1);
+    setPageCursors([]);
+  }, [user.uid]);
 
   const canIssuePip = canCreate('PIP Management');
   const canModifyPip = canEdit('PIP Management');
@@ -1096,6 +1169,32 @@ Berg Technologies Corp HS Division
                   </TableBody>
                 </Table>
               )}
+              {/* Pagination Controls */}
+              <div className="flex items-center justify-between p-4 border-t border-slate-100 dark:border-slate-800 bg-slate-50/30">
+                <div className="text-xs text-slate-500 font-semibold">
+                  Page <span className="font-bold">{currentPage}</span>
+                </div>
+                <div className="flex gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={currentPage === 1 || loading}
+                    onClick={() => setCurrentPage(prev => Math.max(prev - 1, 1))}
+                    className="font-bold text-xs h-8"
+                  >
+                    Previous
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={!hasMore || loading}
+                    onClick={() => setCurrentPage(prev => prev + 1)}
+                    className="font-bold text-xs h-8"
+                  >
+                    Next
+                  </Button>
+                </div>
+              </div>
             </CardContent>
           </Card>
         </div>

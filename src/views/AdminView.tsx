@@ -25,7 +25,6 @@ import { DashboardSubView } from '../components/admin/DashboardSubView';
 import { UserManagementSubView } from '../components/admin/UserManagementSubView';
 import { RolePermissionSubView } from '../components/admin/RolePermissionSubView';
 import { TeamProcessMappingSubView } from '../components/admin/TeamProcessMappingSubView';
-import { AuditLogsSubView } from '../components/admin/AuditLogsSubView';
 import { DataManagementSubView } from '../components/admin/DataManagementSubView';
 import { BackupRestoreSubView } from '../components/admin/BackupRestoreSubView';
 import { ProcessManagementSubView } from '../components/admin/ProcessManagementSubView';
@@ -34,7 +33,7 @@ import { HierarchySyncWizard } from '../components/admin/HierarchySyncWizard';
 import { EmailDashboardSubView } from '../components/admin/EmailDashboardSubView';
 
 // Subview type definition
-type SubTabType = 'dashboard' | 'users' | 'roles' | 'mapping' | 'process' | 'audits' | 'data' | 'backup' | 'attendancecfg' | 'hierarchy' | 'emailcfg';
+type SubTabType = 'dashboard' | 'users' | 'roles' | 'mapping' | 'process' | 'data' | 'backup' | 'attendancecfg' | 'hierarchy' | 'emailcfg';
 
 interface AdminViewProps {
   activeTab: string;
@@ -99,7 +98,6 @@ export default function AdminView({
     { id: 'process', label: 'Process Management', icon: Activity, visible: canEdit('Console') },
     { id: 'roles', label: 'Roles Matrix', icon: Settings, visible: canEdit('Console') },
     { id: 'mapping', label: 'Team Mapping', icon: RefreshCw, visible: canEdit('Console') },
-    { id: 'audits', label: 'Audit Trail', icon: History, visible: canView('Console') },
     { id: 'data', label: 'Data Management', icon: Database, visible: canDelete('Console') },
     { id: 'attendancecfg', label: 'Attendance Rules', icon: FileText, visible: canEdit('Console') },
     { id: 'emailcfg', label: 'Email Portal', icon: FileText, visible: canEdit('Console') },
@@ -190,10 +188,6 @@ export default function AdminView({
 
         {activeSubTab === 'process' && (
           <ProcessManagementSubView user={requesterUser} adminTheme={adminTheme} />
-        )}
-
-        {activeSubTab === 'audits' && (
-          <AuditLogsSubView adminTheme={adminTheme} />
         )}
 
         {activeSubTab === 'data' && (

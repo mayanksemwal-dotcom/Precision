@@ -40,7 +40,8 @@ import { UserRole, AuditRecord, DisputeStatus, DisputeHistory, UserProfile, QAAl
 import DisputeWorkflow from '../components/DisputeWorkflow';
 import { analyzePrecision } from '../services/geminiService';
 import { db, handleFirestoreError, OperationType } from '../lib/firebase';
-import { doc, getDoc, setDoc, updateDoc, collection, query, where, onSnapshot, orderBy, getDocs, limit, getCountFromServer } from 'firebase/firestore';
+import { firestoreLogger } from '../lib/firestoreLogger';
+import { doc, getDoc, setDoc, updateDoc, collection, query, where, onSnapshot, orderBy, getDocs, limit, getCountFromServer, startAfter } from 'firebase/firestore';
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogTrigger } from '../components/ui/dialog';
 import WarningManager from '../components/WarningManager';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../components/ui/table';
@@ -533,14 +534,13 @@ export default function QAView({
   const [totalCount, setTotalCount] = useState(0);
   const [currentPage, setCurrentPage] = useState(1);
   const [isLoadingQueue, setIsLoadingQueue] = useState(false);
+  const [pageCursors, setPageCursors] = useState<Record<number, any>>({});
   const PAGE_LIMIT = 25;
 
   useEffect(() => {
     const loadScalableQueue = async () => {
       setIsLoadingQueue(true);
       try {
-        // Fetch paginated pending tasks from Firestore Audit Queue (Pending Tasks)
-        // To reduce reads, improve performance and control Blaze plan costs, only readcurrentPage * PAGE_LIMIT docs
         let countQuery = query(collection(db, 'tasks'), where('status', '==', 'Pending'));
         if (selectedAgent) {
           countQuery = query(countQuery, where('qvName', '==', selectedAgent));
@@ -550,20 +550,30 @@ export default function QAView({
 
         let q = query(
           collection(db, 'tasks'),
-          where('status', '==', 'Pending')
+          where('status', '==', 'Pending'),
+          orderBy('__name__')
         );
         if (selectedAgent) {
           q = query(q, where('qvName', '==', selectedAgent));
         }
 
-        // Fetch only the needed items up to currentPage * PAGE_LIMIT to prevent index and heavy-read constraints
-        const qLimit = query(q, limit(currentPage * PAGE_LIMIT));
+        let qLimit = query(q, limit(PAGE_LIMIT));
+        if (currentPage > 1 && pageCursors[currentPage - 1]) {
+          qLimit = query(q, startAfter(pageCursors[currentPage - 1]), limit(PAGE_LIMIT));
+        }
+
         const snap = await getDocs(qLimit);
-        const allDocs = snap.docs.map(doc => ({ id: doc.id, ...(doc.data() as any) } as SamplingTask));
+        firestoreLogger.trackRead('tasks_paginated_getDocs', snap.size);
+        const paginatedTasks = snap.docs.map(doc => ({ id: doc.id, ...(doc.data() as any) } as SamplingTask));
         
-        // Slice the items local to this page
-        const startIndex = (currentPage - 1) * PAGE_LIMIT;
-        const paginatedTasks = allDocs.slice(startIndex, startIndex + PAGE_LIMIT);
+        // Save the cursor for the next page
+        if (snap.docs.length > 0) {
+          setPageCursors(prev => ({
+            ...prev,
+            [currentPage]: snap.docs[snap.docs.length - 1]
+          }));
+        }
+
         setScalableTasks(paginatedTasks);
       } catch (err) {
         toast.error("Failed to load queue");
@@ -577,6 +587,7 @@ export default function QAView({
 
   useEffect(() => {
     setCurrentPage(1);
+    setPageCursors({});
   }, [selectedAgent]);
 
   // Filter agents based on alignment

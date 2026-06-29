@@ -1,5 +1,30 @@
 {
   "entities": {
+    "LiveSession": {
+      "title": "Live Session",
+      "description": "Active session for a logged-in user",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "employeeId": { "type": "string" },
+        "employeeName": { "type": "string" },
+        "role": { "type": "string" },
+        "process": { "type": "string" },
+        "managerId": { "type": "string" },
+        "tlId": { "type": "string" },
+        "status": { "type": "string", "enum": ["ACTIVE", "BREAK", "MEETING", "TRAINING"] },
+        "currentTask": { "type": "string" },
+        "currentActivity": { "type": "string" },
+        "clockInTime": { "type": "string" },
+        "productiveTime": { "type": "number" },
+        "breakTime": { "type": "number" },
+        "deviceName": { "type": "string" },
+        "platform": { "type": "string" },
+        "lastHeartbeat": { "type": "string" },
+        "sessionId": { "type": "string" }
+      },
+      "required": ["uid", "employeeId", "status"]
+    },
     "UserProfile": {
       "title": "User Profile",
       "description": "User account information and roles",
@@ -449,6 +474,10 @@
     "tmsShifts/{shiftId}": {
       "schema": "TMSShift",
       "description": "Workforce shifts"
+    },
+    "live_sessions/{uid}": {
+      "schema": "LiveSession",
+      "description": "Currently active user sessions"
     },
     "dashboardSummary/{id}": {
       "schema": { "type": "object" },

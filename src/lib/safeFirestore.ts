@@ -8,12 +8,13 @@
 
 import { FirestoreError } from 'firebase/firestore';
 import { firestoreLogger } from './firestoreLogger';
+import { safeStorage } from './safeStorage';
 
 const QUOTA_BLOCK_KEY = 'precision360_firestore_blocked';
 
 export function isFirestoreBlocked(): boolean {
   if (typeof window !== 'undefined') {
-    return localStorage.getItem(QUOTA_BLOCK_KEY) === 'true';
+    return safeStorage.get(QUOTA_BLOCK_KEY) === 'true';
   }
   return false;
 }
@@ -26,7 +27,7 @@ export function handleFirestoreError(error: any, op: string, collection: string)
     if (error.code === 'resource-exhausted') {
       console.error('RESOURCE EXHAUSTED: Blocking further Firestore reads.');
       if (typeof window !== 'undefined') {
-        localStorage.setItem(QUOTA_BLOCK_KEY, 'true');
+        safeStorage.set(QUOTA_BLOCK_KEY, 'true');
       }
       // Reload to trigger fallback state if blocked at boot
       window.location.reload(); 

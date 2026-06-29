@@ -9,6 +9,7 @@ import { toast } from 'sonner';
 import BergLogo from '../components/BergLogo';
 import { updateProfile, sendEmailVerification, signOut } from 'firebase/auth';
 import { setDoc, doc } from 'firebase/firestore';
+import { safeStorage } from '../lib/safeStorage';
 
 export default function LoginView() {
   const [loading, setLoading] = useState(false);
@@ -60,15 +61,15 @@ export default function LoginView() {
   // Lockout storage helper functions
   const checkEmailLockout = (emailAddress: string): { locked: boolean; remainingMinutes: number } => {
     const cleanEmail = emailAddress.toLowerCase().trim();
-    const lockoutUntilStr = localStorage.getItem(`login_lockout_until_${cleanEmail}`);
+    const lockoutUntilStr = safeStorage.get<string>(`login_lockout_until_${cleanEmail}`);
     if (lockoutUntilStr) {
       const lockoutTime = parseInt(lockoutUntilStr, 10);
       if (Date.now() < lockoutTime) {
         return { locked: true, remainingMinutes: Math.ceil((lockoutTime - Date.now()) / 1000 / 60) };
       } else {
         // Lock has expired, clean up
-        localStorage.removeItem(`login_lockout_until_${cleanEmail}`);
-        localStorage.removeItem(`login_failed_attempts_${cleanEmail}`);
+        safeStorage.remove(`login_lockout_until_${cleanEmail}`);
+        safeStorage.remove(`login_failed_attempts_${cleanEmail}`);
       }
     }
     return { locked: false, remainingMinutes: 0 };
@@ -76,14 +77,14 @@ export default function LoginView() {
 
   const incrementEmailFailedAttempts = (emailAddress: string) => {
     const cleanEmail = emailAddress.toLowerCase().trim();
-    const attemptsStr = localStorage.getItem(`login_failed_attempts_${cleanEmail}`) || '0';
+    const attemptsStr = safeStorage.get<string>(`login_failed_attempts_${cleanEmail}`) || '0';
     const nextAttempts = parseInt(attemptsStr, 10) + 1;
-    localStorage.setItem(`login_failed_attempts_${cleanEmail}`, nextAttempts.toString());
+    safeStorage.set(`login_failed_attempts_${cleanEmail}`, nextAttempts.toString());
     
     if (nextAttempts >= 3) {
       const lockoutDuration = 30 * 60 * 1000; // 30 minutes
       const lockoutUntil = Date.now() + lockoutDuration;
-      localStorage.setItem(`login_lockout_until_${cleanEmail}`, lockoutUntil.toString());
+      safeStorage.set(`login_lockout_until_${cleanEmail}`, lockoutUntil.toString());
       return true; // Locked out now
     }
     return false;
@@ -91,8 +92,8 @@ export default function LoginView() {
 
   const clearEmailFailedAttempts = (emailAddress: string) => {
     const cleanEmail = emailAddress.toLowerCase().trim();
-    localStorage.removeItem(`login_failed_attempts_${cleanEmail}`);
-    localStorage.removeItem(`login_lockout_until_${cleanEmail}`);
+    safeStorage.remove(`login_failed_attempts_${cleanEmail}`);
+    safeStorage.remove(`login_lockout_until_${cleanEmail}`);
   };
 
   const handleGoogleLogin = async () => {
@@ -147,7 +148,7 @@ export default function LoginView() {
       
       if (error.code === 'auth/wrong-password' || error.code === 'auth/invalid-credential') {
         const lockedNow = incrementEmailFailedAttempts(cleanEmail);
-        const attemptsStr = localStorage.getItem(`login_failed_attempts_${cleanEmail}`) || '1';
+        const attemptsStr = safeStorage.get<string>(`login_failed_attempts_${cleanEmail}`) || '1';
         const attempts = parseInt(attemptsStr, 10);
         
         if (lockedNow) {
@@ -198,7 +199,7 @@ export default function LoginView() {
 
     console.log('Attempting email registration...');
     setLoading(true);
-    localStorage.setItem('is_registering', 'true');
+    safeStorage.set('is_registering', 'true');
     try {
       // Create user in Firebase Auth using cleanEmail
       const result = await signupWithEmail(cleanEmail, registerPassword);
@@ -243,7 +244,7 @@ export default function LoginView() {
       console.error('Registration failed:', error);
       handleAuthError(error);
     } finally {
-      localStorage.removeItem('is_registering');
+      safeStorage.remove('is_registering');
       setLoading(false);
     }
   };

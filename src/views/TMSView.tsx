@@ -36,6 +36,7 @@ import { Label } from '../components/ui/label';
 import { toast } from 'sonner';
 import { usePermission } from '../components/PermissionContext';
 import { db, auth, handleFirestoreError, OperationType } from '../lib/firebase';
+import { firestoreLogger } from '../lib/firestoreLogger';
 import { syncShiftToAttendance } from '../services/attendanceSyncService';
 import { 
   doc, 
@@ -59,6 +60,8 @@ import { motion, AnimatePresence } from 'motion/react';
 import * as XLSX from 'xlsx';
 import { canActOn } from '../lib/hierarchy';
 import { getLiveTime, getLiveTimeISO } from '../lib/timeSync';
+import { useSharedTimer } from '../lib/sharedTimer';
+import { safeStorage } from '../lib/safeStorage';
 // No Sheets imports
 
 interface TMSViewProps {
@@ -81,6 +84,7 @@ export interface TMSShift {
   userId: string;
   userName: string;
   userEmail: string;
+  teamLeadUid?: string;
   mappedTL?: string;
   mappedManager?: string;
   clockInTime: string; // ISO
@@ -113,8 +117,15 @@ export function getDeviceType(): 'mobile' | 'desktop' {
   if (typeof window === 'undefined' || !navigator) return 'desktop';
   const ua = (navigator.userAgent || '').toLowerCase();
   
-  // 1. Standard mobile regular expression check
-  if (/mobile|android|iphone|ipad|ipod|blackberry|iemobile|opera mini|mobi|tablet|kindle/i.test(ua)) {
+  // Exclude tablet user agents and consider them desktop
+  const isTabletUA = /ipad|tablet|playbook|silk/i.test(ua) || 
+                     (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  if (isTabletUA) {
+    return 'desktop';
+  }
+
+  // 1. Standard mobile regular expression check (excluding tablet/ipad keywords)
+  if (/mobile|android|iphone|ipod|blackberry|iemobile|opera mini|mobi/i.test(ua)) {
     return 'mobile';
   }
   
@@ -124,37 +135,38 @@ export function getDeviceType(): 'mobile' | 'desktop' {
     return 'mobile';
   }
   
-  // 3. iOS 13+ iPad Safari / iPhone "Request Desktop Site" check (Mac OS user agent style with touch support)
-  const isIPadOrIPhoneDesktopMode = (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-  if (isIPadOrIPhoneDesktopMode) {
-    return 'mobile';
-  }
-
+  // 3. iOS 13+ iPad Safari / iPhone "Request Desktop Site" check - handled as desktop since iPads are desktop
+  
   // 4. Bypassing Attempt Check (e.g., Mobile Phone faking Desktop client/viewport via "Desktop Site" mode)
   // @ts-ignore
   const hasTouch = ('ontouchstart' in window || navigator.maxTouchPoints > 1 || (navigator.msMaxTouchPoints && navigator.msMaxTouchPoints > 1));
   const isCoarsePointer = window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
   
-  // Coarse pointer AND touch support is a definitive mobile device indicator
+  const screenWidth = window.screen ? (window.screen.width || 0) : 0;
+  const screenHeight = window.screen ? (window.screen.height || 0) : 0;
+  const minPhysicalDim = Math.min(screenWidth, screenHeight);
+
+  // Coarse pointer AND touch support is a mobile device indicator unless screen is tablet-sized or larger
   if (hasTouch && isCoarsePointer) {
+    if (minPhysicalDim > 0 && minPhysicalDim >= 600) {
+      return 'desktop';
+    }
     return 'mobile';
   }
 
-  const screenWidth = window.screen ? (window.screen.width || 0) : 0;
-  const screenHeight = window.screen ? (window.screen.height || 0) : 0;
-  
   if (screenWidth > 0 && screenHeight > 0) {
-    const minPhysicalDim = Math.min(screenWidth, screenHeight);
-    
-    // Physical screen width or height under 1024 with touch is a mobile or tablet
-    if (hasTouch && minPhysicalDim < 1024) {
+    // Physical screen width or height under 600 with touch is mobile
+    if (hasTouch && minPhysicalDim < 600) {
       return 'mobile';
     }
   }
 
-  // 5. Classic Orientation Checks (Desktops do not support window.orientation, mobile browsers do)
+  // 5. Classic Orientation Checks
   const hasMobileOrientation = typeof window.orientation !== 'undefined';
   if (hasMobileOrientation && hasTouch) {
+    if (minPhysicalDim > 0 && minPhysicalDim >= 600) {
+      return 'desktop';
+    }
     return 'mobile';
   }
 
@@ -178,19 +190,9 @@ export function getDetailedDeviceMetadata() {
   const resolvedType = getDeviceType();
   
   if (resolvedType === 'mobile') {
-    const screenWidth = window.screen ? (window.screen.width || 0) : 0;
-    const screenHeight = window.screen ? (window.screen.height || 0) : 0;
-    const minPhysicalDim = Math.min(screenWidth, screenHeight);
-
-    const isTabletUA = /ipad|tablet|playbook|silk/i.test(ua) || 
-                       (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1) ||
-                       (minPhysicalDim >= 600 && minPhysicalDim < 1024);
-    
-    if (isTabletUA) {
-      deviceType = 'Tablet';
-    } else {
-      deviceType = 'Mobile';
-    }
+    deviceType = 'Mobile';
+  } else {
+    deviceType = 'Desktop';
   }
 
   // 2. Determine Browser
@@ -444,6 +446,170 @@ const BREAK_OPTIONS = [
   'Bio Break'
 ];
 
+const LiveHeaderClock = () => {
+  const time = useSharedTimer();
+  return <>{time.toLocaleString('en-US', { 
+    timeZone: 'Asia/Kolkata',
+    dateStyle: 'medium',
+    timeStyle: 'medium'
+  })}</>;
+};
+
+const LiveDurationClock = ({ startTime }: { startTime: string }) => {
+  const now = useSharedTimer();
+  const ms = Math.max(0, now.getTime() - new Date(startTime).getTime());
+  
+  const totalSecs = Math.floor(ms / 1000);
+  const hrs = Math.floor(totalSecs / 3600);
+  const mins = Math.floor((totalSecs % 3600) / 60);
+  const secs = totalSecs % 60;
+  return <>{`${hrs.toString().padStart(2, '0')}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`}</>;
+};
+
+const LiveAgentDurations = ({
+  currentShift,
+  myPastShifts,
+  formatMs
+}: {
+  currentShift: TMSShift | null,
+  myPastShifts: TMSShift[],
+  formatMs: (ms: number) => string
+}) => {
+  const now = useSharedTimer();
+  
+  const nowTime = now.getTime();
+  let totalShiftMs = 0;
+  let activeMs = 0;
+  let breakMs = 0;
+
+  const nowLocalDateString = now.toDateString();
+  const completedShiftsToday = myPastShifts.filter(s => {
+    const isCompleted = s.status !== 'ACTIVE' && s.status !== 'BREAK';
+    if (!isCompleted || s.id === currentShift?.id) return false;
+    const shiftOutDate = s.clockOutTime ? new Date(s.clockOutTime) : new Date(s.clockInTime);
+    return shiftOutDate.toDateString() === nowLocalDateString;
+  });
+
+  completedShiftsToday.forEach(s => {
+    const outTime = s.clockOutTime ? new Date(s.clockOutTime).getTime() : new Date(s.clockInTime).getTime();
+    const inTimePrev = new Date(s.clockInTime).getTime();
+    totalShiftMs += Math.max(0, outTime - inTimePrev);
+
+    (s.activities || []).forEach(act => {
+      const start = new Date(act.startTime).getTime();
+      const end = act.endTime ? new Date(act.endTime).getTime() : (s.clockOutTime ? new Date(s.clockOutTime).getTime() : start);
+      const duration = Math.max(0, end - start);
+      const actName = (act.name || '').toLowerCase();
+      const isProductive = act.type === 'productive' || 
+                           actName.includes('meeting') || 
+                           actName.includes('coaching') || 
+                           actName.includes('training') || 
+                           actName.includes('alignment');
+      if (isProductive) activeMs += duration;
+      else breakMs += duration;
+    });
+  });
+
+  if (currentShift) {
+    const inTime = new Date(currentShift.clockInTime).getTime();
+    totalShiftMs += Math.max(0, nowTime - inTime);
+
+    (currentShift.activities || []).forEach(act => {
+      const start = new Date(act.startTime).getTime();
+      const end = act.endTime ? new Date(act.endTime).getTime() : nowTime;
+      const duration = Math.max(0, end - start);
+      const actName = (act.name || '').toLowerCase();
+      const isProductive = act.type === 'productive' || 
+                           actName.includes('meeting') || 
+                           actName.includes('coaching') || 
+                           actName.includes('training') || 
+                           actName.includes('alignment');
+      if (isProductive) activeMs += duration;
+      else breakMs += duration;
+    });
+  }
+
+  const elapsedShift = formatMs(totalShiftMs);
+  const elapsedActive = formatMs(activeMs);
+  const elapsedBreak = formatMs(breakMs);
+
+  return (
+    <div className="grid grid-cols-3 gap-3 p-4 bg-slate-50 rounded-xl border border-slate-200">
+      <div className="text-center border-r border-slate-200">
+        <p className="text-[9px] font-black uppercase text-slate-400 tracking-wider">Shift Elapsed</p>
+        <p className="font-mono text-sm font-black text-slate-800 mt-1">{elapsedShift}</p>
+      </div>
+      <div className="text-center border-r border-slate-200">
+        <p className="text-[9px] font-black uppercase text-slate-400 tracking-wider text-teal-600">Active Work</p>
+        <p className="font-mono text-sm font-black text-teal-700 mt-1">{elapsedActive}</p>
+      </div>
+      <div className="text-center">
+        <p className="text-[9px] font-black uppercase text-slate-400 tracking-wider text-amber-600">Total Breaks</p>
+        <p className="font-mono text-sm font-black text-amber-700 mt-1">{elapsedBreak}</p>
+      </div>
+    </div>
+  );
+};
+
+const LiveSummaryStats = ({
+  shift,
+  formatMs,
+  computeShiftStats
+}: {
+  shift: TMSShift,
+  formatMs: (ms: number) => string,
+  computeShiftStats: (shift: TMSShift) => any
+}) => {
+  const now = useSharedTimer();
+  const stats = computeShiftStats(shift);
+
+  return (
+    <>
+      <div className="flex items-center justify-between text-xs font-medium border-b border-slate-100 pb-1.5">
+        <span className="text-slate-500">Total Connected:</span>
+        <span className="font-bold text-slate-700">{formatMs(stats.totalShiftMs)}</span>
+      </div>
+      <div className="flex items-center justify-between text-xs font-medium">
+        <span className="text-slate-500">Break Duration:</span>
+        <span className="font-bold text-amber-600">{formatMs(stats.breakMs)}</span>
+      </div>
+    </>
+  );
+};
+
+const LiveSummaryProgress = ({
+  shift,
+  computeShiftStats
+}: {
+  shift: TMSShift,
+  computeShiftStats: (shift: TMSShift) => any
+}) => {
+  const now = useSharedTimer();
+  const util = computeShiftStats(shift).utilization;
+
+  return (
+    <>
+      <svg className="w-full h-full transform -rotate-90">
+        <circle cx="40" cy="40" r="32" stroke="#E2E8F0" strokeWidth="6" fill="transparent" />
+        <circle 
+          cx="40" 
+          cy="40" 
+          r="32" 
+          stroke="#0D9488" 
+          strokeWidth="6" 
+          fill="transparent" 
+          strokeDasharray={2 * Math.PI * 32}
+          strokeDashoffset={2 * Math.PI * 32 * (1 - util / 100)}
+          strokeLinecap="round"
+        />
+      </svg>
+      <span className="absolute font-mono text-xs font-black text-slate-800">
+        {Math.round(util)}%
+      </span>
+    </>
+  );
+};
+
 export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, externalTheme }: TMSViewProps) {
   const { canView, canCreate, canEdit, canDelete, hasTmsPermission } = usePermission();
   
@@ -458,10 +624,10 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
   const [processes, setProcesses] = useState<string[]>([]);
   const [presentThreshold, setPresentThreshold] = useState<number>(480);
   const [recentProcesses, setRecentProcesses] = useState<string[]>(
-    JSON.parse(localStorage.getItem('tms_recent_processes') || '[]')
+    safeStorage.get<string[]>('tms_recent_processes') || []
   );
   const [favoriteProcesses, setFavoriteProcesses] = useState<string[]>(
-    JSON.parse(localStorage.getItem('tms_favorite_processes') || '[]')
+    safeStorage.get<string[]>('tms_favorite_processes') || []
   );
   
   const [newProcessName, setNewProcessName] = useState('');
@@ -471,21 +637,57 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
       ? favoriteProcesses.filter(p => p !== process)
       : [...favoriteProcesses, process];
     setFavoriteProcesses(newFavorites);
-    localStorage.setItem('tms_favorite_processes', JSON.stringify(newFavorites));
+    safeStorage.set('tms_favorite_processes', newFavorites);
   };
   
   const updateRecent = (process: string) => {
     const newRecent = [process, ...recentProcesses.filter(p => p !== process)].slice(0, 5);
     setRecentProcesses(newRecent);
-    localStorage.setItem('tms_recent_processes', JSON.stringify(newRecent));
+    safeStorage.set('tms_recent_processes', newRecent);
   };
 
   const [processing, setProcessing] = useState(false);
   
-  // Real-time user's shift state
+  // Real-time user's shift state with optimistic UI shielding
   const [currentShift, setCurrentShift] = useState<TMSShift | null>(null);
+  const [rawActiveShift, setRawActiveShift] = useState<TMSShift | null | undefined>(undefined);
+  const [localOwnShift, setLocalOwnShift] = useState<TMSShift | null | undefined>(undefined);
   const [myPastShifts, setMyPastShifts] = useState<TMSShift[]>([]);
   const attemptedHealsRef = useRef<Set<string>>(new Set());
+
+  // Reconcile real-time Firestore updates and local optimistic overrides
+  useEffect(() => {
+    if (rawActiveShift === undefined) return; // Wait for initial load
+
+    let resolvedOwnShift = localOwnShift;
+    if (localOwnShift !== undefined) {
+      if (localOwnShift === null) {
+        // We local-clocked out. If server also shows no active shift, clear the override lock.
+        if (!rawActiveShift) {
+          setLocalOwnShift(undefined);
+          resolvedOwnShift = undefined;
+        }
+      } else {
+        // We local-clocked in / on break / switched process.
+        // Once the server matches our local status, process, and activities list size, clear the override.
+        if (rawActiveShift) {
+          const serverLastAct = rawActiveShift.activities?.[rawActiveShift.activities.length - 1];
+          const localLastAct = localOwnShift.activities?.[localOwnShift.activities.length - 1];
+          const statusMatches = rawActiveShift.status === localOwnShift.status;
+          const processMatches = serverLastAct?.name === localLastAct?.name;
+          const countMatches = rawActiveShift.activities?.length === localOwnShift.activities?.length;
+
+          if (statusMatches && processMatches && countMatches) {
+            setLocalOwnShift(undefined);
+            resolvedOwnShift = undefined;
+          }
+        }
+      }
+    }
+
+    const finalShift = resolvedOwnShift !== undefined ? resolvedOwnShift : rawActiveShift;
+    setCurrentShift(finalShift);
+  }, [rawActiveShift, localOwnShift]);
   
   // Admin view variables
   const [allShifts, setAllShifts] = useState<TMSShift[]>([]);
@@ -495,7 +697,7 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
   
   // Reactively pre-select last used process if user profile updates
   useEffect(() => {
-    if (user.lastUsedProcess && !selectedProcessInput) {
+    if (user.lastUsedProcess) {
       setSelectedProcessInput(user.lastUsedProcess);
     }
   }, [user.lastUsedProcess]);
@@ -546,18 +748,6 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
     }
   }, [exportFormat, reportType]);
   
-  // System timer ticker
-  const [currentTime, setCurrentTime] = useState(getLiveTime());
-  const [elapsedActive, setElapsedActive] = useState('00:00:00');
-  const [elapsedBreak, setElapsedBreak] = useState('00:00:00');
-  const [elapsedShift, setElapsedShift] = useState('00:00:00');
-
-  // Trigger real-time ticking clock
-  useEffect(() => {
-    const timer = setInterval(() => setCurrentTime(getLiveTime()), 1000);
-    return () => clearInterval(timer);
-  }, []);
-
   // Fetch Attendance present threshold in Real-time from config/attendanceSettings document
   const [desktopOnlyMode, setDesktopOnlyMode] = useState<boolean>(false);
   const [adminBypass, setAdminBypass] = useState<boolean>(false);
@@ -613,69 +803,64 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
     return () => unsub();
   }, [user?.uid]);
 
-  // Fetch User's Personal Shifts & Current Active Shift
+  // Fetch User's Personal Shifts (Optimized Phase 3)
   useEffect(() => {
     if (!user) return;
-    const qMyShifts = query(
+    
+    // Real-time listener ONLY for Active/Break sessions
+    const qActive = query(
       collection(db, 'tmsShifts'),
-      where('userId', '==', user.uid)
+      where('userId', '==', user.uid),
+      where('status', 'in', ['ACTIVE', 'BREAK']),
+      limit(5)
     );
 
-    const unsubscribe = onSnapshot(qMyShifts, (snapshot) => {
-      const shifts = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as TMSShift));
+    const unsubActive = onSnapshot(qActive, (snapshot) => {
+      firestoreLogger.trackRead('my_active_shifts_snapshot', snapshot.size);
+      const activeShiftsList = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as TMSShift));
       
-      // Sort shifts by clockInTime desc
-      shifts.sort((a, b) => new Date(b.clockInTime).getTime() - new Date(a.clockInTime).getTime());
-      
-      setMyPastShifts(shifts);
-
-      // Find and heal duplicate active shifts
-      const activeShiftsList = shifts.filter(s => s.status === 'ACTIVE' || s.status === 'BREAK');
-      const filteredDuplicateClosingShifts = activeShiftsList.slice(1).filter(sh => {
-        if (!attemptedHealsRef.current.has(sh.id)) {
-          attemptedHealsRef.current.add(sh.id);
-          return true;
-        }
-        return false;
-      });
-
-      if (filteredDuplicateClosingShifts.length > 0) {
-        // Find older duplicates to close
+      // Phase 3 Optimization: Healing logic for duplicate active shifts
+      if (activeShiftsList.length > 1) {
+        console.log(`[TMS HEALING] Found ${activeShiftsList.length} active sessions. Auto-closing duplicates...`);
         const healBatch = writeBatch(db);
         const healNowISO = getLiveTimeISO();
-        filteredDuplicateClosingShifts.forEach(sh => {
-          const updatedActivities = [...(sh.activities || [])];
-          if (updatedActivities.length > 0) {
-            const lastIndex = updatedActivities.length - 1;
-            if (!updatedActivities[lastIndex].endTime) {
-              updatedActivities[lastIndex].endTime = healNowISO;
+        
+        // Keep the newest one, close others
+        activeShiftsList.slice(1).forEach(sh => {
+          if (!attemptedHealsRef.current.has(sh.id)) {
+            attemptedHealsRef.current.add(sh.id);
+            const updatedActivities = [...(sh.activities || [])];
+            if (updatedActivities.length > 0) {
+              const lastIndex = updatedActivities.length - 1;
+              if (!updatedActivities[lastIndex].endTime) {
+                updatedActivities[lastIndex].endTime = healNowISO;
+              }
             }
+            const finalized = {
+              ...sh,
+              activities: updatedActivities,
+              status: 'AUTO_CLOSED' as const,
+              clockOutTime: healNowISO,
+              remarks: 'System Auto-Resolved Duplicate Active Shift'
+            };
+            healBatch.set(doc(db, 'tmsShifts', sh.id), finalized);
+            syncShiftToAttendance(finalized).catch(e => console.error('Failed to sync duplicate shift attendance', e));
           }
-          const finalized = {
-            ...sh,
-            activities: updatedActivities,
-            status: 'AUTO_CLOSED',
-            clockOutTime: healNowISO,
-            remarks: 'System Auto-Resolved Duplicate Active Shift (User Self-Healing)'
-          };
-          healBatch.set(doc(db, 'tmsShifts', sh.id), finalized);
-          
-          // Trigger attendance sync for each closed duplicate
-          syncShiftToAttendance(finalized).catch(e => console.error('Failed to sync duplicate shift attendance', e));
         });
-        healBatch.commit().catch(e => console.error('Failed to auto-heal duplicate shifts for active user', e));
+        healBatch.commit().catch(e => console.error('Failed to commit auto-heal batch', e));
       }
 
-      // Find if there's any active shift (status ACTIVE or BREAK)
+      // Find if there's any active shift
       const active = activeShiftsList.length > 0 ? activeShiftsList[0] : null;
+      
       if (active) {
         const referenceTime = getLiveTime().getTime();
         const activeProductiveMs = getShiftProductiveMs(active, referenceTime);
         const TEN_HOURS_MS = 10 * 60 * 60 * 1000;
+        
         if (activeProductiveMs >= TEN_HOURS_MS) {
           if (!attemptedHealsRef.current.has(active.id)) {
             attemptedHealsRef.current.add(active.id);
-
             const { activities: updatedActivities, clockOutTime } = truncateShiftToProductiveTime(active, TEN_HOURS_MS);
             const finalizedShift = {
               ...active,
@@ -696,10 +881,9 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
               })
               .catch(err => console.error('Error auto-clocking out shift:', err));
           }
-
-          setCurrentShift(null);
+          setRawActiveShift(null);
         } else {
-          setCurrentShift(active);
+          setRawActiveShift(active);
           // Default select previous active process if available
           const lastProductive = [...active.activities]
             .reverse()
@@ -709,13 +893,32 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
           }
         }
       } else {
-        setCurrentShift(null);
+        setRawActiveShift(null);
       }
     }, (error) => {
-      handleFirestoreError(error, OperationType.LIST, 'tmsShifts');
+      handleFirestoreError(error, OperationType.LIST, 'tmsShifts_active');
     });
 
-    return () => unsubscribe();
+    // One-time fetch for historical shifts
+    const fetchHistory = async () => {
+      try {
+        const qHistory = query(
+          collection(db, 'tmsShifts'),
+          where('userId', '==', user.uid),
+          orderBy('clockInTime', 'desc'),
+          limit(25)
+        );
+        const snap = await getDocs(qHistory);
+        firestoreLogger.trackRead('my_shifts_history_fetch', snap.size);
+        const shifts = snap.docs.map(doc => ({ id: doc.id, ...doc.data() } as TMSShift));
+        setMyPastShifts(shifts);
+      } catch (err) {
+        console.error('Error fetching shift history:', err);
+      }
+    };
+    fetchHistory();
+
+    return () => unsubActive();
   }, [user?.uid]);
 
   const getDateRange = (preset: string, customStart?: string, customEnd?: string) => {
@@ -769,17 +972,43 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
   };
 
   useEffect(() => {
-    // OPTIMIZED: Only fetch the massive 5000 shift list if NOT a dashboard user (who uses SupervisorDashboard's own optimized sync)
-    if (!user || !canViewReports || isDashboardUser) return;
-    const qAllShifts = query(collection(db, 'tmsShifts'), orderBy('clockInTime', 'desc'), limit(500));
-    const unsubscribe = onSnapshot(qAllShifts, (snap) => {
-      const shifts = snap.docs.map(doc => ({ id: doc.id, ...doc.data() } as TMSShift));
-      setAllShifts(shifts);
-    }, (error) => {
-      console.warn('Failed real-time subscription to tmsShifts', error);
-    });
-    return () => unsubscribe();
-  }, [user, canViewReports]);
+    // OPTIMIZED: Only fetch the massive shift list if NOT a dashboard user (who uses SupervisorDashboard's own optimized sync)
+    if (!user?.uid || !canViewReports) return;
+    
+    const dashboardRolesList = [
+      UserRole.TEAM_LEAD, 
+      UserRole.QTL, 
+      UserRole.STL, 
+      UserRole.OPS_TL, 
+      UserRole.TRAINER_TL, 
+      UserRole.MANAGER, 
+      UserRole.ADMIN, 
+      UserRole.MIS,
+      UserRole.OPS_HEAD,
+      UserRole.HR,
+      UserRole.IT_MANAGER,
+      UserRole.SME
+    ];
+    const isDashboard = dashboardRolesList.includes(user.role as UserRole);
+    if (isDashboard) return;
+
+    const fetchShifts = async () => {
+      try {
+        const qAllShifts = query(
+          collection(db, 'tmsShifts'),
+          where('status', 'in', ['ACTIVE', 'BREAK'])
+        );
+        const snap = await getDocs(qAllShifts);
+        firestoreLogger.trackRead('tmsShifts_organizational_getDocs', snap.size);
+        const shifts = snap.docs.map(doc => ({ id: doc.id, ...doc.data() } as TMSShift));
+        setAllShifts(shifts);
+      } catch (error) {
+        console.warn('Failed to fetch tmsShifts', error);
+      }
+    };
+    
+    fetchShifts();
+  }, [user?.uid, canViewReports]);
 
   const startForceLogoutFlow = (shiftId: string, targetUid: string, targetName: string) => {
     setForceOutShiftId(shiftId);
@@ -898,7 +1127,61 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
   }, []);
 
   const saveShiftState = async (updatedShift: TMSShift) => {
-    await setDoc(doc(db, 'tmsShifts', updatedShift.id), updatedShift);
+    // Phase 5 Optimization: Avoid getDoc by using the preloaded 'user' prop in memory if it's the current user's shift
+    const isSelf = updatedShift.userId === user?.uid;
+    let userData: any = isSelf ? user : null;
+
+    if (!userData) {
+      const userRef = doc(db, 'users', updatedShift.userId);
+      const userSnap = await getDoc(userRef);
+      userData = userSnap.exists() ? userSnap.data() : {};
+    }
+    
+    const referenceTime = new Date().getTime();
+    const productiveMs = getShiftProductiveMs(updatedShift, referenceTime);
+    const breakMs = (updatedShift.activities || [])
+      .filter(act => act.type === 'break' && act.name.toLowerCase() !== 'offline' && !act.name.toLowerCase().includes('meeting') && !act.name.toLowerCase().includes('coaching') && !act.name.toLowerCase().includes('training') && !act.name.toLowerCase().includes('alignment'))
+      .reduce((sum, act) => sum + (act.endTime ? new Date(act.endTime).getTime() : referenceTime) - new Date(act.startTime).getTime(), 0);
+
+    const lastAct = updatedShift.activities && updatedShift.activities.length > 0 
+      ? updatedShift.activities[updatedShift.activities.length - 1] 
+      : null;
+
+    const currentActivity = lastAct && !lastAct.endTime ? lastAct.name : 'Offline';
+    const breakType = updatedShift.status === 'BREAK' && lastAct && !lastAct.endTime ? lastAct.name : null;
+
+    const currentActivityStartTime = lastAct ? lastAct.startTime : new Date().toISOString();
+
+    const liveSessionData = {
+      uid: updatedShift.userId,
+      employeeId: updatedShift.userId,
+      employeeName: updatedShift.userName,
+      role: userData?.role || 'AGENT',
+      process: userData?.team || userData?.process || 'N/A',
+      currentProcess: userData?.team || userData?.process || 'N/A',
+      managerId: userData?.mappedManagerId || userData?.managerId || '',
+      tlId: userData?.teamLeadId || userData?.teamLeadUid || '',
+      status: updatedShift.status,
+      sessionStatus: updatedShift.status,
+      currentActivity: currentActivity,
+      currentActivityStartTime: currentActivityStartTime,
+      breakType: breakType,
+      productiveSeconds: Math.floor(productiveMs / 1000),
+      breakSeconds: Math.floor(breakMs / 1000),
+      activities: updatedShift.activities || [],
+      location: (updatedShift as any).location || userData?.location || 'Unknown',
+      clockInTime: updatedShift.clockInTime,
+      clockOutTime: updatedShift.clockOutTime || null,
+      deviceName: updatedShift.deviceType || 'Unknown',
+      platform: updatedShift.os || 'Unknown',
+      lastHeartbeat: new Date().toISOString()
+    };
+
+    const liveSessionRef = doc(db, 'live_sessions', updatedShift.userId);
+    await Promise.all([
+      setDoc(doc(db, 'tmsShifts', updatedShift.id), updatedShift),
+      setDoc(liveSessionRef, liveSessionData, { merge: true })
+    ]);
   };
 
   const saveProcessesList = async (updatedList: string[]) => {
@@ -917,147 +1200,6 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
       'TRAINER_TL'
     ].includes(norm);
   };
-
-  // Handle ticking timers for currently active shift
-  useEffect(() => {
-    if (!currentShift) return;
-
-    const tick = () => {
-      const now = getLiveTime().getTime();
-      const inTime = new Date(currentShift.clockInTime).getTime();
-      
-      // Calculate accumulated stats of earlier completed shifts of today
-      const nowLocalDateString = new Date().toDateString();
-      const isSupervisor = isSupervisorRole(user.role);
-      const completedShiftsToday = isSupervisor
-        ? myPastShifts.filter(s => {
-            const isCompleted = s.status !== 'ACTIVE' && s.status !== 'BREAK';
-            if (!isCompleted || s.id === currentShift.id) return false;
-            const shiftOutDate = s.clockOutTime ? new Date(s.clockOutTime) : new Date(s.clockInTime);
-            return shiftOutDate.toDateString() === nowLocalDateString;
-          })
-        : [];
-
-      let completedShiftMs = 0;
-      let completedActiveMs = 0;
-      let completedBreakMs = 0;
-
-      completedShiftsToday.forEach(s => {
-        const outTime = s.clockOutTime ? new Date(s.clockOutTime).getTime() : new Date(s.clockInTime).getTime();
-        const inTimePrev = new Date(s.clockInTime).getTime();
-        const diff = Math.max(0, outTime - inTimePrev);
-        completedShiftMs += diff;
-
-        (s.activities || []).forEach(act => {
-          const start = new Date(act.startTime).getTime();
-          const end = act.endTime ? new Date(act.endTime).getTime() : (s.clockOutTime ? new Date(s.clockOutTime).getTime() : start);
-          const duration = Math.max(0, end - start);
-          const actName = (act.name || '').toLowerCase();
-          const isProductive = act.type === 'productive' || 
-                               actName.includes('meeting') || 
-                               actName.includes('coaching') || 
-                               actName.includes('training') || 
-                               actName.includes('alignment');
-          if (isProductive) {
-            completedActiveMs += duration;
-          } else {
-            completedBreakMs += duration;
-          }
-        });
-      });
-
-      // 1. Shift duration
-      const currentShiftMs = Math.max(0, now - inTime);
-      const totalShiftMs = currentShiftMs + completedShiftMs;
-      setElapsedShift(formatMs(totalShiftMs));
-
-      // 2. Compute Productive & Break times
-      let activeMs = completedActiveMs;
-      let breakMs = completedBreakMs;
-
-      currentShift.activities.forEach(act => {
-        const start = new Date(act.startTime).getTime();
-        const end = act.endTime ? new Date(act.endTime).getTime() : now;
-        const duration = Math.max(0, end - start);
-        const actName = (act.name || '').toLowerCase();
-        const isProductive = act.type === 'productive' || 
-                             actName.includes('meeting') || 
-                             actName.includes('coaching') || 
-                             actName.includes('training') || 
-                             actName.includes('alignment');
-        if (isProductive) {
-          activeMs += duration;
-        } else {
-          breakMs += duration;
-        }
-      });
-
-      setElapsedActive(formatMs(activeMs));
-      setElapsedBreak(formatMs(breakMs));
-    };
-
-    // Run tick immediately to avoid 1-second display delay
-    tick();
-
-    const interval = setInterval(tick, 1000);
-    return () => clearInterval(interval);
-  }, [currentShift, myPastShifts]);
-
-  // Handle clocked-out user shift durations display and next date reset
-  useEffect(() => {
-    if (currentShift) {
-      return;
-    }
-
-    const nowLocalDateString = new Date().toDateString();
-    const isSupervisor = isSupervisorRole(user.role);
-    const completedShiftsToday = isSupervisor
-      ? myPastShifts.filter(s => {
-          const isCompleted = s.status !== 'ACTIVE' && s.status !== 'BREAK';
-          if (!isCompleted) return false;
-          const shiftOutDate = s.clockOutTime ? new Date(s.clockOutTime) : new Date(s.clockInTime);
-          return shiftOutDate.toDateString() === nowLocalDateString;
-        })
-      : [];
-
-    if (completedShiftsToday.length > 0) {
-      let totalShiftMs = 0;
-      let activeMs = 0;
-      let breakMs = 0;
-
-      completedShiftsToday.forEach(s => {
-        const outTime = s.clockOutTime ? new Date(s.clockOutTime).getTime() : new Date(s.clockInTime).getTime();
-        const inTimePrev = new Date(s.clockInTime).getTime();
-        const diff = Math.max(0, outTime - inTimePrev);
-        totalShiftMs += diff;
-
-        (s.activities || []).forEach(act => {
-          const start = new Date(act.startTime).getTime();
-          const end = act.endTime ? new Date(act.endTime).getTime() : (s.clockOutTime ? new Date(s.clockOutTime).getTime() : start);
-          const duration = Math.max(0, end - start);
-          const actName = (act.name || '').toLowerCase();
-          const isProductive = act.type === 'productive' || 
-                               actName.includes('meeting') || 
-                               actName.includes('coaching') || 
-                               actName.includes('training') || 
-                               actName.includes('alignment');
-          if (isProductive) {
-            activeMs += duration;
-          } else {
-            breakMs += duration;
-          }
-        });
-      });
-
-      setElapsedShift(formatMs(totalShiftMs));
-      setElapsedActive(formatMs(activeMs));
-      setElapsedBreak(formatMs(breakMs));
-    } else {
-      setElapsedShift('00:00:00');
-      setElapsedActive('00:00:00');
-      setElapsedBreak('00:00:00');
-    }
-  }, [currentShift, myPastShifts]);
 
   // Helper: Format Milliseconds to HH:MM:SS
   const formatMs = (ms: number): string => {
@@ -1135,73 +1277,85 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
 
     setIsProcessingPunch(true);
     setShowClockInConfirm(false); // Close modal on confirmed start
+    
+    const nowISO = getLiveTimeISO();
+    const currentDev = getDeviceType();
+    const meta = getDetailedDeviceMetadata();
+    
+    const uaVal = typeof navigator !== 'undefined' ? navigator.userAgent : 'N/A';
+    const platVal = typeof navigator !== 'undefined' ? navigator.platform : 'N/A';
+    const touchVal = typeof navigator !== 'undefined' ? navigator.maxTouchPoints : 0;
+    const swVal = typeof window !== 'undefined' && window.screen ? window.screen.width : 0;
+    const shVal = typeof window !== 'undefined' && window.screen ? window.screen.height : 0;
+
+    // Log exactly as requested
+    console.log(`[DEVICE DETECTION]`);
+    console.log(`userAgent=${uaVal}`);
+    console.log(`platform=${platVal}`);
+    console.log(`maxTouchPoints=${touchVal}`);
+    console.log(`detectedDeviceType=${meta.deviceType}`);
+    console.log(`detectedBrowser=${meta.browser}`);
+    console.log(`detectedOS=${meta.os}`);
+
+    const newShift: TMSShift = {
+      id: `shift-${user.uid || 'anon'}-${Date.now()}`,
+      userId: user.uid || '',
+      userName: user.name || 'Anonymous User',
+      userEmail: user.email || '',
+      teamLeadUid: (user as any).teamLeadUid || (user as any).teamLeadId || '',
+      mappedTL: (user as any).teamLeadEmail || (user as any).mappedTL || 'N/A',
+      mappedManager: (user as any).mappedManagerEmail || (user as any).mappedManager || 'N/A',
+      clockInTime: nowISO,
+      status: 'ACTIVE',
+      clockInDevice: currentDev,
+      hasMobilePunches: currentDev === 'mobile',
+      deviceType: meta.deviceType,
+      browser: meta.browser,
+      os: meta.os,
+      loginTimestamp: meta.loginTimestamp,
+      // Diagnostics
+      userAgent: uaVal,
+      platform: platVal,
+      maxTouchPoints: touchVal,
+      screenWidth: swVal,
+      screenHeight: shVal,
+      detectedDeviceType: meta.deviceType,
+      detectedBrowser: meta.browser,
+      detectedOS: meta.os,
+      activities: [
+        {
+          type: 'productive',
+          name: targetProcess,
+          startTime: nowISO,
+          device: currentDev
+        }
+      ]
+    };
+
+    // 1. Close modal and set state immediately (Optimistic Update)
+    setLocalOwnShift(newShift);
+    setCurrentShift(newShift);
+    setSelectedProcessInput(targetProcess);
+
     try {
-      const nowISO = getLiveTimeISO();
-      const currentDev = getDeviceType();
-      const meta = getDetailedDeviceMetadata();
-      
-      const uaVal = typeof navigator !== 'undefined' ? navigator.userAgent : 'N/A';
-      const platVal = typeof navigator !== 'undefined' ? navigator.platform : 'N/A';
-      const touchVal = typeof navigator !== 'undefined' ? navigator.maxTouchPoints : 0;
-      const swVal = typeof window !== 'undefined' && window.screen ? window.screen.width : 0;
-      const shVal = typeof window !== 'undefined' && window.screen ? window.screen.height : 0;
-
-      // Log exactly as requested
-      console.log(`[DEVICE DETECTION]`);
-      console.log(`userAgent=${uaVal}`);
-      console.log(`platform=${platVal}`);
-      console.log(`maxTouchPoints=${touchVal}`);
-      console.log(`detectedDeviceType=${meta.deviceType}`);
-      console.log(`detectedBrowser=${meta.browser}`);
-      console.log(`detectedOS=${meta.os}`);
-
-      const newShift: TMSShift = {
-        id: `shift-${user.uid || 'anon'}-${Date.now()}`,
-        userId: user.uid || '',
-        userName: user.name || 'Anonymous User',
-        userEmail: user.email || '',
-        mappedTL: (user as any).teamLeadEmail || (user as any).mappedTL || 'N/A',
-        mappedManager: (user as any).mappedManagerEmail || (user as any).mappedManager || 'N/A',
-        clockInTime: nowISO,
-        status: 'ACTIVE',
-        clockInDevice: currentDev,
-        hasMobilePunches: currentDev === 'mobile',
-        deviceType: meta.deviceType,
-        browser: meta.browser,
-        os: meta.os,
-        loginTimestamp: meta.loginTimestamp,
-        // Diagnostics
-        userAgent: uaVal,
-        platform: platVal,
-        maxTouchPoints: touchVal,
-        screenWidth: swVal,
-        screenHeight: shVal,
-        detectedDeviceType: meta.deviceType,
-        detectedBrowser: meta.browser,
-        detectedOS: meta.os,
-        activities: [
-          {
-            type: 'productive',
-            name: targetProcess,
-            startTime: nowISO,
-            device: currentDev
-          }
-        ]
-      };
-
-      // 0. Update User Status to Online in users collection
+      // 2. Perform database writes concurrently in parallel
       const userRef = doc(db, 'users', user.uid);
-      await updateDoc(userRef, {
-        status: 'ONLINE',
-        lastLoginAt: nowISO,
-        lastUsedProcess: targetProcess
-      });
+      await Promise.all([
+        updateDoc(userRef, {
+          status: 'ONLINE',
+          lastLoginAt: nowISO,
+          lastUsedProcess: targetProcess
+        }),
+        saveShiftState(newShift)
+      ]);
 
-      await saveShiftState(newShift);
-      setSelectedProcessInput(targetProcess);
       toast.success(`Clocked In successfully! Process: ${targetProcess}`);
-    } catch (e) {
-      handleFirestoreError(e, OperationType.WRITE, 'tmsShifts');
+    } catch (e: any) {
+      console.error('Clock-in failed:', e);
+      toast.error('Failed to complete clock-in on server: ' + e.message);
+      // Revert optimistic state on error
+      setLocalOwnShift(undefined);
+      setCurrentShift(null);
     } finally {
       setIsProcessingPunch(false);
       setShowClockInConfirm(false);
@@ -1227,6 +1381,8 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
       return;
     }
 
+    const previousShift = currentShift;
+
     try {
       const nowISO = getLiveTimeISO();
       const currentDev = getDeviceType();
@@ -1246,7 +1402,7 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
         device: currentDev
       });
 
-      await saveShiftState({
+      const updatedShift: TMSShift = {
         ...currentShift,
         activities: updatedActivities,
         status: 'ACTIVE',
@@ -1260,13 +1416,29 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
         detectedDeviceType: meta.deviceType,
         detectedBrowser: meta.browser,
         detectedOS: meta.os
-      });
+      };
 
+      // 1. Optimistic Update
+      setLocalOwnShift(updatedShift);
+      setCurrentShift(updatedShift);
       setSelectedProcessInput(targetProcess);
       updateRecent(targetProcess);
+
+      // 2. Perform database writes concurrently in parallel
+      const userRef = doc(db, 'users', user.uid);
+      await Promise.all([
+        saveShiftState(updatedShift),
+        updateDoc(userRef, {
+          lastUsedProcess: targetProcess
+        })
+      ]);
       toast.success(`Process switched to: ${targetProcess}`);
-    } catch (e) {
-      handleFirestoreError(e, OperationType.WRITE, 'tmsShifts');
+    } catch (e: any) {
+      console.error('Process switch failed:', e);
+      toast.error('Failed to switch process on server: ' + e.message);
+      // Revert optimistic update
+      setLocalOwnShift(previousShift ? previousShift : undefined);
+      setCurrentShift(previousShift);
     }
   };
 
@@ -1298,6 +1470,8 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
       }
     }
 
+    const previousShift = currentShift;
+
     try {
       const nowISO = getLiveTimeISO();
       const currentDev = getDeviceType();
@@ -1317,7 +1491,7 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
         device: currentDev
       });
 
-      await saveShiftState({
+      const updatedShift: TMSShift = {
         ...currentShift,
         activities: updatedActivities,
         status: 'BREAK',
@@ -1331,17 +1505,28 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
         detectedDeviceType: meta.deviceType,
         detectedBrowser: meta.browser,
         detectedOS: meta.os
-      });
+      };
 
-      // Update User Status to BREAK in users collection
+      // 1. Optimistic Update
+      setLocalOwnShift(updatedShift);
+      setCurrentShift(updatedShift);
+
+      // 2. Perform database writes concurrently in parallel
       const userRef = doc(db, 'users', user.uid);
-      await updateDoc(userRef, {
-        status: 'BREAK'
-      });
+      await Promise.all([
+        saveShiftState(updatedShift),
+        updateDoc(userRef, {
+          status: 'BREAK'
+        })
+      ]);
 
       toast.success(`Break started: ${selectedBreakInput}`);
-    } catch (e) {
-      handleFirestoreError(e, OperationType.WRITE, 'tmsShifts');
+    } catch (e: any) {
+      console.error('Start break failed:', e);
+      toast.error('Failed to start break on server: ' + e.message);
+      // Revert optimistic update
+      setLocalOwnShift(previousShift ? previousShift : undefined);
+      setCurrentShift(previousShift);
     }
   };
 
@@ -1379,6 +1564,8 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
       }
     }
 
+    const previousShift = currentShift;
+
     try {
       const nowISO = getLiveTimeISO();
       const currentDev = getDeviceType();
@@ -1398,7 +1585,7 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
         device: currentDev
       });
 
-      await saveShiftState({
+      const updatedShift: TMSShift = {
         ...currentShift,
         activities: updatedActivities,
         status: 'ACTIVE',
@@ -1412,19 +1599,31 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
         detectedDeviceType: meta.deviceType,
         detectedBrowser: meta.browser,
         detectedOS: meta.os
-      });
+      };
 
-      // Update User Status to ONLINE in users collection
-      const userRef = doc(db, 'users', user.uid);
-      await updateDoc(userRef, {
-        status: 'ONLINE'
-      });
-
+      // 1. Optimistic Update
+      setLocalOwnShift(updatedShift);
+      setCurrentShift(updatedShift);
       setSelectedProcessInput(resumeProcess);
       updateRecent(resumeProcess);
+
+      // 2. Perform database writes concurrently in parallel
+      const userRef = doc(db, 'users', user.uid);
+      await Promise.all([
+        saveShiftState(updatedShift),
+        updateDoc(userRef, {
+          status: 'ONLINE',
+          lastUsedProcess: resumeProcess
+        })
+      ]);
+
       toast.success(`Resumed work on process: ${resumeProcess}`);
-    } catch (e) {
-      handleFirestoreError(e, OperationType.WRITE, 'tmsShifts');
+    } catch (e: any) {
+      console.error('Resume failed:', e);
+      toast.error('Failed to resume on server: ' + e.message);
+      // Revert optimistic update
+      setLocalOwnShift(previousShift ? previousShift : undefined);
+      setCurrentShift(previousShift);
     }
   };
 
@@ -1439,6 +1638,7 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
 
   const performClockOut = async () => {
     if (!currentShift) return;
+    const previousShift = currentShift;
     try {
       const nowISO = getLiveTimeISO();
       const currentDev = getDeviceType();
@@ -1458,22 +1658,29 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
         hasMobilePunches: currentShift.hasMobilePunches || currentDev === 'mobile'
       };
 
-      await saveShiftState(finalizedShift as any);
-      
-      // Auto-generate Attendance
-      await syncShiftToAttendance({ id: currentShift.id, ...finalizedShift });
+      // 1. Optimistic Update
+      setLocalOwnShift(null);
+      setCurrentShift(null);
+      setShowClockOutConfirm(false);
 
-      // Update User Status to Offline
+      // 2. Perform database writes concurrently in parallel
       const userRef = doc(db, 'users', user.uid);
-      await updateDoc(userRef, {
-        status: 'OFFLINE',
-        lastLogoutAt: nowISO
-      });
+      await Promise.all([
+        saveShiftState(finalizedShift as any),
+        syncShiftToAttendance({ id: currentShift.id, ...finalizedShift }),
+        updateDoc(userRef, {
+          status: 'OFFLINE',
+          lastLogoutAt: nowISO
+        })
+      ]);
 
       toast.success('Clocked Out successfully. Shift recorded.');
-      setCurrentShift(null);
-    } catch (e) {
-      handleFirestoreError(e, OperationType.WRITE, 'tmsShifts');
+    } catch (e: any) {
+      console.error('Clock-out failed:', e);
+      toast.error('Failed to clock out on server: ' + e.message);
+      // Revert optimistic update
+      setLocalOwnShift(previousShift);
+      setCurrentShift(previousShift);
     }
   };
 
@@ -1721,6 +1928,7 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
         allUsers={allUsers} 
         onRefreshAllData={fetchAllShifts}
         externalTheme={externalTheme}
+        processes={processes}
       />
     );
   }
@@ -2102,11 +2310,7 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
               <div>
                 <p className="text-[8px] uppercase font-bold tracking-widest text-slate-400 leading-none">Live Server Time (IST)</p>
                 <p className="font-mono text-[11px] font-bold text-slate-800 leading-none mt-1">
-                  {currentTime.toLocaleString('en-US', { 
-                    timeZone: 'Asia/Kolkata',
-                    dateStyle: 'medium',
-                    timeStyle: 'medium'
-                  })}
+                  <LiveHeaderClock />
                 </p>
               </div>
             </div>
@@ -2171,7 +2375,6 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
                   <option value="all">🟢 Shift Filter: All</option>
                   <option value="active">🟢 Active Shifts</option>
                   <option value="break">🟠 Break Shifts</option>
-                  <option value="offline">⚪ Offline Resources</option>
                 </select>
                 <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-2.5 text-slate-450">
                   <svg className="fill-current h-3.5 w-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><path d="M9.293 12.95l.707.707L15.657 8l-1.414-1.414L10 10.828 5.757 6.586 4.343 8z"/></svg>
@@ -2255,11 +2458,6 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
                                     </Button>
                                   )}
                                 </div>
-                                {activeShift.status === 'BREAK' && activeShift.activities.length > 0 && (
-                                  <span className="text-[10px] font-bold text-amber-600 dark:text-amber-400 font-mono animate-pulse mt-0.5 animate-pulse">
-                                    Break: {formatMs(Math.max(0, currentTime.getTime() - new Date(activeShift.activities[activeShift.activities.length - 1].startTime).getTime()))}
-                                  </span>
-                                )}
                               </>
                             ) : (
                               <Badge variant="secondary" className="text-[10px] bg-slate-100 text-slate-500 font-bold uppercase">
@@ -2272,11 +2470,6 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
                           {activeShift ? (
                             <div className="flex flex-col gap-0.5">
                               <span>{activeShift.activities[activeShift.activities.length - 1]?.name || 'N/A'}</span>
-                              {activeShift.status === 'BREAK' && activeShift.activities.length > 0 && (
-                                <span className="text-[9px] font-bold text-amber-500 font-mono">
-                                  Duration: {formatMs(Math.max(0, currentTime.getTime() - new Date(activeShift.activities[activeShift.activities.length - 1].startTime).getTime()))}
-                                </span>
-                              )}
                             </div>
                           ) : (
                             <span className="text-slate-400">N/A</span>
@@ -2760,11 +2953,7 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
             <div className="text-right">
               <p className="text-[9px] uppercase font-bold tracking-widest text-slate-400">Live Server Time (IST)</p>
               <p className="font-mono text-xs font-bold text-slate-800 leading-none mt-1">
-                {currentTime.toLocaleString('en-US', { 
-                  timeZone: 'Asia/Kolkata',
-                  dateStyle: 'medium',
-                  timeStyle: 'medium'
-                })}
+                <LiveHeaderClock />
               </p>
             </div>
           </div>
@@ -2795,26 +2984,17 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
             <CardContent className="pt-6 space-y-6">
               
               {/* Ticking Clock Status inside Punch station */}
-              <div className="grid grid-cols-3 gap-3 p-4 bg-slate-50 rounded-xl border border-slate-200">
-                <div className="text-center border-r border-slate-200">
-                  <p className="text-[9px] font-black uppercase text-slate-400 tracking-wider">Shift Elapsed</p>
-                  <p className="font-mono text-sm font-black text-slate-800 mt-1">{elapsedShift}</p>
-                </div>
-                <div className="text-center border-r border-slate-200">
-                  <p className="text-[9px] font-black uppercase text-slate-400 tracking-wider text-teal-600">Active Work</p>
-                  <p className="font-mono text-sm font-black text-teal-700 mt-1">{elapsedActive}</p>
-                </div>
-                <div className="text-center">
-                  <p className="text-[9px] font-black uppercase text-slate-400 tracking-wider text-amber-600">Total Breaks</p>
-                  <p className="font-mono text-sm font-black text-amber-700 mt-1">{elapsedBreak}</p>
-                </div>
-              </div>
+              <LiveAgentDurations 
+                currentShift={currentShift} 
+                myPastShifts={myPastShifts} 
+                formatMs={formatMs} 
+              />
 
               {/* Device Verification Status */}
               <div className="flex items-center justify-between px-4 py-2.5 bg-slate-50/80 rounded-xl border border-slate-200 border-dashed">
                 <div className="flex items-center gap-2.5">
                   <div className={`p-1.5 rounded-lg ${deviceType === 'Desktop' ? 'bg-emerald-50 text-emerald-600' : 'bg-fuchsia-50 text-fuchsia-600'}`}>
-                    {deviceType === 'Desktop' ? <Monitor size={14} /> : deviceType === 'Tablet' ? <Tablet size={14} /> : <Smartphone size={14} />}
+                    {deviceType === 'Desktop' ? <Monitor size={14} /> : <Smartphone size={14} />}
                   </div>
                   <div>
                     <p className="text-[9px] font-black uppercase text-slate-400 leading-none">Access Point</p>
@@ -2975,35 +3155,12 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
                       {computeShiftStats(currentShift).utilization}%
                     </span>
                   </div>
-                  <div className="flex items-center justify-between text-xs font-medium border-b border-slate-100 pb-1.5">
-                    <span className="text-slate-500">Total Connected:</span>
-                    <span className="font-bold text-slate-700">{elapsedShift}</span>
-                  </div>
-                  <div className="flex items-center justify-between text-xs font-medium">
-                    <span className="text-slate-500">Break Duration:</span>
-                    <span className="font-bold text-amber-600">{elapsedBreak}</span>
-                  </div>
+                  <LiveSummaryStats shift={currentShift} formatMs={formatMs} computeShiftStats={computeShiftStats} />
                 </div>
 
                 {/* Aesthetic Circular Progress */}
                 <div className="relative w-20 h-20 shrink-0 flex items-center justify-center">
-                  <svg className="w-full h-full transform -rotate-90">
-                    <circle cx="40" cy="40" r="32" stroke="#E2E8F0" strokeWidth="6" fill="transparent" />
-                    <circle 
-                      cx="40" 
-                      cy="40" 
-                      r="32" 
-                      stroke="#0D9488" 
-                      strokeWidth="6" 
-                      fill="transparent" 
-                      strokeDasharray={2 * Math.PI * 32}
-                      strokeDashoffset={2 * Math.PI * 32 * (1 - computeShiftStats(currentShift).utilization / 100)}
-                      strokeLinecap="round"
-                    />
-                  </svg>
-                  <span className="absolute font-mono text-xs font-black text-slate-800">
-                    {computeShiftStats(currentShift).utilization}%
-                  </span>
+                  <LiveSummaryProgress shift={currentShift} computeShiftStats={computeShiftStats} />
                 </div>
               </CardContent>
             </Card>

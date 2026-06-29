@@ -1,6 +1,7 @@
 import React, { createContext, useContext, useState, useEffect, ReactNode } from 'react';
 import { db } from '../lib/firebase';
 import { collection, query, where, getDocs, onSnapshot } from 'firebase/firestore';
+import { firestoreLogger } from '../lib/firestoreLogger';
 import { UserProfile, UserRole } from '../types';
 import { normalizeRole } from '../lib/hierarchy';
 
@@ -262,6 +263,7 @@ export const PermissionProvider: React.FC<PermissionProviderProps> = ({ children
 
     // Realtime listener for role permissions
     const unsubscribe = onSnapshot(q, (snapshot) => {
+      firestoreLogger.trackRead('role_permissions_onSnapshot', snapshot.size);
       let permMap: Record<string, PermissionActions> = {};
       
       // If admin, start with full perms. Otherwise start with empty.
@@ -325,6 +327,39 @@ export const PermissionProvider: React.FC<PermissionProviderProps> = ({ children
     // Legacy support for 'Attendance System' -> 'Attendance'
     const targetModule = module === 'Attendance' ? 'Attendance' : module;
     const fallbackModule = module === 'Attendance' ? 'Attendance System' : module;
+    
+    // Ensure anyone except MIS can view 'Workforce TMS'
+    if (module === 'Workforce TMS') {
+      const rawRole = overriddenRole || user?.role || 'AGENT';
+      const roleName = rawRole.toUpperCase();
+      const norm = normalizeRole(roleName);
+      if (norm !== 'MIS') {
+        const dbPerms = permissions[targetModule] || permissions[fallbackModule];
+        return {
+          can_view: true,
+          can_create: dbPerms ? !!dbPerms.can_create : true,
+          can_edit: dbPerms ? !!dbPerms.can_edit : true,
+          can_delete: dbPerms ? !!dbPerms.can_delete : false,
+          can_export: dbPerms ? !!dbPerms.can_export : false,
+          can_approve: dbPerms ? !!dbPerms.can_approve : false,
+          view_team: dbPerms ? !!dbPerms.view_team : false,
+          view_all: dbPerms ? !!dbPerms.view_all : false,
+          assign: dbPerms ? !!dbPerms.assign : false,
+          override: dbPerms ? !!dbPerms.override : false,
+          force_action: dbPerms ? !!dbPerms.force_action : false,
+          manage_settings: dbPerms ? !!dbPerms.manage_settings : false,
+          manage_masters: dbPerms ? !!dbPerms.manage_masters : false,
+          audit_access: dbPerms ? !!dbPerms.audit_access : false,
+          email_trigger: dbPerms ? !!dbPerms.email_trigger : false,
+          bulk_action: dbPerms ? !!dbPerms.bulk_action : false,
+          reopen_records: dbPerms ? !!dbPerms.reopen_records : false,
+          escalate: dbPerms ? !!dbPerms.escalate : false,
+          comment: dbPerms ? !!dbPerms.comment : true,
+          view_sensitive_data: dbPerms ? !!dbPerms.view_sensitive_data : false,
+          tms_permissions: dbPerms ? dbPerms.tms_permissions : undefined
+        };
+      }
+    }
     
     if (module === 'IT Help Desk') {
       return permissions[targetModule] || permissions[fallbackModule] || {
@@ -413,6 +448,29 @@ export const PermissionProvider: React.FC<PermissionProviderProps> = ({ children
     const isAdmin = (roleName === 'ADMIN' || rawRole === 'ADMIN') || (isDeveloper && !overriddenRole);
 
     if (isAdmin) return true;
+
+    // Critical self-service keys for shift, break, and punch controls.
+    // Guaranteeing these are always enabled for standard roles (and never overridden to false)
+    // ensures ICs are never blocked from clocking in/out, switching processes, or managing breaks.
+    const selfServiceKeys: (keyof TMSPermissions)[] = [
+      'view_self_service',
+      'can_punch_in',
+      'can_punch_out',
+      'can_switch_process',
+      'can_start_break',
+      'can_end_break',
+      'can_start_lunch',
+      'can_end_lunch',
+      'can_start_meeting',
+      'can_end_meeting',
+      'can_view_own_shift_summary',
+      'can_view_own_attendance_summary'
+    ];
+
+    const norm = normalizeRole(roleName);
+    if (selfServiceKeys.includes(permKey) && norm !== 'MIS') {
+      return true;
+    }
 
     // First check if db module contains custom rule
     const tmsMod = permissions['Workforce TMS'];

@@ -18,8 +18,9 @@ import {
   RefreshCw
 } from 'lucide-react';
 import { db, auth } from '../../lib/firebase';
-import { doc, setDoc, deleteDoc, writeBatch, collection, getDocs, getDoc, onSnapshot } from 'firebase/firestore';
+import { doc, setDoc, deleteDoc, writeBatch, collection, getDocs, getDoc } from 'firebase/firestore';
 import { UserRole, UserProfile } from '../../types';
+import { isTLRole } from '../../lib/roles';
 import { toast } from 'sonner';
 import * as XLSX from 'xlsx';
 import { UserPicker } from '../UserPicker';
@@ -311,6 +312,7 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
   const [statusFilter, setStatusFilter] = useState('');
   const [deptFilter, setDeptFilter] = useState('');
   const [procFilter, setProcFilter] = useState('');
+  const [locationFilter, setLocationFilter] = useState('');
   
   // Table Sorting
   const [sortBy, setSortBy] = useState<string>('name');
@@ -357,7 +359,8 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
     teamLeadUid: '',
     mappedManagerName: '',
     mappedManagerUid: '',
-    status: 'Active'
+    status: 'Active',
+    location: ''
   });
 
   const [newForm, setNewForm] = useState({
@@ -374,7 +377,8 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
     mappedManagerName: '',
     mappedManagerUid: '',
     status: 'Active',
-    password: 'Password360@'
+    password: 'Password360@',
+    location: ''
   });
 
   // Compute normalizedUsers
@@ -406,7 +410,7 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
         const filterRole = roleFilter.toUpperCase().trim();
         
         if (filterRole === 'TEAM_LEAD' || filterRole === 'TEAM LEAD') {
-          return ['TEAM_LEAD', 'STL', 'QTL', 'OPS_TL', 'TEAM LEAD', 'TRAINER_TL', 'TRAINER TL', 'OPS TL'].includes(userRole);
+          return isTLRole(userRole);
         }
         
         return userRole === filterRole;
@@ -416,8 +420,9 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
         : true;
       const matchDept = deptFilter ? (u.department || 'Operations') === deptFilter : true;
       const matchProc = procFilter ? u.process === procFilter : true;
+      const matchLoc = locationFilter ? u.location === locationFilter : true;
 
-      return matchSearch && matchRole && matchStatus && matchDept && matchProc;
+      return matchSearch && matchRole && matchStatus && matchDept && matchProc && matchLoc;
     }).sort((a, b) => {
       let fieldA = (sortBy === 'name' ? (a.fullName || a.name || '') : (a[sortBy] || ''));
       let fieldB = (sortBy === 'name' ? (b.fullName || b.name || '') : (b[sortBy] || ''));
@@ -429,7 +434,7 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
       if (fieldA > fieldB) return sortOrder === 'asc' ? 1 : -1;
       return 0;
     });
-  }, [normalizedUsers, searchTerm, roleFilter, statusFilter, deptFilter, procFilter, sortBy, sortOrder]);
+  }, [normalizedUsers, searchTerm, roleFilter, statusFilter, deptFilter, procFilter, locationFilter, sortBy, sortOrder]);
 
   const [registeredProcesses, setRegisteredProcesses] = useState<string[]>([]);
   const [dynamicRoles, setDynamicRoles] = useState<string[]>([]);
@@ -472,6 +477,15 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
     const s = new Set<string>();
     allUsers.forEach(u => u.department && s.add(u.department));
     return Array.from(s);
+  }, [allUsers]);
+
+  const locations = useMemo(() => {
+    const s = new Set<string>();
+    s.add('Dehradun (DDN)');
+    s.add('Jammu (JMU)');
+    s.add('Bangalore (BLR)');
+    allUsers.forEach(u => u.location && s.add(u.location));
+    return Array.from(s).filter(Boolean);
   }, [allUsers]);
 
   const processes = useMemo(() => {
@@ -596,6 +610,7 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
       'Email ID': u.email || 'N/A',
       'User Role': u.role || 'N/A',
       'Department Name': u.department || 'Operations',
+      'Location': u.location || 'N/A',
       'Enterprise Process': u.process || 'N/A',
       'Team Lead': u.teamLeadName || 'N/A',
       'Manager Name': u.mappedManagerName || u.Manager || 'N/A',
@@ -613,13 +628,14 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
   };
 
   const handleExportCSV = () => {
-    const headers = ['Employee ID', 'Employee Name', 'Email ID', 'User Role', 'Department Name', 'Enterprise Process', 'Team Lead', 'Manager Name', 'Joined Date', 'Account State', 'Last Login', 'Employee Notes'];
+    const headers = ['Employee ID', 'Employee Name', 'Email ID', 'User Role', 'Department Name', 'Location', 'Enterprise Process', 'Team Lead', 'Manager Name', 'Joined Date', 'Account State', 'Last Login', 'Employee Notes'];
     const rows = filteredUsers.map(u => [
       u.employeeId || 'N/A',
       u.fullName || u.name || 'N/A',
       u.email || 'N/A',
       u.role || 'N/A',
       u.department || 'Operations',
+      u.location || 'N/A',
       u.process || 'N/A',
       u.teamLeadName || 'N/A',
       u.mappedManagerName || u.Manager || 'N/A',
@@ -702,7 +718,8 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
         mappedManagerUid: newForm.mappedManagerUid,
         status: newForm.status || 'Active',
         isActive: (newForm.status || 'Active') === 'Active',
-        createdAt: new Date().toISOString()
+        createdAt: new Date().toISOString(),
+        location: newForm.location || ''
       };
 
       await setDoc(doc(db, 'users', generatedUid), finalProfile);
@@ -720,7 +737,8 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
         managerName: newForm.mappedManagerName || '',
         status: newForm.status || 'Active',
         dateJoined: newForm.dateJoined || '',
-        lastUpdated: new Date().toISOString()
+        lastUpdated: new Date().toISOString(),
+        location: newForm.location || ''
       };
       await setDoc(doc(db, 'employee_master', generatedUid), masterDoc);
 
@@ -751,7 +769,8 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
         notes: '',
         teamLeadName: '',
         mappedManagerName: '',
-        password: 'Password360@'
+        password: 'Password360@',
+        location: ''
       });
       onRefresh();
     } catch (err: any) {
@@ -774,7 +793,8 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
       teamLeadUid: user.teamLeadUid || '',
       mappedManagerName: user.mappedManagerName || user.Manager || '',
       mappedManagerUid: user.mappedManagerUid || '',
-      status: user.status || (user.isActive === false ? 'Inactive' : 'Active')
+      status: user.status || (user.isActive === false ? 'Inactive' : 'Active'),
+      location: user.location || ''
     });
     setIsEditUserOpen(true);
   };
@@ -804,7 +824,8 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
         mappedManagerUid: editForm.mappedManagerUid,
         status: editForm.status,
         isActive: editForm.status === 'Active',
-        lastModifiedAt: new Date().toISOString()
+        lastModifiedAt: new Date().toISOString(),
+        location: editForm.location || ''
       };
 
       await setDoc(doc(db, 'users', editingUser.uid), updatedProfile);
@@ -822,7 +843,8 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
         managerName: editForm.mappedManagerName || '',
         status: editForm.status || 'Active',
         dateJoined: editForm.dateJoined || '',
-        lastUpdated: new Date().toISOString()
+        lastUpdated: new Date().toISOString(),
+        location: editForm.location || ''
       };
       await setDoc(doc(db, 'employee_master', editingUser.uid), masterDoc);
 
@@ -838,6 +860,13 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
         lastUpdated: new Date().toISOString()
       };
       await setDoc(doc(db, 'teamMappings', editingUser.uid), mappingDoc);
+
+      if (editForm.process) {
+        await setDoc(doc(db, 'live_sessions', editingUser.uid), {
+          process: editForm.process,
+          currentProcess: editForm.process
+        }, { merge: true });
+      }
 
       toast.success(`Profile for '${editForm.name}' updated and hierarchy synchronized.`);
       logAdminEvent(
@@ -1025,6 +1054,14 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
           batch.set(doc(db, 'users', uid), finalProfile, { merge: true });
           batch.set(doc(db, 'employee_master', uid), masterDoc, { merge: true });
           batch.set(doc(db, 'teamMappings', uid), mappingDoc, { merge: true });
+
+          const pVal = orig.process || existingUser?.process || '';
+          if (pVal) {
+            batch.set(doc(db, 'live_sessions', uid), {
+              process: pVal,
+              currentProcess: pVal
+            }, { merge: true });
+          }
         });
 
         await batch.commit();
@@ -1282,6 +1319,20 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
               ))}
             </select>
           </div>
+
+          <div>
+            <label className="block text-[10px] font-bold uppercase text-slate-400 mb-1">Employee Location</label>
+            <select 
+              value={locationFilter} 
+              onChange={e => { setLocationFilter(e.target.value); setPage(0); }} 
+              className={adminTheme === 'dark' ? 'w-full bg-slate-800 text-xs px-2 py-1.5 rounded-lg border border-slate-700' : 'w-full bg-white text-xs px-2 py-1.5 rounded-lg border border-slate-200'}
+            >
+              <option value="">All Locations</option>
+              {locations.map(loc => (
+                <option key={loc} value={loc}>{loc}</option>
+              ))}
+            </select>
+          </div>
         </div>
       </div>
 
@@ -1319,6 +1370,7 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
                 <th className="p-4 font-bold">Email</th>
                 <th className="p-4 font-bold">Role</th>
                 <th className="p-4 font-bold">Division</th>
+                <th className="p-4 font-bold">Location</th>
                 <th className="p-4 font-bold">Process</th>
                 <th className="p-4 font-bold">Team Lead</th>
                 <th className="p-4 font-bold">Manager</th>
@@ -1368,6 +1420,7 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
                         </span>
                       </td>
                       <td className="p-4 font-medium opacity-85">{user.department || 'Operations'}</td>
+                      <td className="p-4 font-bold text-indigo-600 dark:text-indigo-400 opacity-90">{user.location || 'N/A'}</td>
                       <td className="p-4 font-mono font-bold opacity-85">{user.process || 'Commonpool'}</td>
                       <td className="p-4 font-medium text-slate-500 dark:text-slate-400">{user.teamLeadName || 'N/A'}</td>
                       <td className="p-4 font-medium text-slate-500 dark:text-slate-400">{user.mappedManagerName || user.Manager || 'N/A'}</td>
@@ -1579,6 +1632,20 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
               </div>
 
               <div>
+                <label className="block text-[10px] font-bold text-slate-400 mb-0.5">Employee Location</label>
+                <select 
+                  value={newForm.location || ''} 
+                  onChange={e => setNewForm({...newForm, location: e.target.value})} 
+                  className={adminTheme === 'dark' ? 'w-full bg-slate-900 p-2 border border-slate-705 rounded-lg text-slate-350 text-xs' : 'w-full bg-white border border-slate-200 p-2 rounded-lg text-slate-650 text-xs'}
+                >
+                  <option value="">Select Location...</option>
+                  <option value="Dehradun (DDN)">Dehradun (DDN)</option>
+                  <option value="Jammu (JMU)">Jammu (JMU)</option>
+                  <option value="Bangalore (BLR)">Bangalore (BLR)</option>
+                </select>
+              </div>
+
+              <div>
                 <label className="block text-[10px] font-bold text-slate-400 mb-0.5">Product Campaign / Process</label>
                 <select 
                   value={newForm.process} 
@@ -1721,6 +1788,20 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
                   placeholder="e.g. Quality Assurance" 
                   className={adminTheme === 'dark' ? 'w-full bg-slate-900 p-2 border border-slate-700 rounded-lg' : 'w-full bg-white border border-slate-200 p-2 rounded-lg'}
                 />
+              </div>
+
+              <div>
+                <label className="block text-[10px] font-bold text-slate-400 mb-0.5">Employee Location</label>
+                <select 
+                  value={editForm.location || ''} 
+                  onChange={e => setEditForm({...editForm, location: e.target.value})} 
+                  className={adminTheme === 'dark' ? 'w-full bg-slate-900 p-2 border border-slate-700 rounded-lg text-slate-350 text-xs' : 'w-full bg-white border border-slate-200 p-2 rounded-lg text-slate-650 text-xs'}
+                >
+                  <option value="">Select Location...</option>
+                  <option value="Dehradun (DDN)">Dehradun (DDN)</option>
+                  <option value="Jammu (JMU)">Jammu (JMU)</option>
+                  <option value="Bangalore (BLR)">Bangalore (BLR)</option>
+                </select>
               </div>
 
               <div>

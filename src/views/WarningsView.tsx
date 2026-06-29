@@ -31,8 +31,9 @@ import { WarningTicket, UserRole, UserProfile } from '../types';
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogTrigger } from '../components/ui/dialog';
 import WarningManager from '../components/WarningManager';
 import { db, handleFirestoreError, OperationType } from '../lib/firebase';
+import { firestoreLogger } from '../lib/firestoreLogger';
 import { softDeleteRecord } from '../lib/adminUtils';
-import { doc, setDoc, updateDoc, addDoc, collection } from 'firebase/firestore';
+import { doc, setDoc, updateDoc, addDoc, collection, getDoc, getDocs, query, orderBy, where, limit, startAfter } from 'firebase/firestore';
 import { toast } from 'sonner';
 import { usePermission } from '../components/PermissionContext';
 import { canActOn } from '../lib/hierarchy';
@@ -143,8 +144,88 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
   const [editRemarks, setEditRemarks] = useState('');
   const [ticketToDelete, setTicketToDelete] = useState<WarningTicket | null>(null);
 
+  const [warningsList, setWarningsList] = useState<WarningTicket[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [currentPage, setCurrentPage] = useState(1);
+  const [pageCursors, setPageCursors] = useState<any[]>([]);
+  const [hasMore, setHasMore] = useState(false);
+  const PAGE_LIMIT = 10;
+  const [refreshKey, setRefreshKey] = useState(0);
+
+  const triggerRefresh = () => setRefreshKey(prev => prev + 1);
+
+  // Paginated loading of warnings
+  React.useEffect(() => {
+    let active = true;
+    const loadWarnings = async () => {
+      setLoading(true);
+      try {
+        let canSeeAllWarnings = false;
+        
+        const warningsDocId = `${user.role?.toUpperCase()}_Warnings`;
+        const permissionsDoc = await getDoc(doc(db, 'role_permissions', warningsDocId));
+        
+        if (permissionsDoc.exists()) {
+          const perms = permissionsDoc.data();
+          canSeeAllWarnings = !!perms.can_view || !!perms.can_edit || !!perms.can_delete || !!perms.can_approve;
+        } else {
+          canSeeAllWarnings = ['ADMIN', 'MANAGER', 'ASSISTANT_MANAGER', 'QA', 'TEAM_LEAD', 'STL', 'OPS_TL'].includes(user.role?.toUpperCase() || '');
+        }
+
+        let q;
+        if (canSeeAllWarnings) {
+          q = query(collection(db, 'disciplinaryLogs'), orderBy('createdAt', 'desc'));
+        } else {
+          q = query(collection(db, 'disciplinaryLogs'), where('agentId', '==', user.uid), orderBy('createdAt', 'desc'));
+        }
+
+        let qLimit = query(q, limit(PAGE_LIMIT + 1));
+        if (currentPage > 1 && pageCursors[currentPage - 2]) {
+          qLimit = query(q, startAfter(pageCursors[currentPage - 2]), limit(PAGE_LIMIT + 1));
+        }
+
+        const snap = await getDocs(qLimit);
+        if (!active) return;
+        firestoreLogger.trackRead('warnings_paginated_getDocs', snap.size);
+
+        let docs = snap.docs;
+        const moreExist = docs.length > PAGE_LIMIT;
+        if (moreExist) {
+          docs = docs.slice(0, PAGE_LIMIT);
+        }
+        setHasMore(moreExist);
+
+        if (docs.length > 0) {
+          const lastDoc = docs[docs.length - 1];
+          setPageCursors(prev => {
+            const nextCursors = [...prev];
+            nextCursors[currentPage - 1] = lastDoc;
+            return nextCursors;
+          });
+        }
+
+        const list = docs.map(d => ({ id: d.id, ...(d.data() as any) } as WarningTicket));
+        setWarningsList(list);
+      } catch (err) {
+        console.error('Error fetching paginated warnings:', err);
+      } finally {
+        if (active) setLoading(false);
+      }
+    };
+
+    loadWarnings();
+    return () => {
+      active = false;
+    };
+  }, [user.uid, currentPage, refreshKey]);
+
+  React.useEffect(() => {
+    setCurrentPage(1);
+    setPageCursors([]);
+  }, [user.uid]);
+
   // Filter based on hierarchy, and exclude soft-deleted
-  const filteredWarnings = warnings.filter(w => {
+  const filteredWarnings = warningsList.filter(w => {
     if (w.isDeleted) return false; 
     
     // Visibility check: 
@@ -206,6 +287,7 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
 
         toast.success('Warning ticket successfully soft-deleted.');
         setTicketToDelete(null);
+        triggerRefresh();
         if (onRefresh) onRefresh();
     } catch (err: any) {
          console.error('Deletion failure:', err);
@@ -222,6 +304,7 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
       await updateDoc(doc(db, 'disciplinaryLogs', ticketToEdit.id), { remarks: editRemarks });
       toast.success('Warning updated successfully');
       setTicketToEdit(null);
+      triggerRefresh();
       if (onRefresh) onRefresh();
     } catch (err: any) {
       toast.error(`Update failed: ${err.message}`);
@@ -353,7 +436,7 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
                     Select an agent, warning severity, and notification path under the staircase policy.
                   </DialogDescription>
                 </DialogHeader>
-                <WarningManager allUsers={allUsers} onClose={() => { setIsWarningOpen(false); if (onRefresh) onRefresh(); }} />
+                <WarningManager allUsers={allUsers} onClose={() => { setIsWarningOpen(false); triggerRefresh(); if (onRefresh) onRefresh(); }} />
               </DialogContent>
             </Dialog>
           )}
@@ -682,6 +765,33 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
                   )}
                 </TableBody>
               </Table>
+
+              {/* Pagination Controls */}
+              <div className="flex items-center justify-between p-4 border-t border-slate-100 dark:border-slate-800 bg-slate-50/30">
+                <div className="text-xs text-slate-500 font-semibold">
+                  Page <span className="font-bold">{currentPage}</span>
+                </div>
+                <div className="flex gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={currentPage === 1 || loading}
+                    onClick={() => setCurrentPage(prev => Math.max(prev - 1, 1))}
+                    className="font-bold text-xs h-8"
+                  >
+                    Previous
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={!hasMore || loading}
+                    onClick={() => setCurrentPage(prev => prev + 1)}
+                    className="font-bold text-xs h-8"
+                  >
+                    Next
+                  </Button>
+                </div>
+              </div>
             </CardContent>
           </Card>
         </div>

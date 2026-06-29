@@ -904,8 +904,245 @@ export async function runDynamicKPIEngine(reportingPeriod: string, allUsersPasse
       await batch.commit();
     }
 
+    // REDESIGN: Generate precalculated leaderboards to minimize Firestore reads downstream
+    console.log('[KPI ENGINE] Generating precomputed leaderboards...');
+    const lastCalculatedAt = new Date().toISOString();
+    const leaderboardsToSave: any[] = [];
+
+    const getCategoryScores = (kpiBreakdown: any[]) => {
+      let qualitySum = 0, qualityCount = 0;
+      let productivitySum = 0, productivityCount = 0;
+      let attendanceSum = 0, attendanceCount = 0;
+
+      if (kpiBreakdown) {
+        kpiBreakdown.forEach(k => {
+          const kName = (k.name || '').toLowerCase().trim();
+          const pAch = k.achievementPct !== undefined ? k.achievementPct : 0;
+          
+          if (kName.includes('quality') || kName.includes('accuracy') || kName.includes('accura')) {
+            qualitySum += pAch;
+            qualityCount++;
+          }
+          if (kName.includes('productivity') || kName.includes('production') || kName.includes('throughput') || kName.includes('volume') || kName.includes('count') || kName.includes('speed') || kName.includes('efficiency') || kName.includes('output') || kName.includes('aht')) {
+            productivitySum += pAch;
+            productivityCount++;
+          }
+          if (kName.includes('attendance') || kName.includes('present') || kName.includes('absent') || kName.includes('shrinkage') || kName.includes('adherence') || kName.includes('leave')) {
+            attendanceSum += pAch;
+            attendanceCount++;
+          }
+        });
+      }
+
+      return {
+        qualityScore: qualityCount > 0 ? Math.round((qualitySum / qualityCount) * 100) / 100 : 0,
+        productivityScore: productivityCount > 0 ? Math.round((productivitySum / productivityCount) * 100) / 100 : 0,
+        attendanceScore: attendanceCount > 0 ? Math.round((attendanceSum / attendanceCount) * 100) / 100 : 0
+      };
+    };
+
+    const calculateLeaderboardStats = (matches: DynamicScorecard[], lKey: string) => {
+      if (matches.length === 0) {
+        return {
+          processName: lKey,
+          totalEmployees: 0,
+          averageScore: 0,
+          averageQuality: 0,
+          averageProductivity: 0,
+          averageAttendance: 0,
+          topPerformer: '-',
+          topPerformerScore: 0,
+          bottomPerformer: '-',
+          bottomPerformerScore: 0
+        };
+      }
+
+      const sorted = [...matches].sort((a, b) => b.finalScore - a.finalScore);
+      const top = sorted[0];
+      const bottom = sorted[sorted.length - 1];
+
+      let qualitySum = 0, qualityCount = 0;
+      let productivitySum = 0, productivityCount = 0;
+      let attendanceSum = 0, attendanceCount = 0;
+
+      matches.forEach(sc => {
+        if (sc.kpiBreakdown) {
+          sc.kpiBreakdown.forEach(k => {
+            const kName = (k.name || '').toLowerCase().trim();
+            const pAch = k.achievementPct !== undefined ? k.achievementPct : 0;
+            
+            if (kName.includes('quality') || kName.includes('accuracy') || kName.includes('accura')) {
+              qualitySum += pAch;
+              qualityCount++;
+            }
+            if (kName.includes('productivity') || kName.includes('production') || kName.includes('throughput') || kName.includes('volume') || kName.includes('count') || kName.includes('speed') || kName.includes('efficiency') || kName.includes('output') || kName.includes('aht')) {
+              productivitySum += pAch;
+              productivityCount++;
+            }
+            if (kName.includes('attendance') || kName.includes('present') || kName.includes('absent') || kName.includes('shrinkage') || kName.includes('adherence') || kName.includes('leave')) {
+              attendanceSum += pAch;
+              attendanceCount++;
+            }
+          });
+        }
+      });
+
+      return {
+        totalEmployees: matches.length,
+        averageScore: Math.round(matches.reduce((sum, s) => sum + s.finalScore, 0) / matches.length * 10) / 10,
+        averageQuality: qualityCount > 0 ? Math.round(qualitySum / qualityCount * 10) / 10 : 0,
+        averageProductivity: productivityCount > 0 ? Math.round(productivitySum / productivityCount * 10) / 10 : 0,
+        averageAttendance: attendanceCount > 0 ? Math.round(attendanceSum / attendanceCount * 10) / 10 : 0,
+        topPerformer: top ? top.employeeName : '-',
+        topPerformerScore: top ? top.finalScore : 0,
+        bottomPerformer: bottom ? bottom.employeeName : '-',
+        bottomPerformerScore: bottom ? bottom.finalScore : 0
+      };
+    };
+
+    const addLeaderboard = (type: string, key: string, matches: DynamicScorecard[]) => {
+      const sorted = [...matches].sort((a, b) => b.finalScore - a.finalScore);
+      const rankings = sorted.map((m, idx) => {
+        const cat = getCategoryScores(m.kpiBreakdown || []);
+        return {
+          rank: idx + 1,
+          employeeId: m.employeeEmail,
+          employeeName: m.employeeName,
+          employeeEmail: m.employeeEmail,
+          finalScore: m.finalScore,
+          rating: m.rating || 'N/A',
+          qualityScore: cat.qualityScore,
+          productivityScore: cat.productivityScore,
+          attendanceScore: cat.attendanceScore,
+          kpis: [
+            { name: 'Quality', actual: Math.round(cat.qualityScore), target: 100 },
+            { name: 'Productivity', actual: Math.round(cat.productivityScore), target: 100 },
+            { name: 'Attendance', actual: Math.round(cat.attendanceScore), target: 100 }
+          ],
+          process: m.processName
+        };
+      });
+
+      const stats = calculateLeaderboardStats(matches, key === 'global' ? 'Global' : key);
+
+      let docId = '';
+      const sanitizedKey = key.trim().replace(/[\s\/]+/g, '_');
+      if (type === 'role') {
+        docId = `${cleanPeriod}_${sanitizedKey}`;
+      } else {
+        docId = `${cleanPeriod}_${type}_${sanitizedKey}`;
+      }
+
+      leaderboardsToSave.push({
+        id: docId,
+        reportingPeriod: cleanPeriod,
+        leaderboardType: type,
+        leaderboardKey: key,
+        lastCalculatedAt,
+        stats,
+        rankings
+      });
+    };
+
+    // 1. Role Leaderboards
+    SUPPORTED_ROLES.forEach(role => {
+      const matches = computedScorecards.filter(sc => sc.role.toUpperCase() === role.toUpperCase());
+      addLeaderboard('role', role, matches);
+    });
+
+    // 2. Process Leaderboards
+    const processesSet = new Set<string>();
+    computedScorecards.forEach(sc => {
+      if (sc.processName && sc.processName.trim()) {
+        processesSet.add(sc.processName.trim());
+      }
+    });
+    addLeaderboard('process', 'All', computedScorecards);
+    processesSet.forEach(proc => {
+      const matches = computedScorecards.filter(sc => sc.processName === proc);
+      addLeaderboard('process', proc, matches);
+    });
+
+    // 3. Team Lead Leaderboards
+    const teamLeadsSet = new Set<string>();
+    computedScorecards.forEach(sc => {
+      if (sc.teamLeadName && sc.teamLeadName.trim()) {
+        teamLeadsSet.add(sc.teamLeadName.trim());
+      }
+    });
+    addLeaderboard('team_lead', 'All', computedScorecards);
+    teamLeadsSet.forEach(tl => {
+      const matches = computedScorecards.filter(sc => (sc.teamLeadName || '').toLowerCase().trim() === tl.toLowerCase().trim());
+      addLeaderboard('team_lead', tl, matches);
+    });
+
+    // 4. Manager Leaderboards
+    const managersSet = new Set<string>();
+    computedScorecards.forEach(sc => {
+      const mName = sc.mappedManagerName || sc.Manager;
+      if (mName && mName.trim()) {
+        managersSet.add(mName.trim());
+      }
+    });
+    addLeaderboard('manager', 'All', computedScorecards);
+    managersSet.forEach(mgr => {
+      const matches = computedScorecards.filter(sc => {
+        const mName = (sc.mappedManagerName || sc.Manager || '').toLowerCase().trim();
+        return mName === mgr.toLowerCase().trim();
+      });
+      addLeaderboard('manager', mgr, matches);
+    });
+
+    // 5. Global Leaderboard with metadata lists
+    const sortedGlobal = [...computedScorecards].sort((a, b) => b.finalScore - a.finalScore);
+    const globalRankings = sortedGlobal.map((m, idx) => {
+      const cat = getCategoryScores(m.kpiBreakdown || []);
+      return {
+        rank: idx + 1,
+        employeeId: m.employeeEmail,
+        employeeName: m.employeeName,
+        employeeEmail: m.employeeEmail,
+        finalScore: m.finalScore,
+        rating: m.rating || 'N/A',
+        qualityScore: cat.qualityScore,
+        productivityScore: cat.productivityScore,
+        attendanceScore: cat.attendanceScore,
+        kpis: [
+          { name: 'Quality', actual: Math.round(cat.qualityScore), target: 100 },
+          { name: 'Productivity', actual: Math.round(cat.productivityScore), target: 100 },
+          { name: 'Attendance', actual: Math.round(cat.attendanceScore), target: 100 }
+        ],
+        process: m.processName
+      };
+    });
+    const globalStats = calculateLeaderboardStats(computedScorecards, 'Global');
+    
+    const globalDocId = `${cleanPeriod}_global`;
+    leaderboardsToSave.push({
+      id: globalDocId,
+      reportingPeriod: cleanPeriod,
+      leaderboardType: 'global',
+      leaderboardKey: 'global',
+      lastCalculatedAt,
+      stats: globalStats,
+      rankings: globalRankings,
+      availableProcesses: Array.from(processesSet).sort(),
+      availableTeamLeads: Array.from(teamLeadsSet).sort(),
+      availableManagers: Array.from(managersSet).sort()
+    });
+
+    const leaderboardChunks = chunkArray(leaderboardsToSave, 400);
+    for (const chunk of leaderboardChunks) {
+      const batch = writeBatch(db);
+      chunk.forEach(lb => {
+        const ref = doc(db, 'leaderboards', lb.id);
+        batch.set(ref, lb);
+      });
+      await batch.commit();
+    }
+
     console.log('========================================================================');
-    console.log(`[KPI ENGINE REDESIGNED] COMPLETED SUCCESSFULLY. generated ${computedScorecards.length} scorecards.`);
+    console.log(`[KPI ENGINE REDESIGNED] COMPLETED SUCCESSFULLY. generated ${computedScorecards.length} scorecards and ${leaderboardsToSave.length} precomputed leaderboards.`);
     console.log('========================================================================');
 
     return { scorecardsCount: computedScorecards.length };
