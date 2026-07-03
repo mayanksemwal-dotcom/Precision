@@ -20,6 +20,7 @@ import {
   Award,
   Plus,
   Shield,
+  ShieldCheck,
   Clock3,
   UserX,
   Sparkles,
@@ -66,6 +67,7 @@ import {
 import { UserProfile, UserRole } from '../../types';
 import { toast } from 'sonner';
 import { canActOn } from '../../lib/hierarchy';
+import { sanitizeTimestamp } from '../../lib/utils';
 import { usePermission } from '../PermissionContext';
 import { useRoster } from './useRoster';
 import { useLiveShifts } from './useLiveShifts';
@@ -238,13 +240,13 @@ export default function SupervisorDashboard({ user: propUser, currentUser, allUs
   }, [user, propAllUsers]);
 
   // Tab control
-  const [activeTab, setActiveTab] = useState<'controls' | 'hierarchy' | 'alerts'>('controls');
+  const [activeTab, setActiveTab] = useState<'controls' | 'hierarchy' | 'alerts' | 'mapping'>('controls');
   
   // Tab-specific loading states
   const [isTrackingEnabled, setIsTrackingEnabled] = useState(true);
   const [isHistoryEnabled, setIsHistoryEnabled] = useState(true);
   
-  const handleTabChange = (tab: 'controls' | 'hierarchy' | 'alerts') => {
+  const handleTabChange = (tab: 'controls' | 'hierarchy' | 'alerts' | 'mapping') => {
     setActiveTab(tab);
     if (tab === 'alerts' && !isHistoryEnabled) {
       setIsHistoryEnabled(true);
@@ -253,6 +255,38 @@ export default function SupervisorDashboard({ user: propUser, currentUser, allUs
 
   const [activeShifts, setActiveShifts] = useState<TMSShift[]>([]);
   const [localSuperOwnShift, setLocalSuperOwnShift] = useState<TMSShift | null | undefined>(undefined);
+  const [ownActiveShift, setOwnActiveShift] = useState<TMSShift | null>(null);
+
+  // Real-time direct subscription to supervisor's own active/break shifts
+  useEffect(() => {
+    if (!user?.uid) return;
+
+    const q = query(
+      collection(db, 'tmsShifts'),
+      where('userId', '==', user.uid),
+      where('status', 'in', ['ACTIVE', 'BREAK'])
+    );
+
+    const unsub = onSnapshot(q, (snapshot) => {
+      firestoreLogger.trackRead('supervisor_own_active_shifts_snapshot', snapshot.size);
+      const rawActiveShifts = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as TMSShift));
+      
+      const activeShiftsList = [...rawActiveShifts].sort((a, b) => 
+        new Date(b.clockInTime).getTime() - new Date(a.clockInTime).getTime()
+      );
+      
+      if (activeShiftsList.length > 0) {
+        setOwnActiveShift(activeShiftsList[0]);
+      } else {
+        setOwnActiveShift(null);
+      }
+    }, (err) => {
+      console.error('Failed to subscribe supervisor own shifts', err);
+    });
+
+    return () => unsub();
+  }, [user?.uid]);
+
   const { shifts: liveShifts, loading: loadingLiveShifts, fetchLiveShifts } = useLiveShifts(
     user?.uid, 
     user?.role, 
@@ -274,12 +308,20 @@ export default function SupervisorDashboard({ user: propUser, currentUser, allUs
       let finalShifts = [...liveShifts];
       const myId = user.uid;
 
+      // Ensure supervisor's own live shift (if present in authoritative collection) is merged
+      if (ownActiveShift) {
+        finalShifts = finalShifts.filter(s => s.userId !== myId);
+        finalShifts.push(ownActiveShift);
+      } else {
+        finalShifts = finalShifts.filter(s => s.userId !== myId);
+      }
+
       if (localSuperOwnShift !== undefined) {
         if (localSuperOwnShift === null) {
           // Optimistically clocked out. Filter out our own shift.
           finalShifts = finalShifts.filter(s => s.userId !== myId);
           // If the server also shows we are clocked out, clear the override lock.
-          const serverHasMe = liveShifts.some(s => s.userId === myId);
+          const serverHasMe = ownActiveShift !== null;
           if (!serverHasMe) {
             setLocalSuperOwnShift(undefined);
           }
@@ -289,7 +331,7 @@ export default function SupervisorDashboard({ user: propUser, currentUser, allUs
           finalShifts.push(localSuperOwnShift);
 
           // Once the server matches our local status, process, and activities size, clear override.
-          const serverShift = liveShifts.find(s => s.userId === myId);
+          const serverShift = ownActiveShift;
           if (serverShift) {
             const serverLastAct = serverShift.activities?.[serverShift.activities.length - 1];
             const localLastAct = localSuperOwnShift.activities?.[localSuperOwnShift.activities.length - 1];
@@ -308,7 +350,7 @@ export default function SupervisorDashboard({ user: propUser, currentUser, allUs
     } else {
       setActiveShifts([]);
     }
-  }, [liveShifts, isTrackingEnabled, localSuperOwnShift, user.uid]);
+  }, [liveShifts, isTrackingEnabled, localSuperOwnShift, ownActiveShift, user.uid]);
 
   const [isLoadingShifts, setIsLoadingShifts] = useState(false);
   const [lastRefreshed, setLastRefreshed] = useState<Date>(new Date());
@@ -340,12 +382,14 @@ export default function SupervisorDashboard({ user: propUser, currentUser, allUs
   }, [processes]);
 
   useEffect(() => {
-    if (user?.lastUsedProcess) {
-      setSuperSelectedProcess(user.lastUsedProcess);
-    } else if (supervisorProcesses.length > 0 && !superSelectedProcess) {
-      setSuperSelectedProcess(supervisorProcesses[0]);
+    if (supervisorProcesses.length > 0) {
+      if (user?.lastUsedProcess && supervisorProcesses.includes(user.lastUsedProcess)) {
+        setSuperSelectedProcess(user.lastUsedProcess);
+      } else if (!superSelectedProcess || !supervisorProcesses.includes(superSelectedProcess)) {
+        setSuperSelectedProcess(supervisorProcesses[0]);
+      }
     }
-  }, [user?.lastUsedProcess, supervisorProcesses, superSelectedProcess]);
+  }, [user?.lastUsedProcess, supervisorProcesses]);
 
   const performSuperClockIn = async (targetProcess: string) => {
     if (!targetProcess) {
@@ -377,6 +421,7 @@ export default function SupervisorDashboard({ user: propUser, currentUser, allUs
       clockInTime: nowISO,
       activities: [{ type: 'productive', name: targetProcess, startTime: nowISO, device: currentDev }],
       status: 'ACTIVE',
+      currentActivity: targetProcess || 'General',
       clockInDevice: currentDev,
       hasMobilePunches: currentDev === 'mobile',
       deviceType: meta.deviceType,
@@ -418,13 +463,13 @@ export default function SupervisorDashboard({ user: propUser, currentUser, allUs
           employeeId: user.uid,
           employeeName: user.name,
           role: user.role || 'SUPERVISOR',
-          process: targetProcess,
-          currentProcess: targetProcess,
+          process: targetProcess || 'General',
+          currentProcess: targetProcess || 'General',
           managerId: (user as any).mappedManagerId || (user as any).managerId || '',
           tlId: (user as any).teamLeadId || (user as any).teamLeadUid || '',
           status: 'ACTIVE',
           sessionStatus: 'ACTIVE',
-          currentActivity: targetProcess,
+          currentActivity: targetProcess || 'General',
           currentActivityStartTime: nowISO,
           breakType: null,
           productiveSeconds: 0,
@@ -529,6 +574,7 @@ export default function SupervisorDashboard({ user: propUser, currentUser, allUs
         ...myShift, 
         activities: updatedActivities, 
         status: 'BREAK' as const,
+        currentActivity: breakName,
         hasMobilePunches: myShift.hasMobilePunches || currentDev === 'mobile'
       };
 
@@ -598,6 +644,7 @@ export default function SupervisorDashboard({ user: propUser, currentUser, allUs
         ...myShift, 
         activities: updatedActivities, 
         status: 'ACTIVE' as const,
+        currentActivity: resumeProcess || 'General',
         hasMobilePunches: myShift.hasMobilePunches || currentDev === 'mobile'
       };
 
@@ -676,6 +723,7 @@ export default function SupervisorDashboard({ user: propUser, currentUser, allUs
       ...myShift, 
       activities: updatedActivities, 
       status: 'ACTIVE' as const,
+      currentActivity: newProcess || 'General',
       hasMobilePunches: myShift.hasMobilePunches || currentDev === 'mobile'
     };
 
@@ -1020,7 +1068,7 @@ export default function SupervisorDashboard({ user: propUser, currentUser, allUs
   // List of unique Team Leads who have members in mappedUsers or have a TL role
   const teamLeadsList = useMemo(() => {
     const leads = new Map<string, { name: string; role: string }>();
-    const tlRoles = new Set(['TEAM_LEAD', 'STL', 'OPS_TL', 'QTL', 'TRAINER_TL', 'TEAM LEAD', 'OPS TL', 'TRAINER TL', 'SME']);
+    const tlRoles = new Set(['TEAM_LEAD', 'STL', 'OPS_TL', 'QTL', 'TRAINER_TL', 'TEAM LEAD', 'OPS TL', 'TRAINER TL', 'OPS TEAM LEAD', 'TEAM LEADER', 'SME']);
 
     allUsers.forEach(u => {
       // 1. Add anyone explicitly referenced as a team lead in any active user's profile
@@ -1200,9 +1248,7 @@ export default function SupervisorDashboard({ user: propUser, currentUser, allUs
 
     return sourceUsers.filter(u => {
       const liveShift = activeShiftsMap.get(u.uid);
-      
-      // Do not push offline users at front-end Live Operational Supervisor Table
-      if (!liveShift) return false;
+      const isLive = liveShift && ['ACTIVE', 'BREAK'].includes(liveShift.status);
 
       const matchesSearch = !searchLower 
         ? true 
@@ -1217,7 +1263,7 @@ export default function SupervisorDashboard({ user: propUser, currentUser, allUs
       if (shiftFilter !== 'all') {
         if (shiftFilter === 'active' && (!liveShift || liveShift.status !== 'ACTIVE')) return false;
         if (shiftFilter === 'break' && (!liveShift || liveShift.status !== 'BREAK')) return false;
-        if (shiftFilter === 'offline' && liveShift) return false;
+        if (shiftFilter === 'offline' && isLive) return false;
         if (shiftFilter === 'lunch') {
           if (!liveShift || liveShift.status !== 'BREAK') return false;
           const shActs = liveShift.activities || [];
@@ -1389,37 +1435,44 @@ export default function SupervisorDashboard({ user: propUser, currentUser, allUs
   }, [sortedWorkforce, currentPage, itemsPerPage]);
 
   const uniqueActiveActivities = useMemo(() => {
-    if (isTeamLeadOrSME) {
-      // For TL/SME, we might still need to restrict by their assigned process
-      // if that's the business requirement, but if they want "Current Activity",
-      // we should probably still look at the shifts of their mapped users.
-      // Given the previous code, let's keep the restriction but fix the source.
-      
-      const list = new Set<string>();
-      activeShifts.forEach(sh => {
-        // Only consider shifts for users in this TL's team
-        if (sh.userEmail && mappedUsers.some(u => u.email === sh.userEmail)) {
-           const shActs = sh.activities || [];
-           const act = shActs.length > 0 ? shActs[shActs.length - 1] : null;
-           if (act) {
-             list.add(act.name.trim());
-           }
-        }
-      });
-      return Array.from(list).filter(Boolean);
-    }
-
     const list = new Set<string>();
-    // 1. Add processes from currently active/live shifts' current active activity
+    
+    // Determine scope of users to look for activities
+    const relevantUsers = (isTeamLeadOrSME || isManagerOrLead) ? mappedUsers : allUsers;
+    const userEmailSet = new Set(relevantUsers.map(u => (u.email || '').toLowerCase().trim()).filter(Boolean));
+    const userIdSet = new Set(relevantUsers.map(u => u.uid).filter(Boolean));
+
     activeShifts.forEach(sh => {
+      const shEmail = (sh.userEmail || '').toLowerCase().trim();
+      const shUid = sh.userId;
+      
+      // If we are restricted by team, check if shift belongs to our team
+      const isOurTeam = (shEmail && userEmailSet.has(shEmail)) || (shUid && userIdSet.has(shUid));
+      if ((isTeamLeadOrSME || isManagerOrLead) && !isOurTeam) {
+        return;
+      }
+
+      // Check last activity in array
       const shActs = sh.activities || [];
       const act = shActs.length > 0 ? shActs[shActs.length - 1] : null;
-      if (act) {
+      if (act && act.name) {
         list.add(act.name.trim());
       }
+      
+      // Fallback to currentActivity field if present
+      const currAct = (sh as any).currentActivity;
+      if (currAct) {
+        list.add(currAct.trim());
+      }
     });
-    return Array.from(list).filter(Boolean);
-  }, [activeShifts, mappedUsers, user, isTeamLeadOrSME]);
+
+    // Ensure we always have some common activities as fallback if list is empty
+    if (list.size === 0) {
+      ['HITL', 'MPQC', 'OQC', 'SOP Training', 'QA Review', 'Team Alignment', 'Admin', 'Support', 'Quality Check'].forEach(a => list.add(a));
+    }
+
+    return Array.from(list).sort().filter(Boolean);
+  }, [activeShifts, mappedUsers, allUsers, isTeamLeadOrSME, isManagerOrLead]);
 
   const uniqueLocations = useMemo(() => {
     const list = new Set<string>();
@@ -1448,52 +1501,99 @@ export default function SupervisorDashboard({ user: propUser, currentUser, allUs
 
   // Perform operational Force Out
   const executeSupervisorClockOut = async () => {
-    if (!logoutShiftId) return;
+    if (!logoutTargetUid) return;
+    setIsBulkLoggingOut(true);
     try {
-      const shiftRef = doc(db, 'tmsShifts', logoutShiftId);
-      const snapshot = await getDoc(shiftRef);
-      if (!snapshot.exists()) {
-        toast.error('Active shift has completed or moved.');
-        return;
-      }
-
-      const shift = snapshot.data() as TMSShift;
-      const nowISO = new Date().toISOString();
+      let shiftRef = logoutShiftId ? doc(db, 'tmsShifts', logoutShiftId) : null;
+      let snapshot = shiftRef ? await getDoc(shiftRef) : null;
       
-      const updatedActivities = [...(shift.activities || [])];
-      if (updatedActivities.length > 0) {
-        const lastIndex = updatedActivities.length - 1;
-        if (!updatedActivities[lastIndex].endTime) {
-          updatedActivities[lastIndex].endTime = nowISO;
+      if (!snapshot || !snapshot.exists()) {
+        // Fallback: Try to find any active shift for this user
+        const q = query(
+          collection(db, 'tmsShifts'),
+          where('userId', '==', logoutTargetUid)
+        );
+        const qSnap = await getDocs(q);
+        const activeDoc = qSnap.docs.find(d => ['ACTIVE', 'BREAK'].includes(d.data().status));
+        
+        if (activeDoc) {
+          snapshot = activeDoc;
+          shiftRef = doc(db, 'tmsShifts', snapshot.id);
         }
       }
 
-      const finalShift: TMSShift = {
-        ...shift,
-        activities: updatedActivities,
-        status: 'COMPLETED',
-        clockOutTime: nowISO
-      };
+      const nowISO = new Date().toISOString();
 
-      await setDoc(shiftRef, finalShift);
-      await syncShiftToAttendance(finalShift);
+      if (snapshot && snapshot.exists() && shiftRef) {
+        const shift = snapshot.data() as TMSShift;
+        const updatedActivities = [...(shift.activities || [])];
+        if (updatedActivities.length > 0) {
+          const lastIndex = updatedActivities.length - 1;
+          if (!updatedActivities[lastIndex].endTime) {
+            updatedActivities[lastIndex].endTime = nowISO;
+          }
+        }
 
-      // Log in audit trail
-      await addDoc(collection(db, 'adminAuditLogs'), {
-        timestamp: nowISO,
-        performedBy: `${user.name} (${user.email})`,
-        affectedUser: `${logoutTargetName} (${logoutTargetUid})`,
-        action: 'Supervisor Remote Force Logout',
-        previousValue: 'ACTIVE_WORK',
-        newValue: `COMPLETED (Reason: ${logoutReason})`
+        const finalShift: TMSShift = {
+          ...shift,
+          activities: updatedActivities,
+          status: 'COMPLETED',
+          clockOutTime: nowISO
+        };
+
+        await setDoc(shiftRef, finalShift);
+        await syncShiftToAttendance(finalShift);
+
+        // Log in audit trail (Firestore Logging Disabled)
+        console.log('[AUDIT LOG] (Firestore Logging Disabled) Supervisor Remote Force Logout:', {
+          timestamp: nowISO,
+          performedBy: `${user.name} (${user.email})`,
+          affectedUser: `${logoutTargetName} (${logoutTargetUid})`,
+          action: 'Supervisor Remote Force Logout',
+          previousValue: 'ACTIVE_WORK',
+          newValue: `COMPLETED (Reason: ${logoutReason})`,
+          details: { shiftId: snapshot.id }
+        });
+      } else {
+        // No shift found, but we still need to force the user OFFLINE if they are stuck in live_sessions
+        console.warn(`[FORCE_OUT] No active shift found for ${logoutTargetUid}, forcing OFFLINE status.`);
+        
+        // Log in audit trail (Firestore Logging Disabled)
+        console.log('[AUDIT LOG] (Firestore Logging Disabled) Supervisor Force Offline (No Shift):', {
+          timestamp: nowISO,
+          performedBy: `${user.name} (${user.email})`,
+          affectedUser: `${logoutTargetName} (${logoutTargetUid})`,
+          action: 'Supervisor Force Offline (No Shift)',
+          previousValue: 'STUCK_LIVE_SESSION',
+          newValue: 'OFFLINE',
+          remarks: 'User was stuck in live_sessions without an active shift record.'
+        });
+      }
+
+      // ALWAYS Update User Status and clean up live_sessions
+      const userRef = doc(db, 'users', logoutTargetUid);
+      await updateDoc(userRef, {
+        status: 'OFFLINE',
+        lastLogoutAt: nowISO
       });
+
+      // Explicitly delete from live_sessions to ensure UI clears
+      try {
+        await deleteDoc(doc(db, 'live_sessions', logoutTargetUid));
+      } catch (err) {
+        console.warn('[FORCE_OUT] Live session cleanup failed:', err);
+      }
 
       toast.success(`Successfully terminated active session for ${logoutTargetName}`);
       setShowForceLogoutConfirm(false);
-      recomputeMetrics(true);
+      if (recomputeMetrics) recomputeMetrics(true);
+      if (onRefreshAllData) onRefreshAllData();
+
     } catch (err) {
       console.error('[FORCE_OUT_FAIL]', err);
       toast.error('Failed to terminate remote session');
+    } finally {
+      setIsBulkLoggingOut(false);
     }
   };
 
@@ -1659,9 +1759,25 @@ export default function SupervisorDashboard({ user: propUser, currentUser, allUs
     }
   };
 
-  const executeBulkForceLogout = async () => {
-    if (activeShifts.length === 0) {
-      toast.error('No active shifts found to logout.');
+  const executeBulkForceLogout = async (filterMode: 'all' | 'stale' = 'all') => {
+    let targets = [...activeShifts];
+    if (filterMode === 'stale') {
+      const now = Date.now();
+      targets = activeShifts.filter(sh => {
+        let productiveMs = 0;
+        (sh.activities || []).forEach(act => {
+          if (act.type === 'productive' || act.name?.toLowerCase().includes('work')) {
+            const start = new Date(act.startTime).getTime();
+            const end = act.endTime ? new Date(act.endTime).getTime() : now;
+            productiveMs += (end - start);
+          }
+        });
+        return (productiveMs / 3600000) >= 10;
+      });
+    }
+
+    if (targets.length === 0) {
+      toast.error(filterMode === 'stale' ? 'No stale sessions (>10h) found.' : 'No active shifts found to logout.');
       return;
     }
     
@@ -1669,9 +1785,9 @@ export default function SupervisorDashboard({ user: propUser, currentUser, allUs
     try {
       const batch = writeBatch(db);
       const nowISO = new Date().toISOString();
-      const count = activeShifts.length;
+      const count = targets.length;
       
-      activeShifts.forEach(sh => {
+      targets.forEach(sh => {
         const updatedActivities = [...(sh.activities || [])];
         if (updatedActivities.length > 0) {
           const lastIndex = updatedActivities.length - 1;
@@ -1680,39 +1796,43 @@ export default function SupervisorDashboard({ user: propUser, currentUser, allUs
           }
         }
 
+        // 1. Update Shift Record
         batch.set(doc(db, 'tmsShifts', sh.id), {
           ...sh,
           activities: updatedActivities,
           status: 'COMPLETED',
-          clockOutTime: nowISO
-        });
+          clockOutTime: nowISO,
+          remarks: `Bulk Force Logout (${filterMode}) by Supervisor`
+        }, { merge: true });
 
-        // Update User Status
+        // 2. Update User Status
         batch.update(doc(db, 'users', sh.userId), {
           status: 'OFFLINE',
           lastLogoutAt: nowISO
         });
+
+        // 3. Clean up Live Session
+        batch.delete(doc(db, 'live_sessions', sh.userId));
       });
 
       await batch.commit();
 
-      // Audit logs
-      await addDoc(collection(db, 'adminAuditLogs'), {
+      // Audit logs (Firestore Logging Disabled)
+      console.log('[AUDIT LOG] (Firestore Logging Disabled) Supervisor Bulk Force Logout:', {
         timestamp: nowISO,
         performedBy: `${user.name} (${user.email})`,
-        affectedUser: 'Multiple Users (Bulk)',
-        action: 'Bulk Force Logout Execution',
-        previousValue: 'ACTIVE/BREAK',
+        affectedUser: `Multiple Users (${count} - ${filterMode})`,
+        action: 'Supervisor Bulk Force Logout',
+        previousValue: 'ACTIVE_WORK',
         newValue: 'COMPLETED',
-        details: {
-          count,
-          reason: 'Administrative Bulk Logout'
-        }
+        remarks: `Bulk logout performed for ${count} users. Mode: ${filterMode}`,
+        details: { count, filterMode }
       });
 
       toast.success(`Successfully logged out ${count} active users.`);
       setShowBulkLogoutModal(false);
-      recomputeMetrics(true);
+      if (recomputeMetrics) recomputeMetrics(true);
+      if (onRefreshAllData) onRefreshAllData();
     } catch (err) {
       console.error('Bulk Logout Error:', err);
       toast.error('Failed to perform bulk logout');
@@ -1725,7 +1845,10 @@ export default function SupervisorDashboard({ user: propUser, currentUser, allUs
   const liveStats = useMemo(() => {
     // Session device tracking parameters computed locally for true real-time visibility
     // Compute from activeShiftList (filtered by team/TL/Manager/Search/Device)
-    const activeShiftList = filteredWorkforce.map(u => activeShiftsMap.get(u.uid)).filter(Boolean) as TMSShift[];
+    const activeShiftList = filteredWorkforce
+      .map(u => activeShiftsMap.get(u.uid))
+      .filter(Boolean)
+      .filter(s => s && ['ACTIVE', 'BREAK'].includes(s.status)) as TMSShift[];
     
     const activeDesktop = activeShiftList.filter(s => {
       const dtype = s.deviceType || (s.clockInDevice === 'mobile' ? 'Mobile' : 'Desktop');
@@ -1795,7 +1918,10 @@ export default function SupervisorDashboard({ user: propUser, currentUser, allUs
 
   const liveDistribution = useMemo(() => {
     const total = filteredWorkforce.length || 1;
-    const activeShiftList = filteredWorkforce.map(u => activeShiftsMap.get(u.uid)).filter(Boolean) as TMSShift[];
+    const activeShiftList = filteredWorkforce
+      .map(u => activeShiftsMap.get(u.uid))
+      .filter(Boolean)
+      .filter(s => s && ['ACTIVE', 'BREAK'].includes(s.status)) as TMSShift[];
     
     const active = activeShiftList.filter(s => s.status === 'ACTIVE').length;
     
@@ -1969,65 +2095,152 @@ export default function SupervisorDashboard({ user: propUser, currentUser, allUs
             </div>
           </div>
         </div>
+      </div>
 
-        <div className="flex items-center gap-3 flex-wrap">
-          {(() => {
-            const myShift = activeShifts.find(s => s.userId === user.uid);
-            if (myShift) {
-              const lastAct = myShift.activities && myShift.activities.length > 0 
-                ? myShift.activities[myShift.activities.length - 1] 
-                : null;
-              const currentProc = lastAct && !lastAct.endTime ? lastAct.name : 'N/A';
+      {/* MAIN DASHBOARD ROW: KPI TILES + DEVICE ACCESS (LEFT) AND SUPERVISOR PUNCH STATION (RIGHT) */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 items-start">
+        {/* Left Columns: KPIs and Device Access */}
+        <div className="lg:col-span-2 space-y-4">
+          {/* CORE STATS KPI TILES (TOP SUMMARY CARDS - REACTIVE TO ACTIVE FILTERS) */}
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5">
+            <div className="bg-white dark:bg-slate-900 border border-indigo-250 dark:border-indigo-950/30 p-2.5 rounded-xl shadow-xs text-center">
+              <span className="text-[9px] font-black uppercase tracking-widest text-indigo-600 dark:text-indigo-400 leading-none">Active Work</span>
+              <h3 className="text-xl font-black text-indigo-600 dark:text-indigo-400 mt-0.5">{liveStats.active}</h3>
+              <p className="text-[8px] text-indigo-500 dark:text-indigo-505/85 font-bold mt-0.5 leading-none">Productive Timers</p>
+            </div>
+
+            <div className="bg-white dark:bg-slate-900 border border-amber-250 dark:border-amber-950/30 p-2.5 rounded-xl shadow-xs text-center">
+              <span className="text-[9px] font-black uppercase tracking-widest text-amber-600 dark:text-amber-400 leading-none">On Break</span>
+              <h3 className="text-xl font-black text-amber-500 dark:text-amber-400 mt-0.5">{liveStats.onBreak}</h3>
+              <p className="text-[8px] text-amber-500 dark:text-amber-505/85 font-bold mt-0.5 leading-none">Rest Periods</p>
+            </div>
+
+            <div className="bg-white dark:bg-slate-900 border border-teal-250 dark:border-teal-950/30 p-2.5 rounded-xl shadow-xs text-center">
+              <span className="text-[9px] font-black uppercase tracking-widest text-teal-600 dark:text-teal-400 leading-none">Team Avg Util</span>
+              <h3 className="text-xl font-black text-teal-600 dark:text-teal-400 mt-0.5">{liveStats.teamAvgUtilization}%</h3>
+              <p className="text-[8px] text-teal-550 dark:text-teal-500 font-bold mt-0.5 leading-none">Target: {presentThreshold}m</p>
+            </div>
+          </div>
+
+          {/* ADMIN DEVICE ACCESS ANALYTICS */}
+          <div className="bg-slate-50 dark:bg-slate-950 p-4 rounded-2xl border border-slate-200/80 dark:border-slate-800/80 flex flex-col md:flex-row md:items-center md:justify-between gap-4 select-none">
+            <div className="flex items-center gap-3">
+              <div className="p-2.5 bg-indigo-50 dark:bg-indigo-950/40 text-indigo-600 dark:text-indigo-400 rounded-xl shrink-0">
+                <Smartphone size={18} />
+              </div>
+              <div className="text-left leading-normal">
+                <h4 className="text-[11px] font-black text-slate-800 dark:text-slate-200 uppercase tracking-widest leading-none">
+                  Device Access Analytics
+                </h4>
+                <p className="text-[10px] text-slate-500 mt-1 leading-none">Real-time visibility into agent devices, browsers, and access channels</p>
+              </div>
+            </div>
+            
+            <div className="grid grid-cols-3 gap-3 shrink-0">
+              <div className="bg-white dark:bg-slate-900 border border-slate-200/60 dark:border-slate-800/80 px-4 py-2.5 rounded-xl text-center shadow-2xs min-w-28 sm:min-w-32">
+                <div className="text-[8px] uppercase tracking-wider text-slate-400 font-bold">Active Desktop</div>
+                <div className="text-base font-black text-sky-600 dark:text-sky-455 font-mono mt-0.5">{liveStats.activeDesktop || 0}</div>
+              </div>
+              <div className="bg-white dark:bg-slate-900 border border-slate-200/60 dark:border-slate-800/80 px-4 py-2.5 rounded-xl text-center shadow-2xs min-w-28 sm:min-w-32">
+                <div className="text-[8px] uppercase tracking-wider text-slate-400 font-bold">Active Mobile</div>
+                <div className="text-base font-black text-rose-500 font-mono mt-0.5">{liveStats.activeMobile || 0}</div>
+              </div>
+              <div className="bg-white dark:bg-slate-900 border border-slate-200/60 dark:border-slate-800/80 px-4 py-2.5 rounded-xl text-center shadow-2xs min-w-28 sm:min-w-32">
+                <div className="text-[8px] uppercase tracking-wider text-slate-400 font-bold">Mobile Access %</div>
+                <div className="text-base font-black text-indigo-600 dark:text-indigo-455 font-mono mt-0.5">{liveStats.mobileAccessPercent || 0}%</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Right Column: Supervisor Personal Punch Station Card */}
+        <div className="lg:col-span-1">
+          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-5 shadow-sm space-y-4">
+            <div className="flex items-center justify-between border-b border-slate-100 dark:border-slate-800/60 pb-3">
+              <div>
+                <h3 className="text-xs font-black text-slate-900 dark:text-white uppercase tracking-wider">Punch Station</h3>
+                <p className="text-[9px] text-slate-500 mt-0.5">Personal attendance status</p>
+              </div>
+              {(() => {
+                const myShift = ownActiveShift || activeShifts.find(s => s.userId === user.uid);
+                const status = !myShift ? 'CLOCKED_OUT' : myShift.status;
+                return (
+                  <span className={`text-[9px] font-black px-2 py-0.5 rounded uppercase tracking-wider border ${
+                    status === 'CLOCKED_OUT' ? 'bg-rose-50 text-rose-700 border-rose-200/40 dark:bg-rose-950/40 dark:text-rose-350 dark:border-rose-900/40' :
+                    status === 'BREAK' ? 'bg-amber-50 text-amber-700 border-amber-200/40 dark:bg-amber-950/40 dark:text-amber-350 dark:border-amber-900/40' :
+                    'bg-emerald-50 text-emerald-700 border-emerald-200/40 dark:bg-emerald-950/40 dark:text-emerald-350 dark:border-emerald-900/40'
+                  }`}>
+                    {status === 'CLOCKED_OUT' ? 'OFFLINE' : status === 'BREAK' ? 'ON BREAK' : 'ACTIVE'}
+                  </span>
+                );
+              })()}
+            </div>
+
+            {(() => {
+              const myShift = ownActiveShift || activeShifts.find(s => s.userId === user.uid);
               
-              return (
-                <div className="flex flex-col sm:flex-row sm:items-center gap-3 flex-wrap">
-                  {/* Real-time Tickers */}
-                  <SupervisorClockStrip myShift={myShift} />
+              if (myShift) {
+                const lastAct = myShift.activities && myShift.activities.length > 0 
+                  ? myShift.activities[myShift.activities.length - 1] 
+                  : null;
+                const currentProc = lastAct && !lastAct.endTime ? lastAct.name : 'N/A';
+                
+                return (
+                  <div className="space-y-4">
+                    {/* Shift Duration Ticker */}
+                    <div className="bg-slate-50 dark:bg-slate-950/40 rounded-xl p-3 border border-slate-100 dark:border-slate-800/40 flex items-center justify-between">
+                      <span className="text-[10px] font-black uppercase text-slate-400">Shift Elapsed:</span>
+                      <SupervisorClockStrip myShift={myShift} />
+                    </div>
 
-                  <div className="flex items-center gap-2 flex-wrap">
                     {myShift.status === 'ACTIVE' ? (
-                      <>
-                        {/* Switch Process Control */}
-                        <div className="flex items-center gap-1.5 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg px-2 py-1">
-                          <span className="text-[10px] font-black uppercase text-slate-400">Process:</span>
+                      <div className="space-y-3">
+                        {/* Process Mapping Selector */}
+                        <div className="flex flex-col gap-1.5">
+                          <label className="text-[9px] font-black uppercase tracking-wider text-slate-400">Current Process</label>
                           <select
-                            className="bg-transparent border-none text-[11px] font-bold text-slate-700 dark:text-slate-200 focus:outline-none cursor-pointer p-0"
+                            className="w-full bg-slate-50 dark:bg-slate-950/40 border border-slate-200 dark:border-slate-800 rounded-xl p-2.5 text-xs font-bold text-slate-800 dark:text-slate-200 focus:outline-none cursor-pointer"
                             value={currentProc}
                             onChange={(e) => handleSuperSwitchProcess(e.target.value)}
                           >
-                            <option value="" disabled>Switch...</option>
+                            <option value="" disabled>Switch Process...</option>
                             {supervisorProcesses.map(p => (
                               <option key={p} value={p}>{p}</option>
                             ))}
                           </select>
                         </div>
 
-                        {/* Punch Break Control */}
-                        <div className="flex items-center gap-1.5 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg px-2 py-1">
-                          <span className="text-[10px] font-black uppercase text-slate-400">Break:</span>
-                          <select
-                            className="bg-transparent border-none text-[11px] font-bold text-slate-700 dark:text-slate-200 focus:outline-none cursor-pointer p-0"
-                            value={superSelectedBreak}
-                            onChange={(e) => setSuperSelectedBreak(e.target.value)}
-                          >
-                            {SUPERVISOR_BREAK_OPTIONS.map(b => (
-                              <option key={b} value={b}>{b}</option>
-                            ))}
-                          </select>
-                          <button
-                            onClick={() => handleSuperBreakAction(superSelectedBreak)}
-                            className="bg-amber-500 hover:bg-amber-600 text-white text-[10px] px-1.5 py-0.5 rounded font-bold cursor-pointer transition-colors"
-                          >
-                            Punch
-                          </button>
+                        {/* Break Trigger Selector */}
+                        <div className="flex flex-col gap-1.5">
+                          <label className="text-[9px] font-black uppercase tracking-wider text-slate-400">Start Rest Break</label>
+                          <div className="flex gap-2">
+                            <select
+                              className="flex-1 bg-slate-50 dark:bg-slate-950/40 border border-slate-200 dark:border-slate-800 rounded-xl p-2.5 text-xs font-bold text-slate-800 dark:text-slate-200 focus:outline-none cursor-pointer"
+                              value={superSelectedBreak}
+                              onChange={(e) => setSuperSelectedBreak(e.target.value)}
+                            >
+                              {SUPERVISOR_BREAK_OPTIONS.map(b => (
+                                <option key={b} value={b}>{b}</option>
+                              ))}
+                            </select>
+                            <button
+                              onClick={() => handleSuperBreakAction(superSelectedBreak)}
+                              className="bg-amber-500 hover:bg-amber-600 active:scale-[0.98] text-white text-xs px-4 rounded-xl font-bold cursor-pointer transition-all shrink-0 flex items-center gap-1 shadow-sm"
+                            >
+                              <Coffee size={12} />
+                              <span>Break</span>
+                            </button>
+                          </div>
                         </div>
-                      </>
+                      </div>
                     ) : (
-                      /* Break Resume Control */
-                      <div className="flex items-center gap-2 bg-amber-50 dark:bg-amber-950/20 border border-amber-200/40 rounded-lg px-2.5 py-1 text-xs text-amber-800 dark:text-amber-400">
-                        <Coffee size={12} className="animate-bounce" />
-                        <span className="font-bold">On Break ({currentProc})</span>
-                        <div className="h-3 w-px bg-amber-200 dark:bg-amber-800" />
+                      /* Break Active Overlay / Resume Controls */
+                      <div className="bg-amber-500/[0.04] dark:bg-amber-500/[0.02] border border-amber-200/40 rounded-xl p-3.5 space-y-3 text-center">
+                        <div className="flex items-center justify-center gap-2 text-amber-600 dark:text-amber-400 font-bold text-xs">
+                          <Coffee size={14} className="animate-bounce" />
+                          <span>Currently on {currentProc}</span>
+                        </div>
+                        
                         <button
                           onClick={() => {
                             const lastProductive = [...(myShift.activities || [])]
@@ -2036,9 +2249,9 @@ export default function SupervisorDashboard({ user: propUser, currentUser, allUs
                             const resumeProc = lastProductive?.name || user.process || supervisorProcesses[0] || 'HITL';
                             handleSuperResumeAction(resumeProc);
                           }}
-                          className="bg-amber-500 hover:bg-amber-600 text-white text-[10px] px-2 py-1 rounded font-bold cursor-pointer transition-colors shadow-sm flex items-center gap-1"
+                          className="w-full bg-amber-500 hover:bg-amber-600 active:scale-[0.98] text-white text-xs py-2.5 rounded-xl font-black cursor-pointer transition-all shadow-sm flex items-center justify-center gap-1.5 uppercase"
                         >
-                          <Play size={10} />
+                          <Play size={12} />
                           <span>Resume Work</span>
                         </button>
                       </div>
@@ -2047,85 +2260,46 @@ export default function SupervisorDashboard({ user: propUser, currentUser, allUs
                     {/* Clock Out Button */}
                     <button
                       onClick={() => setShowSuperClockOutConfirm(true)}
-                      className="bg-rose-600 hover:bg-rose-700 text-white px-3 py-1.5 rounded-lg text-xs font-bold cursor-pointer transition-colors flex items-center gap-1 shadow-sm"
+                      className="w-full border border-rose-200 dark:border-rose-900/45 hover:bg-rose-50 dark:hover:bg-rose-950/20 text-rose-600 dark:text-rose-400 py-2.5 rounded-xl text-xs font-black cursor-pointer transition-all flex items-center justify-center gap-1.5 uppercase active:scale-[0.98]"
                     >
                       <LogOut size={12} />
-                      <span>Clock Out</span>
+                      <span>Clock Out of Shift</span>
                     </button>
                   </div>
-                </div>
-              );
-            } else {
-              /* Clocked Out Banner */
-              return (
-                <div className="flex items-center gap-3">
-                  <div className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
-                  <span className="text-[11px] font-bold text-slate-500 dark:text-slate-400">You are clocked out.</span>
-                  <button
-                    onClick={() => setShowSuperClockInConfirm(true)}
-                    className="bg-emerald-600 hover:bg-emerald-700 text-white px-3 py-1.5 rounded-lg text-xs font-bold cursor-pointer transition-all flex items-center gap-1 shadow-sm hover:scale-[1.01]"
-                  >
-                    <Play size={11} />
-                    <span>Clock In</span>
-                  </button>
-                </div>
-              );
-            }
-          })()}
-        </div>
-      </div>
+                );
+              } else {
+                /* Clocked Out / Initial State */
+                return (
+                  <div className="space-y-4">
+                    <div className="py-2.5 text-center bg-slate-50 dark:bg-slate-950/40 rounded-xl border border-dashed border-slate-200 dark:border-slate-800 flex flex-col items-center justify-center gap-1.5">
+                      <div className="w-2.5 h-2.5 rounded-full bg-red-500 animate-pulse" />
+                      <span className="text-[11px] font-bold text-slate-500 dark:text-slate-400">Shift status offline. You are clocked out.</span>
+                    </div>
 
-      {/* CORE STATS KPI TILES (TOP SUMMARY CARDS - REACTIVE TO ACTIVE FILTERS) */}
-      <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5 max-w-2xl">
-        <div className="bg-white dark:bg-slate-900 border border-indigo-250 dark:border-indigo-950/30 p-2.5 rounded-xl shadow-xs text-center">
-          <span className="text-[9px] font-black uppercase tracking-widest text-indigo-600 dark:text-indigo-400 leading-none">Active Work</span>
-          <h3 className="text-xl font-black text-indigo-600 dark:text-indigo-400 mt-0.5">{liveStats.active}</h3>
-          <p className="text-[8px] text-indigo-500 dark:text-indigo-505/85 font-bold mt-0.5 leading-none">Productive Timers</p>
-        </div>
+                    <div className="flex flex-col gap-1.5">
+                      <label className="text-[9px] font-black uppercase tracking-wider text-slate-400">Initial Process Mapping</label>
+                      <select
+                        className="w-full bg-slate-50 dark:bg-slate-950/40 border border-slate-200 dark:border-slate-800 rounded-xl p-2.5 text-xs font-bold text-slate-800 dark:text-slate-200 focus:outline-none cursor-pointer"
+                        value={superSelectedProcess}
+                        onChange={(e) => setSuperSelectedProcess(e.target.value)}
+                      >
+                        {supervisorProcesses.map(p => (
+                          <option key={p} value={p}>{p}</option>
+                        ))}
+                      </select>
+                    </div>
 
-        <div className="bg-white dark:bg-slate-900 border border-amber-250 dark:border-amber-950/30 p-2.5 rounded-xl shadow-xs text-center">
-          <span className="text-[9px] font-black uppercase tracking-widest text-amber-600 dark:text-amber-400 leading-none">On Break</span>
-          <h3 className="text-xl font-black text-amber-500 dark:text-amber-400 mt-0.5">{liveStats.onBreak}</h3>
-          <p className="text-[8px] text-amber-500 dark:text-amber-505/85 font-bold mt-0.5 leading-none">Rest Periods</p>
-        </div>
-
-        <div className="bg-white dark:bg-slate-900 border border-teal-250 dark:border-teal-950/30 p-2.5 rounded-xl shadow-xs text-center">
-          <span className="text-[9px] font-black uppercase tracking-widest text-teal-600 dark:text-teal-400 leading-none">Team Avg Util</span>
-          <h3 className="text-xl font-black text-teal-600 dark:text-teal-400 mt-0.5">{liveStats.teamAvgUtilization}%</h3>
-          <p className="text-[8px] text-teal-550 dark:text-teal-500 font-bold mt-0.5 leading-none">Target: {presentThreshold}m</p>
-        </div>
-      </div>
-
-      {/* ONBOARDING USER GUIDE BAR */}
-
-      {/* ADMIN DEVICE ACCESS ANALYTICS */}
-      <div className="bg-slate-50 dark:bg-slate-950 p-4 rounded-2xl border border-slate-200/80 dark:border-slate-800/80 flex flex-col md:flex-row md:items-center md:justify-between gap-4 select-none">
-        <div className="flex items-center gap-3">
-          <div className="p-2.5 bg-indigo-50 dark:bg-indigo-950/40 text-indigo-600 dark:text-indigo-400 rounded-xl shrink-0">
-            <Smartphone size={18} />
-          </div>
-          <div className="text-left leading-normal">
-            <h4 className="text-[11px] font-black text-slate-800 dark:text-slate-200 uppercase tracking-widest leading-none">
-              Device Access Analytics
-            </h4>
-            <p className="text-[10px] text-slate-500 mt-1 leading-none">Real-time visibility into agent devices, browsers, and access channels</p>
-          </div>
-        </div>
-        
-        <div className="grid grid-cols-3 gap-3 shrink-0">
-          <div className="bg-white dark:bg-slate-900 border border-slate-200/60 dark:border-slate-800/80 px-4 py-2.5 rounded-xl text-center shadow-2xs min-w-28 sm:min-w-32">
-            <div className="text-[8px] uppercase tracking-wider text-slate-400 font-bold">Active Desktop</div>
-            <div className="text-base font-black text-sky-600 dark:text-sky-455 font-mono mt-0.5">{liveStats.activeDesktop || 0}</div>
-          </div>
-          <div 
-            className="bg-white dark:bg-slate-900 border border-slate-200/60 dark:border-slate-800/80 px-4 py-2.5 rounded-xl text-center shadow-2xs min-w-28 sm:min-w-32"
-          >
-            <div className="text-[8px] uppercase tracking-wider text-slate-400 font-bold">Active Mobile</div>
-            <div className="text-base font-black text-rose-500 font-mono mt-0.5">{liveStats.activeMobile || 0}</div>
-          </div>
-          <div className="bg-white dark:bg-slate-900 border border-slate-200/60 dark:border-slate-800/80 px-4 py-2.5 rounded-xl text-center shadow-2xs min-w-28 sm:min-w-32">
-            <div className="text-[8px] uppercase tracking-wider text-slate-400 font-bold">Mobile Access %</div>
-            <div className="text-base font-black text-indigo-600 dark:text-indigo-455 font-mono mt-0.5">{liveStats.mobileAccessPercent || 0}%</div>
+                    <button
+                      onClick={() => performSuperClockIn(superSelectedProcess)}
+                      className="w-full bg-emerald-600 hover:bg-emerald-700 active:scale-[0.98] text-white py-3 rounded-xl text-xs font-black cursor-pointer transition-all flex items-center justify-center gap-1.5 uppercase shadow-md shadow-emerald-100 dark:shadow-none"
+                    >
+                      <Play size={13} />
+                      <span>Clock In / Start Shift</span>
+                    </button>
+                  </div>
+                );
+              }
+            })()}
           </div>
         </div>
       </div>
@@ -2174,10 +2348,163 @@ export default function SupervisorDashboard({ user: propUser, currentUser, allUs
           <span className={`text-[10px] font-medium ${activeTab === 'alerts' ? 'text-rose-600/80 dark:text-rose-400/80' : 'text-slate-500 dark:text-slate-400'}`}>Exceeded breaks & stale sessions</span>
         </button>
 
+        {(isManagerOrLead || isTeamLeadOrSME) && (
+          <button 
+            onClick={() => handleTabChange('mapping')}
+            className={`flex flex-col items-start gap-1 px-5 py-3 rounded-xl text-left transition-all cursor-pointer border shadow-sm select-none ${
+              activeTab === 'mapping' 
+                ? 'bg-emerald-50/70 border-emerald-200 text-emerald-700 dark:bg-emerald-950/40 dark:border-emerald-900/40 dark:text-emerald-300' 
+                : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50 hover:border-slate-300 dark:bg-slate-900 dark:border-slate-800 dark:text-slate-300 dark:hover:bg-slate-850'
+            }`}
+          >
+            <div className="flex items-center gap-1.5 font-black text-xs">
+              <ShieldCheck size={14} className={activeTab === 'mapping' ? 'text-emerald-500' : 'text-emerald-400/60'} />
+              Mapping Check
+            </div>
+            <span className={`text-[10px] font-medium ${activeTab === 'mapping' ? 'text-emerald-600/80 dark:text-emerald-400/80' : 'text-slate-500 dark:text-slate-400'}`}>Verify team & manager UIDs</span>
+          </button>
+        )}
+
+        {['ADMIN', 'MANAGER', 'OPS_HEAD', 'HR', 'IT_MANAGER'].includes((user.role || '').toUpperCase()) && (
+          <button 
+            onClick={() => handleTabChange('hierarchy')}
+            className={`flex flex-col items-start gap-1 px-5 py-3 rounded-xl text-left transition-all cursor-pointer border shadow-sm select-none ${
+              activeTab === 'hierarchy' 
+                ? 'bg-indigo-50/70 border-indigo-200 text-indigo-700 dark:bg-indigo-950/40 dark:border-indigo-900/40 dark:text-indigo-300' 
+                : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50 hover:border-slate-300 dark:bg-slate-900 dark:border-slate-800 dark:text-slate-300 dark:hover:bg-slate-850'
+            }`}
+          >
+            <div className="flex items-center gap-1.5 font-black text-xs">
+              <Shield size={14} className={activeTab === 'hierarchy' ? 'text-indigo-500' : 'text-indigo-400/60'} />
+              Org Health
+            </div>
+            <span className={`text-[10px] font-medium ${activeTab === 'hierarchy' ? 'text-indigo-600/80 dark:text-indigo-400/80' : 'text-slate-500 dark:text-slate-400'}`}>Org-wide hierarchy validation</span>
+          </button>
+        )}
+
       </div>
 
       {/* RENDER SELECTED TAB VIEWS */}
       <div className="space-y-6">
+
+        {/* TAB: MAPPING VERIFICATION (TL DEBUG TOOL) */}
+        {activeTab === 'mapping' && (
+          <div className="space-y-6 animate-in fade-in slide-in-from-bottom-2 duration-300">
+            <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-6 shadow-sm">
+              <div className="flex items-center justify-between mb-6">
+                <div>
+                  <h3 className="text-sm font-black text-slate-900 dark:text-white uppercase tracking-wider flex items-center gap-1.5">
+                    <ShieldCheck className="text-emerald-500" size={18} />
+                    User Mapping Verification tool
+                  </h3>
+                  <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">Verify that your team members have correct Manager and Team Lead UIDs for proper hierarchy monitoring.</p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <div className="bg-slate-50 dark:bg-slate-800 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700">
+                    <span className="text-[10px] font-black text-slate-400 uppercase mr-2">Your UID:</span>
+                    <span className="text-[10px] font-mono font-bold text-slate-700 dark:text-slate-200">{user.uid}</span>
+                  </div>
+                  <button 
+                    onClick={() => onRefreshAllData?.()}
+                    className="bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 p-2 rounded-lg transition-colors"
+                  >
+                    <RefreshCw size={14} />
+                  </button>
+                </div>
+              </div>
+
+              <div className="overflow-x-auto border border-slate-100 dark:border-slate-800 rounded-xl">
+                <table className="w-full text-left border-collapse">
+                  <thead className="bg-slate-50 dark:bg-slate-800/50 text-[10px] uppercase font-black text-slate-500">
+                    <tr>
+                      <th className="px-4 py-3 border-b border-slate-100 dark:border-slate-800">User Profile</th>
+                      <th className="px-4 py-3 border-b border-slate-100 dark:border-slate-800">Profile Mappings</th>
+                      <th className="px-4 py-3 border-b border-slate-100 dark:border-slate-800">Live Session Mapping</th>
+                      <th className="px-4 py-3 border-b border-slate-100 dark:border-slate-800 text-right">Integrity</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-50 dark:divide-slate-850">
+                    {mappedUsers.map((u) => {
+                      const live = activeShifts.find(s => s.userId === u.uid);
+                      const profileTL = u.teamLeadUid || u.teamLeadId || 'MISSING';
+                      const profileMgr = u.mappedManagerId || u.managerId || u.mappedManagerUid || 'MISSING';
+                      const liveTL = live ? (live.teamLeadUid || (live as any).tlId || 'OFFLINE') : 'OFFLINE';
+                      const liveMgr = live ? (live.managerId || 'OFFLINE') : 'OFFLINE';
+                      
+                      const tlMatch = profileTL.toLowerCase() === user.uid.toLowerCase();
+                      const mgrMatch = profileMgr.toLowerCase() === user.uid.toLowerCase();
+                      const isSupervisedByMe = tlMatch || mgrMatch;
+                      
+                      const liveSyncMismatch = live && (profileTL !== liveTL || (profileMgr !== liveMgr && liveMgr !== 'OFFLINE'));
+
+                      return (
+                        <tr key={u.uid} className="hover:bg-slate-50 dark:hover:bg-slate-850/40 transition-colors">
+                          <td className="px-4 py-3">
+                            <div className="font-extrabold text-xs text-slate-800 dark:text-slate-200">{u.fullName || u.name}</div>
+                            <div className="text-[9px] font-bold text-slate-400">{u.role} • {u.uid}</div>
+                          </td>
+                          <td className="px-4 py-3 space-y-1">
+                            <div className="flex flex-col">
+                              <span className="text-[8px] uppercase font-black text-slate-400 leading-none">TL UID</span>
+                              <span className={`text-[10px] font-bold ${tlMatch ? 'text-emerald-600' : 'text-slate-600'}`}>{profileTL}</span>
+                            </div>
+                            <div className="flex flex-col">
+                              <span className="text-[8px] uppercase font-black text-slate-400 leading-none">MGR UID</span>
+                              <span className={`text-[10px] font-bold ${mgrMatch ? 'text-indigo-600' : 'text-slate-600'}`}>{profileMgr}</span>
+                            </div>
+                          </td>
+                          <td className="px-4 py-3">
+                            {live ? (
+                              <div className="space-y-1">
+                                <div className="flex flex-col">
+                                  <span className="text-[8px] uppercase font-black text-slate-400 leading-none">Live TL</span>
+                                  <span className={`text-[10px] font-bold ${liveTL === profileTL ? 'text-slate-600' : 'text-rose-600'}`}>{liveTL}</span>
+                                </div>
+                                <div className="flex flex-col">
+                                  <span className="text-[8px] uppercase font-black text-slate-400 leading-none">Live MGR</span>
+                                  <span className={`text-[10px] font-bold ${liveMgr === profileMgr ? 'text-slate-600' : 'text-rose-600'}`}>{liveMgr}</span>
+                                </div>
+                              </div>
+                            ) : (
+                              <span className="text-[10px] text-slate-400 italic">User Offline</span>
+                            )}
+                          </td>
+                          <td className="px-4 py-3 text-right">
+                            <div className="flex flex-col items-end gap-1">
+                              {!isSupervisedByMe && (
+                                <div className="bg-rose-50 text-rose-600 border border-rose-100 text-[9px] font-black py-0.5 px-2 rounded uppercase">
+                                  Mapping Error
+                                </div>
+                              )}
+                              {liveSyncMismatch && (
+                                <div className="bg-orange-50 text-orange-600 border border-orange-100 text-[9px] font-black py-0.5 px-2 rounded uppercase">
+                                  Sync Lag
+                                </div>
+                              )}
+                              {isSupervisedByMe && !liveSyncMismatch && (
+                                <div className="bg-emerald-50 text-emerald-600 border border-emerald-100 text-[9px] font-black py-0.5 px-2 rounded uppercase">
+                                  Healthy
+                                </div>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+
+              <div className="mt-6 p-4 bg-slate-50 dark:bg-slate-950/40 rounded-xl border border-slate-200 dark:border-slate-800">
+                <h4 className="text-[11px] font-black text-slate-800 dark:text-slate-200 uppercase mb-2">How to fix mapping issues?</h4>
+                <ul className="text-[10px] text-slate-500 space-y-1.5 list-disc pl-4">
+                  <li>If <strong>Mapping Error</strong> is shown: The user's profile does not have your UID in their <code className="bg-slate-200 dark:bg-slate-800 px-1 rounded">teamLeadUid</code> or <code className="bg-slate-200 dark:bg-slate-800 px-1 rounded">managerId</code> field.</li>
+                  <li>If <strong>Sync Lag</strong> is shown: User clocked in before a mapping update. They need to Clock Out and Clock In again.</li>
+                </ul>
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* TAB: ALERTS & VIOLATIONS */}
         {activeTab === 'alerts' && (
@@ -2678,6 +3005,11 @@ export default function SupervisorDashboard({ user: propUser, currentUser, allUs
                             {live ? (
                               <div className="flex flex-col gap-0.5">
                                 <span>{currentActivityName}</span>
+                                {!loadingLiveShifts && !activeShifts.some(sh => sh.userId === u.uid) && (
+                                  <span className="text-[8px] font-black text-rose-600 uppercase flex items-center gap-1 animate-pulse">
+                                    <AlertTriangle size={8} /> Stuck Session
+                                  </span>
+                                )}
                               </div>
                             ) : <span className="text-slate-400">-</span>}
                           </td>
@@ -3022,26 +3354,36 @@ export default function SupervisorDashboard({ user: propUser, currentUser, allUs
       {showBulkLogoutModal && (
         <div className="fixed inset-0 bg-slate-900/55 backdrop-blur-sm flex items-center justify-center z-[99999] p-4 text-slate-800 animate-in fade-in duration-200">
           <div className="bg-white rounded-3xl w-full max-w-md p-8 border border-slate-200 shadow-2xl space-y-6 text-center">
-            <div className="w-20 h-20 bg-rose-50 text-rose-600 rounded-full flex items-center justify-center mx-auto mb-2 shadow-sm animate-bounce-slow">
+            <div className="w-20 h-20 bg-rose-50 text-rose-600 rounded-full flex items-center justify-center mx-auto mb-2 shadow-sm">
               <UserX size={40} />
             </div>
             
             <div className="space-y-2">
               <h4 className="text-2xl font-black text-slate-900 uppercase tracking-tight">Bulk Force Logout</h4>
               <p className="text-slate-500 text-sm font-medium">
-                You are about to forcefully terminate <span className="text-rose-600 font-black">{activeShifts.length} active sessions</span>. This action cannot be undone and will immediately move all users to OFFLINE status.
+                Forcefully terminate active sessions for the selected scope below.
               </p>
             </div>
 
             <div className="flex flex-col gap-3 pt-2">
               <button 
-                onClick={executeBulkForceLogout}
+                onClick={() => executeBulkForceLogout('stale')}
+                disabled={isBulkLoggingOut || activeShifts.length === 0}
+                className="w-full py-4 rounded-2xl bg-amber-600 hover:bg-amber-700 text-white font-black text-sm transition-all uppercase tracking-widest shadow-lg shadow-amber-200 flex items-center justify-center gap-2 disabled:opacity-50 cursor-pointer"
+              >
+                {isBulkLoggingOut ? <RefreshCw size={18} className="animate-spin" /> : <Clock size={18} />}
+                Logout Sessions &gt; 10 Hours
+              </button>
+              
+              <button 
+                onClick={() => executeBulkForceLogout('all')}
                 disabled={isBulkLoggingOut || activeShifts.length === 0}
                 className="w-full py-4 rounded-2xl bg-rose-600 hover:bg-rose-700 text-white font-black text-sm transition-all uppercase tracking-widest shadow-lg shadow-rose-200 flex items-center justify-center gap-2 disabled:opacity-50 cursor-pointer"
               >
                 {isBulkLoggingOut ? <RefreshCw size={18} className="animate-spin" /> : <Shield size={18} />}
-                Confirm Emergency Logout
+                Logout ALL Active Users
               </button>
+
               <button 
                 onClick={() => setShowBulkLogoutModal(false)}
                 className="w-full py-4 rounded-2xl bg-slate-100 hover:bg-slate-200 text-slate-600 font-black text-xs transition-all uppercase tracking-widest cursor-pointer"

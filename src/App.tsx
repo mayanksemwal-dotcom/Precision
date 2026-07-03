@@ -194,7 +194,7 @@ export default function App() {
                 email: (firebaseUser.email || '').toLowerCase().trim(),
                 name: currentData.name || currentData.fullName || getCleanName(),
                 fullName: currentData.fullName || currentData.name || getCleanName(),
-                role: (firebaseUser.email?.toLowerCase().trim() === 'mayank.semwal@bergtechnologies.co.in') ? 'ADMIN' : (currentData.role || UserRole.AGENT).toUpperCase(),
+                role: (currentData.role ? currentData.role.toUpperCase() : (firebaseUser.email?.toLowerCase().trim() === 'mayank.semwal@bergtechnologies.co.in' ? 'ADMIN' : (currentData.role || UserRole.AGENT).toUpperCase())),
                 status: finalStatus,
                 department: currentData.department || 'Operations',
                 Manager: currentData.Manager || '',
@@ -223,7 +223,7 @@ export default function App() {
                       email: (firebaseUser.email || '').toLowerCase().trim(),
                       name: currentData.name || currentData.fullName || getCleanName(),
                       fullName: currentData.fullName || currentData.name || getCleanName(),
-                      role: (firebaseUser.email?.toLowerCase().trim() === 'mayank.semwal@bergtechnologies.co.in') ? 'ADMIN' : (currentData.role || UserRole.AGENT).toUpperCase(),
+                      role: (currentData.role ? currentData.role.toUpperCase() : (firebaseUser.email?.toLowerCase().trim() === 'mayank.semwal@bergtechnologies.co.in' ? 'ADMIN' : (currentData.role || UserRole.AGENT).toUpperCase())),
                       status: finalStatus,
                       department: currentData.department || 'Operations',
                       Manager: currentData.Manager || '',
@@ -272,7 +272,7 @@ export default function App() {
                     email: (firebaseUser.email || '').toLowerCase().trim(),
                     name: getCleanName(),
                     fullName: getCleanName(),
-                    role: (firebaseUser.email?.toLowerCase().trim() === 'mayank.semwal@bergtechnologies.co.in') ? UserRole.ADMIN : UserRole.AGENT,
+                    role: (firebaseUser.email?.toLowerCase().trim() === 'mayank.semwal@bergtechnologies.co.in') ? UserRole.ADMIN : UserRole.AGENT, // Default for first-time login
                     status: 'Active',
                     department: 'Operations',
                     Manager: '',
@@ -444,22 +444,33 @@ let rosterFetchPromise: Promise<{ roster: any[], profiles: Record<string, any> }
         }
 
         console.log(`[TMS Billing Optimization] Cache expired or forceRefresh=${forceRefresh}. Fetching roster from Firestore...`);
-        const usersSnap = await getDocsOptimized(collection(db, 'users'), 'users_roster_refresh', forceRefresh);
+        const [usersSnap, profilesSnap] = await Promise.all([
+          getDocsOptimized(collection(db, 'users'), 'users_roster_refresh', forceRefresh),
+          getDocsOptimized(collection(db, 'employeeProfiles'), 'profiles_roster_refresh', forceRefresh)
+        ]);
+
         firestoreLogger.trackRead('users_roster_refresh', usersSnap.size);
+        firestoreLogger.trackRead('profiles_roster_refresh', profilesSnap.size);
+
+        const profiles: Record<string, any> = {};
+        profilesSnap.forEach(d => { profiles[d.id] = d.data(); });
+
         const roster = usersSnap.docs.map(doc => {
           const data = doc.data() as any;
-          const normalizedTLId = data.teamLeadUid || data.teamLeadId || '';
-          const normalizedManagerId = data.mappedManagerUid || data.mappedManagerId || data.managerId || '';
+          const prof = profiles[doc.id] || {};
+          const mergedData = { ...prof, ...data };
+          const normalizedTLId = mergedData.teamLeadUid || mergedData.teamLeadId || prof.teamLeadId || data.teamLeadId || '';
+          const normalizedManagerId = mergedData.mappedManagerUid || mergedData.mappedManagerId || mergedData.managerId || prof.managerId || data.managerId || '';
           return {
             uid: doc.id,
-            ...data,
-            name: data.fullName || data.name || data.employeeName || '',
-            fullName: data.fullName || data.name || data.employeeName || '',
-            email: (data.email || '').toString().toLowerCase().trim(),
-            employeeId: data.employeeId || '',
-            photoURL: data.profilePhotoUrl || data.photoURL || '',
-            role: (data.role || UserRole.AGENT).toString().toUpperCase(),
-            status: data.status || 'Active',
+            ...mergedData,
+            name: mergedData.fullName || mergedData.name || mergedData.employeeName || prof.employeeName || '',
+            fullName: mergedData.fullName || mergedData.name || mergedData.employeeName || prof.employeeName || '',
+            email: (mergedData.email || '').toString().toLowerCase().trim(),
+            employeeId: mergedData.employeeId || '',
+            photoURL: mergedData.profilePhotoUrl || mergedData.photoURL || '',
+            role: (mergedData.role || UserRole.AGENT).toString().toUpperCase(),
+            status: mergedData.status || 'Active',
             teamLeadId: normalizedTLId,
             teamLeadUid: normalizedTLId,
             managerId: normalizedManagerId,
@@ -467,11 +478,6 @@ let rosterFetchPromise: Promise<{ roster: any[], profiles: Record<string, any> }
             mappedManagerUid: normalizedManagerId
           } as UserProfile;
         });
-
-        const profilesSnap = await getDocsOptimized(collection(db, 'employeeProfiles'), 'profiles_roster_refresh', forceRefresh);
-        firestoreLogger.trackRead('profiles_roster_refresh', profilesSnap.size);
-        const profiles: Record<string, any> = {};
-        profilesSnap.forEach(d => { profiles[d.id] = d.data(); });
 
         safeStorage.set('precision360_roster_cache', roster);
         safeStorage.set('precision360_profiles_cache', profiles);
@@ -521,7 +527,7 @@ let rosterFetchPromise: Promise<{ roster: any[], profiles: Record<string, any> }
 
       // Refresh staff roster if manual trigger
       const userRole = (user.role || '').toUpperCase().trim();
-      const isStaff = ['ADMIN', 'MANAGER', 'TEAM_LEAD', 'STL', 'QTL', 'OPS_TL', 'TRAINER_TL', 'MIS', 'OPS_HEAD', 'HR', 'IT_MANAGER', 'QA', 'ASSISTANT_MANAGER', 'TRAINER', 'SME', 'TEAM LEAD', 'TRAINER TL', 'OPS TL'].includes(userRole);
+      const isStaff = ['ADMIN', 'MANAGER', 'TEAM_LEAD', 'STL', 'QTL', 'OPS_TL', 'TRAINER_TL', 'MIS', 'OPS_HEAD', 'HR', 'IT_MANAGER', 'QA', 'ASSISTANT_MANAGER', 'TRAINER', 'SME', 'TEAM LEAD', 'TRAINER TL', 'OPS TL', 'OPS TEAM LEAD', 'TEAM LEADER'].includes(userRole);
 
       if (isStaff) {
         console.log('[TMS Billing Optimization] Loading staff roster...');
@@ -578,7 +584,7 @@ let rosterFetchPromise: Promise<{ roster: any[], profiles: Record<string, any> }
     const initializeData = async () => {
       // 1. Fetch Roster & Profiles (Phase 5 Optimization)
       const userRole = (user.role || '').toUpperCase().trim();
-      const isStaff = ['ADMIN', 'MANAGER', 'TEAM_LEAD', 'STL', 'QTL', 'OPS_TL', 'TRAINER_TL', 'MIS', 'OPS_HEAD', 'HR', 'IT_MANAGER', 'QA', 'ASSISTANT_MANAGER', 'TRAINER', 'SME', 'TEAM LEAD', 'TRAINER TL', 'OPS TL'].includes(userRole);
+      const isStaff = ['ADMIN', 'MANAGER', 'TEAM_LEAD', 'STL', 'QTL', 'OPS_TL', 'TRAINER_TL', 'MIS', 'OPS_HEAD', 'HR', 'IT_MANAGER', 'QA', 'ASSISTANT_MANAGER', 'TRAINER', 'SME', 'TEAM LEAD', 'TRAINER TL', 'OPS TL', 'OPS TEAM LEAD', 'TEAM LEADER'].includes(userRole);
       
       if (isStaff) {
         console.log('[TMS Billing Optimization] Loading staff roster...');
@@ -611,7 +617,7 @@ let rosterFetchPromise: Promise<{ roster: any[], profiles: Record<string, any> }
     console.log('Setting up optimized subscription for current user profile...');
     
     const userRole = (user.role || '').toUpperCase().trim();
-    const isStaff = ['ADMIN', 'MANAGER', 'TEAM_LEAD', 'STL', 'QTL', 'OPS_TL', 'TRAINER_TL', 'MIS', 'OPS_HEAD', 'HR', 'IT_MANAGER', 'QA', 'ASSISTANT_MANAGER', 'TRAINER', 'SME', 'TEAM LEAD', 'TRAINER TL', 'OPS TL'].includes(userRole);
+    const isStaff = ['ADMIN', 'MANAGER', 'TEAM_LEAD', 'STL', 'QTL', 'OPS_TL', 'TRAINER_TL', 'MIS', 'OPS_HEAD', 'HR', 'IT_MANAGER', 'QA', 'ASSISTANT_MANAGER', 'TRAINER', 'SME', 'TEAM LEAD', 'TRAINER TL', 'OPS TL', 'OPS TEAM LEAD', 'TEAM LEADER'].includes(userRole);
 
     const mapDocToUserProfile = (d: any) => {
       const data = d.data() as any;

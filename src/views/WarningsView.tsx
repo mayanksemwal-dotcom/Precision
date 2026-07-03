@@ -169,7 +169,7 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
           const perms = permissionsDoc.data();
           canSeeAllWarnings = !!perms.can_view || !!perms.can_edit || !!perms.can_delete || !!perms.can_approve;
         } else {
-          canSeeAllWarnings = ['ADMIN', 'MANAGER', 'ASSISTANT_MANAGER', 'QA', 'TEAM_LEAD', 'STL', 'OPS_TL'].includes(user.role?.toUpperCase() || '');
+          canSeeAllWarnings = ['ADMIN', 'MANAGER', 'ASSISTANT_MANAGER', 'QA', 'TEAM_LEAD', 'STL', 'OPS_TL', 'TEAM LEAD', 'OPS TL', 'TRAINER TL', 'OPS TEAM LEAD', 'TEAM LEADER'].includes(user.role?.toUpperCase() || '');
         }
 
         let q;
@@ -236,7 +236,10 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
     const targetUser = allUsers.find(u => u.uid === w.agentId);
     const isSubordinate = targetUser ? canActOn(user, targetUser, allUsers) : false;
 
-    if (!isMine && !isSubordinate) return false;
+    // 3. Did I raise this warning?
+    const iRaisedIt = w.qaId === user.uid;
+
+    if (!isMine && !isSubordinate && !iRaisedIt) return false;
 
     // Search filter
     const matchesSearch = 
@@ -269,8 +272,8 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
             deletedBy: user.email
         });
 
-        // Log tool audit event
-        await addDoc(collection(db, 'adminAuditLogs'), {
+        // Log tool audit event (Firestore Logging Disabled)
+        console.log('[AUDIT LOG] (Firestore Logging Disabled) Warning Closed:', {
           timestamp: nowISO,
           action: 'Warning Closed',
           performedBy: `${performerName} (${user.email})`,
@@ -379,8 +382,8 @@ export default function WarningsView({ warnings = [], user, allUsers = [], onRef
       const docRef = doc(db, 'disciplinaryLogs', ticket.id);
       await setDoc(docRef, updatedTicket, { merge: true });
 
-      // Log to audit logs
-      await addDoc(collection(db, 'adminAuditLogs'), {
+      // Log to audit logs (Firestore Logging Disabled)
+      console.log('[AUDIT LOG] (Firestore Logging Disabled) Warning Modified:', {
         timestamp: nowISO,
         action: 'Warning Modified',
         performedBy: `${user.fullName || user.name || user.email} (${user.email})`,

@@ -219,7 +219,7 @@ export default function LoginView() {
         email: cleanEmail,
         name: registerName,
         fullName: registerName,
-        role: (cleanEmail === 'mayank.semwal@bergtechnologies.co.in') ? 'ADMIN' : 'AGENT',
+        role: (cleanEmail === 'mayank.semwal@bergtechnologies.co.in') ? 'ADMIN' : 'AGENT', // Initial default on registration
         status: 'Active',
         department: 'Operations',
         Manager: '',

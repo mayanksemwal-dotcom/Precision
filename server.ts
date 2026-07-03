@@ -192,7 +192,7 @@ async function start() {
         console.warn(`[API /api/set-claims] Skipping user database record verification due to database permission constraints inside sandbox:`, dbErr.message || String(dbErr));
       }
       
-      const finalAdminClaim = isDeveloper || 
+      const finalAdminClaim = (isDeveloper && role === 'ADMIN') || 
         role === 'ADMIN' || 
         role === 'SYSTEM_ADMIN' || 
         role === 'MANAGER' || 
@@ -476,7 +476,7 @@ async function start() {
         email: email,
         name: oldData.name || oldData.fullName || decodedToken.name || email.split('@')[0],
         fullName: oldData.fullName || oldData.name || decodedToken.name || email.split('@')[0],
-        role: (email === 'mayank.semwal@bergtechnologies.co.in') ? 'ADMIN' : (oldData.role || 'AGENT').toUpperCase(),
+        role: (oldData.role ? oldData.role.toUpperCase() : (email === 'mayank.semwal@bergtechnologies.co.in' ? 'ADMIN' : (oldData.role || 'AGENT').toUpperCase())),
         status: oldData.status || 'Active',
         department: oldData.department || 'Operations',
         createdAt: oldData.createdAt || now.toISOString(),
@@ -576,7 +576,7 @@ async function start() {
             uid: authUser.uid,
             name: authUser.displayName || email.split('@')[0],
             email: email,
-            role: email === 'mayank.semwal@bergtechnologies.co.in' ? 'ADMIN' : 'AGENT',
+            role: email === 'mayank.semwal@bergtechnologies.co.in' ? 'ADMIN' : 'AGENT', // Default for new syncs
             status: 'Active'
           };
           const udocRef = db.collection('users').doc(authUser.uid);

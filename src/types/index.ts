@@ -1,6 +1,7 @@
 export enum UserRole {
   ADMIN = 'ADMIN',
   MANAGER = 'MANAGER',
+  ASSISTANT_MANAGER = 'ASSISTANT_MANAGER',
   OPS_HEAD = 'OPS_HEAD',
   HR = 'HR',
   IT_MANAGER = 'IT_MANAGER',
@@ -41,6 +42,7 @@ export interface UserProfile {
   managerName?: string; // Master field
   managerEmail?: string;
   mappedManagerId?: string; // Legacy/Auth field
+  mappedManagerUid?: string;
   mappedManagerName?: string; // Legacy/Auth field
   mappedManagerEmail?: string;
   managerOfManagerId?: string;

@@ -185,11 +185,15 @@ export function getDetailedDeviceMetadata() {
 
   const ua = (navigator.userAgent || '').toLowerCase();
   
-  // 1. Determine Device Type Check (relying on our robust getDeviceType)
+  // 1. Determine Device Type Check
   let deviceType: 'Mobile' | 'Tablet' | 'Desktop' = 'Desktop';
-  const resolvedType = getDeviceType();
+  const isTablet = /ipad|tablet|playbook|silk/i.test(ua) || 
+                   (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  const isMobile = /mobile|android|iphone|ipod|blackberry|iemobile|opera mini|mobi/i.test(ua);
   
-  if (resolvedType === 'mobile') {
+  if (isTablet) {
+    deviceType = 'Tablet';
+  } else if (isMobile) {
     deviceType = 'Mobile';
   } else {
     deviceType = 'Desktop';
@@ -227,13 +231,13 @@ export function getDetailedDeviceMetadata() {
   } else if (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1) {
     os = 'iOS';
   } else if (/macintosh|mac os x/i.test(ua)) {
-    if (resolvedType === 'mobile') {
+    if (isMobile) {
       os = 'iOS';
     } else {
       os = 'Mac OS';
     }
   } else if (/linux/i.test(ua)) {
-    if (resolvedType === 'mobile') {
+    if (isMobile) {
       os = 'Android';
     } else {
       os = 'Linux';
@@ -486,8 +490,8 @@ const LiveAgentDurations = ({
   const completedShiftsToday = myPastShifts.filter(s => {
     const isCompleted = s.status !== 'ACTIVE' && s.status !== 'BREAK';
     if (!isCompleted || s.id === currentShift?.id) return false;
-    const shiftOutDate = s.clockOutTime ? new Date(s.clockOutTime) : new Date(s.clockInTime);
-    return shiftOutDate.toDateString() === nowLocalDateString;
+    const shiftInDate = new Date(s.clockInTime);
+    return shiftInDate.toDateString() === nowLocalDateString;
   });
 
   completedShiftsToday.forEach(s => {
@@ -695,12 +699,16 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
   const [currentPage, setCurrentPage] = useState(1);
   const [selectedProcessInput, setSelectedProcessInput] = useState(user.lastUsedProcess || '');
   
-  // Reactively pre-select last used process if user profile updates
+  // Reactively pre-select last used process if user profile or processes configuration updates
   useEffect(() => {
-    if (user.lastUsedProcess) {
-      setSelectedProcessInput(user.lastUsedProcess);
+    if (processes.length > 0) {
+      if (user.lastUsedProcess && processes.includes(user.lastUsedProcess)) {
+        setSelectedProcessInput(user.lastUsedProcess);
+      } else if (!selectedProcessInput || !processes.includes(selectedProcessInput)) {
+        setSelectedProcessInput(processes[0]);
+      }
     }
-  }, [user.lastUsedProcess]);
+  }, [user.lastUsedProcess, processes]);
 
   const [selectedBreakInput, setSelectedBreakInput] = useState(BREAK_OPTIONS[0]);
   const [activeShiftFilter, setActiveShiftFilter] = useState('all');
@@ -817,15 +825,20 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
 
     const unsubActive = onSnapshot(qActive, (snapshot) => {
       firestoreLogger.trackRead('my_active_shifts_snapshot', snapshot.size);
-      const activeShiftsList = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as TMSShift));
+      const rawActiveShifts = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as TMSShift));
+      
+      // Sort so the newest active shift is at index 0
+      const activeShiftsList = [...rawActiveShifts].sort((a, b) => 
+        new Date(b.clockInTime).getTime() - new Date(a.clockInTime).getTime()
+      );
       
       // Phase 3 Optimization: Healing logic for duplicate active shifts
       if (activeShiftsList.length > 1) {
-        console.log(`[TMS HEALING] Found ${activeShiftsList.length} active sessions. Auto-closing duplicates...`);
+        console.log(`[TMS HEALING] Found ${activeShiftsList.length} active sessions. Auto-closing older duplicates...`);
         const healBatch = writeBatch(db);
         const healNowISO = getLiveTimeISO();
         
-        // Keep the newest one, close others
+        // Keep the newest one (index 0), close others
         activeShiftsList.slice(1).forEach(sh => {
           if (!attemptedHealsRef.current.has(sh.id)) {
             attemptedHealsRef.current.add(sh.id);
@@ -850,7 +863,7 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
         healBatch.commit().catch(e => console.error('Failed to commit auto-heal batch', e));
       }
 
-      // Find if there's any active shift
+      // Find if there's any active shift (guaranteed to be the newest)
       const active = activeShiftsList.length > 0 ? activeShiftsList[0] : null;
       
       if (active) {
@@ -858,16 +871,39 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
         const activeProductiveMs = getShiftProductiveMs(active, referenceTime);
         const TEN_HOURS_MS = 10 * 60 * 60 * 1000;
         
-        if (activeProductiveMs >= TEN_HOURS_MS) {
+        const clockInMs = new Date(active.clockInTime).getTime();
+        const elapsedShiftMs = referenceTime - clockInMs;
+        const TWELVE_HOURS_MS = 12 * 60 * 60 * 1000;
+        
+        const clockInDate = new Date(active.clockInTime);
+        const nowDate = getLiveTime();
+        const isDifferentDay = 
+          clockInDate.getFullYear() !== nowDate.getFullYear() ||
+          clockInDate.getMonth() !== nowDate.getMonth() ||
+          clockInDate.getDate() !== nowDate.getDate();
+
+        const lastAct = active.activities?.[active.activities.length - 1];
+        const lastActTime = lastAct 
+          ? new Date(lastAct.endTime || lastAct.startTime).getTime()
+          : clockInMs;
+        const idleMs = referenceTime - lastActTime;
+
+        // Auto-close if exceeded 12 hours total, OR if it is a different day and idle for more than 6 hours
+        const isStale = elapsedShiftMs >= TWELVE_HOURS_MS || (isDifferentDay && idleMs >= 6 * 60 * 60 * 1000);
+
+        if (activeProductiveMs >= TEN_HOURS_MS || isStale) {
           if (!attemptedHealsRef.current.has(active.id)) {
             attemptedHealsRef.current.add(active.id);
-            const { activities: updatedActivities, clockOutTime } = truncateShiftToProductiveTime(active, TEN_HOURS_MS);
+            const limitMs = Math.min(activeProductiveMs, TEN_HOURS_MS);
+            const { activities: updatedActivities, clockOutTime } = truncateShiftToProductiveTime(active, limitMs);
             const finalizedShift = {
               ...active,
               activities: updatedActivities,
               clockOutTime,
               status: 'AUTO_CLOSED' as const,
-              remarks: 'Auto-clocked out after 10 hours productive time'
+              remarks: isStale 
+                ? 'Auto-clocked out due to stale session spanning multiple days/shifts'
+                : 'Auto-clocked out after 10 hours productive time'
             };
 
             saveShiftState(finalizedShift)
@@ -878,6 +914,9 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
                   status: 'OFFLINE',
                   lastLogoutAt: clockOutTime
                 });
+              })
+              .then(() => {
+                toast.info('Your previous stale shift was automatically clocked out. Timer reset for new shift.', { duration: 8000 });
               })
               .catch(err => console.error('Error auto-clocking out shift:', err));
           }
@@ -1082,9 +1121,8 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
         details: `Force Logout executed. User Forced Out: ${forceOutTargetName} (${shift.userEmail}). Forced By: ${user.name} (${user.email}). Reason: ${finalReason}. Current Activity at logout: ${lastActivity}.`
       });
 
-      // 2. Also add to adminAuditLogs to be fully aligned with general compliance dashboard
-      const adminLogId = `wt-audit-${Date.now()}`;
-      await setDoc(doc(db, 'adminAuditLogs', adminLogId), {
+      // 2. Log force-logout event to console (Firestore Logging Disabled)
+      console.log('[AUDIT LOG] (Firestore Logging Disabled) Force Logout:', {
         timestamp: nowISO,
         action: 'Force Logout',
         performedBy: `${user.name} (${user.email})`,
@@ -1116,15 +1154,96 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
     }
   };
 
-  // Trigger cleanup for managers on mount
+  // Trigger cleanup for managers on mount and periodically
   useEffect(() => {
     fetchAllShifts();
     if (isManagerRole) {
       import('../services/tmsCleanupService').then(service => {
         service.performTmsStaleSessionCleanup();
+        service.performTmsTenHourForceOut();
       });
+
+      // Run 10-hour auto force-out checks every 5 minutes automatically
+      const cleanupInterval = setInterval(() => {
+        import('../services/tmsCleanupService').then(service => {
+          service.performTmsTenHourForceOut();
+        });
+      }, 5 * 60 * 1000);
+
+      return () => clearInterval(cleanupInterval);
     }
-  }, []);
+  }, [isManagerRole]);
+
+  // Automated 10-hour productive time force-clockout and stale monitor
+  useEffect(() => {
+    if (!currentShift || currentShift.status === 'COMPLETED' || currentShift.status === 'AUTO_CLOSED') return;
+
+    const interval = setInterval(() => {
+      const now = new Date().getTime();
+      const productiveMs = getShiftProductiveMs(currentShift, now);
+      const TEN_HOURS_MS = 10 * 60 * 60 * 1000;
+
+      const clockInMs = new Date(currentShift.clockInTime).getTime();
+      const elapsedShiftMs = now - clockInMs;
+      const TWELVE_HOURS_MS = 12 * 60 * 60 * 1000;
+
+      const clockInDate = new Date(currentShift.clockInTime);
+      const nowDate = getLiveTime();
+      const isDifferentDay = 
+        clockInDate.getFullYear() !== nowDate.getFullYear() ||
+        clockInDate.getMonth() !== nowDate.getMonth() ||
+        clockInDate.getDate() !== nowDate.getDate();
+
+      const lastAct = currentShift.activities?.[currentShift.activities.length - 1];
+      const lastActTime = lastAct 
+        ? new Date(lastAct.endTime || lastAct.startTime).getTime()
+        : clockInMs;
+      const idleMs = now - lastActTime;
+
+      // Auto-close if exceeded 12 hours total, OR if it is a different day and idle for more than 6 hours
+      const isStale = elapsedShiftMs >= TWELVE_HOURS_MS || (isDifferentDay && idleMs >= 6 * 60 * 60 * 1000);
+
+      if (productiveMs >= TEN_HOURS_MS || isStale) {
+        console.log('[AUTO-LOGOUT] Stale session or 10 hours productive time reached. Forcing clock-out.');
+        
+        // Truncate shift to productive limit and close
+        const limitMs = Math.min(productiveMs, TEN_HOURS_MS);
+        const { activities: updatedActivities, clockOutTime } = truncateShiftToProductiveTime(currentShift, limitMs);
+        const finalizedShift = {
+          ...currentShift,
+          activities: updatedActivities,
+          clockOutTime,
+          status: 'AUTO_CLOSED' as const,
+          remarks: isStale 
+            ? 'Auto-clocked out due to stale session spanning multiple days/shifts'
+            : 'Auto-clocked out after 10 hours productive time'
+        };
+
+        saveShiftState(finalizedShift)
+          .then(() => syncShiftToAttendance({ id: currentShift.id, ...finalizedShift }))
+          .then(() => {
+             const userRef = doc(db, 'users', user.uid);
+             return updateDoc(userRef, {
+               status: 'OFFLINE',
+               lastLogoutAt: clockOutTime
+             });
+          })
+          .then(() => {
+            setCurrentShift(null);
+            setLocalOwnShift(undefined);
+            toast.info(
+              isStale 
+                ? 'Your previous stale shift has been automatically clocked out. Timer reset for new shift.'
+                : 'You have been automatically clocked out after 10 hours of productive time.',
+              { duration: 10000 }
+            );
+          })
+          .catch(err => console.error('Error in auto-logout loop:', err));
+      }
+    }, 60000); // Check every minute
+
+    return () => clearInterval(interval);
+  }, [currentShift?.id, currentShift?.status, user?.uid]);
 
   const saveShiftState = async (updatedShift: TMSShift) => {
     // Phase 5 Optimization: Avoid getDoc by using the preloaded 'user' prop in memory if it's the current user's shift
@@ -1147,18 +1266,28 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
       ? updatedShift.activities[updatedShift.activities.length - 1] 
       : null;
 
-    const currentActivity = lastAct && !lastAct.endTime ? lastAct.name : 'Offline';
+    const currentActivity = (lastAct && !lastAct.endTime && lastAct.name) || 'Offline';
     const breakType = updatedShift.status === 'BREAK' && lastAct && !lastAct.endTime ? lastAct.name : null;
 
     const currentActivityStartTime = lastAct ? lastAct.startTime : new Date().toISOString();
 
+    const validateDate = (d: any, label: string) => {
+      const date = new Date(d);
+      if (isNaN(date.getTime())) {
+        console.error(`Invalid Date in ${label}:`, d);
+        return false;
+      }
+      return true;
+    };
+
     const liveSessionData = {
+      sessionId: updatedShift.id,
       uid: updatedShift.userId,
       employeeId: updatedShift.userId,
       employeeName: updatedShift.userName,
       role: userData?.role || 'AGENT',
-      process: userData?.team || userData?.process || 'N/A',
-      currentProcess: userData?.team || userData?.process || 'N/A',
+      process: lastAct?.name || userData?.team || userData?.process || 'N/A',
+      currentProcess: lastAct?.name || userData?.team || userData?.process || 'N/A',
       managerId: userData?.mappedManagerId || userData?.managerId || '',
       tlId: userData?.teamLeadId || userData?.teamLeadUid || '',
       status: updatedShift.status,
@@ -1173,15 +1302,33 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
       clockInTime: updatedShift.clockInTime,
       clockOutTime: updatedShift.clockOutTime || null,
       deviceName: updatedShift.deviceType || 'Unknown',
+      deviceType: updatedShift.deviceType || 'Desktop',
+      clockInDevice: updatedShift.clockInDevice || 'desktop',
       platform: updatedShift.os || 'Unknown',
+      os: updatedShift.os || 'Unknown',
       lastHeartbeat: new Date().toISOString()
     };
 
+    // Validate timestamps
+    validateDate(liveSessionData.clockInTime, 'clockInTime');
+    validateDate(liveSessionData.currentActivityStartTime, 'currentActivityStartTime');
+
     const liveSessionRef = doc(db, 'live_sessions', updatedShift.userId);
-    await Promise.all([
-      setDoc(doc(db, 'tmsShifts', updatedShift.id), updatedShift),
-      setDoc(liveSessionRef, liveSessionData, { merge: true })
-    ]);
+    
+    // If shift is completed, remove from live_sessions entirely to ensure dashboard sync
+    const isCompleted = ['COMPLETED', 'AUTO_CLOSED', 'COMPLETED_FORCED'].includes(updatedShift.status);
+
+    if (isCompleted) {
+      await Promise.all([
+        setDoc(doc(db, 'tmsShifts', updatedShift.id), updatedShift),
+        deleteDoc(liveSessionRef)
+      ]);
+    } else {
+      await Promise.all([
+        setDoc(doc(db, 'tmsShifts', updatedShift.id), updatedShift),
+        setDoc(liveSessionRef, liveSessionData, { merge: true })
+      ]);
+    }
   };
 
   const saveProcessesList = async (updatedList: string[]) => {
@@ -1253,7 +1400,7 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
       return;
     }
 
-    const targetProcess = selectedProcessInput || (processes.length > 0 ? processes[0] : '');
+    const targetProcess = (selectedProcessInput || (processes.length > 0 ? processes[0] : '') || '').trim();
     if (!targetProcess) {
       toast.error('Please select a starting process before Clocking In.');
       return;

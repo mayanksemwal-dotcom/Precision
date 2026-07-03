@@ -200,7 +200,7 @@ export const PermissionProvider: React.FC<PermissionProviderProps> = ({ children
     const roleName = rawRole.toUpperCase();
     const isDeveloper = user.email.toLowerCase().trim() === 'mayank.semwal@bergtechnologies.co.in';
     const isFullPrivilegeRole = [UserRole.ADMIN, 'ADMIN', 'SYSTEM_ADMIN'].includes(roleName);
-    const isAdmin = isFullPrivilegeRole || (isDeveloper && !overriddenRole);
+    const isAdmin = isFullPrivilegeRole || (isDeveloper && !overriddenRole && roleName === 'ADMIN');
     
     // Seed default full access
     const getFullPermissions = () => {
@@ -445,7 +445,7 @@ export const PermissionProvider: React.FC<PermissionProviderProps> = ({ children
     const rawRole = overriddenRole || user?.role || 'AGENT';
     const roleName = rawRole.toUpperCase();
     const isDeveloper = user?.email?.toLowerCase().trim() === 'mayank.semwal@bergtechnologies.co.in';
-    const isAdmin = (roleName === 'ADMIN' || rawRole === 'ADMIN') || (isDeveloper && !overriddenRole);
+    const isAdmin = (roleName === 'ADMIN' || rawRole === 'ADMIN') || (isDeveloper && !overriddenRole && (roleName === 'ADMIN' || rawRole === 'ADMIN'));
 
     if (isAdmin) return true;
 

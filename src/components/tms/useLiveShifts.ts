@@ -12,6 +12,8 @@ export function useLiveShifts(uid?: string, role?: string, userIds?: string[], m
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<Error | null>(null);
 
+  const userIdsKey = userIds?.join(',');
+
   useEffect(() => {
     if (!uid) return;
 
@@ -19,11 +21,31 @@ export function useLiveShifts(uid?: string, role?: string, userIds?: string[], m
     setError(null);
 
     const normRole = (role || '').toUpperCase().trim();
-    const isSupervisorOrTL = ['TEAM_LEAD', 'STL', 'QTL', 'OPS_TL', 'TRAINER_TL', 'ASSISTANT_MANAGER', 'SME'].includes(normRole);
+    const isSupervisorOrTL = ['TEAM_LEAD', 'STL', 'QTL', 'OPS_TL', 'TRAINER_TL', 'ASSISTANT_MANAGER', 'SME', 'TEAM LEAD', 'OPS TL', 'TRAINER TL', 'OPS TEAM LEAD', 'TEAM LEADER', 'MANAGER', 'OPS_HEAD', 'HR', 'IT_MANAGER', 'EXECUTIVE', 'OPS HEAD'].includes(normRole);
 
     let unsubscribers: (() => void)[] = [];
 
-      // Phase 4: Build session cards entirely from live_sessions
+    // Deduplicate helper to prevent duplicate/stale user entries
+    const deduplicateShifts = (shiftsList: TMSShift[]): TMSShift[] => {
+      const uniqueMap = new Map<string, TMSShift>();
+      shiftsList.forEach(s => {
+        if (!s.userId) return;
+        const existing = uniqueMap.get(s.userId);
+        if (!existing) {
+          uniqueMap.set(s.userId, s);
+        } else {
+          const existingTime = (existing as any).lastHeartbeat ? new Date((existing as any).lastHeartbeat).getTime() : 0;
+          const sTime = (s as any).lastHeartbeat ? new Date((s as any).lastHeartbeat).getTime() : 0;
+          // Keep the newer heartbeat record to avoid showing stale status details
+          if (sTime > existingTime) {
+            uniqueMap.set(s.userId, s);
+          }
+        }
+      });
+      return Array.from(uniqueMap.values());
+    };
+
+    // Phase 4: Build session cards entirely from live_sessions
     const mapLiveSessionToShift = (data: any): TMSShift => {
       return {
         id: data.sessionId || data.uid,
@@ -36,9 +58,14 @@ export function useLiveShifts(uid?: string, role?: string, userIds?: string[], m
         lastHeartbeat: data.lastHeartbeat,
         currentActivity: data.currentActivity,
         currentActivityStartTime: data.currentActivityStartTime,
-        deviceName: data.deviceName,
+        deviceName: data.deviceName || data.deviceType || 'Unknown',
+        deviceType: data.deviceType || (data.deviceName && data.deviceName !== 'Unknown' ? data.deviceName : 'Desktop'),
+        clockInDevice: data.clockInDevice || (data.deviceType === 'Mobile' ? 'mobile' : 'desktop'),
+        os: data.os || data.platform || 'Unknown',
         productiveMs: data.productiveSeconds ? data.productiveSeconds * 1000 : 0,
-        breakMs: data.breakSeconds ? data.breakSeconds * 1000 : 0
+        breakMs: data.breakSeconds ? data.breakSeconds * 1000 : 0,
+        teamLeadUid: data.tlId || data.teamLeadUid || data.teamLeadId || '',
+        managerId: data.managerId || ''
       } as unknown as TMSShift;
     };
 
@@ -57,8 +84,7 @@ export function useLiveShifts(uid?: string, role?: string, userIds?: string[], m
       unsubscribers = chunks.map((chunk, index) => {
         const q = query(
           collection(db, 'live_sessions'),
-          where('uid', 'in', chunk),
-          where('status', 'in', ['ACTIVE', 'BREAK'])
+          where('uid', 'in', chunk)
         );
         
         return onSnapshot(q, (snap) => {
@@ -66,30 +92,31 @@ export function useLiveShifts(uid?: string, role?: string, userIds?: string[], m
           
           const allActive: TMSShift[] = [];
           Object.values(activeListMap).forEach(list => allActive.push(...list));
-          setShifts(allActive);
+          setShifts(deduplicateShifts(allActive));
           setLoading(false);
         }, (err) => {
           console.error(`[useLiveShifts] live_sessions chunk ${index} error:`, err);
         });
       });
     } else if (isSupervisorOrTL && !monitorAll) {
-      console.log(`[useLiveShifts] Monitoring live_sessions for TL: ${uid} and self`);
+      const isManagerRole = ['MANAGER', 'ASSISTANT_MANAGER', 'OPS_HEAD', 'HR', 'IT_MANAGER', 'EXECUTIVE', 'OPS HEAD'].includes(normRole);
+      const supervisorField = isManagerRole ? 'managerId' : 'tlId';
+
+      console.log(`[useLiveShifts] Monitoring live_sessions for supervisor: ${uid} (field: ${supervisorField}) and self`);
       const qTeam = query(
         collection(db, 'live_sessions'),
-        where('tlId', '==', uid),
-        where('status', 'in', ['ACTIVE', 'BREAK'])
+        where(supervisorField, '==', uid)
       );
       const qSelf = query(
         collection(db, 'live_sessions'),
-        where('uid', '==', uid),
-        where('status', 'in', ['ACTIVE', 'BREAK'])
+        where('uid', '==', uid)
       );
 
       const unsubTeam = onSnapshot(qTeam, (snap) => {
         setShifts(prev => {
-          const others = prev.filter(s => s.teamLeadUid !== uid);
+          const others = prev.filter(s => isManagerRole ? (s as any).managerId !== uid : s.teamLeadUid !== uid);
           const current = snap.docs.map(d => mapLiveSessionToShift(d.data()));
-          return [...others, ...current];
+          return deduplicateShifts([...others, ...current]);
         });
         setLoading(false);
       });
@@ -98,21 +125,20 @@ export function useLiveShifts(uid?: string, role?: string, userIds?: string[], m
         setShifts(prev => {
           const others = prev.filter(s => s.userId !== uid);
           const current = snap.docs.map(d => mapLiveSessionToShift(d.data()));
-          return [...others, ...current];
+          return deduplicateShifts([...others, ...current]);
         });
         setLoading(false);
       });
 
       unsubscribers = [unsubTeam, unsubSelf];
     } else {
-      console.log(`[useLiveShifts] Monitoring all live_sessions (ACTIVE/BREAK)`);
+      console.log(`[useLiveShifts] Monitoring all live_sessions`);
       const qAll = query(
         collection(db, 'live_sessions'),
-        where('status', 'in', ['ACTIVE', 'BREAK']),
         limit(300)
       );
       const unsubAll = onSnapshot(qAll, (snap) => {
-        setShifts(snap.docs.map(d => mapLiveSessionToShift(d.data())));
+        setShifts(deduplicateShifts(snap.docs.map(d => mapLiveSessionToShift(d.data()))));
         setLoading(false);
       });
       unsubscribers = [unsubAll];
@@ -121,7 +147,7 @@ export function useLiveShifts(uid?: string, role?: string, userIds?: string[], m
     return () => {
       unsubscribers.forEach(unsub => unsub());
     };
-  }, [uid, role, userIds?.length, monitorAll]); // Stable dependencies
+  }, [uid, role, userIdsKey, monitorAll]); // Stable dependencies including joined userIdsKey
 
   const fetchLiveShifts = useCallback(async (forceRefresh = false) => {
     // This is now handled by realtime listeners, but we keep the interface

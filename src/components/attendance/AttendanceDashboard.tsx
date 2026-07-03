@@ -44,7 +44,7 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
   const roleNormalized = (user.role || '').toUpperCase().trim().replace(/\s+/g, '_');
   const isTopAdmin = ['ADMIN', 'MANAGER', 'MIS', 'OPS_HEAD', 'HR', 'IT_MANAGER'].includes(roleNormalized);
   const isStrictAdminOrManager = ['ADMIN', 'MANAGER', 'MIS', 'ASSISTANT_MANAGER', 'OPS_HEAD', 'HR', 'IT_MANAGER'].includes(roleNormalized);
-  const isTLRole = ['QTL', 'STL', 'OPS_TL', 'TRAINER_TL', 'TEAM_LEAD', 'TRAINER', 'SME'].includes(roleNormalized);
+  const isTLRole = ['QTL', 'STL', 'OPS_TL', 'TRAINER_TL', 'TEAM_LEAD', 'TRAINER', 'SME', 'OPS_TEAM_LEAD', 'TEAM_LEADER'].includes(roleNormalized);
 
   const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState(false);
@@ -135,14 +135,14 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
 
     // 3. Map for enhancement
     return consolidated.map(r => {
-      const user = userLookup[r.employeeEmail.toLowerCase().trim()];
+      const user = userLookup[r.employeeEmail.toLowerCase().trim()] || (r.userId ? userLookup[r.userId] : null);
       if (!user) return r;
 
       return {
         ...r,
         process: r.process !== 'N/A' && r.process ? r.process : (user.process || 'N/A'),
         mappedTL: r.mappedTL !== 'N/A' && r.mappedTL ? r.mappedTL : (user.teamLeadName || 'N/A'),
-        mappedManager: r.mappedManager !== 'N/A' && r.mappedManager ? r.mappedManager : (user.mappedManagerName || user.Manager || 'N/A'),
+        mappedManager: r.mappedManager !== 'N/A' && r.mappedManager ? r.mappedManager : (user.managerName || user.mappedManagerName || user.Manager || 'N/A'),
         employeeId: r.employeeId || user.employeeId || ''
       };
     });
@@ -167,12 +167,12 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
           // Check reporting structure
           let isReport = false;
           if (employeeProfile) {
-            const empTLId = employeeProfile.teamLeadId;
-            const empMgrId = employeeProfile.mappedManagerId || employeeProfile.managerId;
+            const empTLId = employeeProfile.teamLeadId || employeeProfile.teamLeadUid;
+            const empMgrId = employeeProfile.mappedManagerId || employeeProfile.managerId || employeeProfile.mappedManagerUid;
             const empTLEmail = (employeeProfile.teamLeadEmail || '').toLowerCase().trim();
             const empMgrEmail = (employeeProfile.mappedManagerEmail || employeeProfile.managerEmail || '').toLowerCase().trim();
             const empTLName = (employeeProfile.teamLeadName || '').toLowerCase().trim();
-            const empMgrName = (employeeProfile.mappedManagerName || '').toLowerCase().trim();
+            const empMgrName = (employeeProfile.managerName || employeeProfile.mappedManagerName || '').toLowerCase().trim();
 
             isReport = (
               empTLId === user.uid || 
@@ -272,7 +272,7 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
   }, [allUsers, records]);
 
   const availableManagers = useMemo(() => {
-    const fromUsers = allUsers.map(u => u.mappedManagerName || u.Manager);
+    const fromUsers = allUsers.map(u => u.managerName || u.mappedManagerName || u.Manager);
     const fromRecords = records.map(r => r.mappedManager);
     const combined = [...fromUsers, ...fromRecords];
     const list = Array.from(new Set(combined.filter(m => m !== 'N/A' && !!m)));
@@ -296,25 +296,10 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
   }, [allUsers]);
 
   const fetchAttendanceRecords = async (isLoadMore = false) => {
-    if (isLoadMore) setLoadingMore(true);
-    else setLoading(true);
+    if (!isLoadMore) return ''; // Managed in real-time by the active useEffect listener!
+    setLoadingMore(true);
 
     try {
-      // 1. Fetch Config one-time
-      if (!isLoadMore) {
-        const configSnap = await getDoc(doc(db, 'config', 'attendanceSettings'));
-        firestoreLogger.trackRead('attendance_config_fetch_one_time', configSnap.exists() ? 1 : 0);
-        if (configSnap.exists()) {
-          const c = configSnap.data();
-          setConfig({
-            presentThreshold: c.presentThreshold ?? 480,
-            halfDayThreshold: c.halfDayThreshold ?? 240,
-            countBreakTime: c.countBreakTime ?? false
-          });
-        }
-      }
-
-      // 2. Compute date range
       const getLocalDateString = (d: Date): string => {
         const yyyy = d.getFullYear();
         const mm = String(d.getMonth() + 1).padStart(2, '0');
@@ -361,7 +346,6 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
         endStr = customEndDate;
       }
 
-      // 3. Fetch Records with Cursor Pagination
       const isStaff = isTopAdmin || isStrictAdminOrManager || isTLRole;
       const attRef = collection(db, 'attendanceSummary');
       
@@ -370,7 +354,7 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
         ? query(attRef, where('attendanceDate', '>=', startStr), where('attendanceDate', '<=', endStr), orderBy('attendanceDate', 'desc'), limit(PAGE_SIZE))
         : query(attRef, where('userId', '==', user.uid), where('attendanceDate', '>=', startStr), where('attendanceDate', '<=', endStr), orderBy('attendanceDate', 'desc'), limit(PAGE_SIZE));
 
-      if (isLoadMore && lastDoc) {
+      if (lastDoc) {
         q = query(q, startAfter(lastDoc));
       }
 
@@ -379,30 +363,116 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
       
       const attData = snap.docs.map(d => ({ ...d.data(), id: d.id } as AttendanceSummary));
       
-      if (isLoadMore) {
-        setRecords(prev => [...prev, ...attData]);
-      } else {
-        setRecords(attData);
-      }
+      setRecords(prev => {
+        const existingIds = new Set(prev.map(p => p.id));
+        const filteredNew = attData.filter(d => !existingIds.has(d.id));
+        return [...prev, ...filteredNew];
+      });
 
       setLastDoc(snap.docs[snap.docs.length - 1] || null);
       setHasMore(snap.size === PAGE_SIZE);
-      
-      if (!isLoadMore) setLoading(false);
-      else setLoadingMore(false);
-    } catch (error: any) {
-      console.error('Error loading attendance records:', error);
-      toast.error(`Failed to load attendance records: ${error.message || 'Unknown error'}`);
-      setLoading(false);
       setLoadingMore(false);
+      return startStr;
+    } catch (error: any) {
+      console.error('Error loading more attendance records:', error);
+      setLoadingMore(false);
+      return '';
     }
   };
 
   useEffect(() => {
-    if (user?.uid) {
-      fetchAttendanceRecords(false);
+    if (!user?.uid) return;
+
+    let unsubscribe: (() => void) | null = null;
+    setLoading(true);
+
+    const getLocalDateString = (d: Date): string => {
+      const yyyy = d.getFullYear();
+      const mm = String(d.getMonth() + 1).padStart(2, '0');
+      const dd = String(d.getDate()).padStart(2, '0');
+      return `${yyyy}-${mm}-${dd}`;
+    };
+
+    let startStr = '';
+    let endStr = '';
+
+    if (dateRange === 'today') {
+      const todayStr = getLocalDateString(new Date());
+      startStr = todayStr;
+      endStr = todayStr;
+    } else if (dateRange === 'yesterday') {
+      const d = new Date();
+      d.setDate(d.getDate() - 1);
+      const yesterdayStr = getLocalDateString(d);
+      startStr = yesterdayStr;
+      endStr = yesterdayStr;
+    } else if (dateRange === 'week') {
+      const d = new Date();
+      d.setDate(d.getDate() - 7);
+      startStr = getLocalDateString(d);
+      endStr = getLocalDateString(new Date());
+    } else if (dateRange === 'month') {
+      const d = new Date();
+      d.setDate(d.getDate() - 30);
+      startStr = getLocalDateString(d);
+      endStr = getLocalDateString(new Date());
+    } else if (dateRange === 'current_month') {
+      const d = new Date();
+      const firstDay = new Date(d.getFullYear(), d.getMonth(), 1);
+      startStr = getLocalDateString(firstDay);
+      endStr = getLocalDateString(d);
+    } else if (dateRange === 'previous_month') {
+      const d = new Date();
+      const firstDayOfPrev = new Date(d.getFullYear(), d.getMonth() - 1, 1);
+      const lastDayOfPrev = new Date(d.getFullYear(), d.getMonth(), 0);
+      startStr = getLocalDateString(firstDayOfPrev);
+      endStr = getLocalDateString(lastDayOfPrev);
+    } else if (dateRange === 'custom') {
+      startStr = customStartDate;
+      endStr = customEndDate;
     }
-  }, [dateRange, customStartDate, customEndDate, user?.uid]);
+
+    // Load config first
+    getDoc(doc(db, 'config', 'attendanceSettings')).then((configSnap) => {
+      if (configSnap.exists()) {
+        const c = configSnap.data();
+        setConfig({
+          presentThreshold: c.presentThreshold ?? 480,
+          halfDayThreshold: c.halfDayThreshold ?? 240,
+          countBreakTime: c.countBreakTime ?? false
+        });
+      }
+    }).catch(err => console.error("Error fetching config:", err));
+
+    const isStaff = isTopAdmin || isStrictAdminOrManager || isTLRole;
+    const attRef = collection(db, 'attendanceSummary');
+    
+    const PAGE_SIZE = 100;
+    const q = isStaff
+      ? query(attRef, where('attendanceDate', '>=', startStr), where('attendanceDate', '<=', endStr), orderBy('attendanceDate', 'desc'), limit(PAGE_SIZE))
+      : query(attRef, where('userId', '==', user.uid), where('attendanceDate', '>=', startStr), where('attendanceDate', '<=', endStr), orderBy('attendanceDate', 'desc'), limit(PAGE_SIZE));
+
+    unsubscribe = onSnapshot(q, (snap) => {
+      firestoreLogger.trackRead('attendance_records_onSnapshot', snap.size);
+      const attData = snap.docs.map(d => ({ ...d.data(), id: d.id } as AttendanceSummary));
+      
+      setRecords(attData);
+      setLastDoc(snap.docs[snap.docs.length - 1] || null);
+      setHasMore(snap.size === PAGE_SIZE);
+      setLoading(false);
+    }, (error) => {
+      console.error('Error in attendance summary onSnapshot:', error);
+      setLoading(false);
+    });
+
+    if (startStr) {
+      silentSyncAttendance(startStr);
+    }
+
+    return () => {
+      if (unsubscribe) unsubscribe();
+    };
+  }, [dateRange, customStartDate, customEndDate, user?.uid, isTopAdmin, isStrictAdminOrManager, isTLRole]);
 
   const loadData = async () => {
     await fetchAttendanceRecords();
@@ -412,6 +482,124 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
      if (productiveMins >= thresholdConf.presentThreshold) return 'Present';
      if (productiveMins >= thresholdConf.halfDayThreshold) return 'Half Day';
      return 'Absent';
+  };
+
+  const silentSyncAttendance = async (startStr: string) => {
+    try {
+      let syncSinceDate = new Date();
+      syncSinceDate.setDate(syncSinceDate.getDate() - 14);
+      if (startStr) {
+        const parsed = new Date(startStr);
+        if (!isNaN(parsed.getTime())) {
+          syncSinceDate = parsed;
+          syncSinceDate.setDate(syncSinceDate.getDate() - 1);
+        }
+      }
+      const syncSinceISO = syncSinceDate.toISOString();
+      const syncSinceDateStr = syncSinceDate.toISOString().split('T')[0];
+
+      const shiftsRef = collection(db, 'tmsShifts');
+      const qShifts = query(shiftsRef, where('clockInTime', '>=', syncSinceISO));
+      const shiftsSnap = await getDocs(qShifts);
+      
+      const completedShifts = shiftsSnap.docs
+        .map(d => ({ ...d.data(), id: d.id }))
+        .filter((s: any) => s.status === 'COMPLETED' || s.status === 'AUTO_CLOSED' || s.status === 'COMPLETED_FORCED');
+
+      if (completedShifts.length === 0) return;
+
+      const attSnap = await getDocs(query(collection(db, 'attendanceSummary'), where('attendanceDate', '>=', syncSinceDateStr)));
+      const existingShiftIds = new Set(attSnap.docs.map(d => d.data().shiftId));
+
+      // Fetch the config to ensure correct threshold calculations
+      const confSnap = await getDoc(doc(db, 'config', 'attendanceSettings'));
+      let activeConfig = config;
+      if (confSnap.exists()) {
+        const c = confSnap.data();
+        activeConfig = {
+          presentThreshold: c.presentThreshold ?? 480,
+          halfDayThreshold: c.halfDayThreshold ?? 240,
+          countBreakTime: c.countBreakTime ?? false
+        };
+      }
+
+      let batch = writeBatch(db);
+      let newCount = 0;
+      let batchCount = 0;
+
+      for (const shift of completedShifts as any[]) {
+        if (existingShiftIds.has(shift.id)) continue; 
+
+        const startMs = new Date(shift.clockInTime).getTime();
+        const endMs = shift.clockOutTime ? new Date(shift.clockOutTime).getTime() : startMs;
+        
+        let prodMs = 0;
+        let breakMs = 0;
+        (shift.activities || []).forEach((act: any) => {
+          const aStart = new Date(act.startTime).getTime();
+          const aEnd = act.endTime ? new Date(act.endTime).getTime() : endMs;
+          const dur = Math.max(0, aEnd - aStart);
+          const actName = (act.name || '').toLowerCase();
+          const isProductive = act.type === 'productive' || 
+                               actName.includes('meeting') || 
+                               actName.includes('coaching') || 
+                               actName.includes('training') || 
+                               actName.includes('alignment');
+          if (isProductive) prodMs += dur;
+          else breakMs += dur;
+        });
+
+        let totalMins = Math.floor(prodMs / 60000);
+        if (activeConfig.countBreakTime) {
+          totalMins += Math.floor(breakMs / 60000);
+        }
+
+        const dateStr = shift.clockInTime.split('T')[0];
+        const isOvernight = shift.clockOutTime ? (shift.clockInTime.split('T')[0] !== shift.clockOutTime.split('T')[0]) : false;
+
+        const summary: AttendanceSummary = {
+          id: shift.id,
+          shiftId: shift.id,
+          userId: shift.userId,
+          employeeName: shift.userName || shift.userEmail,
+          employeeEmail: shift.userEmail,
+          employeeId: shift.employeeId || '',
+          process: shift.process || 'N/A',
+          mappedTL: shift.mappedTL || 'N/A',
+          mappedManager: shift.mappedManager || 'N/A',
+          attendanceDate: dateStr,
+          attendanceStatus: calculateStatus(totalMins, activeConfig),
+          productiveMinutes: totalMins,
+          totalBreakMinutes: Math.floor(breakMs / 60000),
+          sessionStart: shift.clockInTime,
+          sessionEnd: shift.clockOutTime || shift.clockInTime,
+          generatedBySystem: true,
+          isOvernight
+        };
+
+        const attDocRef = doc(db, 'attendanceSummary', shift.id);
+        batch.set(attDocRef, summary);
+        newCount++;
+        batchCount++;
+
+        if (batchCount >= 450) {
+            await batch.commit();
+            batch = writeBatch(db);
+            batchCount = 0;
+        }
+      }
+
+      if (batchCount > 0) {
+        await batch.commit();
+      }
+
+      if (newCount > 0) {
+        console.log(`[SILENT AUTO SYNC] Successfully auto-synchronized ${newCount} new attendance records.`);
+        fetchAttendanceRecords(false);
+      }
+    } catch (e) {
+      console.error('[SILENT AUTO SYNC ERROR]', e);
+    }
   };
 
   const handleSyncAttendance = async () => {

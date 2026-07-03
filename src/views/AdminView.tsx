@@ -79,16 +79,28 @@ export default function AdminView({
       const actorEmail = actor?.email || 'mayank.semwal@bergtechnologies.co.in';
       const actorName = actor?.displayName || actorEmail.split('@')[0];
       
-      await addDoc(collection(db, 'adminAuditLogs'), {
+      // Safety truncation to prevent Firestore 1MB document size limit errors
+      // Max size is 1,048,576 bytes. We'll cap each value at 250KB to be safe.
+      const MAX_LOG_LENGTH = 250000;
+      
+      const safePrev = (prevValue && prevValue.length > MAX_LOG_LENGTH) 
+        ? prevValue.substring(0, MAX_LOG_LENGTH) + '... [TRUNCATED DUE TO SIZE]'
+        : (prevValue || 'None');
+        
+      const safeNext = (newValue && newValue.length > MAX_LOG_LENGTH)
+        ? newValue.substring(0, MAX_LOG_LENGTH) + '... [TRUNCATED DUE TO SIZE]'
+        : (newValue || 'None');
+
+      console.log('[ADMIN EVENT LOG] (Firestore Logging Disabled):', {
         timestamp: new Date().toISOString(),
         performedBy: `${actorName} (${actorEmail})`,
         affectedUser: affectedUser || 'System/N/A',
         action,
-        previousValue: prevValue || 'None',
-        newValue: newValue || 'None'
+        previousValue: safePrev,
+        newValue: safeNext
       });
     } catch (err) {
-      console.error('Failed to write administration audit trail log: ', err);
+      console.error('Failed to handle administration audit trail log: ', err);
     }
   };
 

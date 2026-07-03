@@ -77,17 +77,21 @@ export function convertExcelDate(serial: any): string {
   }
 
   return str;
-
-  // Fallback to native Date for random strings
-  try {
-    const d = new Date(str);
-    if (!isNaN(d.getTime())) {
-      return format(d, 'yyyy-MM-dd');
-    }
-  } catch (e) {}
-  
-  return str;
 }
+
+/**
+ * Validates and sanitizes timestamps before Firestore write.
+ */
+export function sanitizeTimestamp(d: any): string {
+  if (!d) return new Date().toISOString();
+  const date = new Date(d);
+  if (isNaN(date.getTime())) {
+    console.error(`Invalid Date encountered, sanitizing to now:`, d);
+    return new Date().toISOString();
+  }
+  return date.toISOString();
+}
+
 
 /**
  * Parses and returns a period in YYYY-MM-DD format

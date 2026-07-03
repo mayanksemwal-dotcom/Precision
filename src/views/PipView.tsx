@@ -311,8 +311,8 @@ export default function PipView({ user, allUsers = [], externalTheme }: PipViewP
       const nowISO = new Date().toISOString();
       const performerName = `${user.fullName || user.name || user.email}`;
 
-      // 1. Audit Log: PIP Initiated
-      await addDoc(collection(db, 'adminAuditLogs'), {
+      // 1. Audit Log: PIP Initiated (Firestore Logging Disabled)
+      console.log('[AUDIT LOG] (Firestore Logging Disabled) PIP Initiated:', {
         timestamp: nowISO,
         action: 'PIP Initiated',
         performedBy: `${performerName} (${user.email})`,
@@ -408,8 +408,8 @@ Berg Technologies Corp HS Division
 (CC: HR Executive Desk, Operational Managers, and Direct Team Leads)
         `.trim();
 
-        // Audit Log: Email Sent
-        await addDoc(collection(db, 'adminAuditLogs'), {
+        // Audit Log: Email Sent (Firestore Logging Disabled)
+        console.log('[AUDIT LOG] (Firestore Logging Disabled) Email Sent:', {
           timestamp: nowISO,
           action: 'Email Sent',
           performedBy: `${performerName} (${user.email})`,
@@ -520,8 +520,8 @@ Berg Technologies Corp HS Division
           toast.success(`Automated notification email queued in Firestore extension!`);
         }
       } else {
-        // Audit Log: Email Skipped
-        await addDoc(collection(db, 'adminAuditLogs'), {
+        // Audit Log: Email Skipped (Firestore Logging Disabled)
+        console.log('[AUDIT LOG] (Firestore Logging Disabled) Email Skipped:', {
           timestamp: nowISO,
           action: 'Email Skipped',
           performedBy: `${performerName} (${user.email})`,
@@ -593,8 +593,8 @@ Berg Technologies Corp HS Division
         updatedAt: nowISO
       });
 
-      // Audit log: Milestone update
-      await addDoc(collection(db, 'adminAuditLogs'), {
+      // Audit log: Milestone update (Firestore Logging Disabled)
+      console.log('[AUDIT LOG] (Firestore Logging Disabled) PIP Updated:', {
         timestamp: nowISO,
         action: 'PIP Updated',
         performedBy: `${user.fullName || user.name || user.email} (${user.email})`,
@@ -718,8 +718,8 @@ Berg Technologies Corp HS Division
 
       await updateDoc(doc(db, 'pips', selectedPip.id), payload);
 
-      // Audit log: PIP Status update
-      await addDoc(collection(db, 'adminAuditLogs'), {
+      // Audit log: PIP Status update (Firestore Logging Disabled)
+      console.log('[AUDIT LOG] (Firestore Logging Disabled) PIP Updated/Closed:', {
         timestamp: nowISO,
         action: newStatus === 'Extended' ? 'PIP Updated' : 'PIP Closed',
         performedBy: `${user.fullName || user.name || user.email} (${user.email})`,

@@ -11,6 +11,7 @@ import { UserProfile, UserRole } from '../types';
 const HIERARCHY_MAP: Record<UserRole, UserRole[]> = {
   [UserRole.ADMIN]: Object.values(UserRole), // All Users
   [UserRole.MANAGER]: [
+    UserRole.ASSISTANT_MANAGER,
     UserRole.TEAM_LEAD, 
     UserRole.STL, 
     UserRole.QTL, 
@@ -24,8 +25,20 @@ const HIERARCHY_MAP: Record<UserRole, UserRole[]> = {
     UserRole.HR,
     UserRole.IT_MANAGER,
   ],
+  [UserRole.ASSISTANT_MANAGER]: [
+    UserRole.TEAM_LEAD, 
+    UserRole.STL, 
+    UserRole.QTL, 
+    UserRole.OPS_TL,
+    UserRole.SME, 
+    UserRole.TRAINER, 
+    UserRole.TRAINER_TL, 
+    UserRole.QA, 
+    UserRole.AGENT,
+  ],
   [UserRole.OPS_HEAD]: [
     UserRole.MANAGER,
+    UserRole.ASSISTANT_MANAGER,
     UserRole.TEAM_LEAD, 
     UserRole.STL, 
     UserRole.QTL, 
@@ -38,6 +51,7 @@ const HIERARCHY_MAP: Record<UserRole, UserRole[]> = {
   ],
   [UserRole.HR]: [
     UserRole.MANAGER,
+    UserRole.ASSISTANT_MANAGER,
     UserRole.TEAM_LEAD, 
     UserRole.STL, 
     UserRole.QTL, 
@@ -50,6 +64,7 @@ const HIERARCHY_MAP: Record<UserRole, UserRole[]> = {
   ],
   [UserRole.IT_MANAGER]: [
     UserRole.MANAGER,
+    UserRole.ASSISTANT_MANAGER,
     UserRole.TEAM_LEAD, 
     UserRole.STL, 
     UserRole.QTL, 
@@ -75,13 +90,13 @@ const HIERARCHY_MAP: Record<UserRole, UserRole[]> = {
 export function normalizeRole(role: string | undefined | null): UserRole {
   if (!role) return '' as any;
   const raw = role.toString().toUpperCase().trim().replace(/[\s\-_]+/g, '_');
-  if (raw === 'TEAM_LEAD' || raw === 'TEAMLEAD' || raw === 'TEAM_LEADS' || raw === 'TEAM' || raw === 'TEAM_LEADERS') {
+  if (raw === 'TEAM_LEAD' || raw === 'TEAMLEAD' || raw === 'TEAM_LEADS' || raw === 'TEAM' || raw === 'TEAM_LEADERS' || raw === 'TEAM_LEADER') {
     return UserRole.TEAM_LEAD;
   }
-  if (raw === 'TRAINER_TL' || raw === 'TRAINERTL') {
+  if (raw === 'TRAINER_TL' || raw === 'TRAINERTL' || raw === 'TRAINER_TEAM_LEAD' || raw === 'TRAINER_TEAM_LEADER') {
     return UserRole.TRAINER_TL;
   }
-  if (raw === 'OPS_TL' || raw === 'OPSTL' || raw === 'OPS_TEAM_LEAD') {
+  if (raw === 'OPS_TL' || raw === 'OPSTL' || raw === 'OPS_TEAM_LEAD' || raw === 'OPS_TEAM_LEADER') {
     return UserRole.OPS_TL;
   }
   if (raw === 'STL') {
@@ -95,6 +110,9 @@ export function normalizeRole(role: string | undefined | null): UserRole {
   }
   if (raw === 'MANAGER' || raw === 'MANAGERS') {
     return UserRole.MANAGER;
+  }
+  if (raw === 'ASSISTANT_MANAGER' || raw === 'ASST_MANAGER' || raw === 'ASSISTANTMANAGER' || raw === 'AM') {
+    return UserRole.ASSISTANT_MANAGER;
   }
   if (raw === 'OPS_HEAD' || raw === 'OPSHEAD' || raw === 'OPERATIONS_HEAD') {
     return UserRole.OPS_HEAD;
@@ -143,41 +161,37 @@ export function canActOn(actor: UserProfile, target: UserProfile, allUsers: User
   // 1. Admin bypass
   if (actorRole === UserRole.ADMIN) return true;
 
-  // 2. Manager/Executive bypass: Managers are executive roles that have global authority over all subordinate roles.
-  if (actorRole === UserRole.MANAGER || actorRole === UserRole.OPS_HEAD || actorRole === UserRole.HR || actorRole === UserRole.IT_MANAGER) {
-    return true; // Executive roles see everyone below Admin
-  }
-
-  // 3. Check if actor role is allowed to supervise target role
+  // 2. Check if actor role is allowed to supervise target role
   const subordinates = HIERARCHY_MAP[actorRole] || [];
   const isRoleAuthorized = subordinates.includes(targetRole);
 
   if (!isRoleAuthorized) return false;
 
-  const actorIdLower = (actor.uid || '').toLowerCase().trim();
-  const actorEmailLower = (actor.email || '').toLowerCase().trim();
-  const actorNameLower = (actor.name || '').toLowerCase().trim();
-  const actorFullNameLower = (actor.fullName || actor.employeeName || '').toLowerCase().trim();
+  const actorIdLower = (actor?.uid || '').toLowerCase().trim();
+  const actorEmailLower = (actor?.email || '').toLowerCase().trim();
+  const actorNameLower = (actor?.name || '').toLowerCase().trim();
+  const actorFullNameLower = ((actor?.fullName || actor?.employeeName) || '').toLowerCase().trim();
 
   // 3. Verify reporting structure (Authoritative Source: Team Mapping fields)
   const isDirectReport = 
-    (target.teamLeadId && target.teamLeadId.toLowerCase().trim() === actorIdLower) ||
-    (target.teamLeadEmail && target.teamLeadEmail.toLowerCase().trim() === actorEmailLower) ||
-    (target.teamLeadId && target.teamLeadId.toLowerCase().trim() === actorEmailLower) ||
-    (target.teamLeadName && actorNameLower && target.teamLeadName.toLowerCase().trim() === actorNameLower) ||
-    (target.teamLeadName && actorFullNameLower && target.teamLeadName.toLowerCase().trim() === actorFullNameLower) ||
-    (target.mappedTL && target.mappedTL.toLowerCase().trim() === actorIdLower) ||
-    (target.teamLeadUid && target.teamLeadUid.toLowerCase().trim() === actorIdLower) ||
+    (target?.teamLeadId && target.teamLeadId.toLowerCase().trim() === actorIdLower) ||
+    (target?.teamLeadEmail && target.teamLeadEmail.toLowerCase().trim() === actorEmailLower) ||
+    (target?.teamLeadId && target.teamLeadId.toLowerCase().trim() === actorEmailLower) ||
+    (target?.teamLeadName && actorNameLower && target.teamLeadName.toLowerCase().trim() === actorNameLower) ||
+    (target?.teamLeadName && actorFullNameLower && target.teamLeadName.toLowerCase().trim() === actorFullNameLower) ||
+    (target?.mappedTL && target.mappedTL.toLowerCase().trim() === actorIdLower) ||
+    (target?.teamLeadUid && target.teamLeadUid.toLowerCase().trim() === actorIdLower) ||
+    (target?.mappedManagerUid && target.mappedManagerUid.toLowerCase().trim() === actorIdLower) ||
     
     // Manager mappings
-    (target.mappedManagerId && target.mappedManagerId.toLowerCase().trim() === actorIdLower) ||
-    (target.managerId && target.managerId.toLowerCase().trim() === actorIdLower) ||
-    (target.managerEmail && target.managerEmail.toLowerCase().trim() === actorEmailLower) ||
-    (target.mappedManagerEmail && target.mappedManagerEmail.toLowerCase().trim() === actorEmailLower) ||
-    (target.managerName && actorNameLower && target.managerName.toLowerCase().trim() === actorNameLower) ||
-    (target.managerName && actorFullNameLower && target.managerName.toLowerCase().trim() === actorFullNameLower) ||
-    (target.mappedManagerName && actorNameLower && target.mappedManagerName.toLowerCase().trim() === actorNameLower) ||
-    (target.mappedManagerName && actorFullNameLower && target.mappedManagerName.toLowerCase().trim() === actorFullNameLower);
+    (target?.mappedManagerId && target.mappedManagerId.toLowerCase().trim() === actorIdLower) ||
+    (target?.managerId && target.managerId.toLowerCase().trim() === actorIdLower) ||
+    (target?.managerEmail && target.managerEmail.toLowerCase().trim() === actorEmailLower) ||
+    (target?.mappedManagerEmail && target.mappedManagerEmail.toLowerCase().trim() === actorEmailLower) ||
+    (target?.managerName && actorNameLower && target.managerName.toLowerCase().trim() === actorNameLower) ||
+    (target?.managerName && actorFullNameLower && target.managerName.toLowerCase().trim() === actorFullNameLower) ||
+    (target?.mappedManagerName && actorNameLower && target.mappedManagerName.toLowerCase().trim() === actorNameLower) ||
+    (target?.mappedManagerName && actorFullNameLower && target.mappedManagerName.toLowerCase().trim() === actorFullNameLower);
   
   // indirect report check (e.g. Manager -> TL -> Agent)
   const isIndirectReport = allUsers.some(tl => {

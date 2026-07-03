@@ -27,8 +27,9 @@ service cloud.firestore {
     
     function isRole(role) { return isVerified() && getUserRole().upper() == role; }
     function isAdmin() {
+      let role = getUserRole().upper();
       let isAdminEmail = request.auth.token.email != null && request.auth.token.email.lower() == 'mayank.semwal@bergtechnologies.co.in';
-      return isSignedIn() && (isAdminEmail || getUserRole().upper() == 'ADMIN');
+      return isSignedIn() && (role == 'ADMIN' || (isAdminEmail && (role == 'AGENT' || role == '')));
     }
 
     function isManager() { 
@@ -330,9 +331,7 @@ service cloud.firestore {
     }
 
     match /adminAuditLogs/{id} {
-      allow read: if isVerified() && isAdmin();
-      allow create: if isVerified();
-      allow update, delete: if isAdmin();
+      allow read, write: if false;
     }
 
     match /admin_roles_config/{id} {

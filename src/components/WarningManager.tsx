@@ -131,8 +131,8 @@ export default function WarningManager({ agentName: initialName, agentId: initia
         ? `${currentUserProfile.fullName || currentUserProfile.name || currentUserProfile.email}`
         : (auth.currentUser?.email || 'System Admin');
 
-      // 1. Audit Log: Warning Issued
-      await addDoc(collection(db, 'adminAuditLogs'), {
+      // 1. Audit Log: Warning Issued (Firestore Logging Disabled)
+      console.log('[AUDIT LOG] (Firestore Logging Disabled) Warning Issued:', {
         timestamp: nowISO,
         action: 'Warning Issued',
         performedBy: performerName + ` (${auth.currentUser?.email || ''})`,
@@ -222,8 +222,8 @@ CC Checklist:
       }
 
       if (sendEmailNotification) {
-        // Log "Email Sent" in audit logs
-        await addDoc(collection(db, 'adminAuditLogs'), {
+        // Log "Email Sent" in audit logs (Firestore Logging Disabled)
+        console.log('[AUDIT LOG] (Firestore Logging Disabled) Email Sent:', {
           timestamp: nowISO,
           action: 'Email Sent',
           performedBy: performerName + ` (${auth.currentUser?.email || ''})`,
@@ -324,8 +324,8 @@ CC Checklist:
           toast.success(`Warning issued & notification queued in Firestore successfully.`);
         }
       } else {
-        // Log "Email Skipped" in audit logs
-        await addDoc(collection(db, 'adminAuditLogs'), {
+        // Log "Email Skipped" in audit logs (Firestore Logging Disabled)
+        console.log('[AUDIT LOG] (Firestore Logging Disabled) Email Skipped:', {
           timestamp: nowISO,
           action: 'Email Skipped',
           performedBy: performerName + ` (${auth.currentUser?.email || ''})`,

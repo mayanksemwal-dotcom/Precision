@@ -33,7 +33,7 @@ export function useHistoricalShifts(uid?: string, role?: string, itemsPerPage: n
       setError(null);
 
       const normRole = (role || '').toUpperCase().trim();
-      const isSupervisorOrTL = ['TEAM_LEAD', 'STL', 'QTL', 'OPS_TL', 'TRAINER_TL', 'ASSISTANT_MANAGER', 'SME'].includes(normRole);
+      const isSupervisorOrTL = ['TEAM_LEAD', 'STL', 'QTL', 'OPS_TL', 'TRAINER_TL', 'ASSISTANT_MANAGER', 'SME', 'MANAGER', 'OPS_HEAD', 'HR', 'IT_MANAGER', 'EXECUTIVE', 'OPS HEAD'].includes(normRole);
 
       let q;
       if (userIds && userIds.length > 0) {
@@ -84,10 +84,12 @@ export function useHistoricalShifts(uid?: string, role?: string, itemsPerPage: n
         });
         return;
       } else if (isSupervisorOrTL) {
-        console.log(`[useHistoricalShifts] Fetching first page for Team Lead: ${uid}`);
+        const isManagerRole = ['MANAGER', 'ASSISTANT_MANAGER', 'OPS_HEAD', 'HR', 'IT_MANAGER', 'EXECUTIVE', 'OPS HEAD'].includes(normRole);
+        const supervisorField = isManagerRole ? 'managerId' : 'teamLeadUid';
+        console.log(`[useHistoricalShifts] Fetching first page for supervisor: ${uid} (field: ${supervisorField})`);
         q = query(
           collection(db, 'tmsShifts'),
-          where('teamLeadUid', '==', uid),
+          where(supervisorField, '==', uid),
           orderBy('clockInTime', 'desc'),
           limit(itemsPerPage)
         );
@@ -133,13 +135,15 @@ export function useHistoricalShifts(uid?: string, role?: string, itemsPerPage: n
       setError(null);
 
       const normRole = (role || '').toUpperCase().trim();
-      const isSupervisorOrTL = ['TEAM_LEAD', 'STL', 'QTL', 'OPS_TL', 'TRAINER_TL'].includes(normRole);
+      const isSupervisorOrTL = ['TEAM_LEAD', 'STL', 'QTL', 'OPS_TL', 'TRAINER_TL', 'ASSISTANT_MANAGER', 'SME', 'MANAGER', 'OPS_HEAD', 'HR', 'IT_MANAGER', 'EXECUTIVE', 'OPS HEAD'].includes(normRole);
 
       let q;
       if (isSupervisorOrTL) {
+        const isManagerRole = ['MANAGER', 'ASSISTANT_MANAGER', 'OPS_HEAD', 'HR', 'IT_MANAGER', 'EXECUTIVE', 'OPS HEAD'].includes(normRole);
+        const supervisorField = isManagerRole ? 'managerId' : 'teamLeadUid';
         q = query(
           collection(db, 'tmsShifts'),
-          where('teamLeadUid', '==', uid),
+          where(supervisorField, '==', uid),
           orderBy('clockInTime', 'desc'),
           startAfter(lastDoc),
           limit(itemsPerPage)
