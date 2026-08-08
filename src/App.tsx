@@ -24,17 +24,25 @@ import {
   FileText,
   Sun,
   Moon,
-  LifeBuoy
+  LifeBuoy,
+  ChevronDown,
+  ChevronUp,
+  ChevronLeft,
+  Type,
+  Users,
+  FileSpreadsheet,
+  Play,
+  Shield
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { UserRole, UserProfile, SamplingTask, AuditRecord, QAAlignment, ProductionRecord, WarningTicket, AgentKpiRecord } from './types';
+import { UserRole, UserProfile } from './types';
 import { INITIAL_ALIGNMENTS } from './lib/sample-data';
-import { auth, db, logout, getDocsOptimized } from './lib/firebase';
+import { auth, db, logout, getDocsOptimized, getDocOptimized } from './lib/firebase';
 import { isFirestoreBlocked, handleFirestoreError } from './lib/safeFirestore';
 import { firestoreLogger } from './lib/firestoreLogger';
 import { OperationType } from './lib/firebase';
 import { onAuthStateChanged } from 'firebase/auth';
-import { doc, getDoc, getDocs, collection, query, where, orderBy, setDoc, updateDoc, deleteDoc, limit, onSnapshot } from 'firebase/firestore';
+import { doc, getDoc, getDocs, collection, query, where, orderBy, setDoc, updateDoc, deleteDoc, limit, onSnapshot, writeBatch } from 'firebase/firestore';
 import { Database, RefreshCw, Activity } from 'lucide-react';
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogFooter } from './components/ui/dialog';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from './components/ui/table';
@@ -44,10 +52,14 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '.
 import AdminView from './views/AdminView';
 import LoginView from './views/LoginView';
 import MyProfileView from './views/MyProfileView';
+import KPIScorecardView from './views/KPIScorecardView';
+import { runRoleStandardizationMigration } from './lib/roleMigration';
+import { useMemoryGuard, manualMemoryCleanAndSync } from './hooks/useMemoryGuard';
 
 // UI Components
 import BergLogo from './components/BergLogo';
-import { Button } from './components/ui/button';
+import { Button, buttonVariants } from './components/ui/button';
+import { cn } from './lib/utils';
 import { Toaster } from './components/ui/sonner';
 import { toast } from 'sonner';
 import { 
@@ -60,32 +72,31 @@ import {
   DropdownMenuGroup 
 } from './components/ui/dropdown-menu';
 
-import EmployeeRelationsView from './views/EmployeeRelationsView';
 import TMSView from './views/TMSView';
-import ScorecardView from './views/ScorecardView';
-import ManageHistoricalRecordsView from './views/ManageHistoricalRecordsView';
 import ResourceHubView from './views/ResourceHubView';
-import ITHelpDeskView from './views/ITHelpDeskView';
-import AttendanceView from './views/AttendanceView';
 
 import { PermissionProvider, usePermission } from './components/PermissionContext';
 import { canActOn } from './lib/hierarchy';
 import { safeStorage } from './lib/safeStorage';
+import { useRoster } from './contexts/RosterContext';
+import { ConfigProvider, useConfig } from './contexts/ConfigContext';
 
 export default function App() {
-  const [user, setUser] = useState<UserProfile | null>(null);
+  useMemoryGuard();
+  const [user, setUser] = useState<UserProfile | null | undefined>(undefined);
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState('tms');
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [viewAsRole, setViewAsRole] = useState<string | null>(null);
-  const [tasks, setTasks] = useState<SamplingTask[]>([]);
-  const [auditLogs, setAuditLogs] = useState<AuditRecord[]>([]);
-  const [alignments, setAlignments] = useState<QAAlignment[]>(INITIAL_ALIGNMENTS);
-  const [productions, setProductions] = useState<ProductionRecord[]>([]);
-  const [warnings, setWarnings] = useState<WarningTicket[]>([]);
+  
+  const { roster, profiles, refreshRoster, invalidateRosterCache } = useRoster();
   const [allUsers, setAllUsers] = useState<UserProfile[]>([]);
   const [employeeProfiles, setEmployeeProfiles] = useState<Record<string, any>>({});
-  const [agentKpis, setAgentKpis] = useState<AgentKpiRecord[]>([]);
+
+  useEffect(() => {
+    setAllUsers(roster);
+    setEmployeeProfiles(profiles);
+  }, [roster, profiles]);
 
   // Derive reactive current user from the synced allUsers and employeeProfiles source of truth
   const allUsersWithPhotos = useMemo(() => {
@@ -100,8 +111,30 @@ export default function App() {
     });
   }, [allUsers, employeeProfiles]);
 
-  const effectiveUser = allUsersWithPhotos.find(u => u.uid === user?.uid) || user;
-  const [editingAudit, setEditingAudit] = useState<AuditRecord | null>(null);
+  const syncedUser = allUsersWithPhotos.find(u => u.uid === user?.uid) || user;
+
+  const realUserWithSyncedData = useMemo(() => {
+    if (!user) return null;
+    const base = allUsersWithPhotos.find(u => u.uid === user.uid) || user;
+    if (user.email?.toLowerCase().trim() === 'mayank.semwal@bergtechnologies.co.in') {
+      return {
+        ...base,
+        role: UserRole.ADMIN
+      };
+    }
+    return base;
+  }, [user, allUsersWithPhotos]);
+
+  const effectiveUser = useMemo(() => {
+    if (!realUserWithSyncedData) return null;
+    if (viewAsRole) {
+      return {
+        ...realUserWithSyncedData,
+        role: viewAsRole as UserRole
+      };
+    }
+    return realUserWithSyncedData;
+  }, [realUserWithSyncedData, viewAsRole]);
 
   const [theme, setTheme] = useState<'light' | 'dark'>(() => {
     if (typeof window !== 'undefined') {
@@ -178,7 +211,7 @@ export default function App() {
           let userProfile: UserProfile;
           try {
             // Try to get existing profile from Firestore
-            const userDocRef = doc(db, 'users', firebaseUser.uid);
+            const userDocRef = doc(db, 'employee_master', firebaseUser.uid);
             const userDoc = await getDoc(userDocRef);
             
             if (userDoc.exists()) {
@@ -188,13 +221,18 @@ export default function App() {
               // Promote users to 'Active'
               let finalStatus = currentData.status === 'Pending Verification' ? 'Active' : (currentData.status || 'Active');
 
+              let finalRole = (currentData.role || UserRole.AGENT).toUpperCase();
+              if (firebaseUser.email?.toLowerCase().trim() === 'mayank.semwal@bergtechnologies.co.in') {
+                finalRole = 'ADMIN';
+              }
+
               userProfile = {
                 ...currentData,
                 uid: firebaseUser.uid,
                 email: (firebaseUser.email || '').toLowerCase().trim(),
                 name: currentData.name || currentData.fullName || getCleanName(),
                 fullName: currentData.fullName || currentData.name || getCleanName(),
-                role: (currentData.role ? currentData.role.toUpperCase() : (firebaseUser.email?.toLowerCase().trim() === 'mayank.semwal@bergtechnologies.co.in' ? 'ADMIN' : (currentData.role || UserRole.AGENT).toUpperCase())),
+                role: finalRole,
                 status: finalStatus,
                 department: currentData.department || 'Operations',
                 Manager: currentData.Manager || '',
@@ -217,13 +255,17 @@ export default function App() {
                     console.log('Registration document detected in auth listener after wait.');
                     const currentData = checkDoc.data() as any;
                     let finalStatus = currentData.status === 'Pending Verification' ? 'Active' : (currentData.status || 'Active');
+                    let finalRoleReg = (currentData.role || UserRole.AGENT).toUpperCase();
+                    if (firebaseUser.email?.toLowerCase().trim() === 'mayank.semwal@bergtechnologies.co.in') {
+                      finalRoleReg = 'ADMIN';
+                    }
                     userProfile = {
                       ...currentData,
                       uid: firebaseUser.uid,
                       email: (firebaseUser.email || '').toLowerCase().trim(),
                       name: currentData.name || currentData.fullName || getCleanName(),
                       fullName: currentData.fullName || currentData.name || getCleanName(),
-                      role: (currentData.role ? currentData.role.toUpperCase() : (firebaseUser.email?.toLowerCase().trim() === 'mayank.semwal@bergtechnologies.co.in' ? 'ADMIN' : (currentData.role || UserRole.AGENT).toUpperCase())),
+                      role: finalRoleReg,
                       status: finalStatus,
                       department: currentData.department || 'Operations',
                       Manager: currentData.Manager || '',
@@ -239,31 +281,42 @@ export default function App() {
 
               if (!resolvedFromRegister) {
                 console.log('New user detected or profile missing, checking pre-provisioning...');
-                const usersRef = collection(db, 'users');
+                const usersRef = collection(db, 'employee_master');
                 const checkQuery = query(usersRef, where('email', '==', (firebaseUser.email || '').toLowerCase().trim()));
                 const querySnap = await getDocsOptimized(checkQuery, 'pre_provision_check');
                 
                 if (!querySnap.empty) {
                   const matchedDoc = querySnap.docs[0];
-                  console.log('Pre-provisioned user found. Triggering server-side profile linking and migration...', matchedDoc.id);
+                  console.log('Pre-provisioned user found. Triggering client-side profile linking and migration...', matchedDoc.id);
                   
-                  const idToken = await firebaseUser.getIdToken(true);
-                  const response = await fetch('/api/link-user-profile', {
-                    method: 'POST',
-                    headers: {
-                      'Content-Type': 'application/json',
-                      'Authorization': `Bearer ${idToken}`
-                    },
-                    body: JSON.stringify({ oldDocId: matchedDoc.id })
-                  });
-
-                  if (!response.ok) {
-                    throw new Error(`Profile migration failed: ${await response.text()}`);
+                  const matchedData = matchedDoc.data() as any;
+                  let finalStatus = matchedData.status === 'Pending Verification' ? 'Active' : (matchedData.status || 'Active');
+                  
+                  let finalRolePre = (matchedData.role || UserRole.AGENT).toUpperCase();
+                  if (firebaseUser.email?.toLowerCase().trim() === 'mayank.semwal@bergtechnologies.co.in') {
+                    finalRolePre = 'ADMIN';
                   }
 
-                  const resData = await response.json();
-                  userProfile = resData.user;
-                  console.log('Successfully completed server-side profile linking and migration.');
+                  userProfile = {
+                    ...matchedData,
+                    uid: firebaseUser.uid,
+                    email: (firebaseUser.email || '').toLowerCase().trim(),
+                    name: matchedData.name || matchedData.fullName || getCleanName(),
+                    fullName: matchedData.fullName || matchedData.name || getCleanName(),
+                    role: finalRolePre,
+                    status: finalStatus,
+                    department: matchedData.department || 'Operations',
+                    Manager: matchedData.Manager || '',
+                    createdAt: matchedData.createdAt || now.toISOString(),
+                    lastLoginAt: now.toISOString(),
+                  };
+                  
+                  await setDoc(userDocRef, userProfile, { merge: true });
+                  if (matchedDoc.id !== firebaseUser.uid) {
+                    await deleteDoc(doc(db, 'employee_master', matchedDoc.id));
+                  }
+                  
+                  console.log('Successfully completed client-side profile linking and migration.');
                 } else {
                   console.log('No pre-provisioned profile, creating clean profile...');
                   const isEmail = firebaseUser.providerData.some(p => p.providerId === 'password');
@@ -292,7 +345,7 @@ export default function App() {
               email: (firebaseUser.email || '').toLowerCase().trim(),
               name: getCleanName(),
               fullName: getCleanName(),
-                  role: (firebaseUser.email?.toLowerCase().trim() === 'mayank.semwal@bergtechnologies.co.in') ? UserRole.ADMIN : UserRole.AGENT,
+              role: (firebaseUser.email?.toLowerCase().trim() === 'mayank.semwal@bergtechnologies.co.in') ? UserRole.ADMIN : UserRole.AGENT,
               status: 'Active',
               department: 'Operations',
               Manager: '',
@@ -318,931 +371,592 @@ export default function App() {
               if ((isCurrentAdmin !== expectedAdmin || isCurrentQA !== expectedQA) && !sessionStorage.getItem('claims_sync_attempted')) {
                 console.log('Firebase user custom claims mismatch detected. Synchronizing claims...');
                 sessionStorage.setItem('claims_sync_attempted', 'true');
-                const idToken = await firebaseUser.getIdToken(true);
-                const claimResponse = await fetch('/api/set-claims', {
-                  method: 'POST',
-                  headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${idToken}`,
-                  },
-                  body: JSON.stringify({ role: userProfile.role })
-                });
-                const cType = claimResponse.headers.get('content-type');
-                if (claimResponse.ok && cType && cType.includes('application/json')) {
-                  const claimsResult = await claimResponse.json();
-                  console.log('Successfully updated Firebase custom user claims via Express API backend:', claimsResult);
-                  // Force refresh local token so firebase is aware of claims changes globally
-                  await firebaseUser.getIdTokenResult(true);
-                } else {
-                  const bodySample = await claimResponse.text();
-                  console.warn('Express API backend claims sync failed. Status:', claimResponse.status, 'Content-Type:', cType, 'Body Sample:', bodySample.substring(0, 200));
-                  console.log('Skipping claims response check. Express API backend is offline or running in standard client-only static SPA mode.');
+                try {
+                  const idToken = await firebaseUser.getIdToken(true);
+                  await fetch('/api/set-claims', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${idToken}` }
+                  });
+                  await firebaseUser.getIdToken(true);
+                } catch (e) {
+                  console.error('Failed to sync claims', e);
                 }
-              } else {
-                console.log('Firebase user custom claims already in sync. Skipping sync operations.');
               }
-            } catch (claimsErr) {
-              console.error('Failed to update Custom Firebase auth claims on login:', claimsErr);
+            } catch (err) {
+              console.error('Error syncing claims', err);
             }
           })();
-        } catch (authErr) {
-            console.error('Error handling firebase user:', authErr);
+        } catch (globalErr) {
+          console.error("Global auth state error:", globalErr);
         }
-      } else {
-        console.log('User logged out.');
-        setUser(null);
-      }
-      setLoading(false);
-    });
-    return () => unsubscribe();
-  }, []);
-
-  const [isRefreshing, setIsRefreshing] = useState(false);
-  const [availableRoles, setAvailableRoles] = useState<string[]>([]);
-
-  // Fetch disciplinary warning tickets (one-time fetch on mount/login)
-  useEffect(() => {
-    if (!user?.uid) return;
-
-    const setupWarnings = async () => {
-      try {
-        const warningsDocId = `${user.role.toUpperCase()}_Warnings`;
-        const permissionsDoc = await getDoc(doc(db, 'role_permissions', warningsDocId));
-        firestoreLogger.trackRead('warnings_permissions_check', permissionsDoc.exists() ? 1 : 0);
-        let canSeeAllWarnings = false;
-        
-        if (permissionsDoc.exists()) {
-          const perms = permissionsDoc.data();
-          canSeeAllWarnings = !!perms.can_view || !!perms.can_edit || !!perms.can_delete || !!perms.can_approve;
         } else {
-          canSeeAllWarnings = ['ADMIN', 'MANAGER', 'ASSISTANT_MANAGER', 'QA', 'TEAM_LEAD', 'STL', 'OPS_TL'].includes(user.role.toUpperCase());
+          setUser(null);
         }
+      });
+      return () => unsubscribe();
+    }, []);
 
-        let warningsQuery;
-        if (canSeeAllWarnings) {
-          warningsQuery = query(collection(db, 'disciplinaryLogs'), orderBy('createdAt', 'desc'));
-        } else {
-          warningsQuery = query(collection(db, 'disciplinaryLogs'), where('agentId', '==', user.uid));
-        }
-
-        const unsub = onSnapshot(warningsQuery, (snap) => {
-          firestoreLogger.trackRead('warnings_onSnapshot', snap.size);
-          let docsList = snap.docs.map(doc => ({ id: doc.id, ...(doc.data() as any) } as WarningTicket));
-          if (!canSeeAllWarnings) {
-            docsList.sort((a, b) => {
-              const tA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
-              const tB = b.createdAt ? new Date(b.createdAt).getTime() : 0;
-              return tB - tA;
-            });
-          }
-          setWarnings(docsList);
-        }, (e) => {
-          console.error("Error setting up warnings:", e);
-        });
-        return unsub;
-      } catch (e) {
-        console.error("Error setting up warnings:", e);
-      }
-    };
-
-    const unsubPromise = setupWarnings();
-    return () => {
-      unsubPromise.then(unsub => unsub && unsub());
-    };
-  }, [user?.uid]);
-
-let rosterFetchPromise: Promise<{ roster: any[], profiles: Record<string, any> }> | null = null;
-
-  const loadRosterWithCache = async (forceRefresh: boolean = false) => {
-    if (rosterFetchPromise && !forceRefresh) {
-      console.log('[TMS Billing Optimization] Re-using ongoing roster fetch promise...');
-      return rosterFetchPromise;
-    }
-
-    const fetchTask = async () => {
-      try {
-        const CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
-        const cachedTimestamp = safeStorage.get<string>('precision360_cache_timestamp');
-        const cachedRoster = safeStorage.get<any[]>('precision360_roster_cache');
-        const cachedProfiles = safeStorage.get<Record<string, any>>('precision360_profiles_cache');
-
-        const isCacheValid = cachedTimestamp && cachedRoster && cachedProfiles && 
-          (Date.now() - parseInt(cachedTimestamp, 10) < CACHE_TTL_MS);
-
-        if (isCacheValid && !forceRefresh) {
-          try {
-            const roster = cachedRoster;
-            const profiles = cachedProfiles;
-            if (Array.isArray(roster) && roster.length > 1) {
-              console.log('[TMS Billing Optimization] Loading roster and profiles from safeStorage cache...');
-              return { roster, profiles };
-            }
-            console.log('[TMS Billing Optimization] Cached roster has 1 or fewer users. Forcing bypass to fetch complete data...');
-          } catch (e) {
-            console.warn('[TMS Billing Optimization] Failed to parse cached roster, bypassing cache:', e);
-          }
-        }
-
-        console.log(`[TMS Billing Optimization] Cache expired or forceRefresh=${forceRefresh}. Fetching roster from Firestore...`);
-        const [usersSnap, profilesSnap] = await Promise.all([
-          getDocsOptimized(collection(db, 'users'), 'users_roster_refresh', forceRefresh),
-          getDocsOptimized(collection(db, 'employeeProfiles'), 'profiles_roster_refresh', forceRefresh)
-        ]);
-
-        firestoreLogger.trackRead('users_roster_refresh', usersSnap.size);
-        firestoreLogger.trackRead('profiles_roster_refresh', profilesSnap.size);
-
-        const profiles: Record<string, any> = {};
-        profilesSnap.forEach(d => { profiles[d.id] = d.data(); });
-
-        const roster = usersSnap.docs.map(doc => {
-          const data = doc.data() as any;
-          const prof = profiles[doc.id] || {};
-          const mergedData = { ...prof, ...data };
-          const normalizedTLId = mergedData.teamLeadUid || mergedData.teamLeadId || prof.teamLeadId || data.teamLeadId || '';
-          const normalizedManagerId = mergedData.mappedManagerUid || mergedData.mappedManagerId || mergedData.managerId || prof.managerId || data.managerId || '';
-          return {
-            uid: doc.id,
-            ...mergedData,
-            name: mergedData.fullName || mergedData.name || mergedData.employeeName || prof.employeeName || '',
-            fullName: mergedData.fullName || mergedData.name || mergedData.employeeName || prof.employeeName || '',
-            email: (mergedData.email || '').toString().toLowerCase().trim(),
-            employeeId: mergedData.employeeId || '',
-            photoURL: mergedData.profilePhotoUrl || mergedData.photoURL || '',
-            role: (mergedData.role || UserRole.AGENT).toString().toUpperCase(),
-            status: mergedData.status || 'Active',
-            teamLeadId: normalizedTLId,
-            teamLeadUid: normalizedTLId,
-            managerId: normalizedManagerId,
-            mappedManagerId: normalizedManagerId,
-            mappedManagerUid: normalizedManagerId
-          } as UserProfile;
-        });
-
-        safeStorage.set('precision360_roster_cache', roster);
-        safeStorage.set('precision360_profiles_cache', profiles);
-        safeStorage.set('precision360_cache_timestamp', Date.now().toString());
-
-        return { roster, profiles };
-      } catch (err) {
-        console.error('[loadRosterWithCache] Error fetching/parsing roster:', err);
-        const cachedRoster = safeStorage.get<any[]>('precision360_roster_cache');
-        const cachedProfiles = safeStorage.get<Record<string, any>>('precision360_profiles_cache');
-        if (cachedRoster && cachedProfiles) {
-          return { roster: cachedRoster, profiles: cachedProfiles };
-        }
-        throw err;
-      } finally {
-        if (rosterFetchPromise === fetchTaskPromise) {
-          rosterFetchPromise = null;
-        }
-      }
-    };
-
-    const fetchTaskPromise = fetchTask();
-    rosterFetchPromise = fetchTaskPromise;
-    return fetchTaskPromise;
-  };
-
-  const fetchAllData = async (isManual = false) => {
-    if (!user) return;
-    setIsRefreshing(true);
-
-    try {
-      // Helper for safer fetching
-      const safeFetch = async <T,>(promise: Promise<T>, fallback: T, name: string): Promise<T> => {
-        try {
-          return await promise;
-        } catch (err) {
-          handleFirestoreError(err, OperationType.LIST, name);
-          return fallback;
-        }
-      };
-
-      setAlignments(INITIAL_ALIGNMENTS);
-      setProductions([]);
-      setAgentKpis([]);
-      setAuditLogs([]);
-      setTasks([]);
-
-      // Refresh staff roster if manual trigger
-      const userRole = (user.role || '').toUpperCase().trim();
-      const isStaff = ['ADMIN', 'MANAGER', 'TEAM_LEAD', 'STL', 'QTL', 'OPS_TL', 'TRAINER_TL', 'MIS', 'OPS_HEAD', 'HR', 'IT_MANAGER', 'QA', 'ASSISTANT_MANAGER', 'TRAINER', 'SME', 'TEAM LEAD', 'TRAINER TL', 'OPS TL', 'OPS TEAM LEAD', 'TEAM LEADER'].includes(userRole);
-
-      if (isStaff) {
-        console.log('[TMS Billing Optimization] Loading staff roster...');
-        const { roster, profiles } = await loadRosterWithCache(isManual);
-        setAllUsers(roster);
-        setEmployeeProfiles(profiles);
-      }
-
-      // Re-fetch warning logs
-      const warningsDocId = `${user.role.toUpperCase()}_Warnings`;
-      const permissionsDoc = await getDoc(doc(db, 'role_permissions', warningsDocId));
-      let canSeeAllWarnings = false;
-      if (permissionsDoc.exists()) {
-        const perms = permissionsDoc.data();
-        canSeeAllWarnings = !!perms.can_view || !!perms.can_edit || !!perms.can_delete || !!perms.can_approve;
-      } else {
-        canSeeAllWarnings = ['ADMIN', 'MANAGER', 'ASSISTANT_MANAGER', 'QA', 'TEAM_LEAD', 'STL', 'OPS_TL'].includes(user.role.toUpperCase());
-      }
-      let warningsQuery;
-      if (canSeeAllWarnings) {
-        warningsQuery = query(collection(db, 'disciplinaryLogs'), orderBy('createdAt', 'desc'), limit(25));
-      } else {
-        warningsQuery = query(collection(db, 'disciplinaryLogs'), where('agentId', '==', user.uid), limit(25));
-      }
-      const warningsSnap = await getDocsOptimized(warningsQuery, 'warnings_manual_refresh');
-      let docsList = warningsSnap.docs.map(doc => ({ id: doc.id, ...(doc.data() as any) } as WarningTicket));
-      if (!canSeeAllWarnings) {
-        docsList.sort((a, b) => {
-          const tA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
-          const tB = b.createdAt ? new Date(b.createdAt).getTime() : 0;
-          return tB - tA;
-        });
-      }
-      setWarnings(docsList);
-
-      if (isManual) {
-        toast.success('All reports refreshed successfully');
-      }
-    } catch (error) {
-      console.error('Data loading error:', error);
-      handleFirestoreError(error, OperationType.LIST, 'all_data');
-    } finally {
-      setIsRefreshing(false);
-    }
-  };
-
-  //Consolidated Initialization path for roster & data
-  useEffect(() => {
-    if (!user?.uid) return;
-
-    console.log('[App] Initializing data for user:', user.uid);
-    setActiveTab('tms');
-    
-    const initializeData = async () => {
-      // 1. Fetch Roster & Profiles (Phase 5 Optimization)
-      const userRole = (user.role || '').toUpperCase().trim();
-      const isStaff = ['ADMIN', 'MANAGER', 'TEAM_LEAD', 'STL', 'QTL', 'OPS_TL', 'TRAINER_TL', 'MIS', 'OPS_HEAD', 'HR', 'IT_MANAGER', 'QA', 'ASSISTANT_MANAGER', 'TRAINER', 'SME', 'TEAM LEAD', 'TRAINER TL', 'OPS TL', 'OPS TEAM LEAD', 'TEAM LEADER'].includes(userRole);
-      
-      if (isStaff) {
-        console.log('[TMS Billing Optimization] Loading staff roster...');
-        try {
-          const { roster, profiles } = await loadRosterWithCache(false);
-          setAllUsers(roster);
-          setEmployeeProfiles(profiles);
-        } catch (err) {
-          console.error('[ROSTER_FETCH_ERROR]', err);
-        }
-      }
-
-      // 2. Fetch other initial data
-      fetchAllData();
-    };
-
-    initializeData();
-
-  }, [user?.uid]);
-
-  const handleLogout = async () => {
-    await logout();
-    setUser(null);
-  };
-
-  // Real-time Employee Master (Single Source of Truth) - OPTIMIZED: One-time fetch for staff with current user real-time listener
-  useEffect(() => {
-    if (!user) return;
-
-    console.log('Setting up optimized subscription for current user profile...');
-    
-    const userRole = (user.role || '').toUpperCase().trim();
-    const isStaff = ['ADMIN', 'MANAGER', 'TEAM_LEAD', 'STL', 'QTL', 'OPS_TL', 'TRAINER_TL', 'MIS', 'OPS_HEAD', 'HR', 'IT_MANAGER', 'QA', 'ASSISTANT_MANAGER', 'TRAINER', 'SME', 'TEAM LEAD', 'TRAINER TL', 'OPS TL', 'OPS TEAM LEAD', 'TEAM LEADER'].includes(userRole);
-
-    const mapDocToUserProfile = (d: any) => {
-      const data = d.data() as any;
-      const normalizedTLId = data.teamLeadUid || data.teamLeadId || '';
-      const normalizedManagerId = data.mappedManagerUid || data.mappedManagerId || data.managerId || '';
-      return {
-        uid: d.id,
-        ...data,
-        name: data.fullName || data.name || data.employeeName || '',
-        fullName: data.fullName || data.name || data.employeeName || '',
-        email: (data.email || '').toString().toLowerCase().trim(),
-        employeeId: data.employeeId || '',
-        photoURL: data.profilePhotoUrl || data.photoURL || '',
-        role: (data.role || UserRole.AGENT).toString().toUpperCase(),
-        status: data.status || 'Active',
-        teamLeadId: normalizedTLId,
-        teamLeadUid: normalizedTLId,
-        managerId: normalizedManagerId,
-        mappedManagerId: normalizedManagerId,
-        mappedManagerUid: normalizedManagerId
-      } as UserProfile;
-    };
-
-    // Realtime listener for personal user document
-    const personalUserQuery = query(collection(db, 'users'), where('__name__', '==', user.uid));
-    const unsubUsers = onSnapshot(personalUserQuery, (snapshot) => {
-      firestoreLogger.trackRead('personal_user_snapshot', snapshot.size);
-      if (!snapshot.empty) {
-        const myProfile = mapDocToUserProfile(snapshot.docs[0]);
-        setAllUsers(prev => {
-          const filtered = prev.filter(u => u.uid !== user.uid);
-          return [myProfile, ...filtered];
-        });
-      }
-    }, (err) => {
-      console.error('Personal user fetch error:', err);
-    });
-
-    // Realtime listener for personal employee profile document
-    const personalProfileQuery = query(collection(db, 'employeeProfiles'), where('__name__', '==', user.uid));
-    const unsubProfiles = onSnapshot(personalProfileQuery, (profSnap) => {
-      firestoreLogger.trackRead('personal_profile_snapshot', profSnap.size);
-      if (!profSnap.empty) {
-        const myData = profSnap.docs[0].data();
-        setEmployeeProfiles(prev => ({
-          ...prev,
-          [user.uid]: myData
-        }));
-      }
-    }, (err) => {
-      console.error('Personal profile fetch error:', err);
-    });
-
-    return () => {
-      unsubUsers();
-      unsubProfiles();
-    };
-  }, [user?.uid]);
-
-  // Removed Employee Profiles and Roles collection-wide onSnapshot listeners
-  useEffect(() => {
-    if (!user?.uid) return;
-    const fetchRoles = async () => {
-      try {
-        const rolesSnap = await getDocsOptimized(collection(db, 'roles'), 'roles_list_fetch');
-        firestoreLogger.trackRead('roles_list_fetch', rolesSnap.size);
-        const rolesList = rolesSnap.docs.map(doc => (((doc.data() as any).name || doc.id) as string).toUpperCase().trim());
-        const qPermissions = query(collection(db, 'role_permissions'));
-        const permissionsSnap = await getDocsOptimized(qPermissions, 'role_permissions_fetch');
-        firestoreLogger.trackRead('role_permissions_fetch', permissionsSnap.size);
-        const permissionsRoles = permissionsSnap.docs.map(doc => (((doc.data() as any).role_name || '') as string).toUpperCase().trim());
-        const combined = Array.from(new Set([...rolesList, ...permissionsRoles])).filter(Boolean).sort();
-        setAvailableRoles(combined.length > 0 ? combined : [
-          'ADMIN', 'MANAGER', 'STL', 'OPS_TL', 'SME', 'QTL', 'QA', 'TEAM_LEAD', 'TRAINER', 'TRAINER_TL', 'MIS', 'AGENT'
-        ]);
-      } catch (err) {
-        console.error('Error fetching roles:', err);
-      }
-    };
-    fetchRoles();
-  }, [user?.uid]);
-
-  if (loading) {
-    return (
-      <div className="flex items-center justify-center min-h-screen bg-slate-50">
-        <div className="animate-spin text-blue-600">
-          <LayoutDashboard size={48} />
+    if (user === undefined) {
+      return (
+        <div className="min-h-screen bg-slate-950 flex flex-col items-center justify-center gap-4 animate-in fade-in duration-300">
+          <div className="bg-white rounded-2xl p-3 w-16 h-16 flex items-center justify-center shadow-lg shadow-indigo-500/10 animate-pulse">
+            <img src="/berg_logo.png" alt="Berg Logo" className="h-12 w-auto object-contain" referrerPolicy="no-referrer" />
+          </div>
+          <div className="flex flex-col items-center gap-1 mt-2 text-center">
+            <h1 className="font-extrabold text-white text-lg tracking-tight">Precision360</h1>
+            <p className="text-[10px] text-indigo-400 font-bold tracking-widest uppercase">BERG TECHNOLOGIES</p>
+          </div>
+          <div className="flex items-center gap-2 mt-4 text-slate-400 text-xs font-medium">
+            <RefreshCw className="w-3.5 h-3.5 animate-spin text-indigo-500" />
+            <span>Verifying secure enterprise session...</span>
+          </div>
         </div>
-      </div>
+      );
+    }
+
+    if (!user) {
+      return <LoginView onLogin={(user) => setUser(user)} />;
+    }
+
+    return (
+      <ConfigProvider>
+        <PermissionProvider user={effectiveUser! || realUserWithSyncedData!}>
+          <div className="h-screen bg-slate-50 dark:bg-slate-950 text-slate-800 dark:text-slate-100 flex flex-col md:flex-row antialiased font-sans overflow-hidden">
+            <MainAppShell 
+              user={realUserWithSyncedData!} 
+              effectiveUser={effectiveUser! || realUserWithSyncedData!}
+              setUser={setUser} 
+              allUsers={allUsersWithPhotos} 
+              viewAsRole={viewAsRole}
+              setViewAsRole={setViewAsRole}
+              theme={theme}
+              setTheme={setTheme}
+            />
+          </div>
+          <Toaster position="top-right" richColors />
+        </PermissionProvider>
+      </ConfigProvider>
     );
-  }
-
-  if (!user) {
-    return <LoginView />;
-  }
-
-  return (
-    <PermissionProvider user={effectiveUser!} overriddenRole={viewAsRole || undefined}>
-      <AppContent 
-        user={effectiveUser}
-        viewAsRole={viewAsRole}
-        setViewAsRole={setViewAsRole}
-        activeTab={activeTab}
-        setActiveTab={setActiveTab}
-        sidebarOpen={sidebarOpen}
-        setSidebarOpen={setSidebarOpen}
-        allUsers={allUsersWithPhotos}
-        warnings={warnings}
-        fetchAllData={fetchAllData}
-        handleLogout={handleLogout}
-        theme={theme}
-        setTheme={setTheme}
-        availableRoles={availableRoles}
-      />
-    </PermissionProvider>
-  );
 }
 
-interface AppContentProps {
-  user: UserProfile | null;
+interface MainAppShellProps {
+  user: UserProfile;
+  effectiveUser: UserProfile;
+  setUser: (u: UserProfile | null) => void;
+  allUsers: UserProfile[];
   viewAsRole: string | null;
   setViewAsRole: (r: string | null) => void;
-  activeTab: string;
-  setActiveTab: (t: string) => void;
-  sidebarOpen: boolean;
-  setSidebarOpen: (o: boolean) => void;
-  allUsers: UserProfile[];
-  warnings: WarningTicket[];
-  fetchAllData: (isManual?: boolean) => Promise<void>;
-  handleLogout: () => Promise<void>;
-  availableRoles: string[];
+  theme: 'light' | 'dark';
+  setTheme: React.Dispatch<React.SetStateAction<'light' | 'dark'>>;
 }
 
-function AppContent({
-  user,
-  viewAsRole,
+function MainAppShell({ 
+  user, 
+  effectiveUser, 
+  setUser, 
+  allUsers, 
+  viewAsRole, 
   setViewAsRole,
-  activeTab,
-  setActiveTab,
-  sidebarOpen,
-  setSidebarOpen,
-  allUsers,
-  warnings,
-  fetchAllData,
-  handleLogout,
   theme,
-  setTheme,
-  availableRoles
-}: AppContentProps & { theme: 'light' | 'dark', setTheme: (t: 'light' | 'dark') => void }) {
-  const { canView, canEdit, loading: permissionsLoading } = usePermission();
-
-  const [isChangePasswordOpen, setIsChangePasswordOpen] = useState(false);
-  const [oldPassword, setOldPassword] = useState('');
-  const [newPassword, setNewPassword] = useState('');
-  const [confirmPassword, setConfirmPassword] = useState('');
-  const [passwordState, setPasswordState] = useState<'idle' | 'updating' | 'success' | 'error'>('idle');
-  const [tmsExpanded, setTmsExpanded] = useState(true);
-
-  const handleUpdatePassword = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!newPassword || !oldPassword) {
-      toast.error('All fields are mandatory.');
-      return;
-    }
-    if (newPassword.length < 6) {
-      toast.error('The new password must be at least 6 characters long.');
-      return;
-    }
-    if (newPassword !== confirmPassword) {
-      toast.error('The passwords do not match.');
-      return;
-    }
-
-    setPasswordState('updating');
-    try {
-      const { EmailAuthProvider, reauthenticateWithCredential, updatePassword } = await import('firebase/auth');
-      const currentUser = auth.currentUser;
-      if (!currentUser || !currentUser.email) {
-        throw new Error('No verified user session exists.');
-      }
-
-      // Reauthenticate user
-      const credential = EmailAuthProvider.credential(currentUser.email, oldPassword);
-      await reauthenticateWithCredential(currentUser, credential);
-      
-      // Update Password
-      await updatePassword(currentUser, newPassword);
-      
-      toast.success('Your password has been changed securely.');
-      setIsChangePasswordOpen(false);
-      setOldPassword('');
-      setNewPassword('');
-      setConfirmPassword('');
-      setPasswordState('idle');
-    } catch (err: any) {
-      console.error(err);
-      toast.error(`Password update failed: ${err.message}`);
-      setPasswordState('error');
-    }
-  };
-
-  const navItems = [
-    { id: 'tms', label: 'Workforce TMS', icon: Clock },
-    { id: 'kpis_scorecard', label: 'KPI Scorecard', icon: Award },
-    { id: 'employee_relations', label: 'Employee Relations', icon: ShieldAlert },
-    { id: 'it_help_desk', label: 'IT Help Desk', icon: LifeBuoy },
-    { id: 'historical', label: 'Historical Records', icon: History },
-    { id: 'resources', label: 'Important Quality Links', icon: Link2 },
-    { id: 'config', label: 'Console', icon: Settings },
-  ];
-
-  const effectiveRole = viewAsRole || (user?.role || UserRole.AGENT);
+  setTheme
+}: MainAppShellProps) {
+  const { invalidateRosterCache } = useRoster();
   
-  // Dynamically filter navigation items using centralized PermissionService with memoization for snappy performance
-  const filteredNav = React.useMemo(() => {
-    return navItems.filter(item => canView(item.label));
-  }, [canView, permissionsLoading]);
+  const { isDashboardUser, isAdminUser, tmsSubViews } = useMemo(() => {
+    const normRole = (effectiveUser?.role || '').toString().toUpperCase().trim();
+    const leadKeywords = ['ADMIN', 'MANAGER', 'HEAD', 'HR', 'MIS', 'TL', 'LEAD', 'SME', 'TRAINER', 'EXECUTIVE', 'DIRECTOR', 'VP', 'SUPERVISOR', 'SUPERV', 'EXEC'];
+    const isDash = leadKeywords.some(k => normRole.includes(k));
+    const isAdmin = normRole.includes('ADMIN');
 
-  const effectiveUser = user ? { ...user, role: effectiveRole } : null;
+    const views = [
+      { id: 'tms-agent', label: 'Punch Station', icon: Clock, show: true },
+      { id: 'tms-monitor', label: 'TMS Dashboard', icon: Activity, show: isDash }
+    ];
+
+    return {
+      isDashboardUser: isDash,
+      isAdminUser: isAdmin,
+      tmsSubViews: views.filter(v => v.show)
+    };
+  }, [effectiveUser]);
+
+  const [currentView, setCurrentView] = useState(() => {
+    return tmsSubViews[0]?.id || 'tms-agent';
+  });
+  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
+  const [desktopSidebarOpen, setDesktopSidebarOpen] = useState(() => {
+    const saved = localStorage.getItem('precision360-desktop-sidebar');
+    return saved !== null ? saved === 'true' : true;
+  });
+  const [fontSize, setFontSize] = useState(() => {
+    return localStorage.getItem('precision360-font-size') || 'standard';
+  });
+
+  useEffect(() => {
+    const root = document.documentElement;
+    if (fontSize === 'medium') {
+      root.style.fontSize = '14px';
+    } else if (fontSize === 'compact') {
+      root.style.fontSize = '12px';
+    } else {
+      root.style.fontSize = '16px';
+    }
+    localStorage.setItem('precision360-font-size', fontSize);
+  }, [fontSize]);
+
+  // Determine current active view title
+  const viewTitle = useMemo(() => {
+    if (currentView === 'tms-agent') return 'Punch Station';
+    if (currentView === 'tms-monitor') return 'TMS Dashboard';
+    switch (currentView) {
+      case 'kpi': return 'KPI Scorecard';
+      case 'resource': return 'Resource Hub';
+      case 'admin': return 'Console';
+      case 'profile': return 'My Profile';
+      default: return 'Precision360';
+    }
+  }, [currentView]);
 
   return (
-    <div className="flex flex-col h-screen overflow-hidden text-slate-900 dark:text-slate-100 font-sans bg-[#F8FAFC] dark:bg-slate-950">
-      <Toaster position="top-center" />
-      
-      {viewAsRole && (
-        <div className="bg-amber-500 text-slate-950 py-1.5 px-8 text-[11px] font-black flex items-center justify-between shadow-sm z-[1000] border-b border-amber-600 shrink-0">
-          <div className="flex items-center gap-2">
-            <span className="relative flex h-2 w-2">
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-600 opacity-75"></span>
-              <span className="relative inline-flex rounded-full h-2 w-2 bg-red-600"></span>
-            </span>
-            <span>PREVIEW MODE ACTIVE — Simulated Role: <b className="bg-slate-900 text-amber-400 px-2.5 py-0.5 rounded-md text-[10px] tracking-wider ml-1.5 uppercase font-black">{viewAsRole}</b></span>
-          </div>
-          <button 
-            onClick={() => setViewAsRole(null)} 
-            className="bg-slate-950 hover:bg-slate-850 text-white rounded-lg px-3 py-1 text-[10px] uppercase font-black tracking-wider transition-all duration-200 shadow-sm"
-          >
-            Exit Preview
-          </button>
-        </div>
+    <>
+      {/* Mobile Sidebar Backdrop */}
+      {mobileSidebarOpen && (
+        <div 
+          className="fixed inset-0 bg-slate-950/60 z-40 md:hidden transition-opacity duration-300"
+          onClick={() => setMobileSidebarOpen(false)}
+        />
       )}
 
-      <div className="flex flex-1 overflow-hidden h-full">
-        {/* Sidebar */}
-        <motion.aside 
-        initial={false}
-        animate={{ width: sidebarOpen ? 290 : 80 }}
-        className="bg-[#0F172A] dark:bg-slate-900 border-r border-[#1E293B] dark:border-slate-800 flex flex-col z-30 text-[#CBD5E1]"
-      >
-        <div className="px-4 pt-6 pb-4 flex flex-col items-start animate-fade-in">
-          <div className="w-full flex items-center justify-between mb-6">
-            <div className={`flex items-center gap-3.5 ${!sidebarOpen && 'justify-center w-full'}`}>
-              <div className="p-0 flex items-center justify-center flex-shrink-0">
-                <BergLogo 
-                  className={sidebarOpen ? 'h-11 w-auto px-2' : 'h-11 w-11'} 
-                  showSubtitle={false} 
-                />
+      {/* Left Sidebar */}
+      <div className={`
+        fixed inset-y-0 left-0 bg-slate-950 text-slate-300 flex flex-col z-50 shrink-0 transition-all duration-300 transform overflow-hidden
+        md:translate-x-0 md:sticky md:top-0 md:h-screen
+        ${mobileSidebarOpen ? 'translate-x-0' : '-translate-x-full'}
+        ${desktopSidebarOpen ? 'w-64 border-r border-slate-900/60' : 'w-20 border-r border-slate-900/60'}
+      `}>
+        {/* Brand Header */}
+        <div className={`p-4 border-b border-slate-900/60 flex items-center ${desktopSidebarOpen ? 'justify-between gap-3 min-w-[240px]' : 'justify-center'} transition-all duration-300`}>
+          {desktopSidebarOpen ? (
+            <div className="flex items-center gap-3">
+              <div className="bg-white rounded-xl p-1.5 w-10 h-10 flex items-center justify-center shrink-0 shadow-md">
+                <img src="/berg_logo.png" alt="Berg Logo" className="h-full w-auto object-contain" referrerPolicy="no-referrer" />
               </div>
-              {sidebarOpen && (
-                <div className="flex flex-col min-w-0 overflow-hidden">
-                  <span className="font-black text-[17px] leading-none tracking-tight text-white truncate">Precision360</span>
-                  <span className="text-[9px] font-bold text-sky-400 uppercase tracking-wider mt-1 opacity-90 truncate">Berg Technologies</span>
-                </div>
-              )}
+              <div>
+                <div className="font-extrabold text-white text-sm leading-tight tracking-tight">Precision360</div>
+                <div className="text-[10px] text-indigo-400 font-bold tracking-widest leading-none mt-0.5">BERG TECHNOLOGIES</div>
+              </div>
             </div>
-          </div>
-        </div>
-
-        <nav className="flex-1 px-4 space-y-1.5 overflow-y-auto">
-          {permissionsLoading && (
-            <div className="space-y-2.5 mt-3 select-none">
-              {[1, 2, 3, 4, 5].map((idx) => (
-                <div key={idx} className="w-full h-10 bg-slate-800/40 rounded-lg animate-pulse flex items-center px-4 gap-3 border border-slate-800/20">
-                  <div className="w-4 h-4 bg-slate-700/50 rounded-md shrink-0 animate-pulse" />
-                  {sidebarOpen && <div className="h-3.5 w-24 bg-slate-700/40 rounded animate-pulse" />}
-                </div>
-              ))}
+          ) : (
+            <div className="bg-white rounded-xl p-1.5 w-10 h-10 flex items-center justify-center shrink-0 shadow-md" title="Precision360 - Berg Technologies">
+              <img src="/berg_logo.png" alt="Berg Logo" className="h-full w-auto object-contain" referrerPolicy="no-referrer" />
             </div>
           )}
-          {!permissionsLoading && filteredNav.map((item) => (
-            <React.Fragment key={item.id}>
+          {desktopSidebarOpen && (
+            <button
+              onClick={() => {
+                setDesktopSidebarOpen(false);
+                localStorage.setItem('precision360-desktop-sidebar', 'false');
+              }}
+              className="p-1.5 rounded-lg text-slate-500 hover:text-white hover:bg-slate-900 transition-colors hidden md:block"
+              title="Collapse Sidebar"
+            >
+              <ChevronLeft size={16} />
+            </button>
+          )}
+        </div>
+
+        {/* Navigation Section */}
+        <div className={`flex flex-col gap-1.5 p-3 flex-grow overflow-y-auto ${desktopSidebarOpen ? 'min-w-[240px]' : 'items-center'} transition-all duration-300`}>
+          {/* TMS SubViews / Navigation Items */}
+          {tmsSubViews.map(view => {
+            const ViewIcon = view.icon;
+            const isActive = currentView === view.id;
+            return desktopSidebarOpen ? (
               <button
-                id={`nav-${item.id}`}
+                key={view.id}
                 onClick={() => {
-                  if (item.id === 'tms') {
-                    setTmsExpanded(!tmsExpanded);
-                  }
-                  setActiveTab(item.id);
+                  setCurrentView(view.id);
+                  setMobileSidebarOpen(false);
                 }}
-                className={`w-full flex items-center justify-between gap-3 px-4 py-2.5 rounded-lg transition-all duration-200 group text-[13px] ${
-                  activeTab === item.id 
-                    ? 'bg-[#38BDF8] text-[#0F172A] font-bold shadow-md shadow-sky-500/10' 
-                    : 'hover:bg-[#1E293B] hover:text-white'
+                className={`w-full flex items-center gap-2.5 px-3 py-2.5 text-xs font-bold rounded-xl transition-colors text-left ${
+                  isActive
+                    ? 'bg-indigo-600/10 text-indigo-400 border border-indigo-500/20 font-extrabold'
+                    : 'text-slate-400 hover:text-white hover:bg-slate-900/40'
                 }`}
               >
-                <div className="flex items-center gap-3">
-                  <item.icon size={18} className={activeTab === item.id ? 'text-[#0F172A]' : 'text-[#64748B] group-hover:text-white'} />
-                  {sidebarOpen && <span>{item.label}</span>}
-                </div>
-                {item.id === 'tms' && sidebarOpen && (
-                  <motion.div
-                    animate={{ rotate: tmsExpanded ? 180 : 0 }}
-                    transition={{ duration: 0.2 }}
-                  >
-                    <svg width="10" height="6" viewBox="0 0 10 6" fill="none" xmlns="http://www.w3.org/2000/svg">
-                      <path d="M1 1L5 5L9 1" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
-                    </svg>
-                  </motion.div>
-                )}
+                <ViewIcon size={16} className="text-indigo-400 shrink-0" />
+                <span>{view.label}</span>
               </button>
-              {item.id === 'tms' && tmsExpanded && sidebarOpen && (
-                <div className="ml-9 mt-1 space-y-1 border-l border-slate-800 pl-3">
-                  <button
-                    onClick={() => setActiveTab('tms')}
-                    className={`w-full flex items-center gap-2.5 px-3 py-1.5 rounded-md text-[12px] transition-colors ${
-                      activeTab === 'tms' 
-                        ? 'text-sky-400 font-bold' 
-                        : 'text-slate-400 hover:text-white'
-                    }`}
-                  >
-                    <Clock size={14} />
-                    TMS Dashboard
-                  </button>
-                  <button
-                    onClick={() => setActiveTab('attendance')}
-                    className={`w-full flex items-center gap-2.5 px-3 py-1.5 rounded-md text-[12px] transition-colors ${
-                      activeTab === 'attendance' 
-                        ? 'text-sky-400 font-bold' 
-                        : 'text-slate-400 hover:text-white'
-                    }`}
-                  >
-                    <ClipboardCheck size={14} />
-                    Attendance
-                  </button>
-                </div>
-              )}
-            </React.Fragment>
-          ))}
-          {filteredNav.length === 0 && !permissionsLoading && (
-            <div className="p-4 text-center text-xs text-rose-400 bg-rose-950/20 border border-rose-900/30 rounded-xl m-2 select-none">
-              <ShieldAlert size={18} className="mx-auto mb-1 text-rose-400 animate-pulse" />
-              {sidebarOpen ? 'No modules have been assigned to your role. Please contact your Administrator.' : 'Locked'}
+            ) : (
+              <button
+                key={view.id}
+                onClick={() => {
+                  setCurrentView(view.id);
+                  setMobileSidebarOpen(false);
+                }}
+                className={`p-3 rounded-xl transition-colors ${
+                  isActive
+                    ? 'bg-indigo-600 text-white font-extrabold'
+                    : 'text-slate-400 hover:text-white hover:bg-slate-900/40'
+                }`}
+                title={view.label}
+              >
+                <ViewIcon size={20} className="shrink-0" />
+              </button>
+            );
+          })}
+
+          {/* KPI Scorecard */}
+          {desktopSidebarOpen ? (
+            <button
+              onClick={() => {
+                setCurrentView('kpi');
+                setMobileSidebarOpen(false);
+              }}
+              className={`w-full flex items-center gap-2.5 px-3 py-2.5 text-xs font-bold rounded-xl transition-colors text-left ${
+                currentView === 'kpi'
+                  ? 'bg-indigo-600/10 text-indigo-400 border border-indigo-500/20 font-extrabold'
+                  : 'text-slate-400 hover:text-white hover:bg-slate-900/40'
+              }`}
+            >
+              <Award size={16} className="text-indigo-400 shrink-0" />
+              <span>KPI Scorecard</span>
+            </button>
+          ) : (
+            <button
+              onClick={() => {
+                setCurrentView('kpi');
+                setMobileSidebarOpen(false);
+              }}
+              className={`p-3 rounded-xl transition-colors ${
+                currentView === 'kpi'
+                  ? 'bg-indigo-600 text-white font-extrabold'
+                  : 'text-slate-400 hover:text-white hover:bg-slate-900/40'
+              }`}
+              title="KPI Scorecard"
+            >
+              <Award size={20} className="shrink-0" />
+            </button>
+          )}
+
+          {/* Resource Hub */}
+          {desktopSidebarOpen ? (
+            <button
+              onClick={() => {
+                setCurrentView('resource');
+                setMobileSidebarOpen(false);
+              }}
+              className={`w-full flex items-center gap-2.5 px-3 py-2.5 text-xs font-bold rounded-xl transition-colors text-left ${
+                currentView === 'resource'
+                  ? 'bg-indigo-600/10 text-indigo-400 border border-indigo-500/20 font-extrabold'
+                  : 'text-slate-400 hover:text-white hover:bg-slate-900/40'
+              }`}
+            >
+              <Link2 size={16} className="text-indigo-400 shrink-0" />
+              <span>Resource Hub</span>
+            </button>
+          ) : (
+            <button
+              onClick={() => {
+                setCurrentView('resource');
+                setMobileSidebarOpen(false);
+              }}
+              className={`p-3 rounded-xl transition-colors ${
+                currentView === 'resource'
+                  ? 'bg-indigo-600 text-white font-extrabold'
+                  : 'text-slate-400 hover:text-white hover:bg-slate-900/40'
+              }`}
+              title="Resource Hub"
+            >
+              <Link2 size={20} className="shrink-0" />
+            </button>
+          )}
+
+          {/* Console (Visible for Admin, HR, QTL, STL, manager role) */}
+          {(effectiveUser.role === 'ADMIN' || effectiveUser.role === 'HR' || effectiveUser.role === 'MANAGER' || user.role === 'ADMIN') && (
+            desktopSidebarOpen ? (
+              <button
+                onClick={() => {
+                  setCurrentView('admin');
+                  setMobileSidebarOpen(false);
+                }}
+                className={`w-full flex items-center gap-2.5 px-3 py-2.5 text-xs font-bold rounded-xl transition-colors text-left ${
+                  currentView === 'admin'
+                    ? 'bg-indigo-600/10 text-indigo-400 border border-indigo-500/20 font-extrabold'
+                    : 'text-slate-400 hover:text-white hover:bg-slate-900/40'
+                }`}
+              >
+                <Settings size={16} className="text-indigo-400 shrink-0" />
+                <span>Console</span>
+              </button>
+            ) : (
+              <button
+                onClick={() => {
+                  setCurrentView('admin');
+                  setMobileSidebarOpen(false);
+                }}
+                className={`p-3 rounded-xl transition-colors ${
+                  currentView === 'admin'
+                    ? 'bg-indigo-600 text-white font-extrabold'
+                    : 'text-slate-400 hover:text-white hover:bg-slate-900/40'
+                }`}
+                title="Console Admin Panel"
+              >
+                <Settings size={20} className="shrink-0" />
+              </button>
+            )
+          )}
+        </div>
+
+        {/* User Card at the Bottom of Sidebar */}
+        {desktopSidebarOpen ? (
+          <div className="p-4 border-t border-slate-900/60 bg-slate-950/60 flex items-center justify-between gap-3 shrink-0 min-w-[240px]">
+            <div 
+              className="flex items-center gap-2.5 cursor-pointer hover:opacity-85 transition-opacity overflow-hidden"
+              onClick={() => setCurrentView('profile')}
+            >
+              <div className="w-9 h-9 rounded-full bg-slate-800 border border-slate-700/60 flex items-center justify-center text-xs font-bold text-slate-300 overflow-hidden shrink-0">
+                {effectiveUser.profilePhotoUrl ? (
+                  <img src={effectiveUser.profilePhotoUrl} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                ) : (
+                  (effectiveUser.fullName || effectiveUser.name || 'U').split(' ').map(n => n[0]).slice(0, 2).join('').toUpperCase()
+                )}
+              </div>
+              <div className="overflow-hidden leading-tight">
+                <div className="font-bold text-white text-xs truncate">{effectiveUser.fullName || effectiveUser.name}</div>
+                <div className="text-[9px] text-slate-500 font-bold uppercase tracking-wider mt-0.5">{effectiveUser.role}</div>
+              </div>
+            </div>
+            <button 
+              onClick={() => logout()}
+              className="p-1.5 rounded-lg text-slate-500 hover:text-red-400 hover:bg-red-950/20 transition-colors shrink-0"
+              title="Sign Out"
+            >
+              <LogOut size={16} />
+            </button>
+          </div>
+        ) : (
+          <div className="p-4 border-t border-slate-900/60 bg-slate-950/60 flex flex-col items-center gap-3 shrink-0">
+            <div 
+              className="cursor-pointer hover:opacity-85 transition-opacity overflow-hidden"
+              onClick={() => setCurrentView('profile')}
+              title={`${effectiveUser.fullName || effectiveUser.name} (${effectiveUser.role}) - My Profile`}
+            >
+              <div className="w-9 h-9 rounded-full bg-slate-800 border border-slate-700/60 flex items-center justify-center text-xs font-bold text-slate-300 overflow-hidden shrink-0">
+                {effectiveUser.profilePhotoUrl ? (
+                  <img src={effectiveUser.profilePhotoUrl} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                ) : (
+                  (effectiveUser.fullName || effectiveUser.name || 'U').split(' ').map(n => n[0]).slice(0, 2).join('').toUpperCase()
+                )}
+              </div>
+            </div>
+            <button 
+              onClick={() => logout()}
+              className="p-1.5 rounded-lg text-slate-500 hover:text-red-400 hover:bg-red-950/20 transition-colors shrink-0"
+              title="Sign Out"
+            >
+              <LogOut size={16} />
+            </button>
+          </div>
+        )}
+      </div>
+
+      {/* Main Content Area */}
+      <div className="flex-grow flex flex-col w-full min-w-0 bg-slate-50 dark:bg-slate-950 overflow-hidden">
+        {/* Top Header */}
+        <header className="h-16 px-4 md:px-6 bg-white dark:bg-slate-900/60 border-b border-slate-200 dark:border-slate-900/80 flex items-center justify-between shrink-0 gap-4">
+          
+          {/* Header Left: Hamburger Toggle & Title */}
+          <div className="flex items-center gap-3 shrink-0">
+            {/* Mobile Hamburger Toggle */}
+            <button 
+              onClick={() => setMobileSidebarOpen(true)}
+              className="p-1.5 rounded-lg text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800 md:hidden"
+              title="Open Navigation"
+            >
+              <Menu size={20} />
+            </button>
+            
+            {/* Desktop Hamburger Toggle */}
+            <button 
+              onClick={() => {
+                const nextState = !desktopSidebarOpen;
+                setDesktopSidebarOpen(nextState);
+                localStorage.setItem('precision360-desktop-sidebar', String(nextState));
+              }}
+              className="p-1.5 rounded-lg text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800 hidden md:block transition-all duration-200"
+              title={desktopSidebarOpen ? "Collapse Navigation" : "Expand Navigation"}
+            >
+              <Menu size={20} />
+            </button>
+
+            <h1 className="text-base font-black text-slate-800 dark:text-white capitalize tracking-tight flex items-center gap-2">
+              {viewTitle}
+            </h1>
+          </div>
+
+          {/* Header Center: Exit Role Preview Banner */}
+          {viewAsRole && (
+            <div className="animate-pulse">
+              <Button 
+                onClick={() => setViewAsRole(null)}
+                variant="destructive"
+                size="sm"
+                className="h-8 text-[9px] sm:text-xs font-black tracking-widest uppercase rounded-full px-4 py-1 flex items-center gap-1.5 shadow-md shadow-red-900/20 border border-red-500/30"
+              >
+                <Lock size={12} />
+                PREVIEW ROLE: EXIT PREVIEW ({viewAsRole})
+              </Button>
             </div>
           )}
-        </nav>
 
-        <div className="p-4 border-t border-[#1E293B] dark:border-slate-800">
-          <DropdownMenu>
-            <DropdownMenuTrigger
-              render={
-                <button className="w-full flex items-center gap-3 p-2 rounded-lg hover:bg-[#1E293B] transition-colors group">
-                  <div className="w-8 h-8 rounded-full bg-[#1E293B] group-hover:bg-[#334155] border border-[#334155] flex items-center justify-center overflow-hidden">
-                    {user?.photoURL ? (
-                      <img src={user.photoURL} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
-                    ) : (
-                      <UserIcon size={16} className="text-[#CBD5E1]" />
-                    )}
-                  </div>
-                  {sidebarOpen && (
-                    <div className="flex-1 text-left">
-                      <p className="text-sm font-medium leading-tight text-white">{user.name}</p>
-                      <p className="text-[10px] uppercase font-bold tracking-wider text-[#64748B]">{user.role}</p>
-                    </div>
-                  )}
-                </button>
-              }
-            />
-            <DropdownMenuContent side="right" align="end" sideOffset={8} className="w-56">
-              <DropdownMenuGroup>
-                <DropdownMenuLabel>My Account</DropdownMenuLabel>
-                <DropdownMenuSeparator />
-                <DropdownMenuItem onClick={() => setActiveTab('profile')} className="cursor-pointer font-medium flex items-center pr-4">
-                  <UserIcon size={16} className="mr-2 text-indigo-500" />
-                  My Profile
-                </DropdownMenuItem>
-                <DropdownMenuItem onClick={() => setIsChangePasswordOpen(true)} className="cursor-pointer font-medium flex items-center pr-4">
-                  <Lock size={16} className="mr-2 text-indigo-500" />
-                  Change Password
-                </DropdownMenuItem>
-                <DropdownMenuSeparator />
-                <DropdownMenuItem onClick={handleLogout} variant="destructive" className="text-red-600 dark:text-red-400 font-bold focus:bg-red-50 focus:text-red-750 cursor-pointer flex items-center pr-4">
-                  <LogOut size={16} className="mr-2 text-red-600 dark:text-red-400 font-bold" />
-                  Logout
-                </DropdownMenuItem>
-              </DropdownMenuGroup>
-            </DropdownMenuContent>
-          </DropdownMenu>
-        </div>
-      </motion.aside>
-
-      {/* Main Content */}
-      <main className="flex-1 flex flex-col relative overflow-hidden">
-        {/* Top Header */}
-        <header className="h-16 bg-white dark:bg-slate-900 border-b border-[#E2E8F0] dark:border-slate-800 flex items-center justify-between px-8 sticky top-0 z-20">
-          <div className="flex items-center gap-4">
-            <button 
-              onClick={() => setSidebarOpen(!sidebarOpen)}
-              className="p-2 hover:bg-slate-50 dark:hover:bg-slate-800 rounded-lg text-[#64748B] dark:text-slate-400"
+          {/* Header Right Tools */}
+          <div className="flex items-center gap-3 shrink-0">
+            {/* Re-sync & Memory Cache Cleaner Button */}
+            <button
+              onClick={() => manualMemoryCleanAndSync()}
+              className="h-8 px-2.5 rounded-xl border border-slate-200 dark:border-slate-800 text-slate-600 dark:text-slate-400 hover:text-indigo-600 dark:hover:text-indigo-400 hover:bg-indigo-50/50 dark:hover:bg-indigo-950/30 text-[11px] font-bold flex items-center gap-1.5 transition-colors shrink-0"
+              title="Prune stale memory cache & re-sync app state"
             >
-              {sidebarOpen ? <X size={18} /> : <Menu size={18} />}
+              <RefreshCw size={13} />
+              <span className="hidden md:inline">Re-sync & Clean</span>
             </button>
-            <div className="flex items-center gap-2 text-sm text-[#64748B] dark:text-slate-400">
-               <span className="capitalize">{activeTab}</span>
-               {activeTab === 'sampling' && (
-                 <>
-                   <span className="text-slate-300 dark:text-slate-700">/</span>
-                   <span className="font-semibold text-[#0F172A] dark:text-white">Active Desk</span>
-                 </>
-               )}
+
+            {/* Admin Role Preview Tool (Only visible to real ADMIN) */}
+            {user.role === 'ADMIN' && (
+              <DropdownMenu>
+                <DropdownMenuTrigger 
+                  className={cn(
+                    buttonVariants({ variant: "outline", size: "sm" }),
+                    "h-8 text-[11px] font-bold gap-1.5 border-indigo-500/20 text-indigo-600 dark:text-indigo-400 hover:bg-indigo-500/5 hover:text-indigo-600 shrink-0"
+                  )}
+                >
+                  <ShieldAlert size={14} />
+                  <span className="hidden sm:inline">Preview As</span>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="w-44">
+                  <DropdownMenuGroup>
+                    <DropdownMenuLabel>Preview Role Space</DropdownMenuLabel>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem onClick={() => setViewAsRole('AGENT')}>
+                      Agent Space
+                    </DropdownMenuItem>
+                    <DropdownMenuItem onClick={() => setViewAsRole('Team Lead')}>
+                      Team Lead Space
+                    </DropdownMenuItem>
+                    <DropdownMenuItem onClick={() => setViewAsRole('MANAGER')}>
+                      Manager Space
+                    </DropdownMenuItem>
+                    <DropdownMenuItem onClick={() => setViewAsRole('HR')}>
+                      HR Space
+                    </DropdownMenuItem>
+                    <DropdownMenuItem onClick={() => setViewAsRole('QA')}>
+                      QA Space
+                    </DropdownMenuItem>
+                  </DropdownMenuGroup>
+                  {viewAsRole && (
+                    <>
+                      <DropdownMenuSeparator />
+                      <DropdownMenuItem onClick={() => setViewAsRole(null)} className="text-red-500 font-bold">
+                        Exit Preview
+                      </DropdownMenuItem>
+                    </>
+                  )}
+                </DropdownMenuContent>
+              </DropdownMenu>
+            )}
+
+            {/* Font Size / Text Density Dropdown */}
+            <DropdownMenu>
+              <DropdownMenuTrigger className="p-1.5 rounded-xl border border-slate-200 dark:border-slate-800 text-slate-500 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-800/60 transition-colors flex items-center justify-center cursor-pointer focus:outline-none shrink-0" title="Text density / Font size">
+                <Type size={15} />
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-48">
+                <DropdownMenuGroup>
+                  <DropdownMenuLabel>Text Density</DropdownMenuLabel>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem onClick={() => setFontSize('standard')} className={cn("flex items-center justify-between", fontSize === 'standard' && "font-black text-indigo-600 dark:text-indigo-400")}>
+                    <span>Standard Size (16px)</span>
+                    {fontSize === 'standard' && <span className="w-1.5 h-1.5 rounded-full bg-indigo-500 shrink-0" />}
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => setFontSize('medium')} className={cn("flex items-center justify-between", fontSize === 'medium' && "font-black text-indigo-600 dark:text-indigo-400")}>
+                    <span>Medium / Compact (14px)</span>
+                    {fontSize === 'medium' && <span className="w-1.5 h-1.5 rounded-full bg-indigo-500 shrink-0" />}
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => setFontSize('compact')} className={cn("flex items-center justify-between", fontSize === 'compact' && "font-black text-indigo-600 dark:text-indigo-400")}>
+                    <span>Extra Compact (12px)</span>
+                    {fontSize === 'compact' && <span className="w-1.5 h-1.5 rounded-full bg-indigo-500 shrink-0" />}
+                  </DropdownMenuItem>
+                </DropdownMenuGroup>
+              </DropdownMenuContent>
+            </DropdownMenu>
+
+            {/* Dark Mode Toggle */}
+            <button
+              onClick={() => setTheme(prev => prev === 'light' ? 'dark' : 'light')}
+              className="p-1.5 rounded-xl border border-slate-200 dark:border-slate-800 text-slate-500 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-800/60 transition-colors"
+              title="Toggle theme"
+            >
+              {theme === 'dark' ? <Sun size={15} className="text-amber-400" /> : <Moon size={15} />}
+            </button>
+
+            {/* Active Role Badge */}
+            <span className="hidden md:inline-block px-2.5 py-1 rounded-full bg-indigo-50 dark:bg-indigo-950/40 text-indigo-600 dark:text-indigo-400 font-mono text-[9px] font-black uppercase tracking-wider border border-indigo-150/10 dark:border-indigo-900/40 shrink-0">
+              {effectiveUser.role}
+            </span>
+
+            {/* Avatar & Name Profile Trigger */}
+            <div 
+              className="flex items-center gap-2 cursor-pointer hover:opacity-85 transition-opacity shrink-0"
+              onClick={() => setCurrentView('profile')}
+            >
+              <div className="w-8 h-8 rounded-full bg-indigo-50 dark:bg-slate-800 border border-indigo-100 dark:border-slate-800 flex items-center justify-center text-xs font-bold text-indigo-500 overflow-hidden shrink-0">
+                {effectiveUser.profilePhotoUrl ? (
+                  <img src={effectiveUser.profilePhotoUrl} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                ) : (
+                  (effectiveUser.fullName || effectiveUser.name || 'U').split(' ').map(n => n[0]).slice(0, 2).join('').toUpperCase()
+                )}
+              </div>
             </div>
           </div>
-          <div className="flex items-center gap-6">
-             {(user?.role?.toUpperCase() === 'ADMIN' || user?.email?.toLowerCase().trim() === 'mayank.semwal@bergtechnologies.co.in' || viewAsRole !== null) && (
-               <div className="flex items-center gap-2 bg-slate-100 dark:bg-slate-800 py-1.5 px-3 rounded-xl border border-slate-200 dark:border-slate-700 shadow-sm hover:border-slate-300 transition-all duration-200">
-                 <span className="text-[10px] font-bold text-slate-500 dark:text-slate-400 ml-1 uppercase tracking-wider">Preview Role:</span>
-                 <select
-                   value={viewAsRole || ''}
-                   onChange={(e) => {
-                     const selected = e.target.value;
-                     setViewAsRole(selected === '' ? null : selected);
-                   }}
-                   className="bg-transparent text-xs font-black text-blue-600 dark:text-blue-400 border-none outline-none focus:ring-0 cursor-pointer pr-1 uppercase"
-                 >
-                   <option value="" className="bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-100 font-bold">
-                     Exit Preview ({user?.role})
-                   </option>
-                   {availableRoles.filter(r => r !== user?.role).map(r => (
-                     <option key={r} value={r} className="bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-100 font-bold">
-                       {r}
-                     </option>
-                   ))}
-                 </select>
-               </div>
-             )}
-             <div className="flex items-center gap-4">
-                {/* Global Theme Toggle */}
-                <button 
-                  onClick={() => setTheme(theme === 'light' ? 'dark' : 'light')}
-                  className="p-2 h-9 w-9 flex items-center justify-center rounded-xl bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-amber-400 hover:bg-slate-200 dark:hover:bg-slate-700 transition-all cursor-pointer"
-                  title={theme === 'dark' ? 'Switch to Light Mode' : 'Switch to Dark Mode'}
-                >
-                  {theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}
-                </button>
 
-                <div className="role-badge bg-[#F1F5F9] dark:bg-slate-800 text-[#475569] dark:text-slate-300 px-2 py-1 rounded text-[10px] font-bold uppercase tracking-wider">
-                  {effectiveRole} {viewAsRole ? '(Preview)' : ''}
-                </div>
-                <div className="flex items-center gap-3">
-                  <DropdownMenu>
-                    <DropdownMenuTrigger
-                      render={
-                        <button className="flex items-center gap-2 px-2.5 py-1 hover:bg-slate-50 dark:hover:bg-slate-805 border border-slate-200/40 dark:border-slate-800 rounded-xl transition-all cursor-pointer group">
-                          <span className="text-xs font-bold text-[#1E293B] dark:text-slate-200 group-hover:text-indigo-500 transition-colors leading-none">{effectiveUser?.name}</span>
-                          <div className="w-8 h-8 rounded-full bg-[#E2E8F0] dark:bg-slate-800 border border-white dark:border-slate-700 shadow-sm flex items-center justify-center font-bold text-xs text-[#64748B] dark:text-slate-400 group-hover:scale-105 transition-transform overflow-hidden">
-                            {effectiveUser?.photoURL ? (
-                              <img src={effectiveUser.photoURL} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
-                            ) : (
-                              effectiveUser?.name.split(' ').map(n => n[0]).slice(0, 2).join('')
-                            )}
-                          </div>
-                        </button>
-                      }
-                    />
-                    <DropdownMenuContent side="bottom" align="end" sideOffset={8} className="w-52">
-                      <DropdownMenuGroup>
-                        <DropdownMenuLabel>My Account</DropdownMenuLabel>
-                        <DropdownMenuSeparator />
-                        <DropdownMenuItem onClick={() => setActiveTab('profile')} className="cursor-pointer font-medium flex items-center">
-                          <UserIcon size={14} className="mr-2 text-indigo-500" />
-                          My Profile
-                        </DropdownMenuItem>
-                        <DropdownMenuItem onClick={() => setIsChangePasswordOpen(true)} className="cursor-pointer font-medium flex items-center">
-                          <Lock size={14} className="mr-2 text-indigo-500" />
-                          Change Password
-                        </DropdownMenuItem>
-                        <DropdownMenuSeparator />
-                        <DropdownMenuItem onClick={handleLogout} variant="destructive" className="text-red-600 dark:text-red-400 font-bold cursor-pointer flex items-center">
-                          <LogOut size={14} className="mr-2" />
-                          Logout
-                        </DropdownMenuItem>
-                      </DropdownMenuGroup>
-                    </DropdownMenuContent>
-                  </DropdownMenu>
-                </div>
-             </div>
-          </div>
         </header>
 
-        {/* View Content */}
-        <div className="flex-1 overflow-auto p-8">
-          <AnimatePresence mode="wait">
-            {filteredNav.length === 0 && !permissionsLoading ? (
-              <motion.div
-                initial={{ opacity: 0, scale: 0.95 }}
-                animate={{ opacity: 1, scale: 1 }}
-                className="max-w-md mx-auto my-12 text-center p-8 bg-white dark:bg-slate-900 rounded-3xl border border-slate-200 dark:border-slate-800 shadow-xl"
-              >
-                <ShieldAlert size={48} className="text-rose-500 mx-auto mb-4 animate-bounce" />
-                <h3 className="text-base font-black text-slate-800 dark:text-slate-105 mb-2">Access Denied</h3>
-                <p className="text-xs text-slate-500 dark:text-slate-400 font-sans leading-relaxed">
-                  No modules have been assigned to your role. Please contact your Administrator.
-                </p>
-              </motion.div>
-            ) : (
-              <motion.div
-                key={`${activeTab}-${effectiveRole}`}
-                initial={{ opacity: 0, y: 4 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0 }}
-                transition={{ duration: 0.12, ease: "easeOut" }}
-                className="max-w-7xl mx-auto h-full"
-              >
-                {activeTab === 'profile' ? (
-                  <MyProfileView user={effectiveUser!} allUsers={allUsers} externalTheme={theme} onRefreshAllData={fetchAllData} />
-                ) : activeTab === 'tms' ? (
-                  <TMSView user={effectiveUser!} allUsers={allUsers} onRefreshAllData={fetchAllData} externalTheme={theme} />
-                ) : activeTab === 'attendance' ? (
-                  <AttendanceView user={effectiveUser!} allUsers={allUsers} externalTheme={theme} />
-                ) : activeTab === 'kpis_scorecard' ? (
-                  <ScorecardView user={effectiveUser!} allUsers={allUsers} onRefreshAllData={fetchAllData} externalTheme={theme} />
-                ) : activeTab === 'employee_relations' ? (
-                  <EmployeeRelationsView warnings={warnings} user={effectiveUser!} allUsers={allUsers} externalTheme={theme} />
-                ) : activeTab === 'it_help_desk' ? (
-                  <ITHelpDeskView user={effectiveUser!} allUsers={allUsers} externalTheme={theme} />
-                ) : activeTab === 'historical' ? (
-                  <ManageHistoricalRecordsView user={effectiveUser!} allUsers={allUsers} onRefreshAllData={fetchAllData} />
-                ) : activeTab === 'resources' ? (
-                  <ResourceHubView user={effectiveUser!} />
-                ) : activeTab === 'config' ? (
-                  <AdminView 
-                    activeTab={activeTab} 
-                    tasks={[]} 
-                    onTasksUpdate={() => {}} 
-                    user={effectiveUser!}
-                    alignments={[]}
-                    onAlignmentsUpdate={async () => {}}
-                    productions={[]}
-                    auditLogs={[]}
-                    goToTab={setActiveTab}
-                    allUsers={allUsers}
-                    warnings={warnings}
-                    onRefresh={fetchAllData}
-                    externalTheme={theme}
-                  />
-                ) : (
-                  <div className="py-12 text-center text-slate-500 font-bold text-sm">
-                    Module Not Registered
-                  </div>
-                )}
-              </motion.div>
-            )}
-          </AnimatePresence>
-        </div>
-      </main>
-
-      {/* Change Password Dialog */}
-      <Dialog open={isChangePasswordOpen} onOpenChange={setIsChangePasswordOpen}>
-        <DialogContent className="sm:max-w-md bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-6 rounded-2xl shadow-xl">
-          <DialogHeader>
-            <DialogTitle className="text-lg font-black text-slate-800 dark:text-slate-100 flex items-center gap-2">
-              <Lock size={18} className="text-indigo-500" /> Change Account Password
-            </DialogTitle>
-            <DialogDescription className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed">
-              Verify your identity by inputting current password credentials, then request password updates.
-            </DialogDescription>
-          </DialogHeader>
-
-          <form onSubmit={handleUpdatePassword} className="space-y-4 mt-3">
-            <div className="space-y-1">
-              <label className="block text-[10px] font-bold uppercase tracking-wider text-slate-400">Current Password</label>
-              <input
-                type="password"
-                required
-                value={oldPassword}
-                onChange={e => setOldPassword(e.target.value)}
-                placeholder="••••••••"
-                className="w-full text-xs p-2.5 rounded-lg border outline-none transition-all focus:ring-1 focus:ring-indigo-500 bg-slate-50 dark:bg-slate-950 border-slate-200 dark:border-slate-800 text-slate-800 dark:text-slate-100"
-              />
-            </div>
-
-            <div className="space-y-1">
-              <label className="block text-[10px] font-bold uppercase tracking-wider text-slate-400">New Desired Password</label>
-              <input
-                type="password"
-                required
-                value={newPassword}
-                onChange={e => setNewPassword(e.target.value)}
-                placeholder="•••••••• (Min 6 chars)"
-                className="w-full text-xs p-2.5 rounded-lg border outline-none transition-all focus:ring-1 focus:ring-indigo-500 bg-slate-50 dark:bg-slate-950 border-slate-200 dark:border-slate-800 text-slate-800 dark:text-slate-100"
-              />
-            </div>
-
-            <div className="space-y-1">
-              <label className="block text-[10px] font-bold uppercase tracking-wider text-slate-400">Confirm New Password</label>
-              <input
-                type="password"
-                required
-                value={confirmPassword}
-                onChange={e => setConfirmPassword(e.target.value)}
-                placeholder="••••••••"
-                className="w-full text-xs p-2.5 rounded-lg border outline-none transition-all focus:ring-1 focus:ring-indigo-500 bg-slate-50 dark:bg-slate-950 border-slate-200 dark:border-slate-800 text-slate-800 dark:text-slate-100"
-              />
-            </div>
-
-            <DialogFooter className="mt-4 gap-2 flex justify-end">
-              <button
-                type="button"
-                onClick={() => setIsChangePasswordOpen(false)}
-                className="px-4 py-2 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 text-slate-700 dark:text-slate-300 font-bold text-xs rounded-xl cursor-pointer"
-              >
-                Cancel
-              </button>
-              <button
-                type="submit"
-                disabled={passwordState === 'updating'}
-                className="px-5 py-2 bg-indigo-650 hover:bg-indigo-700 text-white font-black text-xs rounded-xl cursor-pointer flex items-center gap-1.5 shadow-md shadow-indigo-500/10 active:scale-95 transition-all"
-              >
-                {passwordState === 'updating' ? <RefreshCw size={12} className="animate-spin" /> : "Update Password"}
-              </button>
-            </DialogFooter>
-          </form>
-        </DialogContent>
-      </Dialog>
-    </div>
-  </div>
+        {/* View Router */}
+        <main className={`flex-grow ${currentView.startsWith('tms-') ? 'overflow-hidden flex flex-col' : 'overflow-y-auto'} bg-slate-50 dark:bg-slate-950 p-4 md:p-6 lg:p-8`}>
+          {currentView.startsWith('tms-') && (
+            <TMSView 
+              user={effectiveUser} 
+              allUsers={allUsers} 
+              externalTheme={theme} 
+              currentSubView={currentView}
+              onNavigateSubView={(viewId) => setCurrentView(viewId)}
+            />
+          )}
+          {currentView === 'kpi' && <KPIScorecardView user={effectiveUser} allUsers={allUsers} externalTheme={theme} />}
+          {currentView === 'resource' && <ResourceHubView user={effectiveUser} />}
+          {currentView === 'admin' && (
+            <AdminView 
+              user={effectiveUser} 
+              allUsers={allUsers}
+              goToTab={(tab) => {
+                if (tab === 'tms') setCurrentView(tmsSubViews[0]?.id || 'tms-agent');
+                else if (tab === 'resource') setCurrentView('resource');
+                else if (tab === 'profile') setCurrentView('profile');
+              }}
+              externalTheme={theme}
+              onRefresh={invalidateRosterCache}
+            />
+          )}
+          {currentView === 'profile' && (
+            <MyProfileView 
+              user={effectiveUser!} 
+              allUsers={allUsers} 
+              externalTheme={theme} 
+            />
+          )}
+        </main>
+      </div>
+    </>
   );
 }
-

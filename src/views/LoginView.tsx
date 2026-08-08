@@ -3,6 +3,7 @@ import { Button } from '../components/ui/button';
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from '../components/ui/card';
 import { ShieldCheck, LogIn, AlertCircle, Mail, Lock, User as UserIcon, Eye, EyeOff, Check, X, BadgeCheck } from 'lucide-react';
 import { loginWithGoogle, loginWithEmail, signupWithEmail, db, syncUserProfile, auth } from '../lib/firebase';
+import { getLiveTimeISO } from '../lib/timeSync';
 import { Input } from '../components/ui/input';
 import { Label } from '../components/ui/label';
 import { toast } from 'sonner';
@@ -219,12 +220,12 @@ export default function LoginView() {
         email: cleanEmail,
         name: registerName,
         fullName: registerName,
-        role: (cleanEmail === 'mayank.semwal@bergtechnologies.co.in') ? 'ADMIN' : 'AGENT', // Initial default on registration
+        role: (cleanEmail === 'deepa.shukla@bergtechnologies.co.in') ? 'MANAGER' : 'AGENT', // Initial default on registration
         status: 'Active',
         department: 'Operations',
         Manager: '',
-        createdAt: new Date().toISOString(),
-        lastLoginAt: new Date().toISOString(),
+        createdAt: getLiveTimeISO(),
+        lastLoginAt: getLiveTimeISO(),
         authProvider: 'email',
         isActive: true,
       });

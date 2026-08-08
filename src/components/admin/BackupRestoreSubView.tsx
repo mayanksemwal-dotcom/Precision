@@ -120,16 +120,47 @@ export const BackupRestoreSubView: React.FC<BackupRestoreSubViewProps> = ({
       const timestamp = new Date().toISOString();
       const currentUserEmail = auth.currentUser?.email || 'admin@precision360.com';
 
-      // 1. Store in Firestore backups list
-      await setDoc(doc(db, 'admin_backups', backupId), {
-        id: backupId,
-        timestamp,
-        createdBy: currentUserEmail,
-        recordCounts: counts,
-        backupContent: backupString
-      });
+      // Firestore document size limit is 1,048,576 bytes.
+      // We will split the backup content into 800,000 character chunks if it's large.
+      const isLarge = backupString.length > 800000;
 
-      // 2. Client download trigger
+      if (isLarge) {
+        toast.info('Payload is large. Processing chunked secure transfer...');
+        const CHUNK_SIZE = 800000;
+        const chunks: string[] = [];
+        for (let i = 0; i < backupString.length; i += CHUNK_SIZE) {
+          chunks.push(backupString.substring(i, i + CHUNK_SIZE));
+        }
+
+        // Store metadata in parent document
+        await setDoc(doc(db, 'admin_backups', backupId), {
+          id: backupId,
+          timestamp,
+          createdBy: currentUserEmail,
+          recordCounts: counts,
+          hasContentInChunks: true,
+          numChunks: chunks.length
+        });
+
+        // Store chunks in a subcollection
+        for (let i = 0; i < chunks.length; i++) {
+          await setDoc(doc(db, 'admin_backups', backupId, 'chunks', `chunk_${i}`), {
+            index: i,
+            content: chunks[i]
+          });
+        }
+      } else {
+        // Store normally as a single document
+        await setDoc(doc(db, 'admin_backups', backupId), {
+          id: backupId,
+          timestamp,
+          createdBy: currentUserEmail,
+          recordCounts: counts,
+          backupContent: backupString
+        });
+      }
+
+      // 2. Client download trigger (always triggers complete backup file download)
       const blob = new Blob([backupString], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
@@ -150,7 +181,23 @@ export const BackupRestoreSubView: React.FC<BackupRestoreSubViewProps> = ({
   const handleRestoreCloudItem = async (bItem: any) => {
     if (!window.confirm(`⚠️ CRITICAL RECOVERY OVERRIDE! Are you absolutely sure you want to restore snapshot from ${new Date(bItem.timestamp).toLocaleString()}? Existing database values will be completely overwritten.`)) return;
     try {
-      const data = JSON.parse(bItem.backupContent);
+      let backupContentStr = '';
+      if (bItem.hasContentInChunks) {
+        toast.info('Fetching backup chunks from Cloud storage...');
+        const chunksSnap = await getDocs(collection(db, 'admin_backups', bItem.id, 'chunks'));
+        const sortedChunks = chunksSnap.docs
+          .map(doc => doc.data())
+          .sort((a: any, b: any) => a.index - b.index);
+        backupContentStr = sortedChunks.map((c: any) => c.content).join('');
+      } else {
+        backupContentStr = bItem.backupContent;
+      }
+
+      if (!backupContentStr) {
+        throw new Error('Backup content is empty or could not be retrieved.');
+      }
+
+      const data = JSON.parse(backupContentStr);
       await executeDataRestoration(data);
     } catch (err: any) {
       toast.error('Error recovering data: ' + err.message);
@@ -217,11 +264,22 @@ export const BackupRestoreSubView: React.FC<BackupRestoreSubViewProps> = ({
   const handleDeleteBackupDoc = async (id: string) => {
     if (!window.confirm('Delete this backup snapshot record from Cloud catalog?')) return;
     try {
+      // 1. Check and clean up chunks from the subcollection first
+      const chunksSnap = await getDocs(collection(db, 'admin_backups', id, 'chunks'));
+      if (!chunksSnap.empty) {
+        const batch = writeBatch(db);
+        chunksSnap.docs.forEach(docSnap => {
+          batch.delete(docSnap.ref);
+        });
+        await batch.commit();
+      }
+
+      // 2. Delete parent document
       await deleteDoc(doc(db, 'admin_backups', id));
       toast.info('Historical index deleted.');
       fetchBackupsAndSettings();
     } catch (err: any) {
-      toast.error('Deletion error.');
+      toast.error('Deletion error: ' + err.message);
     }
   };
 

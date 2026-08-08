@@ -17,13 +17,14 @@ import {
   ExternalLink,
   RefreshCw
 } from 'lucide-react';
-import { db, auth } from '../../lib/firebase';
-import { doc, setDoc, deleteDoc, writeBatch, collection, getDocs, getDoc } from 'firebase/firestore';
+import { db, auth, getDocsOptimized, getDocOptimized } from '../../lib/firebase';
+import { doc, setDoc, deleteDoc, writeBatch, collection, getDocs, getDoc, updateDoc } from 'firebase/firestore';
 import { UserRole, UserProfile } from '../../types';
 import { isTLRole } from '../../lib/roles';
 import { toast } from 'sonner';
 import * as XLSX from 'xlsx';
 import { UserPicker } from '../UserPicker';
+import { useRoster } from '../../contexts/RosterContext';
 
 // Robust CSV Line parser helper that supports dynamic separators and double quotes containing commas/delimiters
 export function parseCSVLine(line: string): string[] {
@@ -68,7 +69,7 @@ export function parseBulkCSVText(text: string): {
 } {
   const users: any[] = [];
   const errors: { lineNum: number; text: string; type: 'error' | 'warning'; message: string }[] = [];
-  const validRoles = ['ADMIN', 'MANAGER', 'ASSISTANT_MANAGER', 'TEAM_LEAD', 'SME', 'TRAINER', 'QA', 'AGENT'];
+  const validRoles = ['ADMIN', 'MANAGER', 'ASSISTANT_MANAGER', 'TEAM LEAD', 'TEAM_LEAD', 'SME', 'TRAINER', 'QA', 'AGENT'];
 
   if (!text || !text.trim()) {
     return { users, errors };
@@ -149,6 +150,7 @@ export function parseBulkCSVText(text: string): {
   let notesIdx = -1;
   let teamLeadIdx = -1;
   let managerIdx = -1;
+  let locationIdx = -1;
 
   let startIndex = 0;
 
@@ -162,6 +164,8 @@ export function parseBulkCSVText(text: string): {
         teamLeadIdx = idx;
       } else if (lower.includes('manager') || lower.includes('mgr')) {
         managerIdx = idx;
+      } else if (lower.includes('location') || lower.includes('loc') || lower.includes('branch') || lower.includes('site') || lower.includes('city')) {
+        locationIdx = idx;
       } else if (lower.includes('name')) {
         nameIdx = idx;
       } else if (lower.includes('id') || lower.includes('empid') || lower.includes('number') || lower.includes('uid')) {
@@ -191,6 +195,7 @@ export function parseBulkCSVText(text: string): {
   if (notesIdx === -1) notesIdx = 7;
   if (teamLeadIdx === -1) teamLeadIdx = 8;
   if (managerIdx === -1) managerIdx = 9;
+  if (locationIdx === -1) locationIdx = 10;
 
   for (let i = startIndex; i < parsedLines.length; i++) {
     const line = parsedLines[i];
@@ -216,6 +221,7 @@ export function parseBulkCSVText(text: string): {
     const notesStr = getField(notesIdx);
     const teamLeadRaw = getField(teamLeadIdx);
     const mngrRaw = getField(managerIdx);
+    const locationStr = getField(locationIdx);
 
     // Heuristics: if email column contains no @, try to find one in the row
     if (!email || !email.includes('@')) {
@@ -266,21 +272,30 @@ export function parseBulkCSVText(text: string): {
       continue;
     }
 
+    let finalRoleStr = roleStr || 'AGENT';
+    if (roleStr) {
+      const upper = roleStr.toUpperCase().trim();
+      if (upper === 'TEAM_LEAD' || upper === 'TEAM LEAD') {
+        finalRoleStr = 'Team Lead';
+      }
+    }
+
     users.push({
       employeeId: empId,
       name: name,
       email: email.toLowerCase(),
-      role: roleStr,
+      role: finalRoleStr,
       department: dept,
       process: processStr,
       dateJoined: joinDate,
       notes: notesStr,
       teamLeadRawText: teamLeadRaw,
       managerRawText: mngrRaw,
+      location: locationStr,
       password: 'Password360@'
     });
 
-    if (roleStr && !validRoles.includes(roleStr.toUpperCase())) {
+    if (finalRoleStr && !validRoles.includes(finalRoleStr.toUpperCase())) {
       errors.push({
         lineNum,
         text: line,
@@ -389,7 +404,7 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
       name: u.fullName || u.name || u.employeeName || 'Unknown User',
       fullName: u.fullName || u.name || u.employeeName || 'Unknown User',
       photoURL: u.profilePhotoUrl || u.photoURL || '',
-      mappedManagerName: u.mappedManagerName || u.managerName || u.Manager || '',
+      mappedManagerName: u.mappedManagerName || u.managerName || '',
       teamLeadName: u.teamLeadName || '',
     }));
   }, [allUsers]);
@@ -438,33 +453,48 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
 
   const [registeredProcesses, setRegisteredProcesses] = useState<string[]>([]);
   const [dynamicRoles, setDynamicRoles] = useState<string[]>([]);
+  const { roles } = useRoster();
 
   useEffect(() => {
-    const fetchRegisteredRoles = async () => {
-      try {
-        const snapshot = await getDocs(collection(db, 'roles'));
-        const list = snapshot.docs.map(doc => doc.id.toUpperCase().trim());
-        const baselineRoles = Object.keys(UserRole);
-        const combined = Array.from(new Set([...baselineRoles, ...list]));
-        setDynamicRoles(combined);
-      } catch (error) {
-        console.error('Error fetching dynamic roles:', error);
+    const baselineRoles = Object.values(UserRole) as string[];
+    const normalizeRoleName = (r: string): string => {
+      const trimmed = r.trim();
+      const upper = trimmed.toUpperCase();
+      if (upper === 'TEAM LEAD' || upper === 'TEAM_LEAD') {
+        return 'Team Lead';
       }
+      return upper;
     };
-    fetchRegisteredRoles();
-  }, []);
+    const combined = Array.from(new Set([...baselineRoles, ...roles].map(normalizeRoleName)));
+      const filtered = combined.filter(r => {
+        if (!r) return false;
+        const upper = r.toUpperCase();
+        const oldTLVariations = ['STL', 'OPS_TL', 'QTL', 'TRAINER_TL', 'TEAM_LEAD', 'TRAINER TL', 'OPS TL', 'OPS_TEAM_LEAD', 'TEAM_LEADER'];
+        return !oldTLVariations.includes(upper);
+      });
+    setDynamicRoles(filtered);
+  }, [roles]);
 
   useEffect(() => {
     const fetchRegisteredProcesses = async () => {
       try {
-        const snap = await getDoc(doc(db, 'config', 'tmsProcesses'));
-        let list: string[] = [];
-        if (snap.exists() && Array.isArray(snap.data()?.list)) {
-          list = snap.data()?.list;
+        const snap = await getDocOptimized(doc(db, 'config', 'tmsProcesses'), 'tms_processes_fetch');
+        let list: string[] | null = null;
+        if (snap.exists()) {
+          const data = snap.data();
+          if (Array.isArray(data?.processes)) {
+            list = data.processes
+              .filter((p: any) => p.status === 'Active' && !p.hidden)
+              .map((p: any) => p.name);
+          } else if (Array.isArray(data?.list)) {
+            list = data.list;
+          }
         }
-        if (list.length === 0) {
-          list = ['HITL', 'MPQC', 'OQC', 'SOP Training', 'QA Review', 'Team Alignment'];
+        if (list === null) {
+          list = ['HITL', 'OQC', 'SOP Training', 'QA Review', 'Team Alignment'];
         }
+        const blocked = ['mpqc', 'mpqc-fk', 'mpqc-sh'];
+        list = list.filter(p => !blocked.includes((p || '').toLowerCase().trim()));
         setRegisteredProcesses(list);
       } catch (err) {
         console.warn('Failed to load registered processes', err);
@@ -489,11 +519,18 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
   }, [allUsers]);
 
   const processes = useMemo(() => {
-    const s = new Set<string>();
-    allUsers.forEach(u => u.process && s.add(u.process));
-    registeredProcesses.forEach(p => s.add(p));
-    return Array.from(s);
-  }, [allUsers, registeredProcesses]);
+    const map = new Map<string, string>();
+    registeredProcesses.forEach(p => {
+      if (typeof p === 'string' && p.trim().length > 0) {
+        const trimmed = p.trim();
+        const lower = trimmed.toLowerCase();
+        if (!map.has(lower)) {
+          map.set(lower, trimmed);
+        }
+      }
+    });
+    return Array.from(map.values()).sort();
+  }, [registeredProcesses]);
 
   // Paginated View
   const paginatedUsers = useMemo(() => {
@@ -534,26 +571,38 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
     setSelectedUids(news);
   };
 
+  // Helper to clean user profile before writing to Firestore to avoid size limits
+  const cleanUserProfile = (user: any) => {
+    const { 
+      activities, history, documents, notificationLogs, auditLogs, 
+      // Add other potentially large fields here
+      ...clean 
+    } = user;
+    return clean;
+  };
+
   // Status toggle handler
   const handleToggleStatus = async (user: any) => {
     const currentStatus = user.status?.toLowerCase() === 'active' || user.isActive === true;
     const nextStatus = currentStatus ? 'Inactive' : 'Active';
     try {
+      // Use setDoc with merge: true to avoid throwing document-not-found exceptions
       await setDoc(doc(db, 'users', user.uid), {
-        ...user,
         status: nextStatus,
         isActive: !currentStatus,
         lastModifiedAt: new Date().toISOString()
-      });
+      }, { merge: true });
+      
       await setDoc(doc(db, 'employee_master', user.uid), {
         status: nextStatus,
         lastUpdated: new Date().toISOString()
       }, { merge: true });
+      
       toast.success(`User '${user.name || user.fullName}' status modified to ${nextStatus}.`);
       logAdminEvent('User Status Checked', user.email, currentStatus ? 'Active' : 'Inactive', nextStatus);
       onRefresh();
     } catch (err) {
-      toast.error('Could not overwrite status.');
+      toast.error('Could not update status.');
     }
   };
 
@@ -567,16 +616,19 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
       const batch = writeBatch(db);
       const list = normalizedUsers.filter(u => selectedUids.has(u.uid));
       list.forEach(u => {
-        batch.set(doc(db, 'users', u.uid), {
-          ...u,
+        const userRef = doc(db, 'users', u.uid);
+        const masterRef = doc(db, 'employee_master', u.uid);
+        
+        batch.update(userRef, {
           status: target,
           isActive: target === 'Active',
           lastModifiedAt: new Date().toISOString()
         });
-        batch.set(doc(db, 'employee_master', u.uid), {
+        
+        batch.update(masterRef, {
           status: target,
           lastUpdated: new Date().toISOString()
-        }, { merge: true });
+        });
       });
       await batch.commit();
       toast.success(`Broadened status to ${target} for ${selectedUids.size} team profiles.`);
@@ -685,9 +737,24 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
         })
       });
 
+      const contentType = response.headers.get('content-type');
+      const isJson = !!(contentType && contentType.includes('application/json'));
+
       if (!response.ok) {
-        const errObj = await response.json();
-        throw new Error(errObj.error || 'Server rejected user creation.');
+        let errMsg = 'Server rejected user creation.';
+        if (isJson) {
+          const errObj = await response.json();
+          errMsg = errObj.error || errMsg;
+        } else {
+          const text = await response.text();
+          errMsg = `Server error (${response.status}): ${text.substring(0, 80).trim()}...`;
+        }
+        throw new Error(errMsg);
+      }
+
+      if (!isJson) {
+        const text = await response.text();
+        throw new Error(`Expected JSON response, but received Content-Type: ${contentType || 'none'} (body: ${text.substring(0, 80).trim()}...)`);
       }
 
       const resData = await response.json();
@@ -716,13 +783,14 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
         teamLeadUid: newForm.teamLeadUid,
         mappedManagerName: newForm.mappedManagerName,
         mappedManagerUid: newForm.mappedManagerUid,
+        Manager: newForm.mappedManagerName || '',
         status: newForm.status || 'Active',
         isActive: (newForm.status || 'Active') === 'Active',
         createdAt: new Date().toISOString(),
         location: newForm.location || ''
       };
 
-      await setDoc(doc(db, 'users', generatedUid), finalProfile);
+      await setDoc(doc(db, 'users', generatedUid), cleanUserProfile(finalProfile));
 
       const masterDoc = {
         employeeId: newForm.employeeId || '',
@@ -735,6 +803,7 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
         teamLeadName: newForm.teamLeadName || '',
         managerId: newForm.mappedManagerUid || '',
         managerName: newForm.mappedManagerName || '',
+        Manager: newForm.mappedManagerName || '',
         status: newForm.status || 'Active',
         dateJoined: newForm.dateJoined || '',
         lastUpdated: new Date().toISOString(),
@@ -750,6 +819,7 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
         teamLeadName: newForm.teamLeadName || '',
         managerId: newForm.mappedManagerUid || '',
         managerName: newForm.mappedManagerName || '',
+        Manager: newForm.mappedManagerName || '',
         process: newForm.process || '',
         lastUpdated: new Date().toISOString()
       };
@@ -781,6 +851,42 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
   // Edit User Handlers
   const handleEditUserOpen = (user: any) => {
     setEditingUser(user);
+
+    // Resolve direct Team Lead
+    let tlUid = user.teamLeadUid || user.teamLeadId || user.mappedTL || '';
+    let tlName = user.teamLeadName || user.TeamLead || user.teamLead || '';
+    if (tlUid && allUsers) {
+      const foundTL = allUsers.find((u: any) => u.uid === tlUid);
+      if (foundTL) {
+        tlName = foundTL.fullName || foundTL.name || foundTL.employeeName || tlName;
+      }
+    } else if (!tlUid && tlName && allUsers) {
+      const foundTL = allUsers.find((u: any) => 
+        (u.fullName || u.name || u.employeeName || '').toLowerCase().trim() === tlName.toLowerCase().trim()
+      );
+      if (foundTL) {
+        tlUid = foundTL.uid;
+      }
+    }
+
+    // Resolve direct Manager
+    let mgrUid = user.mappedManagerUid || user.mappedManagerId || user.managerId || '';
+    let mgrName = user.mappedManagerName || user.managerName || user.Manager || '';
+
+    if (mgrUid && allUsers) {
+      const foundMgr = allUsers.find((u: any) => u.uid === mgrUid);
+      if (foundMgr) {
+        mgrName = foundMgr.fullName || foundMgr.name || foundMgr.employeeName || mgrName;
+      }
+    } else if (!mgrUid && mgrName && allUsers) {
+      const foundMgr = allUsers.find((u: any) => 
+        (u.fullName || u.name || u.employeeName || '').toLowerCase().trim() === mgrName.toLowerCase().trim()
+      );
+      if (foundMgr) {
+        mgrUid = foundMgr.uid;
+      }
+    }
+
     setEditForm({
       employeeId: user.employeeId || '',
       name: user.fullName || user.name || '',
@@ -789,10 +895,10 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
       process: user.process || '',
       dateJoined: user.dateJoined || '',
       notes: user.notes || '',
-      teamLeadName: user.teamLeadName || '',
-      teamLeadUid: user.teamLeadUid || '',
-      mappedManagerName: user.mappedManagerName || user.Manager || '',
-      mappedManagerUid: user.mappedManagerUid || '',
+      teamLeadName: tlName,
+      teamLeadUid: tlUid,
+      mappedManagerName: mgrName,
+      mappedManagerUid: mgrUid,
       status: user.status || (user.isActive === false ? 'Inactive' : 'Active'),
       location: user.location || ''
     });
@@ -802,71 +908,112 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
   const handleEditSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!editingUser) return;
-    if (!editForm.name) {
+    if (!editForm.employeeId || !editForm.employeeId.trim()) {
+      toast.error('Employee ID is required.');
+      return;
+    }
+    if (!editForm.name || !editForm.name.trim()) {
       toast.error('Name is required.');
       return;
     }
 
     try {
+      const selectedTLObj = (allUsers || []).find((u: any) => u.uid === editForm.teamLeadUid);
+      const selectedMgrObj = (allUsers || []).find((u: any) => u.uid === editForm.mappedManagerUid);
+      const teamLeadEmail = selectedTLObj?.email || '';
+      const managerEmail = selectedMgrObj?.email || '';
+
       const updatedProfile = {
-        ...editingUser,
-        employeeId: editForm.employeeId,
-        name: editForm.name,
-        fullName: editForm.name,
+        employeeId: editForm.employeeId.trim(),
+        name: editForm.name.trim(),
+        fullName: editForm.name.trim(),
         role: editForm.role,
-        department: editForm.department,
-        process: editForm.process,
-        dateJoined: editForm.dateJoined,
-        notes: editForm.notes,
-        teamLeadName: editForm.teamLeadName,
-        teamLeadUid: editForm.teamLeadUid,
-        mappedManagerName: editForm.mappedManagerName,
-        mappedManagerUid: editForm.mappedManagerUid,
-        status: editForm.status,
+        department: editForm.department || 'Operations',
+        process: editForm.process || '',
+        dateJoined: editForm.dateJoined || '',
+        notes: editForm.notes || '',
+        teamLeadName: editForm.teamLeadName || '',
+        teamLeadUid: editForm.teamLeadUid || '',
+        teamLeadId: editForm.teamLeadUid || '',
+        mappedTL: editForm.teamLeadUid || '',
+        teamLeadEmail: teamLeadEmail,
+        mappedManagerName: editForm.mappedManagerName || '',
+        managerName: editForm.mappedManagerName || '',
+        mappedManagerUid: editForm.mappedManagerUid || '',
+        mappedManagerId: editForm.mappedManagerUid || '',
+        managerId: editForm.mappedManagerUid || '',
+        Manager: editForm.mappedManagerName || '',
+        mappedManagerEmail: managerEmail,
+        managerEmail: managerEmail,
+        status: editForm.status || 'Active',
         isActive: editForm.status === 'Active',
         lastModifiedAt: new Date().toISOString(),
         location: editForm.location || ''
       };
 
-      await setDoc(doc(db, 'users', editingUser.uid), updatedProfile);
+      // Use setDoc with merge: true to avoid throwing document-not-found exceptions
+      await setDoc(doc(db, 'users', editingUser.uid), updatedProfile, { merge: true });
 
       const masterDoc = {
-        employeeId: editForm.employeeId || '',
-        employeeName: editForm.name || '',
+        employeeId: editForm.employeeId.trim(),
+        employeeName: editForm.name.trim(),
+        fullName: editForm.name.trim(),
         email: (editingUser.email || '').toLowerCase().trim(),
         role: editForm.role,
         department: editForm.department || 'Operations',
         process: editForm.process || '',
         teamLeadId: editForm.teamLeadUid || '',
+        teamLeadUid: editForm.teamLeadUid || '',
         teamLeadName: editForm.teamLeadName || '',
+        teamLeadEmail: teamLeadEmail,
         managerId: editForm.mappedManagerUid || '',
+        mappedManagerId: editForm.mappedManagerUid || '',
+        mappedManagerUid: editForm.mappedManagerUid || '',
         managerName: editForm.mappedManagerName || '',
+        mappedManagerName: editForm.mappedManagerName || '',
+        Manager: editForm.mappedManagerName || '',
+        managerEmail: managerEmail,
+        mappedManagerEmail: managerEmail,
         status: editForm.status || 'Active',
         dateJoined: editForm.dateJoined || '',
         lastUpdated: new Date().toISOString(),
         location: editForm.location || ''
       };
-      await setDoc(doc(db, 'employee_master', editingUser.uid), masterDoc);
+      await setDoc(doc(db, 'employee_master', editingUser.uid), masterDoc, { merge: true });
 
       // 3. Sync Team Mapping (Ongoing Auto-Sync)
       const mappingDoc = {
         userId: editingUser.uid,
-        userName: editForm.name,
+        userName: editForm.name.trim(),
         teamLeadId: editForm.teamLeadUid || '',
+        teamLeadUid: editForm.teamLeadUid || '',
         teamLeadName: editForm.teamLeadName || '',
+        teamLeadEmail: teamLeadEmail,
         managerId: editForm.mappedManagerUid || '',
+        mappedManagerId: editForm.mappedManagerUid || '',
+        mappedManagerUid: editForm.mappedManagerUid || '',
         managerName: editForm.mappedManagerName || '',
+        mappedManagerName: editForm.mappedManagerName || '',
+        Manager: editForm.mappedManagerName || '',
+        managerEmail: managerEmail,
+        mappedManagerEmail: managerEmail,
         process: editForm.process || '',
         lastUpdated: new Date().toISOString()
       };
-      await setDoc(doc(db, 'teamMappings', editingUser.uid), mappingDoc);
+      await setDoc(doc(db, 'teamMappings', editingUser.uid), mappingDoc, { merge: true });
 
       if (editForm.process) {
         await setDoc(doc(db, 'live_sessions', editingUser.uid), {
+          tlId: editForm.teamLeadUid || '',
+          managerId: editForm.mappedManagerUid || '',
+          mappedManagerId: editForm.mappedManagerUid || '',
           process: editForm.process,
           currentProcess: editForm.process
         }, { merge: true });
       }
+
+      // Mutate local editingUser object for INSTANT UI update
+      Object.assign(editingUser, updatedProfile, masterDoc);
 
       toast.success(`Profile for '${editForm.name}' updated and hierarchy synchronized.`);
       logAdminEvent(
@@ -917,13 +1064,28 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
         body: JSON.stringify({ users: usersToCreate })
       });
 
+      const contentType = response.headers.get('content-type');
+      const isJson = !!(contentType && contentType.includes('application/json'));
+
       if (!response.ok) {
         let errMsg = 'Server rejected bulk user creation.';
-        try {
-          const errObj = await response.json();
-          errMsg = errObj.error || errMsg;
-        } catch (jsonErr) {}
+        if (isJson) {
+          try {
+            const errObj = await response.json();
+            errMsg = errObj.error || errMsg;
+          } catch (jsonErr) {}
+        } else {
+          try {
+            const text = await response.text();
+            errMsg = `Server error (${response.status}): ${text.substring(0, 80).trim()}...`;
+          } catch (textErr) {}
+        }
         throw new Error(errMsg);
+      }
+
+      if (!isJson) {
+        const text = await response.text();
+        throw new Error(`Expected JSON response, but received Content-Type: ${contentType || 'none'} (body: ${text.substring(0, 80).trim()}...)`);
       }
 
       const resData = await response.json();
@@ -1021,7 +1183,9 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
             teamLeadId: resolvedTL?.uid || existingUser?.teamLeadId || '',
             teamLeadName: resolvedTL?.name || orig.teamLeadRawText || existingUser?.teamLeadName || '',
             mappedManagerId: resolvedMgr?.uid || existingUser?.mappedManagerId || '',
-            mappedManagerName: resolvedMgr?.name || orig.managerRawText || existingUser?.mappedManagerName || ''
+            mappedManagerName: resolvedMgr?.name || orig.managerRawText || existingUser?.mappedManagerName || '',
+            Manager: resolvedMgr?.name || orig.managerRawText || existingUser?.mappedManagerName || '',
+            location: orig.location || existingUser?.location || ''
           };
 
           const masterDoc = {
@@ -1035,9 +1199,11 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
             teamLeadName: resolvedTL?.name || orig.teamLeadRawText || existingUser?.teamLeadName || '',
             managerId: resolvedMgr?.uid || existingUser?.mappedManagerId || '',
             managerName: resolvedMgr?.name || orig.managerRawText || existingUser?.mappedManagerName || '',
+            Manager: resolvedMgr?.name || orig.managerRawText || existingUser?.mappedManagerName || '',
             status: existingUser?.status || 'Active',
             dateJoined: orig.dateJoined || existingUser?.dateJoined || '',
-            lastUpdated: new Date().toISOString()
+            lastUpdated: new Date().toISOString(),
+            location: orig.location || existingUser?.location || ''
           };
 
           const mappingDoc = {
@@ -1047,19 +1213,23 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
             teamLeadName: resolvedTL?.name || orig.teamLeadRawText || existingUser?.teamLeadName || '',
             managerId: resolvedMgr?.uid || existingUser?.mappedManagerId || '',
             managerName: resolvedMgr?.name || orig.managerRawText || existingUser?.mappedManagerName || '',
+            Manager: resolvedMgr?.name || orig.managerRawText || existingUser?.mappedManagerName || '',
             process: orig.process || existingUser?.process || '',
             lastUpdated: new Date().toISOString()
           };
 
-          batch.set(doc(db, 'users', uid), finalProfile, { merge: true });
+          batch.set(doc(db, 'users', uid), cleanUserProfile(finalProfile), { merge: true });
           batch.set(doc(db, 'employee_master', uid), masterDoc, { merge: true });
           batch.set(doc(db, 'teamMappings', uid), mappingDoc, { merge: true });
 
           const pVal = orig.process || existingUser?.process || '';
           if (pVal) {
             batch.set(doc(db, 'live_sessions', uid), {
+              uid: uid,
+              userId: uid,
               process: pVal,
-              currentProcess: pVal
+              currentProcess: pVal,
+              isOnline: false
             }, { merge: true });
           }
         });
@@ -1095,7 +1265,6 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
     if (!isNotesOpen) return;
     try {
       await setDoc(doc(db, 'users', isNotesOpen.uid), {
-        ...isNotesOpen,
         notes: editingNotes,
         lastModifiedAt: new Date().toISOString()
       }, { merge: true });
@@ -1248,6 +1417,16 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
           </div>
           
           <div className="flex items-center gap-2 flex-wrap">
+            <button 
+              onClick={() => {
+                onRefresh();
+                toast.success('Busting cache... Reloading roster from database.');
+              }} 
+              className="px-3 py-2 text-xs font-bold rounded-lg cursor-pointer bg-indigo-600 hover:bg-indigo-700 text-white flex items-center gap-1.5"
+              title="Bypass cache and force-reload roster from database"
+            >
+              <RefreshCw size={14} /> Force Refresh
+            </button>
             <button onClick={() => setIsNewUserOpen(true)} className={btnStyle}>
               <UserPlus size={14} /> Add Human Resource
             </button>
@@ -1422,8 +1601,12 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
                       <td className="p-4 font-medium opacity-85">{user.department || 'Operations'}</td>
                       <td className="p-4 font-bold text-indigo-600 dark:text-indigo-400 opacity-90">{user.location || 'N/A'}</td>
                       <td className="p-4 font-mono font-bold opacity-85">{user.process || 'Commonpool'}</td>
-                      <td className="p-4 font-medium text-slate-500 dark:text-slate-400">{user.teamLeadName || 'N/A'}</td>
-                      <td className="p-4 font-medium text-slate-500 dark:text-slate-400">{user.mappedManagerName || user.Manager || 'N/A'}</td>
+                      <td className="p-4 font-medium text-slate-500 dark:text-slate-400">
+                        {user.teamLeadName || (user.teamLeadUid || user.teamLeadId ? allUsers.find((u: any) => u.uid === (user.teamLeadUid || user.teamLeadId))?.fullName : '') || 'N/A'}
+                      </td>
+                      <td className="p-4 font-medium text-slate-500 dark:text-slate-400">
+                        {user.mappedManagerName || user.managerName || (user.mappedManagerUid || user.mappedManagerId || user.managerId ? allUsers.find((u: any) => u.uid === (user.mappedManagerUid || user.mappedManagerId || user.managerId))?.fullName : '') || user.Manager || 'N/A'}
+                      </td>
                       <td className="p-4 text-center opacity-75">{user.dateJoined || 'N/A'}</td>
                       <td className="p-4 text-center text-slate-400 dark:text-slate-500 font-medium">
                         {user.lastLoginAt ? new Date(user.lastLoginAt).toLocaleDateString() : (user.lastLogin ? new Date(user.lastLogin).toLocaleDateString() : 'Never')}
@@ -1653,7 +1836,7 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
                   className={adminTheme === 'dark' ? 'w-full bg-slate-900 p-2 border border-slate-705 rounded-lg text-slate-350 text-xs' : 'w-full bg-white border border-slate-200 p-2 rounded-lg text-slate-650 text-xs'}
                 >
                   <option value="">Select Process / Campaign...</option>
-                  {processes.map(p => (
+                  {registeredProcesses.map(p => (
                     <option key={p} value={p}>{p}</option>
                   ))}
                 </select>
@@ -1662,10 +1845,17 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
               <div>
                 <label className="block text-[10px] font-bold text-slate-400 mb-0.5 uppercase tracking-widest pl-1">Team Lead</label>
                 <UserPicker 
-                  onSelect={(u) => setNewForm({...newForm, teamLeadName: u.fullName || u.name, teamLeadUid: u.uid})}
+                  allUsers={allUsers}
+                  onSelect={(u) => {
+                    setNewForm({
+                      ...newForm, 
+                      teamLeadName: u ? (u.fullName || u.name || u.employeeName || '') : '', 
+                      teamLeadUid: u ? (u.uid || '') : ''
+                    });
+                  }}
                   selectedUserId={newForm.teamLeadUid}
                   placeholder="Map Team Lead..."
-                  roleFilter={['TEAM_LEAD', 'STL', 'QTL', 'OPS_TL', 'TRAINER_TL', 'TEAM LEAD', 'MANAGER', 'ADMIN']}
+                  roleFilter={['Team Lead', 'TEAM LEAD', 'STL', 'OPS_TL', 'QTL', 'TRAINER_TL', 'TEAM_LEAD', 'MANAGER', 'ASSISTANT_MANAGER', 'ADMIN', 'OPS_TEAM_LEAD', 'TEAM_LEADER']}
                   className="mt-1"
                 />
               </div>
@@ -1673,10 +1863,15 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
               <div>
                 <label className="block text-[10px] font-bold text-slate-400 mb-0.5 uppercase tracking-widest pl-1">Mapped Manager</label>
                 <UserPicker 
-                  onSelect={(u) => setNewForm({...newForm, mappedManagerName: u.fullName || u.name, mappedManagerUid: u.uid})}
+                  allUsers={allUsers}
+                  onSelect={(u) => setNewForm({
+                    ...newForm, 
+                    mappedManagerName: u ? (u.fullName || u.name || u.employeeName || '') : '', 
+                    mappedManagerUid: u ? (u.uid || '') : ''
+                  })}
                   selectedUserId={newForm.mappedManagerUid}
                   placeholder="Map Manager..."
-                  roleFilter={[UserRole.MANAGER, UserRole.ADMIN]}
+                  roleFilter={['MANAGER', 'ASSISTANT_MANAGER', 'OPS_MANAGER', 'PROJECT_MANAGER', 'SR_MANAGER', 'ADMIN', 'SUPER_ADMIN', 'OPS_HEAD', 'MANAGER / LEAD', 'Manager', 'Assistant Manager', 'Admin']}
                   className="mt-1"
                 />
               </div>
@@ -1812,7 +2007,7 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
                   className={adminTheme === 'dark' ? 'w-full bg-slate-900 p-2 border border-slate-700 rounded-lg text-slate-350 text-xs' : 'w-full bg-white border border-slate-200 p-2 rounded-lg text-slate-650 text-xs'}
                 >
                   <option value="">Select Process / Campaign...</option>
-                  {processes.map(p => (
+                  {registeredProcesses.map(p => (
                     <option key={p} value={p}>{p}</option>
                   ))}
                 </select>
@@ -1821,10 +2016,17 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
               <div>
                 <label className="block text-[10px] font-bold text-slate-400 mb-1 uppercase tracking-widest pl-1">Team Lead Mapping</label>
                 <UserPicker 
-                  onSelect={(u) => setEditForm({...editForm, teamLeadName: u.fullName || u.name, teamLeadUid: u.uid})}
+                  allUsers={allUsers}
+                  onSelect={(u) => {
+                    setEditForm({
+                      ...editForm, 
+                      teamLeadName: u ? (u.fullName || u.name || u.employeeName || '') : '', 
+                      teamLeadUid: u ? (u.uid || '') : ''
+                    });
+                  }}
                   selectedUserId={editForm.teamLeadUid}
                   placeholder="Reassign Team Lead..."
-                  roleFilter={['TEAM_LEAD', 'STL', 'QTL', 'OPS_TL', 'TRAINER_TL', 'TEAM LEAD', 'MANAGER', 'ADMIN']}
+                  roleFilter={['Team Lead', 'TEAM LEAD', 'STL', 'OPS_TL', 'QTL', 'TRAINER_TL', 'TEAM_LEAD', 'MANAGER', 'ASSISTANT_MANAGER', 'ADMIN', 'OPS_TEAM_LEAD', 'TEAM_LEADER']}
                   className="mt-1"
                 />
               </div>
@@ -1832,10 +2034,15 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
               <div>
                 <label className="block text-[10px] font-bold text-slate-400 mb-1 uppercase tracking-widest pl-1">Manager Mapping</label>
                 <UserPicker 
-                  onSelect={(u) => setEditForm({...editForm, mappedManagerName: u.fullName || u.name, mappedManagerUid: u.uid})}
+                  allUsers={allUsers}
+                  onSelect={(u) => setEditForm({
+                    ...editForm, 
+                    mappedManagerName: u ? (u.fullName || u.name || u.employeeName || '') : '', 
+                    mappedManagerUid: u ? (u.uid || '') : ''
+                  })}
                   selectedUserId={editForm.mappedManagerUid}
                   placeholder="Reassign Manager..."
-                  roleFilter={[UserRole.MANAGER, UserRole.ADMIN]}
+                  roleFilter={['MANAGER', 'ASSISTANT_MANAGER', 'OPS_MANAGER', 'PROJECT_MANAGER', 'SR_MANAGER', 'ADMIN', 'SUPER_ADMIN', 'OPS_HEAD', 'MANAGER / LEAD', 'Manager', 'Assistant Manager', 'Admin']}
                   className="mt-1"
                 />
               </div>
@@ -1894,7 +2101,7 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
             <p className="text-[11px] text-slate-400 mb-3 leading-relaxed">
               Standard format schema template (values enclosed in quotes if they contain commas): <br />
               <strong className="font-mono bg-slate-100 dark:bg-slate-900/60 p-1 rounded inline-block mt-1 text-indigo-400 select-all">
-                EmployeeID, Name, Email, Role, Department, Process, DateJoined, Notes, TeamLead, Manager
+                EmployeeID, Name, Email, Role, Department, Process, DateJoined, Notes, TeamLead, Manager, Location
               </strong>
             </p>
 
@@ -1945,7 +2152,7 @@ export const UserManagementSubView: React.FC<UserManagementSubViewProps> = ({
               rows={6}
               value={bulkText}
               onChange={e => setBulkText(e.target.value)}
-              placeholder="e.g.&#10;BT-901,Akshit Sodhi,akshit@bergtechnologies.co.in,QA,Operations,Vertical Core,2026-01-08,Senior Assessor,Mayank Semwal,John Doe"
+              placeholder="e.g.&#10;BT-901,Akshit Sodhi,akshit@bergtechnologies.co.in,QA,Operations,Vertical Core,2026-01-08,Senior Assessor,Mayank Semwal,John Doe,Dehradun (DDN)"
               className={`w-full text-xs p-3 font-mono border rounded-xl focus:outline-none focus:ring-1 focus:ring-indigo-500 mb-4 ${adminTheme === 'dark' ? 'bg-slate-900 border-slate-700 text-slate-100' : 'bg-slate-50 text-slate-800'}`}
             />
 

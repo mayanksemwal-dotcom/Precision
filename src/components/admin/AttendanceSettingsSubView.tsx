@@ -3,8 +3,10 @@ import { db } from '../../lib/firebase';
 import { doc, getDoc, setDoc } from 'firebase/firestore';
 import { toast } from 'sonner';
 import { Save, Settings, RefreshCw, Mail } from 'lucide-react';
+import { useConfig } from '../../contexts/ConfigContext';
 
 export function AttendanceSettingsSubView() {
+  const { refreshAll } = useConfig();
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [settings, setSettings] = useState({
@@ -77,6 +79,9 @@ export function AttendanceSettingsSubView() {
       
       console.log('Attempting to save notification configurations...');
       await setDoc(doc(db, 'config', 'notificationSettings'), emailSettings);
+      
+      // Update global config cache instantly
+      await refreshAll();
       
       toast.success('All configurations saved successfully.');
     } catch (err) {

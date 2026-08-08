@@ -7,23 +7,20 @@ export const MANAGER_ROLES = [
   UserRole.HR,
   UserRole.IT_MANAGER,
   UserRole.TEAM_LEAD,
-  UserRole.STL,
-  UserRole.OPS_TL,
 ];
 
 export const TL_ROLES = [
   UserRole.TEAM_LEAD,
-  UserRole.STL,
-  UserRole.QTL,
-  UserRole.OPS_TL,
-  UserRole.TRAINER_TL,
   UserRole.SME,
 ];
 
 export const normalizeRole = (role: string | undefined): UserRole | null => {
   if (!role) return null;
-  const normalized = role.toUpperCase().trim().replace(/ /g, '_');
-  return (UserRole as any)[normalized] || null;
+  const raw = role.toString().toUpperCase().trim().replace(/[\s\-_]+/g, '_');
+  if (['STL', 'OPS_TL', 'QTL', 'TRAINER_TL', 'TEAM_LEAD', 'TEAM_LEADER', 'OPS_TEAM_LEAD', 'TRAINER_TEAM_LEAD'].includes(raw) || raw.endsWith('_TL')) {
+    return UserRole.TEAM_LEAD;
+  }
+  return (UserRole as any)[raw] || null;
 };
 
 export const isManagerRole = (role: string | undefined) => {

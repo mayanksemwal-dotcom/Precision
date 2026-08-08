@@ -1,9 +1,10 @@
 import React, { createContext, useContext, useState, useEffect, ReactNode } from 'react';
-import { db } from '../lib/firebase';
-import { collection, query, where, getDocs, onSnapshot } from 'firebase/firestore';
+import { db, getDocsOptimized } from '../lib/firebase';
+import { collection, query, where } from 'firebase/firestore';
 import { firestoreLogger } from '../lib/firestoreLogger';
 import { UserProfile, UserRole } from '../types';
 import { normalizeRole } from '../lib/hierarchy';
+import { useConfig } from '../contexts/ConfigContext';
 
 export interface TMSPermissions {
   // SELF SERVICE PERMISSIONS
@@ -46,13 +47,9 @@ export const getDefaultTmsPermissions = (roleName: string): TMSPermissions => {
   const isAdmin = norm === 'ADMIN';
   const isManager = ['MANAGER', 'OPS_HEAD', 'HR', 'IT_MANAGER'].includes(norm);
   const isTLOrSupervisor = [
-    'TEAM_LEAD',
-    'STL',
-    'OPS_TL',
-    'QTL',
-    'TRAINER_TL',
-    'SME'
-  ].includes(norm);
+    UserRole.TEAM_LEAD,
+    UserRole.SME
+  ].includes(norm as UserRole);
   const isMIS = norm === 'MIS';
   const isAgentOrQA = ['AGENT', 'QA', 'TRAINER'].includes(norm);
 
@@ -90,7 +87,7 @@ export const getDefaultTmsPermissions = (roleName: string): TMSPermissions => {
     can_close_sessions: isManager || isAdmin,
     view_team_session_audit_logs: isManager || isAdmin,
     view_clock_master_consolidation: isManager || isAdmin,
-    view_org_wide_workforce_data: isManager || isAdmin,
+    view_org_wide_workforce_data: isAdmin,
   };
 
   if (isAdmin) {
@@ -186,6 +183,7 @@ interface PermissionProviderProps {
 }
 
 export const PermissionProvider: React.FC<PermissionProviderProps> = ({ children, user, overriddenRole }) => {
+  const { rolePermissions, loading: configLoading } = useConfig();
   const [permissions, setPermissions] = useState<Record<string, PermissionActions>>({});
   const [loading, setLoading] = useState(true);
 
@@ -198,23 +196,20 @@ export const PermissionProvider: React.FC<PermissionProviderProps> = ({ children
 
     const rawRole = overriddenRole || user.role || 'AGENT';
     const roleName = rawRole.toUpperCase();
-    const isDeveloper = user.email.toLowerCase().trim() === 'mayank.semwal@bergtechnologies.co.in';
     const isFullPrivilegeRole = [UserRole.ADMIN, 'ADMIN', 'SYSTEM_ADMIN'].includes(roleName);
-    const isAdmin = isFullPrivilegeRole || (isDeveloper && !overriddenRole && roleName === 'ADMIN');
+    const isAdmin = isFullPrivilegeRole;
     
     // Seed default full access
     const getFullPermissions = () => {
       const permMap: Record<string, PermissionActions> = {};
       const modules = [
         'Workforce TMS', 
-        'KPI Scorecard', 
         'Warnings', 
         'PIP Management', 
         'Historical Records', 
         'Important Quality Links', 
         'Console',
-        'Attendance',
-        'IT Help Desk'
+        'Attendance'
       ];
       modules.forEach(mod => {
         permMap[mod] = {
@@ -256,34 +251,34 @@ export const PermissionProvider: React.FC<PermissionProviderProps> = ({ children
       rawRole.toUpperCase(),
       rawRole.toUpperCase().replace(/\s+/g, '_')
     ])).filter(Boolean);
-    const q = query(
-      collection(db, 'role_permissions'),
-      where('role_name', 'in', uniqueRoles)
-    );
 
-    // Realtime listener for role permissions
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      firestoreLogger.trackRead('role_permissions_onSnapshot', snapshot.size);
+    // Phase 5 Optimization: Use cached rolePermissions from ConfigContext instead of querying Firestore
+    const syncFromCache = async () => {
       let permMap: Record<string, PermissionActions> = {};
       
-      // If admin, start with full perms. Otherwise start with empty.
+      // If admin, start with full perms
       if (isAdmin) {
         permMap = getFullPermissions();
       }
 
-      snapshot.docs.forEach((docSnap) => {
-        const docId = docSnap.id;
-        const data = docSnap.data();
+      // Filter global cache for the specific roles relevant to this user
+      let userRelevantDocs = rolePermissions.filter((rp: any) => uniqueRoles.includes(rp.role_name));
+      
+      // Fallback: If we have an overriddenRole that is missing from the global cache, 
+      // we must fetch it directly to avoid UI regressions for managers/admins testing roles.
+      if (userRelevantDocs.length === 0 && !isAdmin && !configLoading) {
+        try {
+          const q = query(collection(db, 'role_permissions'), where('role_name', 'in', uniqueRoles));
+          const snap = await getDocsOptimized(q, 'role_permissions_fallback');
+          userRelevantDocs = snap.docs.map(d => d.data());
+        } catch (err) {
+          console.error('Fallback permission fetch failed:', err);
+        }
+      }
+      
+      userRelevantDocs.forEach((data: any) => {
         const m = data.module_name || '';
         if (!m) return;
-
-        const expectedId = `${data.role_name}_${m}`;
-        const underscoreId = `${data.role_name}_${m.replace(/\s+/g, '_')}`;
-
-        // Skip legacy underscore-keyed duplicate items
-        if (docId === underscoreId && underscoreId !== expectedId) {
-          return;
-        }
 
         permMap[m] = {
           can_view: !!data.can_view,
@@ -309,18 +304,16 @@ export const PermissionProvider: React.FC<PermissionProviderProps> = ({ children
           tms_permissions: data.tms_permissions || undefined
         };
       });
+      
       setPermissions(permMap);
       setLoading(false);
-    }, (error) => {
-      console.error('Error fetching permissions:', error);
-      if (isAdmin) {
-        setPermissions(getFullPermissions());
-      }
-      setLoading(false);
-    });
+    };
 
-    return () => unsubscribe();
-  }, [user?.uid, user?.role, user?.email, overriddenRole]);
+    if (!configLoading) {
+      syncFromCache();
+    }
+    
+  }, [user?.uid, user?.role, user?.email, overriddenRole, rolePermissions, configLoading]);
 
   // Utility to get permissions for a module with fallback
   const getModPerms = (module: string): PermissionActions => {
@@ -361,62 +354,6 @@ export const PermissionProvider: React.FC<PermissionProviderProps> = ({ children
       }
     }
     
-    if (module === 'IT Help Desk') {
-      return permissions[targetModule] || permissions[fallbackModule] || {
-        can_view: true,
-        can_create: true,
-        can_edit: false,
-        can_delete: false,
-        can_export: false,
-        can_approve: false,
-        view_team: false,
-        view_all: false,
-        assign: false,
-        override: false,
-        force_action: false,
-        manage_settings: false,
-        manage_masters: false,
-        audit_access: false,
-        email_trigger: false,
-        bulk_action: false,
-        reopen_records: false,
-        escalate: false,
-        comment: true,
-        view_sensitive_data: false,
-      };
-    }
-    
-    if (module === 'Employee Relations') {
-      const warningPerms = permissions['Warnings'];
-      const pipPerms = permissions['PIP Management'];
-      
-      // If they had access to either, give them access to Employee Relations
-      if ((warningPerms && warningPerms.can_view) || (pipPerms && pipPerms.can_view)) {
-        return {
-          can_view: true,
-          can_create: (warningPerms?.can_create || pipPerms?.can_create) || false,
-          can_edit: (warningPerms?.can_edit || pipPerms?.can_edit) || false,
-          can_delete: (warningPerms?.can_delete || pipPerms?.can_delete) || false,
-          can_export: (warningPerms?.can_export || pipPerms?.can_export) || false,
-          can_approve: (warningPerms?.can_approve || pipPerms?.can_approve) || false,
-          view_team: (warningPerms?.view_team || pipPerms?.view_team) || false,
-          view_all: (warningPerms?.view_all || pipPerms?.view_all) || false,
-          assign: false,
-          override: false,
-          force_action: false,
-          manage_settings: false,
-          manage_masters: false,
-          audit_access: false,
-          email_trigger: false,
-          bulk_action: false,
-          reopen_records: false,
-          escalate: false,
-          comment: false,
-          view_sensitive_data: false,
-        };
-      }
-    }
-    
     return permissions[targetModule] || permissions[fallbackModule] || {
       can_view: false,
       can_create: false,
@@ -444,8 +381,7 @@ export const PermissionProvider: React.FC<PermissionProviderProps> = ({ children
   const hasTmsPermission = (permKey: keyof TMSPermissions): boolean => {
     const rawRole = overriddenRole || user?.role || 'AGENT';
     const roleName = rawRole.toUpperCase();
-    const isDeveloper = user?.email?.toLowerCase().trim() === 'mayank.semwal@bergtechnologies.co.in';
-    const isAdmin = (roleName === 'ADMIN' || rawRole === 'ADMIN') || (isDeveloper && !overriddenRole && (roleName === 'ADMIN' || rawRole === 'ADMIN'));
+    const isAdmin = (roleName === 'ADMIN' || rawRole === 'ADMIN');
 
     if (isAdmin) return true;
 

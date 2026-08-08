@@ -1,4 +1,5 @@
-import React, { useState, useEffect, useRef } from 'react';
+import { calculateShiftMetrics, ShiftMetrics, formatMs, aggregateShiftsForHistoryAndReports, MergedShiftRecord } from "../lib/ledgerCalculations";
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { 
   Clock, 
   Play, 
@@ -13,9 +14,11 @@ import {
   CheckCircle, 
   History, 
   AlertCircle,
+  AlertTriangle,
   FileSpreadsheet,
   Activity,
   Award,
+  GraduationCap,
   ChevronLeft,
   ChevronRight,
   Edit2,
@@ -35,9 +38,10 @@ import { Input } from '../components/ui/input';
 import { Label } from '../components/ui/label';
 import { toast } from 'sonner';
 import { usePermission } from '../components/PermissionContext';
-import { db, auth, handleFirestoreError, OperationType } from '../lib/firebase';
+import { db, auth, handleFirestoreError, OperationType, getDocsOptimized, getDocOptimized, clearCache, invalidateCacheKey } from '../lib/firebase';
+import { parseTimestampMs, isBreakActivity, isMeetingActivity, isTrainingActivity } from '../components/tms/liveSessionMapper';
 import { firestoreLogger } from '../lib/firestoreLogger';
-import { syncShiftToAttendance } from '../services/attendanceSyncService';
+
 import { 
   doc, 
   setDoc, 
@@ -55,28 +59,143 @@ import {
   limit,
   writeBatch
 } from 'firebase/firestore';
-import { UserProfile, UserRole } from '../types';
+import { UserProfile, UserRole, ShiftEvent, ShiftEventType } from '../types';
+import { appendShiftEvent, generateLegacyLedgerIfEmpty, formatShiftLedgerForReport } from '../lib/shiftLedger';
 import { motion, AnimatePresence } from 'motion/react';
 import * as XLSX from 'xlsx';
-import { canActOn } from '../lib/hierarchy';
+import JSZip from 'jszip';
+import { canActOn, normalizeRole, getCachedSubordinateUids, getSubordinateUids } from '../lib/hierarchy';
 import { getLiveTime, getLiveTimeISO } from '../lib/timeSync';
+import { logTmsEvent } from '../lib/tmsLogger';
 import { useSharedTimer } from '../lib/sharedTimer';
 import { safeStorage } from '../lib/safeStorage';
+import { useConfig } from '../contexts/ConfigContext';
+import * as TmsUtils from '../lib/tmsUtils';
+import { 
+  repairAndNormalizeShift, 
+  bulkRepairBackdatedShifts, 
+  sanitizeActivities, 
+  isShiftLockedOrCompleted, 
+  createLockedCompletedShift, 
+  calculateShiftFinalMetrics,
+  performTmsDuplicateShiftCleanup
+} from '../services/tmsCleanupService';
+
+const { isShiftCompleted, buildTimelineFromActivityLedger, getLatestUserActivity, isAuditOrDiagnosticEvent } = TmsUtils;
 // No Sheets imports
+
+// Module-level cache for public IP to avoid slow fetching on button click
+let cachedUserIP: string | null = null;
+let ipFetchPromise: Promise<string> | null = null;
+
+const ipv4Regex = /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/;
+
+export const getOrFetchPublicIP = (): Promise<string> => {
+  if (cachedUserIP) return Promise.resolve(cachedUserIP);
+  if (ipFetchPromise) return ipFetchPromise;
+
+  const ipLookupServices = [
+    { url: 'https://api4.ipify.org?format=json', parse: async (res: Response) => (await res.json()).ip },
+    { url: 'https://api.ipify.org?format=json', parse: async (res: Response) => (await res.json()).ip },
+    { url: 'https://icanhazip.com', parse: async (res: Response) => (await res.text()).trim() },
+    { url: 'https://ifconfig.me/ip', parse: async (res: Response) => (await res.text()).trim() },
+    { url: 'https://ipapi.co/json/', parse: async (res: Response) => (await res.json()).ip }
+  ];
+
+  ipFetchPromise = (async () => {
+    // Try to resolve using Promise.any for fast concurrent execution
+    const fetchPromises = ipLookupServices.map(async (service) => {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 1200); // Fast 1.2s timeout per service
+      try {
+        const res = await fetch(service.url, { signal: controller.signal });
+        clearTimeout(timeoutId);
+        if (res.ok) {
+          let ip = await service.parse(res);
+          if (ip) {
+            ip = ip.trim();
+            if (ip.startsWith('::ffff:')) {
+              ip = ip.substring(7);
+            }
+            ip = ip.split(':')[0].trim();
+            if (ipv4Regex.test(ip) && ip !== '0.0.0.0') {
+              return ip;
+            }
+          }
+        }
+      } catch (err) {
+        clearTimeout(timeoutId);
+      }
+      throw new Error('Failed to resolve IP');
+    });
+
+    try {
+      const resolved = await Promise.any(fetchPromises);
+      cachedUserIP = resolved;
+      return resolved;
+    } catch (e) {
+      // Fallback to sequential fast attempt if Promise.any fails completely
+      for (const service of ipLookupServices) {
+        try {
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 800);
+          const res = await fetch(service.url, { signal: controller.signal });
+          clearTimeout(timeoutId);
+          if (res.ok) {
+            let ip = await service.parse(res);
+            if (ip) {
+              ip = ip.trim();
+              if (ip.startsWith('::ffff:')) {
+                ip = ip.substring(7);
+              }
+              ip = ip.split(':')[0].trim();
+              if (ipv4Regex.test(ip) && ip !== '0.0.0.0') {
+                cachedUserIP = ip;
+                return ip;
+              }
+            }
+          }
+        } catch (err) {
+          // Ignore
+        }
+      }
+    }
+    return '0.0.0.0';
+  })();
+
+  return ipFetchPromise;
+};
+
+// Proactively fetch as soon as file is loaded
+if (typeof window !== 'undefined') {
+  getOrFetchPublicIP().catch(() => {});
+}
 
 interface TMSViewProps {
   user: UserProfile;
   allUsers: UserProfile[];
   onRefreshAllData?: (isManual?: boolean) => void;
   externalTheme?: 'light' | 'dark';
+  currentSubView?: string;
+  onNavigateSubView?: (viewId: string) => void;
 }
 
 export interface ShiftActivity {
-  type: 'productive' | 'break';
-  name: string; // e.g. HITL, Lunch
+  activityId?: string;
+  action?: string;
   startTime: string; // ISO
   endTime?: string; // ISO (undefined if active)
-  device?: 'mobile' | 'desktop';
+  process?: string;
+  actor?: string;
+  reason?: string;
+  sourceService?: string;
+  previousValue?: string;
+  newValue?: string;
+
+  // Legacy fields
+  type?: 'productive' | 'break';
+  name?: string; // e.g. HITL, Lunch
+  device?: 'mobile' | 'desktop' | string;
 }
 
 export interface TMSShift {
@@ -89,14 +208,22 @@ export interface TMSShift {
   mappedManager?: string;
   clockInTime: string; // ISO
   clockOutTime?: string; // ISO
+  endShiftTime?: string; // ISO
+  sessionClosedBy?: string;
   activities: ShiftActivity[];
-  status: 'ACTIVE' | 'BREAK' | 'COMPLETED' | 'AUTO_CLOSED';
+  shiftEventLedger?: ShiftEvent[];
+  status: 'ACTIVE' | 'BREAK' | 'COMPLETED' | 'AUTO_CLOSED' | 'COMPLETED_FORCED' | 'CLOCKED_OUT' | 'CLOSED';
+  statusStartTime?: string;
   clockInDevice?: 'mobile' | 'desktop';
   clockOutDevice?: 'mobile' | 'desktop';
   hasMobilePunches?: boolean;
+  sessionExtended?: boolean;
+  extended?: boolean;
   remarks?: string;
+  lastHeartbeat?: string;
 
   // Real-time Session Metadata
+  process?: string;
   deviceType?: 'Mobile' | 'Desktop' | 'Tablet';
   browser?: string;
   os?: string;
@@ -111,6 +238,32 @@ export interface TMSShift {
   detectedDeviceType?: string;
   detectedBrowser?: string;
   detectedOS?: string;
+
+  // State Machine & Immutable Metric Fields
+  locked?: boolean;
+  lockedAt?: string;
+  version?: number;
+  utilization?: number;
+  finalUtilization?: number;
+  productiveMinutes?: number;
+  breakMinutes?: number;
+  shiftDuration?: number;
+  productiveMs?: number;
+  breakMs?: number;
+  totalShiftMs?: number;
+  totalProductiveTime?: string;
+  totalBreakTime?: string;
+  totalShiftTime?: string;
+  
+  // Work Location Detection fields
+  workLocation?: string;
+  workLocationDetected?: string;
+  workLocationSource?: string;
+  publicIP?: string;
+  officeName?: string;
+  locationCapturedAt?: string;
+  overrideBy?: string;
+  overrideAt?: string;
 }
 
 export function getDeviceType(): 'mobile' | 'desktop' {
@@ -179,7 +332,7 @@ export function getDetailedDeviceMetadata() {
       deviceType: 'Desktop' as const,
       browser: 'Unknown',
       os: 'Unknown',
-      loginTimestamp: new Date().toISOString()
+      loginTimestamp: getLiveTimeISO()
     };
   }
 
@@ -250,92 +403,100 @@ export function getDetailedDeviceMetadata() {
     deviceType,
     browser,
     os,
-    loginTimestamp: new Date().toISOString()
+    loginTimestamp: getLiveTimeISO()
   };
 }
 
 export function getShiftProductiveMs(shift: TMSShift, referenceTime: number): number {
-  let activeMs = 0;
-  const endMs = shift.clockOutTime 
-    ? new Date(shift.clockOutTime).getTime() 
-    : referenceTime;
-
-  (shift.activities || []).forEach(act => {
-    const actStart = new Date(act.startTime).getTime();
-    const actEnd = act.endTime ? new Date(act.endTime).getTime() : endMs;
-    const duration = Math.max(0, actEnd - actStart);
-    const actName = (act.name || '').toLowerCase();
-    const isProductive = act.type === 'productive' || 
-                         actName.includes('meeting') || 
-                         actName.includes('coaching') || 
-                         actName.includes('training') || 
-                         actName.includes('alignment');
-    if (isProductive) {
-      activeMs += duration;
-    }
-  });
-  return activeMs;
+  if (!shift) return 0;
+  return calculateShiftMetrics(shift, referenceTime).productiveMs;
 }
 
 export function truncateShiftToProductiveTime(shift: TMSShift, limitMs: number = 10 * 60 * 60 * 1000): { activities: ShiftActivity[]; clockOutTime: string } {
   let accumulatedProductive = 0;
-  const updatedActivities: ShiftActivity[] = [];
-  let exactEndISO = shift.clockOutTime || new Date().toISOString();
+  let exactEndISO = new Date().toISOString();
+  let foundLimit = false;
 
-  for (const act of shift.activities) {
+  const acts = shift.activities || [];
+  const sorted = [...acts].sort((a, b) => new Date(a.startTime).getTime() - new Date(b.startTime).getTime());
+  
+  let currentStart = -1;
+  let isProductive = false;
+
+  for (let i = 0; i < sorted.length; i++) {
+    const act = sorted[i];
     const actStart = new Date(act.startTime).getTime();
-    const actEnd = act.endTime ? new Date(act.endTime).getTime() : new Date().getTime();
-    const duration = Math.max(0, actEnd - actStart);
+    
+    if (act.endTime) {
+      // Legacy
+      const actEnd = new Date(act.endTime).getTime();
+      const dur = Math.max(0, actEnd - actStart);
+      const isProd = act.type === 'productive' || ['meeting', 'coaching', 'training'].some(k => (act.name || '').toLowerCase().includes(k));
+      if (isProd) {
+        if (accumulatedProductive + dur >= limitMs) {
+          exactEndISO = new Date(actStart + (limitMs - accumulatedProductive)).toISOString();
+          foundLimit = true;
+          break;
+        }
+        accumulatedProductive += dur;
+      }
+      continue;
+    }
 
-    const actName = (act.name || '').toLowerCase();
-    const isProductive = act.type === 'productive' || 
-                         actName.includes('meeting') || 
-                         actName.includes('coaching') || 
-                         actName.includes('training') || 
-                         actName.includes('alignment');
-
-    if (isProductive) {
-      if (accumulatedProductive + duration >= limitMs) {
-        const remainingNeeded = limitMs - accumulatedProductive;
-        const exactEndMs = actStart + remainingNeeded;
-        exactEndISO = new Date(exactEndMs).toISOString();
-        
-        updatedActivities.push({
-          ...act,
-          endTime: exactEndISO
-        });
-        accumulatedProductive = limitMs;
-        break; // stop here
+    if (currentStart !== -1) {
+      const dur = actStart - currentStart;
+      if (isProductive) {
+        if (accumulatedProductive + dur >= limitMs) {
+          exactEndISO = new Date(currentStart + (limitMs - accumulatedProductive)).toISOString();
+          foundLimit = true;
+          break;
+        }
+        accumulatedProductive += dur;
+      }
+    }
+    
+    currentStart = actStart;
+    const action = act.action;
+    if (action) {
+      if (['CLOCK_OUT', 'AUTO_CLOSE', 'FORCE_LOGOUT', 'SYSTEM_REPAIR'].includes(action)) {
+        currentStart = -1;
+      } else if (action === 'BREAK_START') {
+        isProductive = false;
       } else {
-        updatedActivities.push(act);
-        accumulatedProductive += duration;
+        isProductive = true;
       }
     } else {
-      // Preserve breaks up to the point we hit limit (if any)
-      const breakStart = new Date(act.startTime).getTime();
-      if (accumulatedProductive >= limitMs || breakStart >= new Date(exactEndISO).getTime()) {
-        break;
-      }
-      updatedActivities.push(act);
+      isProductive = act.type === 'productive' || ['meeting', 'coaching', 'training'].some(k => (act.name || '').toLowerCase().includes(k));
     }
   }
 
-  // Ensure last activity has endTime set
-  if (updatedActivities.length > 0) {
-    const lastIndex = updatedActivities.length - 1;
-    if (!updatedActivities[lastIndex].endTime) {
-      updatedActivities[lastIndex].endTime = exactEndISO;
-    }
+  if (!foundLimit && currentStart !== -1 && isProductive) {
+    const remaining = limitMs - accumulatedProductive;
+    exactEndISO = new Date(currentStart + remaining).toISOString();
   }
+
+  const newActivities: ShiftActivity[] = [...acts, {
+    activityId: crypto.randomUUID(),
+    action: 'AUTO_CLOSE',
+    startTime: exactEndISO,
+    process: 'System Limit Reached',
+    actor: 'System',
+    sourceService: 'Background Limit Calculation',
+    reason: 'Exceeded 10 hours productive time',
+    type: 'productive',
+    name: 'AUTO_CLOSED',
+    device: 'system'
+  }];
 
   return {
-    activities: updatedActivities,
+    activities: newActivities,
     clockOutTime: exactEndISO
   };
 }
 
 export function getManagerOfManager(u: UserProfile, allUsers: UserProfile[]): string {
   if (!u) return 'N/A';
+  if (!allUsers || !Array.isArray(allUsers)) return 'N/A';
   
   // Prefer explicit/stored managerOfManager mapping if present
   if (u.managerOfManagerName) return u.managerOfManagerName;
@@ -440,7 +601,15 @@ export function getManagerOfManager(u: UserProfile, allUsers: UserProfile[]): st
   return 'N/A';
 }
 
-const DEFAULT_PROCESSES = ['HITL', 'MPQC', 'OQC', 'SOP Training', 'QA Review', 'Team Alignment'];
+const DEFAULT_PROCESSES = [
+  "Allen", "Amazon-Cashify Crawling", "BERG_Book_all-FK", "BERG_Book_autoqc-FK", "BERG_all-FK",
+  "BERG_autoqc-FK", "BERG_autoqc_P2-FK", "BERG_cc-FK", "BERG_dedup-FK", "BERG_deltaedit-FK",
+  "BERG_myntra-FK", "BERG_regionalBook-FK", "BERG_shopsy-SH", "BERG_shopsycc-SH", "BERG_shopsyedit-SH",
+  "BERG_shopsyeqc-SH", "Catalog Enrichment", "Clear Trip", "Compliance-Auditor", "HITL", "HR",
+  "HyperLocal(HL)", "IT", "Labelling", "Multi-Process", "Practice-Set", "Quality", "RQA", "RSQA",
+  "SHOPSY_shopsy_china-SH", "SQA FK", "Safe Search", "UGC", "Video Commerce", "Video-Annotation",
+  "Video-Creation", "WebQC", "Finance", "MIS-Ops", "MIS-Quality", "Admin"
+];
 const BREAK_OPTIONS = [
   'Lunch Break', 
   'Tea/Coffee Break', 
@@ -473,148 +642,221 @@ const LiveDurationClock = ({ startTime }: { startTime: string }) => {
 const LiveAgentDurations = ({
   currentShift,
   myPastShifts,
-  formatMs
+  formatMs,
+  now
 }: {
   currentShift: TMSShift | null,
   myPastShifts: TMSShift[],
-  formatMs: (ms: number) => string
+  formatMs: (ms: number) => string,
+  now: Date
 }) => {
-  const now = useSharedTimer();
-  
-  const nowTime = now.getTime();
-  let totalShiftMs = 0;
-  let activeMs = 0;
-  let breakMs = 0;
-
-  const nowLocalDateString = now.toDateString();
-  const completedShiftsToday = myPastShifts.filter(s => {
-    const isCompleted = s.status !== 'ACTIVE' && s.status !== 'BREAK';
-    if (!isCompleted || s.id === currentShift?.id) return false;
-    const shiftInDate = new Date(s.clockInTime);
-    return shiftInDate.toDateString() === nowLocalDateString;
-  });
-
-  completedShiftsToday.forEach(s => {
-    const outTime = s.clockOutTime ? new Date(s.clockOutTime).getTime() : new Date(s.clockInTime).getTime();
-    const inTimePrev = new Date(s.clockInTime).getTime();
-    totalShiftMs += Math.max(0, outTime - inTimePrev);
-
-    (s.activities || []).forEach(act => {
-      const start = new Date(act.startTime).getTime();
-      const end = act.endTime ? new Date(act.endTime).getTime() : (s.clockOutTime ? new Date(s.clockOutTime).getTime() : start);
-      const duration = Math.max(0, end - start);
-      const actName = (act.name || '').toLowerCase();
-      const isProductive = act.type === 'productive' || 
-                           actName.includes('meeting') || 
-                           actName.includes('coaching') || 
-                           actName.includes('training') || 
-                           actName.includes('alignment');
-      if (isProductive) activeMs += duration;
-      else breakMs += duration;
-    });
-  });
-
-  if (currentShift) {
-    const inTime = new Date(currentShift.clockInTime).getTime();
-    totalShiftMs += Math.max(0, nowTime - inTime);
-
-    (currentShift.activities || []).forEach(act => {
-      const start = new Date(act.startTime).getTime();
-      const end = act.endTime ? new Date(act.endTime).getTime() : nowTime;
-      const duration = Math.max(0, end - start);
-      const actName = (act.name || '').toLowerCase();
-      const isProductive = act.type === 'productive' || 
-                           actName.includes('meeting') || 
-                           actName.includes('coaching') || 
-                           actName.includes('training') || 
-                           actName.includes('alignment');
-      if (isProductive) activeMs += duration;
-      else breakMs += duration;
-    });
-  }
-
-  const elapsedShift = formatMs(totalShiftMs);
-  const elapsedActive = formatMs(activeMs);
-  const elapsedBreak = formatMs(breakMs);
+  const metrics = calculateShiftMetrics({
+    currentShift,
+    myPastShifts,
+    aggregationMode: "TODAY"
+  }, now.getTime());
 
   return (
-    <div className="grid grid-cols-3 gap-3 p-4 bg-slate-50 rounded-xl border border-slate-200">
-      <div className="text-center border-r border-slate-200">
-        <p className="text-[9px] font-black uppercase text-slate-400 tracking-wider">Shift Elapsed</p>
-        <p className="font-mono text-sm font-black text-slate-800 mt-1">{elapsedShift}</p>
+    <div className="grid grid-cols-3 gap-2 p-2 bg-slate-50/80 rounded-xl border border-slate-200/80">
+      <div className="text-center border-r border-slate-200/80 pr-1">
+        <p className="text-[8px] font-black uppercase text-slate-400 tracking-wider">Shift Elapsed</p>
+        <p className="font-mono text-xs font-black text-slate-800 mt-0.5">{metrics.connectedStr}</p>
       </div>
-      <div className="text-center border-r border-slate-200">
-        <p className="text-[9px] font-black uppercase text-slate-400 tracking-wider text-teal-600">Active Work</p>
-        <p className="font-mono text-sm font-black text-teal-700 mt-1">{elapsedActive}</p>
+      <div className="text-center border-r border-slate-200/80 px-1">
+        <p className="text-[8px] font-black uppercase text-slate-400 tracking-wider text-teal-600">Active Work</p>
+        <p className="font-mono text-xs font-black text-teal-700 mt-0.5">{metrics.activeStr}</p>
       </div>
-      <div className="text-center">
-        <p className="text-[9px] font-black uppercase text-slate-400 tracking-wider text-amber-600">Total Breaks</p>
-        <p className="font-mono text-sm font-black text-amber-700 mt-1">{elapsedBreak}</p>
+      <div className="text-center pl-1">
+        <p className="text-[8px] font-black uppercase text-slate-400 tracking-wider text-amber-600">Total Breaks</p>
+        <p className="font-mono text-xs font-black text-amber-700 mt-0.5">{metrics.breakStr}</p>
       </div>
     </div>
   );
 };
 
 const LiveSummaryStats = ({
-  shift,
-  formatMs,
-  computeShiftStats
+  metrics
 }: {
-  shift: TMSShift,
-  formatMs: (ms: number) => string,
-  computeShiftStats: (shift: TMSShift) => any
+  metrics: ShiftMetrics
 }) => {
-  const now = useSharedTimer();
-  const stats = computeShiftStats(shift);
-
   return (
     <>
-      <div className="flex items-center justify-between text-xs font-medium border-b border-slate-100 pb-1.5">
-        <span className="text-slate-500">Total Connected:</span>
-        <span className="font-bold text-slate-700">{formatMs(stats.totalShiftMs)}</span>
+      <div className="flex items-center justify-between text-xs font-medium border-b border-slate-100 dark:border-slate-800/60 pb-1.5">
+        <span className="text-slate-500 dark:text-slate-400">Productive Work:</span>
+        <span className="font-bold text-teal-600 dark:text-teal-400">{metrics.activeStr}</span>
+      </div>
+      <div className="flex items-center justify-between text-xs font-medium border-b border-slate-100 dark:border-slate-800/60 pb-1.5">
+        <span className="text-slate-500 dark:text-slate-400">Total Connected:</span>
+        <span className="font-bold text-slate-700 dark:text-slate-200">{metrics.connectedStr}</span>
       </div>
       <div className="flex items-center justify-between text-xs font-medium">
-        <span className="text-slate-500">Break Duration:</span>
-        <span className="font-bold text-amber-600">{formatMs(stats.breakMs)}</span>
+        <span className="text-slate-500 dark:text-slate-400">Break Duration:</span>
+        <span className="font-bold text-amber-600 dark:text-amber-400">{metrics.breakStr}</span>
       </div>
     </>
   );
 };
 
 const LiveSummaryProgress = ({
-  shift,
-  computeShiftStats
+  utilization
 }: {
-  shift: TMSShift,
-  computeShiftStats: (shift: TMSShift) => any
+  utilization: number;
 }) => {
-  const now = useSharedTimer();
-  const util = computeShiftStats(shift).utilization;
+  const util = Math.min(100, Math.max(0, utilization));
+  const radius = 32;
+  const circumference = 2 * Math.PI * radius;
+  const strokeDashoffset = circumference - (util / 100) * circumference;
 
   return (
-    <>
-      <svg className="w-full h-full transform -rotate-90">
-        <circle cx="40" cy="40" r="32" stroke="#E2E8F0" strokeWidth="6" fill="transparent" />
+    <div className="relative w-full aspect-square max-w-[72px] mx-auto flex items-center justify-center">
+      <svg viewBox="0 0 80 80" className="w-full h-full transform -rotate-90 drop-shadow-sm">
         <circle 
           cx="40" 
           cy="40" 
-          r="32" 
-          stroke="#0D9488" 
-          strokeWidth="6" 
-          fill="transparent" 
-          strokeDasharray={2 * Math.PI * 32}
-          strokeDashoffset={2 * Math.PI * 32 * (1 - util / 100)}
+          r={radius} 
+          className="stroke-slate-200 dark:stroke-slate-800" 
+          strokeWidth="7" 
+          fill="none" 
+        />
+        <circle 
+          cx="40" 
+          cy="40" 
+          r={radius} 
+          className="stroke-teal-600 dark:stroke-teal-400 transition-all duration-500 ease-out" 
+          strokeWidth="7" 
+          fill="none" 
+          strokeDasharray={circumference}
+          strokeDashoffset={strokeDashoffset}
           strokeLinecap="round"
         />
       </svg>
-      <span className="absolute font-mono text-xs font-black text-slate-800">
-        {Math.round(util)}%
+      <span className="absolute inset-0 flex items-center justify-center font-mono text-xs font-black text-slate-800 dark:text-slate-100 pointer-events-none select-none">
+        {util}%
       </span>
-    </>
+    </div>
   );
 };
 
-export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, externalTheme }: TMSViewProps) {
+const LiveShiftMathSummaryCard = ({
+  currentShift,
+  myPastShifts,
+  now
+}: {
+  currentShift: TMSShift | null;
+  myPastShifts: TMSShift[];
+  now: Date;
+}) => {
+  const metrics = calculateShiftMetrics({
+    currentShift,
+    myPastShifts,
+    aggregationMode: "TODAY"
+  }, now.getTime());
+
+  return (
+    <Card className="border-none shadow-md shadow-slate-200 bg-white dark:bg-slate-900">
+      <CardHeader className="border-b border-rose-50/50 dark:border-slate-800/50 py-2.5 px-4">
+        <CardTitle className="text-xs font-black uppercase text-slate-800 dark:text-slate-100 tracking-tight">Shift Math & Utilization Summary</CardTitle>
+        <CardDescription className="text-[10px] text-slate-500 dark:text-slate-400">Real-time shift math (24/7 cross-day logic applied)</CardDescription>
+      </CardHeader>
+      <CardContent className="py-2.5 px-4 flex items-center justify-between gap-4">
+        <div className="flex-1 space-y-2">
+          <div className="flex items-center justify-between text-xs font-medium border-b border-slate-100 dark:border-slate-800/60 pb-1">
+            <span className="text-slate-500 dark:text-slate-400">Utilization Rate:</span>
+            <span className="font-extrabold text-teal-600 dark:text-teal-400 text-xs">
+              {metrics.utilization}%
+            </span>
+          </div>
+          <LiveSummaryStats metrics={metrics} />
+        </div>
+
+        {/* Aesthetic Circular Progress */}
+        <div className="w-16 h-16 shrink-0 flex items-center justify-center">
+          <LiveSummaryProgress utilization={metrics.utilization} />
+        </div>
+      </CardContent>
+    </Card>
+  );
+};
+
+export default React.memo(function TMSView({ 
+  user, 
+  allUsers, 
+  onRefreshAllData, 
+  externalTheme,
+  currentSubView = 'tms-agent',
+  onNavigateSubView
+}: TMSViewProps) {
+  const now = useSharedTimer();
+  const normRoleUser = (user.role || '').toString().toUpperCase().trim();
+  const checkIsDashboardUser = (r: string) => {
+    const upper = r.toUpperCase().trim();
+    // Broad matching for any managerial, administrative, or lead roles
+    const leadKeywords = ['ADMIN', 'MANAGER', 'HEAD', 'HR', 'MIS', 'TL', 'LEAD', 'SME', 'TRAINER', 'EXECUTIVE', 'DIRECTOR', 'VP', 'SUPERVISOR', 'SUPERV', 'EXEC'];
+    return leadKeywords.some(k => upper.includes(k));
+  };
+  const isDashboardUser = checkIsDashboardUser(normRoleUser);
+
+  // Proactive IP pre-fetch on mount so it's instant when clicking Clock-In
+  useEffect(() => {
+    getOrFetchPublicIP().catch(() => {});
+  }, []);
+
+  const [subordinateUids, setSubordinateUids] = useState<string[] | null>(null);
+  const [loadingHierarchy, setLoadingHierarchy] = useState<boolean>(true);
+
+  useEffect(() => {
+    if (!isDashboardUser || !user || !allUsers || allUsers.length === 0) {
+      setSubordinateUids([]);
+      setLoadingHierarchy(false);
+      return;
+    }
+
+    let isMounted = true;
+    setLoadingHierarchy(true);
+
+    const timer = setTimeout(() => {
+      if (isMounted) {
+        console.warn("[TMSView] Hierarchy calculation timed out, executing direct fallback");
+        const fallbackUids = getSubordinateUids(user, allUsers);
+        setSubordinateUids(fallbackUids);
+        setLoadingHierarchy(false);
+      }
+    }, 1200);
+
+    getCachedSubordinateUids(user, allUsers)
+      .then(uids => {
+        if (isMounted) {
+          clearTimeout(timer);
+          setSubordinateUids(uids);
+          setLoadingHierarchy(false);
+        }
+      })
+      .catch(err => {
+        console.error("Error loading hierarchy cache:", err);
+        if (isMounted) {
+          clearTimeout(timer);
+          const uids = getSubordinateUids(user, allUsers);
+          setSubordinateUids(uids);
+          setLoadingHierarchy(false);
+        }
+      });
+
+    return () => {
+      isMounted = false;
+      clearTimeout(timer);
+    };
+  }, [user?.uid, allUsers, isDashboardUser]);
+
+  const filteredUsers = useMemo(() => {
+    if (!isDashboardUser) return allUsers;
+    if (loadingHierarchy || subordinateUids === null) return [];
+
+    const subordinateSet = new Set(subordinateUids);
+    subordinateSet.add(user.uid);
+
+    return allUsers.filter(u => subordinateSet.has(u.uid));
+  }, [allUsers, subordinateUids, loadingHierarchy, isDashboardUser, user?.uid]);
+
   const { canView, canCreate, canEdit, canDelete, hasTmsPermission } = usePermission();
   
   // Dynamic granular permission bindings instead of monolithic role/module checks
@@ -622,11 +864,74 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
   const canManageTMS = hasTmsPermission('can_edit_tms_records'); 
   const canModifyTMS = hasTmsPermission('can_edit_tms_records');
   const canDeleteTMS = hasTmsPermission('can_close_sessions');
-  const canViewReports = hasTmsPermission('view_workforce_dashboard');
+  const normRole = normalizeRole(user?.role);
+  const isQAOrAgent = !isDashboardUser;
+  const canViewReports = hasTmsPermission('view_workforce_dashboard') && isDashboardUser;
 
   // Configured processes in the app
+  const { attendanceSettings: centralAttendance, tmsProcesses: centralProcesses, officeNetworks } = useConfig();
   const [processes, setProcesses] = useState<string[]>([]);
+
+  useEffect(() => {
+    if (centralProcesses) {
+      let processList: string[] | null = null;
+      if (Array.isArray(centralProcesses.processes)) {
+        processList = centralProcesses.processes
+          .filter((p: any) => p.status === 'Active' && !p.hidden)
+          .map((p: any) => p.name);
+      } else if (Array.isArray(centralProcesses.list)) {
+        processList = centralProcesses.list;
+      }
+
+      if (processList !== null) {
+        setProcesses(processList);
+      } else {
+        setProcesses(DEFAULT_PROCESSES);
+      }
+    }
+  }, [centralProcesses]);
+  const allAvailableProcesses = useMemo(() => {
+    const map = new Map<string, string>();
+    const blocked = ['mpqc', 'mpqc-fk', 'mpqc-sh'];
+
+    // 1. Add master processes to guarantee they are always available
+    DEFAULT_PROCESSES.forEach(p => {
+      if (typeof p === 'string' && p.trim().length > 0) {
+        const trimmed = p.trim();
+        const lower = trimmed.toLowerCase();
+        if (blocked.includes(lower)) return;
+        if (!map.has(lower)) {
+          map.set(lower, trimmed);
+        }
+      }
+    });
+
+    // 2. Add configured active processes from Firestore state
+    processes.forEach(p => {
+      if (typeof p === 'string' && p.trim().length > 0) {
+        const trimmed = p.trim();
+        const lower = trimmed.toLowerCase();
+        if (blocked.includes(lower)) return;
+        if (!map.has(lower)) {
+          map.set(lower, trimmed);
+        }
+      }
+    });
+
+    // Return unique sorted list
+    return Array.from(map.values()).sort();
+  }, [processes]);
+
   const [presentThreshold, setPresentThreshold] = useState<number>(480);
+
+  useEffect(() => {
+    if (centralAttendance) {
+      if (typeof centralAttendance.presentThreshold === 'number') {
+        setPresentThreshold(centralAttendance.presentThreshold);
+      }
+      setDesktopOnlyMode(!!centralAttendance.desktopOnlyMode);
+    }
+  }, [centralAttendance]);
   const [recentProcesses, setRecentProcesses] = useState<string[]>(
     safeStorage.get<string[]>('tms_recent_processes') || []
   );
@@ -654,10 +959,23 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
   
   // Real-time user's shift state with optimistic UI shielding
   const [currentShift, setCurrentShift] = useState<TMSShift | null>(null);
+  const currentShiftRef = useRef<TMSShift | null>(null);
+  useEffect(() => {
+    currentShiftRef.current = currentShift;
+  }, [currentShift]);
+
   const [rawActiveShift, setRawActiveShift] = useState<TMSShift | null | undefined>(undefined);
   const [localOwnShift, setLocalOwnShift] = useState<TMSShift | null | undefined>(undefined);
   const [myPastShifts, setMyPastShifts] = useState<TMSShift[]>([]);
   const attemptedHealsRef = useRef<Set<string>>(new Set());
+
+  // Auto Logout warning states
+  const [autoLogoutWarning, setAutoLogoutWarning] = useState<{
+    show: boolean;
+    timeLeft: number;
+    reason: 'stale' | 'limit';
+  }>({ show: false, timeLeft: 120, reason: 'limit' });
+  const [localSessionExtended, setLocalSessionExtended] = useState(false);
 
   // Reconcile real-time Firestore updates and local optimistic overrides
   useEffect(() => {
@@ -673,15 +991,40 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
         }
       } else {
         // We local-clocked in / on break / switched process.
-        // Once the server matches our local status, process, and activities list size, clear the override.
+        // Merge activities between rawActiveShift and localOwnShift to ensure chronological punch logs never vanish.
         if (rawActiveShift) {
-          const serverLastAct = rawActiveShift.activities?.[rawActiveShift.activities.length - 1];
-          const localLastAct = localOwnShift.activities?.[localOwnShift.activities.length - 1];
-          const statusMatches = rawActiveShift.status === localOwnShift.status;
-          const processMatches = serverLastAct?.name === localLastAct?.name;
-          const countMatches = rawActiveShift.activities?.length === localOwnShift.activities?.length;
+          const serverLastAct = getLatestUserActivity(rawActiveShift.activities || []);
+          const localLastAct = getLatestUserActivity(localOwnShift.activities || []);
 
-          if (statusMatches && processMatches && countMatches) {
+          // Normalize server status from activities
+          let serverStatus = rawActiveShift.status;
+          if (serverLastAct) {
+            if (serverLastAct.action === 'BREAK_START' || (serverLastAct.type === 'break' && !serverLastAct.endTime)) {
+              serverStatus = 'BREAK';
+            } else if (serverLastAct.action === 'BREAK_END' || serverLastAct.type === 'productive' || serverLastAct.action === 'CLOCK_IN' || serverLastAct.action === 'PROCESS_SWITCH') {
+              serverStatus = 'ACTIVE';
+            }
+          }
+
+          let localStatus = localOwnShift.status;
+          if (localLastAct) {
+            if (localLastAct.action === 'BREAK_START' || (localLastAct.type === 'break' && !localLastAct.endTime)) {
+              localStatus = 'BREAK';
+            } else if (localLastAct.action === 'BREAK_END' || localLastAct.type === 'productive' || localLastAct.action === 'CLOCK_IN' || localLastAct.action === 'PROCESS_SWITCH') {
+              localStatus = 'ACTIVE';
+            }
+          }
+
+          const statusMatches = serverStatus === localStatus;
+          const processMatches = serverLastAct?.name === localLastAct?.name;
+          const serverActs = rawActiveShift.activities || [];
+          const localActs = localOwnShift.activities || [];
+          const countMatches = serverActs.length >= localActs.length;
+          const hasAllLocalActivities = localActs.every(lAct => 
+            serverActs.some((sAct: any) => (sAct.activityId && lAct.activityId && sAct.activityId === lAct.activityId) || sAct.startTime === lAct.startTime)
+          );
+
+          if (statusMatches && processMatches && countMatches && hasAllLocalActivities) {
             setLocalOwnShift(undefined);
             resolvedOwnShift = undefined;
           }
@@ -689,7 +1032,23 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
       }
     }
 
-    const finalShift = resolvedOwnShift !== undefined ? resolvedOwnShift : rawActiveShift;
+    let finalShift = resolvedOwnShift !== undefined ? resolvedOwnShift : rawActiveShift;
+    
+    // Safety merge: if both rawActiveShift and finalShift exist, ensure all activities are combined & sorted chronologically
+    if (finalShift && rawActiveShift && finalShift.id === rawActiveShift.id) {
+      const combined = [...(rawActiveShift.activities || [])];
+      for (const act of (finalShift.activities || [])) {
+        if (!combined.some((sAct: any) => (sAct.activityId && act.activityId && sAct.activityId === act.activityId) || sAct.startTime === act.startTime)) {
+          combined.push(act);
+        }
+      }
+      combined.sort((a, b) => new Date(a.startTime).getTime() - new Date(b.startTime).getTime());
+      finalShift = {
+        ...finalShift,
+        activities: combined
+      };
+    }
+
     setCurrentShift(finalShift);
   }, [rawActiveShift, localOwnShift]);
   
@@ -697,21 +1056,97 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
   const [allShifts, setAllShifts] = useState<TMSShift[]>([]);
   const [adminSearch, setAdminSearch] = useState('');
   const [currentPage, setCurrentPage] = useState(1);
-  const [selectedProcessInput, setSelectedProcessInput] = useState(user.lastUsedProcess || '');
+
+  // Filtering admin shift records - memoized to prevent constant recalculation during clock ticks
+  const filteredAllShifts = React.useMemo(() => {
+    const search = (adminSearch || '').toLowerCase().trim();
+    if (!search) return allShifts;
+    return allShifts.filter(s => {
+      return (s.userName || '').toLowerCase().includes(search) ||
+             (s.userEmail || '').toLowerCase().includes(search) ||
+             (s.activities || []).some(act => (act.name || '').toLowerCase().includes(search));
+    });
+  }, [allShifts, adminSearch]);
+
+  const itemsPerPage = 30;
+
+  const totalPages = React.useMemo(() => {
+    return Math.ceil(filteredAllShifts.length / itemsPerPage) || 1;
+  }, [filteredAllShifts.length]);
+
+  const paginatedShifts = React.useMemo(() => {
+    return filteredAllShifts.slice(
+      (currentPage - 1) * itemsPerPage,
+      currentPage * itemsPerPage
+    );
+  }, [filteredAllShifts, currentPage]);
+
+  const [selectedProcessInput, setSelectedProcessInput] = useState(() => {
+    const localLast = safeStorage.get<string>(`tms_last_used_process_${user.uid}`);
+    if (localLast) return localLast;
+    return user.lastUsedProcess || '';
+  });
+
+  const handleSelectProcess = (proc: string) => {
+    setSelectedProcessInput(proc);
+    if (proc && user?.uid) {
+      safeStorage.set(`tms_last_used_process_${user.uid}`, proc);
+    }
+  };
   
-  // Reactively pre-select last used process if user profile or processes configuration updates
+  // Derive the actual active process from the current shift activities
+  const currentActiveProcessName = React.useMemo(() => {
+    if (!currentShift) return null;
+    const lastProductive = [...currentShift.activities]
+      .reverse()
+      .find(act => act.type === 'productive');
+    return lastProductive?.name || null;
+  }, [currentShift]);
+  
+  const lastSyncedShiftId = React.useRef<string | null>(null);
+  
+  // Reactively pre-select process based on shift state or user profile
   useEffect(() => {
-    if (processes.length > 0) {
-      if (user.lastUsedProcess && processes.includes(user.lastUsedProcess)) {
-        setSelectedProcessInput(user.lastUsedProcess);
-      } else if (!selectedProcessInput || !processes.includes(selectedProcessInput)) {
-        setSelectedProcessInput(processes[0]);
+    if (allAvailableProcesses.length === 0) return;
+
+    // Priority 1: If we have an active/break shift, sync the dropdown when the shift ID or status changes
+    if (currentShift) {
+      const cacheKey = `${currentShift.id}_${currentShift.status}`;
+      if (cacheKey !== lastSyncedShiftId.current) {
+        const lastProductive = [...currentShift.activities]
+          .reverse()
+          .find(act => act.type === 'productive');
+        
+        if (lastProductive && allAvailableProcesses.includes(lastProductive.name)) {
+          setSelectedProcessInput(lastProductive.name);
+          safeStorage.set(`tms_last_used_process_${user.uid}`, lastProductive.name);
+        }
+        lastSyncedShiftId.current = cacheKey;
+      }
+      return;
+    }
+
+    // Reset sync tracker when clocked out
+    lastSyncedShiftId.current = null;
+
+    // Priority 2: If clocked out, pre-select local storage lastUsedProcess or user.lastUsedProcess by default
+    const localLast = safeStorage.get<string>(`tms_last_used_process_${user.uid}`);
+    if (localLast && allAvailableProcesses.includes(localLast)) {
+      setSelectedProcessInput(localLast);
+    } else if (user.lastUsedProcess && allAvailableProcesses.includes(user.lastUsedProcess)) {
+      setSelectedProcessInput(user.lastUsedProcess);
+    } else if (!selectedProcessInput || !allAvailableProcesses.includes(selectedProcessInput)) {
+      if (user.process && allAvailableProcesses.includes(user.process)) {
+        setSelectedProcessInput(user.process);
+      } else if (allAvailableProcesses.length > 0) {
+        setSelectedProcessInput(allAvailableProcesses[0]);
       }
     }
-  }, [user.lastUsedProcess, processes]);
+  }, [currentShift?.id, currentActiveProcessName, user.lastUsedProcess, user.process, allAvailableProcesses, user.uid]);
 
   const [selectedBreakInput, setSelectedBreakInput] = useState(BREAK_OPTIONS[0]);
   const [activeShiftFilter, setActiveShiftFilter] = useState('all');
+  const [tmsAdminTab, setTmsAdminTab] = useState<'roster' | 'exceeded_12h'>('roster');
   const [editingProcessName, setEditingProcessName] = useState<string | null>(null);
   const [editingProcessValue, setEditingProcessValue] = useState<string>('');
 
@@ -756,200 +1191,177 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
     }
   }, [exportFormat, reportType]);
   
-  // Fetch Attendance present threshold in Real-time from config/attendanceSettings document
+  // Polling removed in Phase 5: Replaced with ConfigContext
   const [desktopOnlyMode, setDesktopOnlyMode] = useState<boolean>(false);
   const [adminBypass, setAdminBypass] = useState<boolean>(false);
 
-  useEffect(() => {
-    if (!user) return;
-    const unsub = onSnapshot(doc(db, 'config', 'attendanceSettings'), (snap) => {
-      if (snap.exists()) {
-        const data = snap.data();
-        if (typeof data.presentThreshold === 'number') {
-          setPresentThreshold(data.presentThreshold);
-        } else if (data.presentThreshold) {
-          setPresentThreshold(Number(data.presentThreshold));
-        }
-        setDesktopOnlyMode(!!data.desktopOnlyMode);
-      }
-    }, (err) => {
-      console.warn('Failed to subscribe config/attendanceSettings in TMSView', err);
-    });
-    return () => unsub();
-  }, [user?.uid]);
-
-  // Fetch Processes Config in Real-time from config/tmsProcesses document
-  useEffect(() => {
-    if (!user) return;
-    const unsub = onSnapshot(doc(db, 'config', 'tmsProcesses'), (snap) => {
-      if (snap.exists()) {
-        const data = snap.data();
-        let processList: string[] = [];
-
-        if (Array.isArray(data.processes)) {
-          // Use the structured processes list, filtering out inactive and hidden
-          processList = data.processes
-            .filter((p: any) => p.status === 'Active' && !p.hidden)
-            .map((p: any) => p.name);
-        } else if (Array.isArray(data.list)) {
-          // Fallback to legacy string array
-          processList = data.list;
-        }
-
-        if (processList.length > 0) {
-          setProcesses(processList);
-        } else {
-          setProcesses(DEFAULT_PROCESSES);
-        }
-      } else {
-        setProcesses(DEFAULT_PROCESSES);
-      }
-    }, (err) => {
-      console.warn('Failed to subscribe to config/tmsProcesses, using local defaults', err);
-      setProcesses(prev => prev.length > 0 ? prev : DEFAULT_PROCESSES);
-    });
-    return () => unsub();
-  }, [user?.uid]);
-
-  // Fetch User's Personal Shifts (Optimized Phase 3)
+  // Fetch User's Personal Shifts (Optimized Phase 3) - Polling to save quota
   useEffect(() => {
     if (!user) return;
     
     // Real-time listener ONLY for Active/Break sessions
     const qActive = query(
       collection(db, 'tmsShifts'),
-      where('userId', '==', user.uid),
-      where('status', 'in', ['ACTIVE', 'BREAK']),
-      limit(5)
+      where('userId', '==', user.uid)
     );
 
-    const unsubActive = onSnapshot(qActive, (snapshot) => {
-      firestoreLogger.trackRead('my_active_shifts_snapshot', snapshot.size);
-      const rawActiveShifts = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as TMSShift));
-      
-      // Sort so the newest active shift is at index 0
-      const activeShiftsList = [...rawActiveShifts].sort((a, b) => 
-        new Date(b.clockInTime).getTime() - new Date(a.clockInTime).getTime()
-      );
-      
-      // Phase 3 Optimization: Healing logic for duplicate active shifts
-      if (activeShiftsList.length > 1) {
-        console.log(`[TMS HEALING] Found ${activeShiftsList.length} active sessions. Auto-closing older duplicates...`);
-        const healBatch = writeBatch(db);
-        const healNowISO = getLiveTimeISO();
+    const fetchData = async () => {
+      try {
+        const snapshot = await getDocsOptimized(qActive, 'my_active_shifts_snapshot', true);
+        const allUserShifts = snapshot.docs.map((doc: any) => ({ id: doc.id, ...doc.data() } as TMSShift));
+        const rawActiveShifts = allUserShifts.filter(s => s.status === 'ACTIVE' || s.status === 'BREAK');
         
-        // Keep the newest one (index 0), close others
-        activeShiftsList.slice(1).forEach(sh => {
-          if (!attemptedHealsRef.current.has(sh.id)) {
-            attemptedHealsRef.current.add(sh.id);
-            const updatedActivities = [...(sh.activities || [])];
-            if (updatedActivities.length > 0) {
-              const lastIndex = updatedActivities.length - 1;
-              if (!updatedActivities[lastIndex].endTime) {
-                updatedActivities[lastIndex].endTime = healNowISO;
+        // Sort so the newest active shift is at index 0
+        const activeShiftsList = [...rawActiveShifts].sort((a, b) => 
+          new Date(b.clockInTime).getTime() - new Date(a.clockInTime).getTime()
+        );
+        
+        // Phase 3 Optimization: Selection logic for active shift (auto-clockouts disabled)
+        if (activeShiftsList.length > 1) {
+          console.log(`[TMS ACTIVE CHECK] Found ${activeShiftsList.length} active sessions. Selecting newest active session ${activeShiftsList[0].id}.`);
+        }
+
+        // Find if there's any active shift (guaranteed to be the newest)
+        const active = activeShiftsList.length > 0 ? activeShiftsList[0] : null;
+        
+        if (active) {
+          const referenceTime = getLiveTime().getTime();
+          const activeProductiveMs = getShiftProductiveMs(active, referenceTime);
+          const TEN_HOURS_MS = 10 * 60 * 60 * 1000;
+          
+          const clockInMs = parseTimestampMs(active.clockInTime);
+          const elapsedShiftMs = Math.max(0, referenceTime - clockInMs);
+          const TWELVE_HOURS_MS = 12 * 60 * 60 * 1000;
+          const SIXTEEN_HOURS_MS = 16 * 60 * 60 * 1000;
+          
+          const isExtended = !!(active.sessionExtended || active.extended);
+          const isStale = elapsedShiftMs >= TWELVE_HOURS_MS;
+          
+          const isSupervisor = checkIsDashboardUser(normRoleUser);
+
+          const forceAutoClose = false; // Bypassed: auto clock-outs are disabled at root level
+
+          if (forceAutoClose) {
+            if (!attemptedHealsRef.current.has(active.id)) {
+              attemptedHealsRef.current.add(active.id);
+              const limitMs = Math.min(activeProductiveMs, TEN_HOURS_MS);
+              const { activities: updatedActivities, clockOutTime } = truncateShiftToProductiveTime(active, limitMs);
+              const finalizedShift = {
+                ...active,
+                activities: updatedActivities,
+                clockOutTime,
+                status: 'AUTO_CLOSED' as const,
+                remarks: 'Auto-clocked out due to stale session (>12h)'
+              };
+
+              saveShiftState(finalizedShift)
+                .then(() => {
+                  const userRef = doc(db, 'users', user.uid);
+                  return setDoc(userRef, {
+                    status: 'OFFLINE',
+                    lastLogoutAt: clockOutTime
+                  }, { merge: true });
+                })
+                .then(() => {
+                  clearCache();
+                  toast.info("Your previous stale shift (>12h) was automatically finalized. Timer reset.", { duration: 8000 });
+                })
+                .catch(err => console.error('Error auto-clocking out shift:', err));
+            }
+            setRawActiveShift(null);
+            setLocalOwnShift(null);
+          } else {
+            const activeActs = active.activities || [];
+            const lastAct = getLatestUserActivity(activeActs);
+            let resolvedActiveStatus = active.status;
+            if (lastAct) {
+              if (lastAct.action === 'BREAK_START' || (lastAct.type === 'break' && !lastAct.endTime)) {
+                resolvedActiveStatus = 'BREAK';
+              } else if (lastAct.action === 'BREAK_END' || lastAct.type === 'productive' || lastAct.action === 'CLOCK_IN' || lastAct.action === 'PROCESS_SWITCH') {
+                resolvedActiveStatus = 'ACTIVE';
               }
             }
-            const finalized = {
-              ...sh,
-              activities: updatedActivities,
-              status: 'AUTO_CLOSED' as const,
-              clockOutTime: healNowISO,
-              remarks: 'System Auto-Resolved Duplicate Active Shift'
-            };
-            healBatch.set(doc(db, 'tmsShifts', sh.id), finalized);
-            syncShiftToAttendance(finalized).catch(e => console.error('Failed to sync duplicate shift attendance', e));
+            setRawActiveShift({ ...active, status: resolvedActiveStatus });
+            if (isExtended) {
+              setLocalSessionExtended(true);
+            }
+            logTmsEvent('SESSION_RESTORE', {
+              userId: user.uid,
+              shiftId: active.id,
+              timestamp: getLiveTimeISO(),
+              reason: 'Active session restored on state fetch / refresh',
+              sourceFunction: 'TMSView.fetchData',
+              details: { status: active.status, clockInTime: active.clockInTime }
+            });
+            // Default select previous active process if available
+            const lastProductive = [...active.activities]
+              .reverse()
+              .find(act => act.type === 'productive');
+            if (lastProductive && !selectedProcessInput) {
+              setSelectedProcessInput(lastProductive.name);
+            }
           }
-        });
-        healBatch.commit().catch(e => console.error('Failed to commit auto-heal batch', e));
-      }
-
-      // Find if there's any active shift (guaranteed to be the newest)
-      const active = activeShiftsList.length > 0 ? activeShiftsList[0] : null;
-      
-      if (active) {
-        const referenceTime = getLiveTime().getTime();
-        const activeProductiveMs = getShiftProductiveMs(active, referenceTime);
-        const TEN_HOURS_MS = 10 * 60 * 60 * 1000;
-        
-        const clockInMs = new Date(active.clockInTime).getTime();
-        const elapsedShiftMs = referenceTime - clockInMs;
-        const TWELVE_HOURS_MS = 12 * 60 * 60 * 1000;
-        
-        const clockInDate = new Date(active.clockInTime);
-        const nowDate = getLiveTime();
-        const isDifferentDay = 
-          clockInDate.getFullYear() !== nowDate.getFullYear() ||
-          clockInDate.getMonth() !== nowDate.getMonth() ||
-          clockInDate.getDate() !== nowDate.getDate();
-
-        const lastAct = active.activities?.[active.activities.length - 1];
-        const lastActTime = lastAct 
-          ? new Date(lastAct.endTime || lastAct.startTime).getTime()
-          : clockInMs;
-        const idleMs = referenceTime - lastActTime;
-
-        // Auto-close if exceeded 12 hours total, OR if it is a different day and idle for more than 6 hours
-        const isStale = elapsedShiftMs >= TWELVE_HOURS_MS || (isDifferentDay && idleMs >= 6 * 60 * 60 * 1000);
-
-        if (activeProductiveMs >= TEN_HOURS_MS || isStale) {
-          if (!attemptedHealsRef.current.has(active.id)) {
-            attemptedHealsRef.current.add(active.id);
-            const limitMs = Math.min(activeProductiveMs, TEN_HOURS_MS);
-            const { activities: updatedActivities, clockOutTime } = truncateShiftToProductiveTime(active, limitMs);
-            const finalizedShift = {
-              ...active,
-              activities: updatedActivities,
-              clockOutTime,
-              status: 'AUTO_CLOSED' as const,
-              remarks: isStale 
-                ? 'Auto-clocked out due to stale session spanning multiple days/shifts'
-                : 'Auto-clocked out after 10 hours productive time'
-            };
-
-            saveShiftState(finalizedShift)
-              .then(() => syncShiftToAttendance({ id: active.id, ...finalizedShift }))
-              .then(() => {
-                const userRef = doc(db, 'users', user.uid);
-                return updateDoc(userRef, {
-                  status: 'OFFLINE',
-                  lastLogoutAt: clockOutTime
-                });
-              })
-              .then(() => {
-                toast.info('Your previous stale shift was automatically clocked out. Timer reset for new shift.', { duration: 8000 });
-              })
-              .catch(err => console.error('Error auto-clocking out shift:', err));
-          }
-          setRawActiveShift(null);
         } else {
-          setRawActiveShift(active);
-          // Default select previous active process if available
-          const lastProductive = [...active.activities]
-            .reverse()
-            .find(act => act.type === 'productive');
-          if (lastProductive && !selectedProcessInput) {
-            setSelectedProcessInput(lastProductive.name);
-          }
+          setRawActiveShift(null);
         }
-      } else {
-        setRawActiveShift(null);
+      } catch (err) {
+        console.error('Failed to fetch active shifts', err);
       }
-    }, (error) => {
-      handleFirestoreError(error, OperationType.LIST, 'tmsShifts_active');
-    });
+    };
+
+    fetchData();
+    const interval = setInterval(() => {
+      // Phase 5 Optimization: Never poll hidden tabs or inactive windows
+      if (document.hidden || !document.hasFocus()) return;
+      fetchData();
+    }, 10 * 60 * 1000); // 10 min poll (increased to save quota)
+
+    const handleMemoryCleaned = () => {
+      console.log('[TMSView] Memory cleaned event detected. Forcing fresh state fetch...');
+      fetchData();
+      fetchHistory();
+    };
+
+    const handleOnlineReconnect = () => {
+      console.log('[TMSView] Internet reconnected. Re-syncing active shift state...');
+      fetchData();
+    };
+
+    window.addEventListener('app_memory_cleaned', handleMemoryCleaned);
+    window.addEventListener('online', handleOnlineReconnect);
+    window.addEventListener('focus', fetchData);
 
     // One-time fetch for historical shifts
     const fetchHistory = async () => {
       try {
-        const qHistory = query(
-          collection(db, 'tmsShifts'),
-          where('userId', '==', user.uid),
-          orderBy('clockInTime', 'desc'),
-          limit(25)
-        );
-        const snap = await getDocs(qHistory);
-        firestoreLogger.trackRead('my_shifts_history_fetch', snap.size);
-        const shifts = snap.docs.map(doc => ({ id: doc.id, ...doc.data() } as TMSShift));
+        let snap;
+        try {
+          const qHistory = query(
+            collection(db, 'tmsShifts'),
+            where('userId', '==', user.uid),
+            orderBy('clockInTime', 'desc'),
+            limit(60)
+          );
+          snap = await getDocsOptimized(qHistory, `my_shifts_history_fetch_${user.uid}`, true);
+        } catch (idxErr) {
+          console.warn('Fallback fetching history without orderBy index:', idxErr);
+          const qHistoryFallback = query(
+            collection(db, 'tmsShifts'),
+            where('userId', '==', user.uid),
+            limit(100)
+          );
+          snap = await getDocsOptimized(qHistoryFallback, `my_shifts_history_fallback_${user.uid}`, true);
+        }
+
+        let shifts = snap.docs.map((doc: any) => ({ id: doc.id, ...doc.data() } as TMSShift));
+        shifts = shifts.map(sh => sh as TMSShift);
+        
+        // Robust client-side sort
+        shifts.sort((a, b) => parseTimestampMs(b.clockInTime) - parseTimestampMs(a.clockInTime));
+        
+        // Take the top 30 newest shifts
+        shifts = shifts.slice(0, 30);
+        
         setMyPastShifts(shifts);
       } catch (err) {
         console.error('Error fetching shift history:', err);
@@ -957,11 +1369,26 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
     };
     fetchHistory();
 
-    return () => unsubActive();
+    return () => {
+      clearInterval(interval);
+      window.removeEventListener('app_memory_cleaned', handleMemoryCleaned);
+      window.removeEventListener('online', handleOnlineReconnect);
+      window.removeEventListener('focus', fetchData);
+    };
+  }, [user?.uid]);
+
+  // Smart recovery for -5.5h corrupted clock-in times & historical time issues on load
+  useEffect(() => {
+    if (!user?.uid) return;
+    import('../services/tmsCleanupService').then(service => {
+      // TMS cleanup/repair service temporarily disabled due to P0 production stability issues.
+      // service.repairCorruptedClockInTimes();
+      // service.bulkRepairBackdatedShifts();
+    }).catch(err => console.error('Failed to trigger TMS repair services', err));
   }, [user?.uid]);
 
   const getDateRange = (preset: string, customStart?: string, customEnd?: string) => {
-    const now = new Date();
+    const now = getLiveTime();
     const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0);
     const endOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
 
@@ -1011,38 +1438,38 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
   };
 
   useEffect(() => {
-    // OPTIMIZED: Only fetch the massive shift list if NOT a dashboard user (who uses SupervisorDashboard's own optimized sync)
+    // OPTIMIZED: Only fetch the active shift list from live_sessions if NOT a dashboard user (who uses SupervisorDashboard's own optimized sync)
     if (!user?.uid || !canViewReports) return;
     
-    const dashboardRolesList = [
-      UserRole.TEAM_LEAD, 
-      UserRole.QTL, 
-      UserRole.STL, 
-      UserRole.OPS_TL, 
-      UserRole.TRAINER_TL, 
-      UserRole.MANAGER, 
-      UserRole.ADMIN, 
-      UserRole.MIS,
-      UserRole.OPS_HEAD,
-      UserRole.HR,
-      UserRole.IT_MANAGER,
-      UserRole.SME
-    ];
-    const isDashboard = dashboardRolesList.includes(user.role as UserRole);
+    const normRole = (user.role || '').toString().toUpperCase().trim();
+    const isDashboard = [
+      'TEAM_LEAD', 'TEAM LEAD', 'TL', 'STL', 'QTL', 'OPS_TL', 'OPS TL', 'TRAINER_TL', 'TRAINER TL', 'SME', 'MANAGER', 'ADMIN', 'MIS', 'OPS_HEAD', 'OPS HEAD', 'HR', 'IT_MANAGER', 'ASSISTANT_MANAGER'
+    ].includes(normRole);
     if (isDashboard) return;
 
     const fetchShifts = async () => {
       try {
         const qAllShifts = query(
-          collection(db, 'tmsShifts'),
-          where('status', 'in', ['ACTIVE', 'BREAK'])
+          collection(db, 'live_sessions')
         );
-        const snap = await getDocs(qAllShifts);
+        const snap = await getDocsOptimized(qAllShifts, 'tmsShifts_organizational_getDocs');
         firestoreLogger.trackRead('tmsShifts_organizational_getDocs', snap.size);
-        const shifts = snap.docs.map(doc => ({ id: doc.id, ...doc.data() } as TMSShift));
+        const shifts = snap.docs.map(doc => {
+          const data = doc.data();
+          return {
+            id: data.sessionId || doc.id,
+            userId: data.userId || data.uid || '',
+            userName: data.employeeName || data.userName || '',
+            userEmail: data.email || data.userEmail || '',
+            clockInTime: data.clockInTime || '',
+            status: data.status || 'ACTIVE',
+            activities: data.activities || [],
+            ...data
+          } as TMSShift;
+        });
         setAllShifts(shifts);
       } catch (error) {
-        console.warn('Failed to fetch tmsShifts', error);
+        console.warn('Failed to fetch tmsShifts from live_sessions', error);
       }
     };
     
@@ -1061,20 +1488,20 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
     if (!forceOutShiftId) return;
     try {
       const shiftRef = doc(db, 'tmsShifts', forceOutShiftId);
-      const shiftSnap = await getDoc(shiftRef);
+      const shiftSnap = await getDocOptimized(shiftRef, 'shift_for_forcelogout');
       if (!shiftSnap.exists()) {
         toast.error('Shift not found');
         return;
       }
       const shift = shiftSnap.data() as TMSShift;
-      const nowISO = new Date().toISOString();
+      const nowISO = getLiveTimeISO();
       const updatedActivities = [...shift.activities];
       const lastActivity = updatedActivities.length > 0 
         ? updatedActivities[updatedActivities.length - 1].name 
         : 'Unknown Process';
         
       if (updatedActivities.length > 0) {
-        updatedActivities[updatedActivities.length - 1].endTime = nowISO;
+        // Immutable ledger: endTime mutation removed
       }
 
       // Apply selected / custom reason
@@ -1082,22 +1509,51 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
         ? (forceOutCustomReason.trim() || 'Forced logout by supervisor')
         : forceOutReason;
 
+      const adminIdentifier = user?.email || user?.uid || 'Unknown' || user.uid;
+      const updatedLedger = appendShiftEvent(
+        shift.shiftEventLedger,
+        shift,
+        {
+          eventType: 'SUPERVISOR_FORCE_LOGOUT',
+          timestamp: nowISO,
+          performedBy: `Supervisor: ${user.name || adminIdentifier}`,
+          source: 'Supervisor Panel',
+          reason: finalReason ? `Force logout: ${finalReason}` : 'Force logout by supervisor',
+          oldValue: shift.status || 'ACTIVE',
+          newValue: 'COMPLETED_FORCED',
+          remarks: `Admin forced checkout performed remotely`
+        }
+      );
+
       const updatedShift = {
         ...shift,
         activities: updatedActivities,
         clockOutTime: nowISO,
-        status: 'COMPLETED'
+        endShiftTime: nowISO,
+        sessionClosedBy: adminIdentifier,
+        remarks: finalReason ? `Admin force logout: ${finalReason}` : 'Admin force logout',
+        status: 'COMPLETED_FORCED',
+        shiftEventLedger: updatedLedger
       };
 
-      // Update shift to COMPLETED
+      // Update shift to COMPLETED_FORCED
       await updateDoc(shiftRef, updatedShift as any);
+
+      logTmsEvent('CLOCK_OUT', {
+        userId: forceOutTargetUid,
+        shiftId: forceOutShiftId,
+        timestamp: nowISO,
+        reason: finalReason ? `Admin force logout: ${finalReason}` : 'Admin force logout',
+        sourceFunction: 'TMSView.performAdminClockOut',
+        details: { closedBy: adminIdentifier, targetName: forceOutTargetName }
+      });
       
-      // Auto-generate Attendance
-      await syncShiftToAttendance(updatedShift);
+      // Auto-generate Attendance - DISABLED
+      // await syncShiftToAttendance(updatedShift);
 
       // 0. Update User Status to Offline in users collection
       const userRef = doc(db, 'users', forceOutTargetUid);
-      const userSnap = await getDoc(userRef);
+      const userSnap = await getDocOptimized(userRef, 'user_for_forcelogout');
       if (userSnap.exists()) {
         await updateDoc(userRef, {
           status: 'OFFLINE',
@@ -1115,17 +1571,17 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
         oldValue: 'ACTIVE/BREAK',
         newValue: 'COMPLETED_FORCED',
         updatedBy: user.uid,
-        updatedByName: user.name,
+        updatedByName: user?.name || user?.fullName || 'User',
         updatedAt: nowISO,
         action: 'force_logout',
-        details: `Force Logout executed. User Forced Out: ${forceOutTargetName} (${shift.userEmail}). Forced By: ${user.name} (${user.email}). Reason: ${finalReason}. Current Activity at logout: ${lastActivity}.`
+        details: `Force Logout executed. User Forced Out: ${forceOutTargetName} (${shift.userEmail}). Forced By: ${user.name} (${user?.email || user?.uid || 'Unknown'}). Reason: ${finalReason}. Current Activity at logout: ${lastActivity}.`
       });
 
       // 2. Log force-logout event to console (Firestore Logging Disabled)
       console.log('[AUDIT LOG] (Firestore Logging Disabled) Force Logout:', {
         timestamp: nowISO,
         action: 'Force Logout',
-        performedBy: `${user.name} (${user.email})`,
+        performedBy: `${user.name} (${user?.email || user?.uid || 'Unknown'})`,
         affectedUser: `${forceOutTargetName} (${shift.userEmail})`,
         previousValue: 'ACTIVE/BREAK',
         newValue: 'COMPLETED_FORCED',
@@ -1147,6 +1603,7 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
       setForceOutReason('Left without logging out');
       setForceOutCustomReason('');
 
+      clearCache();
       await fetchAllShifts();
     } catch (e) {
       console.error('[TMS FORCE LOGOUT ERROR]', e);
@@ -1154,122 +1611,340 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
     }
   };
 
-  // Trigger cleanup for managers on mount and periodically
+  // Trigger cleanup for Dashboard Users on mount and periodically
   useEffect(() => {
     fetchAllShifts();
-    if (isManagerRole) {
+    const normRole = normalizeRole(user?.role);
+    const isDashboard = checkIsDashboardUser(normRole);
+
+    if (isDashboard) {
       import('../services/tmsCleanupService').then(service => {
-        service.performTmsStaleSessionCleanup();
-        service.performTmsTenHourForceOut();
+        // service.performTmsStaleSessionCleanup(user);
+        // service.performTmsTenHourForceOut();
       });
 
-      // Run 10-hour auto force-out checks every 5 minutes automatically
-      const cleanupInterval = setInterval(() => {
-        import('../services/tmsCleanupService').then(service => {
-          service.performTmsTenHourForceOut();
-        });
-      }, 5 * 60 * 1000);
-
-      return () => clearInterval(cleanupInterval);
+      // Run cleanup checks every 2 hours automatically to save quota
+      // TMS cleanup/repair service temporarily disabled due to P0 production stability issues.
+      // const cleanupInterval = setInterval(() => {
+      //   import('../services/tmsCleanupService').then(service => {
+      //     service.performTmsTenHourForceOut();
+      //   });
+      // }, 120 * 60 * 1000);
     }
-  }, [isManagerRole]);
+  }, [user?.role]);
 
-  // Automated 10-hour productive time force-clockout and stale monitor
+  // Reset session extension when shift is cleared
   useEffect(() => {
+    if (!currentShift) {
+      setLocalSessionExtended(false);
+      setAutoLogoutWarning({ show: false, timeLeft: 120, reason: 'limit' });
+    }
+  }, [currentShift?.id]);
+
+  // Automated 10-hour productive time force-clockout and stale monitor with pre-warning triggers
+  useEffect(() => {
+    console.log('[TMS Auto-Close] Client-side auto clock-outs are disabled at root level.');
+    return;
     if (!currentShift || currentShift.status === 'COMPLETED' || currentShift.status === 'AUTO_CLOSED') return;
 
+    const isSupervisor = checkIsDashboardUser(normRoleUser);
+
+    if (isSupervisor) {
+      console.log('[TMS Auto-Close] User is a supervisor. Bypassing client-side auto-clockout monitor.');
+      return;
+    }
+
     const interval = setInterval(() => {
-      const now = new Date().getTime();
-      const productiveMs = getShiftProductiveMs(currentShift, now);
+      const activeShift = currentShiftRef.current;
+      if (!activeShift || activeShift.status === 'COMPLETED' || activeShift.status === 'AUTO_CLOSED') {
+        clearInterval(interval);
+        return;
+      }
+
+      const now = getLiveTime().getTime();
+      const productiveMs = getShiftProductiveMs(activeShift, now);
       const TEN_HOURS_MS = 10 * 60 * 60 * 1000;
 
-      const clockInMs = new Date(currentShift.clockInTime).getTime();
-      const elapsedShiftMs = now - clockInMs;
+      const clockInMs = parseTimestampMs(activeShift.clockInTime);
+      const elapsedShiftMs = Math.max(0, now - clockInMs);
       const TWELVE_HOURS_MS = 12 * 60 * 60 * 1000;
+      const SIXTEEN_HOURS_MS = 16 * 60 * 60 * 1000;
+      const isExtended = !!(activeShift.sessionExtended || activeShift.extended);
 
-      const clockInDate = new Date(currentShift.clockInTime);
-      const nowDate = getLiveTime();
-      const isDifferentDay = 
-        clockInDate.getFullYear() !== nowDate.getFullYear() ||
-        clockInDate.getMonth() !== nowDate.getMonth() ||
-        clockInDate.getDate() !== nowDate.getDate();
+      // Auto-close if exceeded 16 hours total or 12 hours without extension
+      if (elapsedShiftMs >= SIXTEEN_HOURS_MS || (elapsedShiftMs >= TWELVE_HOURS_MS && !isExtended)) {
+        clearInterval(interval);
+        console.log(`[TMS Auto-Close] Stale session detected (>12h). Verifying status on server first...`);
 
-      const lastAct = currentShift.activities?.[currentShift.activities.length - 1];
-      const lastActTime = lastAct 
-        ? new Date(lastAct.endTime || lastAct.startTime).getTime()
-        : clockInMs;
-      const idleMs = now - lastActTime;
+        const shiftRef = doc(db, 'tmsShifts', activeShift.id);
+        getDoc(shiftRef).then(snap => {
+          if (snap.exists()) {
+            const shData = snap.data();
+            if (isShiftLockedOrCompleted(shData)) {
+              console.log(`[TMS Auto-Close] Shift ${activeShift.id} is already locked/completed on server. Aborting client auto-close.`);
+              setCurrentShift(null);
+              setRawActiveShift(null);
+              setLocalOwnShift(null);
+              clearCache();
+              setAutoLogoutWarning({ show: false, timeLeft: 120, reason: 'limit' });
+              return;
+            }
+          }
 
-      // Auto-close if exceeded 12 hours total, OR if it is a different day and idle for more than 6 hours
-      const isStale = elapsedShiftMs >= TWELVE_HOURS_MS || (isDifferentDay && idleMs >= 6 * 60 * 60 * 1000);
+          console.log(`[TMS Auto-Close] Shift status verified as non-completed. Finalizing immediately...`);
+          const limitMs = Math.min(productiveMs, TEN_HOURS_MS);
+          const { activities: updatedActivities, clockOutTime } = truncateShiftToProductiveTime(activeShift, limitMs);
+          const updatedLedger = appendShiftEvent(
+            activeShift.shiftEventLedger,
+            activeShift,
+            {
+              eventType: 'AUTO_CLOSE',
+              timestamp: clockOutTime,
+              performedBy: 'System Cleanup Service',
+              source: 'Cleanup Service',
+              reason: 'Auto-closed stale session (>12h)',
+              oldValue: activeShift.status,
+              newValue: 'AUTO_CLOSED',
+              remarks: 'Shift exceeded maximum elapsed time of 12 hours.'
+            }
+          );
+          const finalizedShift = {
+            ...createLockedCompletedShift(
+              { ...activeShift, activities: updatedActivities },
+              clockOutTime,
+              user?.email || user?.uid || 'Unknown' || user.uid,
+              'Auto-closed stale session (>12h)',
+              undefined,
+              'AUTO_CLOSED',
+              presentThreshold
+            ),
+            shiftEventLedger: updatedLedger
+          };
 
-      if (productiveMs >= TEN_HOURS_MS || isStale) {
-        console.log('[AUTO-LOGOUT] Stale session or 10 hours productive time reached. Forcing clock-out.');
-        
-        // Truncate shift to productive limit and close
-        const limitMs = Math.min(productiveMs, TEN_HOURS_MS);
-        const { activities: updatedActivities, clockOutTime } = truncateShiftToProductiveTime(currentShift, limitMs);
-        const finalizedShift = {
-          ...currentShift,
-          activities: updatedActivities,
-          clockOutTime,
-          status: 'AUTO_CLOSED' as const,
-          remarks: isStale 
-            ? 'Auto-clocked out due to stale session spanning multiple days/shifts'
-            : 'Auto-clocked out after 10 hours productive time'
-        };
-
-        saveShiftState(finalizedShift)
-          .then(() => syncShiftToAttendance({ id: currentShift.id, ...finalizedShift }))
-          .then(() => {
-             const userRef = doc(db, 'users', user.uid);
-             return updateDoc(userRef, {
-               status: 'OFFLINE',
-               lastLogoutAt: clockOutTime
-             });
-          })
-          .then(() => {
-            setCurrentShift(null);
-            setLocalOwnShift(undefined);
-            toast.info(
-              isStale 
-                ? 'Your previous stale shift has been automatically clocked out. Timer reset for new shift.'
-                : 'You have been automatically clocked out after 10 hours of productive time.',
-              { duration: 10000 }
-            );
-          })
-          .catch(err => console.error('Error in auto-logout loop:', err));
+          saveShiftState(finalizedShift)
+            .then(() => {
+               const userRef = doc(db, 'users', user.uid);
+               return setDoc(userRef, {
+                 status: 'OFFLINE',
+                 lastLogoutAt: clockOutTime
+               }, { merge: true });
+            })
+            .then(() => {
+              setCurrentShift(null);
+              setRawActiveShift(null);
+              setLocalOwnShift(null);
+              clearCache();
+              setAutoLogoutWarning({ show: false, timeLeft: 120, reason: 'limit' });
+              toast.info(`Your previous stale shift was automatically finalized. Ready for a new shift.`, { duration: 8000 });
+            })
+            .catch(err => console.error('Error auto-clocking out stale shift:', err));
+        }).catch(err => {
+          console.error('[TMS Auto-Close] Failed to fetch live shift status before auto-closing:', err);
+        });
+        return;
       }
-    }, 60000); // Check every minute
+
+      // Auto-close if exceeded 12 hours total
+      const isStale = elapsedShiftMs >= TWELVE_HOURS_MS;
+      const reachedLimit = productiveMs >= TEN_HOURS_MS;
+
+      // Active working users who extend their session on CURRENT DAY are bypassed
+      if (localSessionExtended || activeShift.sessionExtended || activeShift.extended) {
+        return;
+      }
+
+      const isCloseToLimit = productiveMs >= (TEN_HOURS_MS - 10 * 60 * 1000);
+      const isCloseToStale = elapsedShiftMs >= (TWELVE_HOURS_MS - 10 * 60 * 1000);
+
+      if (isCloseToLimit || isCloseToStale || isStale || reachedLimit) {
+        setAutoLogoutWarning(prev => {
+          if (!prev.show) {
+            console.log('[TMS Auto Logout] Triggering 2-minute pre-logout warning overlay.');
+            return {
+              show: true,
+              timeLeft: 120, // 120 seconds countdown
+              reason: isCloseToLimit || reachedLimit ? 'limit' : 'stale'
+            };
+          } else {
+            const nextTime = prev.timeLeft - 5;
+            if (nextTime <= 0) {
+              clearInterval(interval);
+              console.log('[AUTO-LOGOUT] Pre-warning grace period expired. Verifying status on server first...');
+              
+              const shiftRef = doc(db, 'tmsShifts', activeShift.id);
+              getDoc(shiftRef).then(snap => {
+                if (snap.exists()) {
+                  const shData = snap.data();
+                  if (isShiftLockedOrCompleted(shData)) {
+                    console.log(`[AUTO-LOGOUT] Shift ${activeShift.id} is already locked/completed on server. Aborting client auto-close.`);
+                    setCurrentShift(null);
+                    setLocalOwnShift(undefined);
+                    clearCache();
+                    setAutoLogoutWarning({ show: false, timeLeft: 120, reason: 'limit' });
+                    return;
+                  }
+                }
+
+                console.log(`[AUTO-LOGOUT] Shift status verified as non-completed. Auto clocking out...`);
+                const limitMs = Math.min(productiveMs, TEN_HOURS_MS);
+                const { activities: updatedActivities, clockOutTime } = truncateShiftToProductiveTime(activeShift, limitMs);
+                const eventType = isStale ? 'AUTO_CLOSE' : 'AUTO_PRODUCTIVE_LIMIT';
+                const reasonStr = isStale 
+                  ? 'Auto-clocked out due to stale session spanning multiple days/shifts'
+                  : 'Auto-clocked out after 10 hours productive time';
+                const updatedLedger = appendShiftEvent(
+                  activeShift.shiftEventLedger,
+                  activeShift,
+                  {
+                    eventType,
+                    timestamp: clockOutTime,
+                    performedBy: 'System Cleanup Service',
+                    source: 'Cleanup Service',
+                    reason: reasonStr,
+                    oldValue: activeShift.status,
+                    newValue: 'AUTO_CLOSED',
+                    remarks: isStale ? 'Session exceeded 12 hours.' : 'Session exceeded 10 hours productive limit.'
+                  }
+                );
+                const finalizedShift = {
+                  ...createLockedCompletedShift(
+                    { ...activeShift, activities: updatedActivities },
+                    clockOutTime,
+                    user?.email || user?.uid || 'Unknown' || user.uid,
+                    reasonStr,
+                    undefined,
+                    'AUTO_CLOSED',
+                    presentThreshold
+                  ),
+                  shiftEventLedger: updatedLedger
+                };
+
+                saveShiftState(finalizedShift)
+                  .then(() => {
+                     const userRef = doc(db, 'users', user.uid);
+                     return setDoc(userRef, {
+                       status: 'OFFLINE',
+                       lastLogoutAt: clockOutTime
+                     }, { merge: true });
+                  })
+                  .then(() => {
+                    setCurrentShift(null);
+                    setLocalOwnShift(undefined);
+                    clearCache();
+                    setAutoLogoutWarning({ show: false, timeLeft: 120, reason: 'limit' });
+                    toast.info(
+                      isStale 
+                        ? 'Your previous stale shift has been automatically clocked out. Timer reset for new shift.'
+                        : 'You have been automatically clocked out after 10 hours of productive time.',
+                      { duration: 10000 }
+                    );
+                  })
+                  .catch(err => console.error('Error auto-clocking out shift:', err));
+              }).catch(err => {
+                console.error('[AUTO-LOGOUT] Failed to fetch live shift status before countdown auto-close:', err);
+              });
+
+              return { ...prev, show: false, timeLeft: 0 };
+            }
+
+            return { ...prev, timeLeft: nextTime };
+          }
+        });
+      }
+    }, 5000); // High-frequency 5-second tick for high responsive timer countdowns
 
     return () => clearInterval(interval);
-  }, [currentShift?.id, currentShift?.status, user?.uid]);
+  }, [currentShift?.id, currentShift?.status, user?.uid, localSessionExtended]);
+
+  // Heartbeat optimization: Update lastHeartbeat and isOnline in live_sessions & tmsShifts every 90 seconds
+  useEffect(() => {
+    if (!user?.uid || !currentShift || currentShift.status === 'COMPLETED' || currentShift.status === 'AUTO_CLOSED') return;
+
+    const sendHeartbeat = async () => {
+      try {
+        const liveSessionRef = doc(db, 'live_sessions', user.uid);
+        const userData = (user as any);
+        const tlId = userData.teamLeadId || userData.teamLeadUid || userData.tlId || '';
+        const managerId = userData.mappedManagerId || userData.managerId || '';
+        const nowISO = getLiveTimeISO();
+        
+        await Promise.all([
+          setDoc(liveSessionRef, {
+            lastHeartbeat: nowISO,
+            isOnline: true,
+            tlId: tlId,
+            managerId: managerId,
+            userId: user.uid,
+            uid: user.uid
+          }, { merge: true }),
+          setDoc(doc(db, 'tmsShifts', currentShift.id), {
+            lastHeartbeat: nowISO
+          }, { merge: true })
+        ]);
+        console.log('[HEARTBEAT] Heartbeat updated.');
+        logTmsEvent('HEARTBEAT', {
+          userId: user.uid,
+          shiftId: currentShift.id,
+          timestamp: nowISO,
+          reason: 'Periodic 90s heartbeat',
+          sourceFunction: 'TMSView.sendHeartbeat'
+        });
+      } catch (err) {
+        console.warn('[HEARTBEAT] Failed to update heartbeat:', err);
+      }
+    };
+
+    // Send immediately on mount / state change
+    sendHeartbeat();
+
+    const heartbeatInterval = setInterval(sendHeartbeat, 90 * 1000); // 90 seconds interval (between 60 and 120)
+
+    const handleFocus = () => {
+      console.log('[HEARTBEAT] Window focused or visibility changed, sending heartbeat.');
+      sendHeartbeat();
+    };
+
+    window.addEventListener('focus', handleFocus);
+    document.addEventListener('visibilitychange', handleFocus);
+
+    return () => {
+      clearInterval(heartbeatInterval);
+      window.removeEventListener('focus', handleFocus);
+      document.removeEventListener('visibilitychange', handleFocus);
+    };
+  }, [user?.uid, currentShift?.id, currentShift?.status]);
 
   const saveShiftState = async (updatedShift: TMSShift) => {
+
     // Phase 5 Optimization: Avoid getDoc by using the preloaded 'user' prop in memory if it's the current user's shift
     const isSelf = updatedShift.userId === user?.uid;
     let userData: any = isSelf ? user : null;
 
-    if (!userData) {
-      const userRef = doc(db, 'users', updatedShift.userId);
-      const userSnap = await getDoc(userRef);
-      userData = userSnap.exists() ? userSnap.data() : {};
+    if (!userData && allUsers && allUsers.length > 0) {
+      userData = allUsers.find(u => u.uid === updatedShift.userId);
+    }
+
+    if (!userData || !userData.teamLeadId) {
+      const masterRef = doc(db, 'employee_master', updatedShift.userId);
+      const masterSnap = await getDocOptimized(masterRef, `master_for_state_${updatedShift.userId}`);
+      if (masterSnap.exists()) {
+        const masterData = masterSnap.data();
+        userData = { ...userData, ...masterData };
+      }
     }
     
-    const referenceTime = new Date().getTime();
+    const referenceTime = getLiveTime().getTime();
     const productiveMs = getShiftProductiveMs(updatedShift, referenceTime);
     const breakMs = (updatedShift.activities || [])
       .filter(act => act.type === 'break' && act.name.toLowerCase() !== 'offline' && !act.name.toLowerCase().includes('meeting') && !act.name.toLowerCase().includes('coaching') && !act.name.toLowerCase().includes('training') && !act.name.toLowerCase().includes('alignment'))
       .reduce((sum, act) => sum + (act.endTime ? new Date(act.endTime).getTime() : referenceTime) - new Date(act.startTime).getTime(), 0);
 
-    const lastAct = updatedShift.activities && updatedShift.activities.length > 0 
-      ? updatedShift.activities[updatedShift.activities.length - 1] 
-      : null;
+    const lastAct = getLatestUserActivity(updatedShift.activities || []);
 
     const currentActivity = (lastAct && !lastAct.endTime && lastAct.name) || 'Offline';
     const breakType = updatedShift.status === 'BREAK' && lastAct && !lastAct.endTime ? lastAct.name : null;
 
-    const currentActivityStartTime = lastAct ? lastAct.startTime : new Date().toISOString();
+    const currentActivityStartTime = lastAct ? lastAct.startTime : getLiveTimeISO();
 
     const validateDate = (d: any, label: string) => {
       const date = new Date(d);
@@ -1280,33 +1955,95 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
       return true;
     };
 
+    const isCompleted = ['COMPLETED', 'AUTO_CLOSED', 'COMPLETED_FORCED', 'CLOCKED_OUT', 'CLOSED', 'ENDED'].includes(updatedShift.status);
+
+    // --- PROTECTIVE SESSION LOCK LAYER & STRUCTURED LOGGING ---
+    try {
+      const dbRef = doc(db, 'tmsShifts', updatedShift.id);
+      const serverSnap = await getDocOptimized(dbRef, `sh_state_lock_${updatedShift.id}`, true); // Bypass cache with forceRefresh = true
+      if (serverSnap.exists()) {
+        const serverData = serverSnap.data();
+        const serverStatus = serverData.status;
+        const completedStatuses = ['COMPLETED', 'AUTO_CLOSED', 'COMPLETED_FORCED', 'CLOCKED_OUT', 'CLOSED', 'ENDED'];
+        
+        // If the shift is already marked completed/closed on the server, reject any client-side update to protect immutability.
+        if (completedStatuses.includes(serverStatus)) {
+          console.warn(`[TMS SESSION LOCK] Blocked update to shift ${updatedShift.id}. The shift is already completed/closed on the server (Server Status: ${serverStatus}).`);
+          logTmsEvent('SESSION_RESTORE', {
+            userId: updatedShift.userId,
+            shiftId: updatedShift.id,
+            reason: `Blocked redundant update to already completed shift (Server Status: ${serverStatus})`,
+            sourceFunction: 'saveShiftState.sessionLock',
+            details: { incomingStatus: updatedShift.status, serverStatus }
+          });
+          
+          if (updatedShift.userId === user?.uid) {
+            setLocalOwnShift(null);
+            setCurrentShift(null);
+            toast.info('Your shift has already been completed or closed by the system.');
+          }
+          return;
+        }
+      }
+    } catch (e: any) {
+      console.error('[TMS SESSION LOCK] Failed to verify server lock state, proceeding with caution:', e);
+    }
+
+    logTmsEvent('ACTIVITY_CHANGE', {
+      userId: updatedShift.userId,
+      shiftId: updatedShift.id,
+      reason: `Saving shift state update (Status: ${updatedShift.status}, Activity: ${currentActivity})`,
+      sourceFunction: 'TMSView.saveShiftState',
+      details: {
+        status: updatedShift.status,
+        currentActivity,
+        productiveMs,
+        breakMs,
+        isCompleted
+      }
+    });
+
+    // Verify that status === 'BREAK' is ONLY written if the latest explicit user activity event is a break
+    let validatedStatus = updatedShift.status;
+    if (validatedStatus === 'BREAK') {
+      const lastActInShift = getLatestUserActivity(updatedShift.activities || []);
+      const isActualBreak = lastActInShift && (lastActInShift.action === 'BREAK_START' || (lastActInShift.type === 'break' && !isAuditOrDiagnosticEvent(lastActInShift.action)));
+      if (!isActualBreak) {
+        validatedStatus = 'ACTIVE';
+      }
+    }
+
     const liveSessionData = {
       sessionId: updatedShift.id,
+      userId: updatedShift.userId,
       uid: updatedShift.userId,
       employeeId: updatedShift.userId,
-      employeeName: updatedShift.userName,
-      role: userData?.role || 'AGENT',
+      employeeName: updatedShift.userName || '',
+      email: updatedShift.userEmail || '',
+      userEmail: updatedShift.userEmail || '',
       process: lastAct?.name || userData?.team || userData?.process || 'N/A',
-      currentProcess: lastAct?.name || userData?.team || userData?.process || 'N/A',
-      managerId: userData?.mappedManagerId || userData?.managerId || '',
+      teamLead: userData?.teamLeadId || userData?.teamLeadUid || '',
       tlId: userData?.teamLeadId || userData?.teamLeadUid || '',
-      status: updatedShift.status,
-      sessionStatus: updatedShift.status,
+      manager: userData?.mappedManagerId || userData?.managerId || '',
+      managerId: userData?.mappedManagerId || userData?.managerId || '',
+      isOnline: !isCompleted,
+      status: validatedStatus,
       currentActivity: currentActivity,
-      currentActivityStartTime: currentActivityStartTime,
-      breakType: breakType,
-      productiveSeconds: Math.floor(productiveMs / 1000),
-      breakSeconds: Math.floor(breakMs / 1000),
-      activities: updatedShift.activities || [],
-      location: (updatedShift as any).location || userData?.location || 'Unknown',
       clockInTime: updatedShift.clockInTime,
-      clockOutTime: updatedShift.clockOutTime || null,
-      deviceName: updatedShift.deviceType || 'Unknown',
-      deviceType: updatedShift.deviceType || 'Desktop',
-      clockInDevice: updatedShift.clockInDevice || 'desktop',
-      platform: updatedShift.os || 'Unknown',
-      os: updatedShift.os || 'Unknown',
-      lastHeartbeat: new Date().toISOString()
+      statusStartTime: currentActivityStartTime,
+      currentActivityStartTime: currentActivityStartTime,
+      lastHeartbeat: getLiveTimeISO(),
+      activities: updatedShift.activities || [],
+      
+      // Work Location Detection fields
+      workLocation: updatedShift.workLocation || '',
+      workLocationDetected: updatedShift.workLocationDetected || '',
+      workLocationSource: updatedShift.workLocationSource || '',
+      publicIP: updatedShift.publicIP || '',
+      officeName: updatedShift.officeName || '',
+      locationCapturedAt: updatedShift.locationCapturedAt || '',
+      overrideBy: updatedShift.overrideBy || '',
+      overrideAt: updatedShift.overrideAt || ''
     };
 
     // Validate timestamps
@@ -1316,36 +2053,43 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
     const liveSessionRef = doc(db, 'live_sessions', updatedShift.userId);
     
     // If shift is completed, remove from live_sessions entirely to ensure dashboard sync
-    const isCompleted = ['COMPLETED', 'AUTO_CLOSED', 'COMPLETED_FORCED'].includes(updatedShift.status);
+
+    const updatedShiftToSave = {
+      ...updatedShift,
+      status: validatedStatus,
+      lastHeartbeat: updatedShift.lastHeartbeat || getLiveTimeISO()
+    };
 
     if (isCompleted) {
       await Promise.all([
-        setDoc(doc(db, 'tmsShifts', updatedShift.id), updatedShift),
+        setDoc(doc(db, 'tmsShifts', updatedShift.id), updatedShiftToSave),
         deleteDoc(liveSessionRef)
       ]);
     } else {
       await Promise.all([
-        setDoc(doc(db, 'tmsShifts', updatedShift.id), updatedShift),
+        setDoc(doc(db, 'tmsShifts', updatedShift.id), updatedShiftToSave),
         setDoc(liveSessionRef, liveSessionData, { merge: true })
       ]);
     }
+    clearCache();
   };
 
   const saveProcessesList = async (updatedList: string[]) => {
-    await setDoc(doc(db, 'config', 'tmsProcesses'), { list: updatedList }, { merge: true });
+    const updatedProcesses = updatedList.map(name => ({
+      name,
+      status: 'Active' as const
+    }));
+    await setDoc(doc(db, 'config', 'tmsProcesses'), { 
+      list: updatedList, 
+      processes: updatedProcesses 
+    }, { merge: true });
+    
+    // Immediately invalidate the cached processes list so the punch station reloads it on next render
+    invalidateCacheKey('tms_processes_fetch');
   };
 
   const isSupervisorRole = (role: string | UserRole): boolean => {
-    const norm = (role || '').toString().toUpperCase().trim();
-    return [
-      'ADMIN',
-      'MANAGER',
-      'STL',
-      'OPS_TL',
-      'QTL',
-      'TEAM_LEAD',
-      'TRAINER_TL'
-    ].includes(norm);
+    return checkIsDashboardUser((role || '').toString());
   };
 
   // Helper: Format Milliseconds to HH:MM:SS
@@ -1359,10 +2103,17 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
   };
 
   // Helper: Format ISO timestamp to hh:mm AM/PM in IST
-  const formatTimeStr = (isoStr: string) => {
-    if (!isoStr) return 'N/A';
+  const parseTimestampMs = (isoStr: any) => {
+    if (!isoStr) return 0;
+    const d = new Date(isoStr);
+    return isNaN(d.getTime()) ? 0 : d.getTime();
+  };
+
+  const formatTimeStr = (isoStr: any) => {
+    const ms = parseTimestampMs(isoStr);
+    if (!ms) return 'N/A';
     try {
-      const d = new Date(isoStr);
+      const d = new Date(ms);
       return d.toLocaleTimeString('en-US', { 
         hour: '2-digit', 
         minute: '2-digit', 
@@ -1375,10 +2126,11 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
   };
 
   // Helper: Format ISO timestamp to Date string in IST (DD/MM/YYYY)
-  const formatDateStr = (isoStr: string) => {
-    if (!isoStr) return 'N/A';
+  const formatDateStr = (isoStr: any) => {
+    const ms = parseTimestampMs(isoStr);
+    if (!ms) return 'N/A';
     try {
-      const d = new Date(isoStr);
+      const d = new Date(ms);
       return d.toLocaleDateString('en-GB', {
         day: '2-digit',
         month: '2-digit',
@@ -1400,7 +2152,7 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
       return;
     }
 
-    const targetProcess = (selectedProcessInput || (processes.length > 0 ? processes[0] : '') || '').trim();
+    const targetProcess = (selectedProcessInput || (allAvailableProcesses.length > 0 ? allAvailableProcesses[0] : '') || '').trim();
     if (!targetProcess) {
       toast.error('Please select a starting process before Clocking In.');
       return;
@@ -1417,6 +2169,63 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
     setShowClockInConfirm(true);
   };
 
+  const resumeCompletedShift = async (shift: TMSShift, resumeProcess: string) => {
+    const nowISO = getLiveTimeISO();
+    const currentDev = getDeviceType();
+
+    const updatedActivities = [...(shift.activities || [])];
+    updatedActivities.push({
+      activityId: crypto.randomUUID(),
+      action: 'RESUME_SHIFT',
+      startTime: nowISO,
+      process: resumeProcess || 'Active Work',
+      actor: user?.email || user?.uid || 'Employee',
+      sourceService: 'TMS_UI',
+      type: 'productive',
+      name: resumeProcess || 'Active Work',
+      device: currentDev
+    });
+
+    const updatedShift: TMSShift = {
+      ...shift,
+      status: 'ACTIVE',
+      clockOutTime: null,
+      endShiftTime: null,
+      locked: false,
+      activities: updatedActivities,
+      shiftEventLedger: appendShiftEvent(shift.shiftEventLedger, shift, {
+        eventType: 'SHIFT_RESUME',
+        timestamp: nowISO,
+        performedBy: user.name || 'Employee',
+        source: 'TMS',
+        reason: 'User manual shift resume (Same-day reconnect)',
+        newValue: resumeProcess,
+        metadata: { process: resumeProcess, previousId: shift.id }
+      })
+    };
+
+    setRawActiveShift(updatedShift);
+    setCurrentShift(updatedShift);
+    setLocalOwnShift(updatedShift);
+    setSelectedProcessInput(resumeProcess);
+
+    try {
+      await saveShiftState(updatedShift);
+      logTmsEvent('CLOCK_IN', {
+        userId: user.uid,
+        shiftId: updatedShift.id,
+        timestamp: nowISO,
+        reason: 'User manual shift resume (Same-day)',
+        sourceFunction: 'TMSView.resumeCompletedShift',
+        details: { process: resumeProcess }
+      });
+      toast.success(`Resumed work successfully! Process: ${resumeProcess}`);
+    } catch (e: any) {
+      console.error('Resume failed:', e);
+      toast.error('Failed to resume shift: ' + e.message);
+    }
+  };
+
   const performClockIn = async () => {
     if (isProcessingPunch) return;
     const targetProcess = selectedProcessInput;
@@ -1424,6 +2233,34 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
 
     setIsProcessingPunch(true);
     setShowClockInConfirm(false); // Close modal on confirmed start
+
+    // FOOLPROOF GUARD: Check Firestore directly for any ACTIVE/BREAK shift.
+    try {
+      const now = getLiveTime();
+      const cutoffMs = now.getTime() - (24 * 60 * 60 * 1000); // Look back 24 hours for any active session
+      const cutoffISO = new Date(cutoffMs).toISOString();
+
+      const qCheck = query(
+        collection(db, 'tmsShifts'),
+        where('userId', '==', user.uid),
+        where('clockInTime', '>=', cutoffISO)
+      );
+      const checkSnap = await getDocs(qCheck);
+      const sameDayShifts = checkSnap.docs.map(d => ({ id: d.id, ...d.data() } as TMSShift));
+      
+      // 1. Check for ACTIVE/BREAK first (standard resume/re-sync)
+      const activeShift = sameDayShifts.find(s => s.status === 'ACTIVE' || s.status === 'BREAK');
+      if (activeShift) {
+        toast.warning("You already have an active or break session running. Re-syncing status...");
+        setRawActiveShift(activeShift);
+        setCurrentShift(activeShift);
+        setLocalOwnShift(activeShift);
+        setIsProcessingPunch(false);
+        return;
+      }
+    } catch (errCheck) {
+      console.error("Failed to pre-verify active session status", errCheck);
+    }
     
     const nowISO = getLiveTimeISO();
     const currentDev = getDeviceType();
@@ -1444,11 +2281,153 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
     console.log(`detectedBrowser=${meta.browser}`);
     console.log(`detectedOS=${meta.os}`);
 
+    // ----------------------------------------------------
+    // WORK LOCATION DETECTION (PHASE 1)
+    // ----------------------------------------------------
+    let publicIP = '0.0.0.0';
+    let detectedLocation = 'Home';
+    let officeName = '';
+    
+    console.log('[IP DETECTION] Retrieving public IPv4 from proactive background lookup...');
+    try {
+      publicIP = await getOrFetchPublicIP();
+      console.log(`[IP DETECTION] Retrieved IP: [${publicIP}]`);
+    } catch (err) {
+      console.warn('[IP DETECTION] Failed to retrieve proactive IP. Defaulting to 0.0.0.0.');
+    }
+
+    let officesList: any[] = [];
+    const defaultOffices = [
+      {
+        id: 'office_001',
+        officeName: 'Berg Dehradun',
+        publicIP: '115.243.137.122',
+        status: true,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      },
+      {
+        id: 'office_002',
+        officeName: 'Berg Noida',
+        publicIP: '125.23.171.67',
+        status: true,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      },
+      {
+        id: 'office_003',
+        officeName: 'Berg Delhi',
+        publicIP: '182.71.113.42',
+        status: true,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      }
+    ];
+
+    try {
+      let networksData = officeNetworks;
+      if (!networksData) {
+        console.log('[IP DETECTION] officeNetworks is null/empty in ConfigContext. Reading directly from Firestore config/office_networks...');
+        const officeNetworksRef = doc(db, 'config', 'office_networks');
+        const officeSnap = await getDocOptimized(officeNetworksRef, 'office_networks_global', false);
+        if (officeSnap.exists()) {
+          networksData = officeSnap.data();
+          console.log('[IP DETECTION] office_networks document fetched successfully.');
+        } else {
+          console.log('[IP DETECTION] office_networks document does not exist in DB. Self-healing with defaults...');
+          try {
+            const { setDoc } = await import('firebase/firestore');
+            await setDoc(officeNetworksRef, { offices: defaultOffices });
+          } catch (err) {
+            console.error("[IP DETECTION] Failed to self-heal office networks:", err);
+          }
+          networksData = { offices: defaultOffices };
+        }
+      }
+      
+      let fetchedOffices: any[] = [];
+      if (networksData && Array.isArray(networksData.offices)) {
+        fetchedOffices = networksData.offices;
+      } else if (networksData && Array.isArray(networksData.officeIPs)) {
+        fetchedOffices = networksData.officeIPs.map((ip: string, idx: number) => ({
+          id: `office_legacy_${idx}`,
+          officeName: `Berg Office ${idx + 1}`,
+          publicIP: ip,
+          status: true
+        }));
+      }
+
+      // MERGE RULE: Always include hardcoded offices to guarantee detection works, and layer Console configurations on top
+      const officeMap = new Map<string, any>();
+      defaultOffices.forEach(o => officeMap.set(o.publicIP, o));
+      fetchedOffices.forEach(o => {
+        if (o && o.publicIP) {
+          officeMap.set(o.publicIP, { ...officeMap.get(o.publicIP), ...o });
+        }
+      });
+      officesList = Array.from(officeMap.values());
+    } catch (confErr) {
+      console.error("[IP DETECTION] Failed to load whitelisted office networks, falling back to hardcoded defaults:", confErr);
+      officesList = defaultOffices;
+    }
+
+    // Split detected IP address by commas and strictly filter/validate IPv4
+    const detectedIPs = publicIP.split(',').map(ip => ip.trim()).filter(ip => ipv4Regex.test(ip));
+    console.log('[IP DETECTION] Tokenized Valid User IPv4s:', detectedIPs);
+    console.log('[IP DETECTION] Comparing against whitelisted offices (including merged defaults):', officesList.map(o => ({ name: o.officeName, ip: o.publicIP, status: o.status })));
+    
+    const matchingOffice = officesList.find(office => {
+      if (!office.publicIP) return false;
+      
+      // Split configured office IP by commas and validate IPv4
+      const officeIPs = office.publicIP.split(',').map((ip: string) => ip.trim()).filter(ip => ipv4Regex.test(ip));
+      
+      // Check if any of the user's detected IPv4s matches any configured office IPv4
+      const isIPMatch = officeIPs.some((offIP: string) => 
+        detectedIPs.some(usrIP => usrIP === offIP)
+      );
+      
+      // Permissive boolean check
+      const isActive = office.status === true || 
+                       String(office.status).toLowerCase() === 'true' || 
+                       String(office.status).toLowerCase() === 'active';
+                        
+      console.log(`[IP DETECTION] Matching office [${office.officeName}]: IPs=[${office.publicIP}], isIPMatch=${isIPMatch}, isActive=${isActive}`);
+      return isIPMatch && isActive;
+    });
+
+    if (matchingOffice) {
+      detectedLocation = 'Office';
+      officeName = matchingOffice.officeName || 'Berg Office';
+      console.log(`[IP DETECTION] MATCH SUCCESS! Location set to Office (${officeName})`);
+      toast.info(`Clocking in from Office Location: ${officeName} (IP: ${publicIP})`);
+    } else {
+      detectedLocation = 'Home';
+      officeName = '';
+      console.log(`[IP DETECTION] MATCH FAILED! No active office matched the detected IP list.`);
+      toast.info(`No office matching IP ${publicIP} was found. Defaulting to Home Location.`);
+    }
+
+    const initialLedger = appendShiftEvent(
+      undefined,
+      undefined,
+      {
+        eventType: 'CLOCK_IN',
+        timestamp: nowISO,
+        performedBy: user.name || 'Employee',
+        source: 'TMS',
+        reason: 'User manual clock-in',
+        oldValue: null,
+        newValue: targetProcess,
+        metadata: { process: targetProcess || 'Active Work', workLocation: detectedLocation, publicIP }
+      }
+    );
+
     const newShift: TMSShift = {
       id: `shift-${user.uid || 'anon'}-${Date.now()}`,
       userId: user.uid || '',
       userName: user.name || 'Anonymous User',
-      userEmail: user.email || '',
+      userEmail: user?.email || user?.uid || 'Unknown' || '',
       teamLeadUid: (user as any).teamLeadUid || (user as any).teamLeadId || '',
       mappedTL: (user as any).teamLeadEmail || (user as any).mappedTL || 'N/A',
       mappedManager: (user as any).mappedManagerEmail || (user as any).mappedManager || 'N/A',
@@ -1460,6 +2439,13 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
       browser: meta.browser,
       os: meta.os,
       loginTimestamp: meta.loginTimestamp,
+      // Work Location Detection fields
+      workLocation: detectedLocation,
+      workLocationDetected: detectedLocation,
+      workLocationSource: 'IP Detection',
+      publicIP: publicIP,
+      officeName: officeName,
+      locationCapturedAt: nowISO,
       // Diagnostics
       userAgent: uaVal,
       platform: platVal,
@@ -1469,11 +2455,17 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
       detectedDeviceType: meta.deviceType,
       detectedBrowser: meta.browser,
       detectedOS: meta.os,
+      shiftEventLedger: initialLedger,
       activities: [
         {
-          type: 'productive',
-          name: targetProcess,
+          activityId: crypto.randomUUID(),
+          action: 'CLOCK_IN',
           startTime: nowISO,
+          process: targetProcess || 'Active Work',
+          actor: user?.email || user?.uid || 'Employee',
+          sourceService: 'TMS_UI',
+          type: 'productive',
+          name: targetProcess || 'Active Work',
           device: currentDev
         }
       ]
@@ -1488,14 +2480,23 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
       // 2. Perform database writes concurrently in parallel
       const userRef = doc(db, 'users', user.uid);
       await Promise.all([
-        updateDoc(userRef, {
+        setDoc(userRef, {
           status: 'ONLINE',
           lastLoginAt: nowISO,
           lastUsedProcess: targetProcess
-        }),
+        }, { merge: true }),
         saveShiftState(newShift)
       ]);
 
+      clearCache();
+      logTmsEvent('CLOCK_IN', {
+        userId: user.uid,
+        shiftId: newShift.id,
+        timestamp: nowISO,
+        reason: 'User manual clock-in',
+        sourceFunction: 'TMSView.handleClockIn',
+        details: { process: targetProcess || 'Active Work', workLocation: detectedLocation, publicIP }
+      });
       toast.success(`Clocked In successfully! Process: ${targetProcess}`);
     } catch (e: any) {
       console.error('Clock-in failed:', e);
@@ -1509,7 +2510,66 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
     }
   };
 
+  const handleManualLocationOverride = async (newLocation: string) => {
+    if (!currentShift) return;
+    
+    const nowISO = getLiveTimeISO();
+    const updatedShift: TMSShift = {
+      ...currentShift,
+      workLocation: newLocation,
+      workLocationSource: 'Manual Override',
+      overrideBy: user.uid,
+      overrideAt: nowISO
+    };
+    
+    // Optimistic Update
+    setCurrentShift(updatedShift);
+    setLocalOwnShift(updatedShift);
+    setRawActiveShift(updatedShift);
+    
+    try {
+      await saveShiftState(updatedShift);
+      toast.success(`Work location updated to: ${newLocation === 'Office' ? '🏢 Office' : '🏠 Home'}`);
+    } catch (err: any) {
+      console.error("Failed to save location override:", err);
+      toast.error("Failed to save location override: " + err.message);
+    }
+  };
+
+  const handleExtendShift = async () => {
+    if (!currentShift) return;
+    try {
+      const nowStr = getLiveTimeISO();
+      const updatedLedger = appendShiftEvent(currentShift.shiftEventLedger || [], currentShift, {
+        eventType: 'SHIFT_EXTENSION',
+        timestamp: nowStr,
+        performedBy: user.fullName || user.name || 'Supervisor',
+        source: 'Supervisor Panel',
+        reason: 'Manual extension request from Supervisor Punch Station',
+        newValue: 'EXTENDED'
+      });
+      const updatedShift: TMSShift = {
+        ...currentShift,
+        extended: true,
+        sessionExtended: true,
+        shiftEventLedger: updatedLedger
+      };
+      // Optimistic update
+      setCurrentShift(updatedShift);
+      setLocalOwnShift(updatedShift);
+      setRawActiveShift(updatedShift);
+      setLocalSessionExtended(true);
+      
+      await saveShiftState(updatedShift);
+      toast.success('Your shift has been successfully extended!');
+    } catch (err) {
+      console.error('Error extending shift:', err);
+      toast.error('Failed to extend shift');
+    }
+  };
+
   const handleSwitchProcess = async (targetProcess: string) => {
+    if (isProcessingPunch) return;
     if (!hasTmsPermission('can_switch_process')) {
       toast.error('Access Denied: You do not have permissions to Switch Processes.');
       return;
@@ -1528,26 +2588,47 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
       return;
     }
 
+    setIsProcessingPunch(true);
     const previousShift = currentShift;
-
     try {
       const nowISO = getLiveTimeISO();
       const currentDev = getDeviceType();
       const meta = getDetailedDeviceMetadata();
       const updatedActivities = [...currentShift.activities];
+      const lastActivity = updatedActivities[updatedActivities.length - 1];
       
       // Terminate last activity
       if (updatedActivities.length > 0) {
-        updatedActivities[updatedActivities.length - 1].endTime = nowISO;
+        // Immutable ledger: endTime mutation removed
       }
 
       // Add new active process segment
       updatedActivities.push({
-        type: 'productive',
-        name: targetProcess,
+        activityId: crypto.randomUUID(),
+        action: (currentShift?.status === 'BREAK' ? 'BREAK_END' : 'PROCESS_SWITCH'),
         startTime: nowISO,
+        process: targetProcess || 'Active Work',
+        actor: user?.email || user?.uid || 'Employee',
+        sourceService: 'TMS_UI',
+        type: 'productive',
+        name: targetProcess || 'Active Work',
         device: currentDev
       });
+
+      const updatedLedger = appendShiftEvent(
+        currentShift.shiftEventLedger,
+        currentShift,
+        {
+          eventType: 'PROCESS_SWITCH',
+          timestamp: nowISO,
+          performedBy: user.name || 'Employee',
+          source: 'TMS',
+          reason: `Switched process from ${lastActivity?.name || 'none'} to ${targetProcess}`,
+          oldValue: lastActivity?.name || null,
+          newValue: targetProcess,
+          metadata: { previousProcess: lastActivity?.name || '', nextProcess: targetProcess }
+        }
+      );
 
       const updatedShift: TMSShift = {
         ...currentShift,
@@ -1562,7 +2643,8 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
         maxTouchPoints: typeof navigator !== 'undefined' ? navigator.maxTouchPoints : currentShift.maxTouchPoints,
         detectedDeviceType: meta.deviceType,
         detectedBrowser: meta.browser,
-        detectedOS: meta.os
+        detectedOS: meta.os,
+        shiftEventLedger: updatedLedger
       };
 
       // 1. Optimistic Update
@@ -1575,10 +2657,20 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
       const userRef = doc(db, 'users', user.uid);
       await Promise.all([
         saveShiftState(updatedShift),
-        updateDoc(userRef, {
+        setDoc(userRef, {
           lastUsedProcess: targetProcess
-        })
+        }, { merge: true })
       ]);
+
+      clearCache();
+      logTmsEvent('ACTIVITY_CHANGE', {
+        userId: user.uid,
+        shiftId: updatedShift.id,
+        timestamp: nowISO,
+        reason: `Switched process to ${targetProcess}`,
+        sourceFunction: 'TMSView.handleSwitchProcess',
+        details: { newProcess: targetProcess }
+      });
       toast.success(`Process switched to: ${targetProcess}`);
     } catch (e: any) {
       console.error('Process switch failed:', e);
@@ -1586,16 +2678,29 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
       // Revert optimistic update
       setLocalOwnShift(previousShift ? previousShift : undefined);
       setCurrentShift(previousShift);
+    } finally {
+      setIsProcessingPunch(false);
     }
   };
 
   const handleStartBreak = async () => {
+    if (isProcessingPunch) return;
     if (!currentShift) return;
+
+    // Temporal guard: Ignore break requests if shift started too recently (prevents race conditions/ghost punches)
+    const shiftStartMs = new Date(currentShift.clockInTime).getTime();
+    const timeSinceStart = Date.now() - shiftStartMs;
+    if (timeSinceStart < 5000) {
+      console.warn('[TMS] Break request blocked: Shift started too recently (possible ghost punch).');
+      return;
+    }
+
     if (currentShift.status === 'BREAK') {
       toast.error('You are already on a break.');
       return;
     }
 
+    setIsProcessingPunch(true);
     const breakType = selectedBreakInput || '';
     const isLunch = breakType.toLowerCase().includes('lunch');
     const isMeeting = breakType.toLowerCase().includes('meeting') || breakType.toLowerCase().includes('coaching') || breakType.toLowerCase().includes('training');
@@ -1627,16 +2732,45 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
       
       // Terminate last active segment
       if (updatedActivities.length > 0) {
-        updatedActivities[updatedActivities.length - 1].endTime = nowISO;
+        // Immutable ledger: endTime mutation removed
       }
 
       // Add new break segment
       updatedActivities.push({
-        type: 'break',
-        name: selectedBreakInput,
+        activityId: crypto.randomUUID(),
+        action: 'BREAK_START',
         startTime: nowISO,
+        process: selectedBreakInput || 'Break',
+        actor: user?.email || user?.uid || 'Employee',
+        sourceService: 'TMS_UI',
+        type: 'break',
+        name: selectedBreakInput || 'Break',
         device: currentDev
       });
+
+      // Find the last productive process to pre-select it for resume
+      const lastProductive = [...updatedActivities]
+        .reverse()
+        .find(act => act.type === 'productive');
+      if (lastProductive) {
+        setSelectedProcessInput(lastProductive.name);
+      }
+
+      const lastProductiveName = lastProductive?.name || 'Work';
+      const updatedLedger = appendShiftEvent(
+        currentShift.shiftEventLedger,
+        currentShift,
+        {
+          eventType: 'BREAK_START',
+          timestamp: nowISO,
+          performedBy: user.name || 'Employee',
+          source: 'TMS',
+          reason: `Started break: ${selectedBreakInput}`,
+          oldValue: lastProductiveName,
+          newValue: selectedBreakInput,
+          metadata: { breakType: selectedBreakInput }
+        }
+      );
 
       const updatedShift: TMSShift = {
         ...currentShift,
@@ -1651,7 +2785,8 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
         maxTouchPoints: typeof navigator !== 'undefined' ? navigator.maxTouchPoints : currentShift.maxTouchPoints,
         detectedDeviceType: meta.deviceType,
         detectedBrowser: meta.browser,
-        detectedOS: meta.os
+        detectedOS: meta.os,
+        shiftEventLedger: updatedLedger
       };
 
       // 1. Optimistic Update
@@ -1662,11 +2797,20 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
       const userRef = doc(db, 'users', user.uid);
       await Promise.all([
         saveShiftState(updatedShift),
-        updateDoc(userRef, {
+        setDoc(userRef, {
           status: 'BREAK'
-        })
+        }, { merge: true })
       ]);
 
+      clearCache();
+      logTmsEvent('BREAK_START', {
+        userId: user.uid,
+        shiftId: updatedShift.id,
+        timestamp: nowISO,
+        reason: `Started break: ${selectedBreakInput}`,
+        sourceFunction: 'TMSView.handleStartBreak',
+        details: { breakType: selectedBreakInput }
+      });
       toast.success(`Break started: ${selectedBreakInput}`);
     } catch (e: any) {
       console.error('Start break failed:', e);
@@ -1674,10 +2818,151 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
       // Revert optimistic update
       setLocalOwnShift(previousShift ? previousShift : undefined);
       setCurrentShift(previousShift);
+    } finally {
+      setIsProcessingPunch(false);
+    }
+  };
+
+  const handleTakeBreak = async (breakName: string) => {
+    if (isProcessingPunch) return;
+    if (!currentShift) return;
+
+    const shiftStartMs = new Date(currentShift.clockInTime).getTime();
+    const timeSinceStart = Date.now() - shiftStartMs;
+    if (timeSinceStart < 5000) {
+      console.warn('[TMS] Break request blocked: Shift started too recently (possible ghost punch).');
+      return;
+    }
+
+    if (currentShift.status === 'BREAK') {
+      toast.error('You are already on a break.');
+      return;
+    }
+
+    setIsProcessingPunch(true);
+    const breakType = breakName || '';
+    const isLunch = breakType.toLowerCase().includes('lunch');
+    const isMeeting = breakType.toLowerCase().includes('meeting') || breakType.toLowerCase().includes('coaching') || breakType.toLowerCase().includes('training');
+
+    if (isLunch) {
+      if (!hasTmsPermission('can_start_lunch')) {
+        toast.error('Access Denied: You do not have permission to Start Lunch.');
+        setIsProcessingPunch(false);
+        return;
+      }
+    } else if (isMeeting) {
+      if (!hasTmsPermission('can_start_meeting')) {
+        toast.error('Access Denied: You do not have permission to Start Meetings/Trainings.');
+        setIsProcessingPunch(false);
+        return;
+      }
+    } else {
+      if (!hasTmsPermission('can_start_break')) {
+        toast.error('Access Denied: You do not have permission to Start Breaks.');
+        setIsProcessingPunch(false);
+        return;
+      }
+    }
+
+    const previousShift = currentShift;
+
+    try {
+      const nowISO = getLiveTimeISO();
+      const currentDev = getDeviceType();
+      const meta = getDetailedDeviceMetadata();
+      const updatedActivities = [...currentShift.activities];
+      
+      if (updatedActivities.length > 0) {
+        // Immutable ledger: endTime mutation removed
+      }
+
+      updatedActivities.push({
+        activityId: crypto.randomUUID(),
+        action: 'BREAK_START',
+        startTime: nowISO,
+        process: breakName || 'Break',
+        actor: user?.email || user?.uid || 'Employee',
+        sourceService: 'TMS_UI',
+        type: 'break',
+        name: breakName || 'Break',
+        device: currentDev
+      });
+
+      const lastProductive = [...updatedActivities]
+        .reverse()
+        .find(act => act.type === 'productive');
+      if (lastProductive) {
+        setSelectedProcessInput(lastProductive.name);
+      }
+
+      const lastProductiveName = lastProductive?.name || 'Work';
+      const updatedLedger = appendShiftEvent(
+        currentShift.shiftEventLedger,
+        currentShift,
+        {
+          eventType: 'BREAK_START',
+          timestamp: nowISO,
+          performedBy: user.name || 'Employee',
+          source: 'TMS',
+          reason: `Started break: ${breakName}`,
+          oldValue: lastProductiveName,
+          newValue: breakName,
+          metadata: { breakType: breakName }
+        }
+      );
+
+      const updatedShift: TMSShift = {
+        ...currentShift,
+        activities: updatedActivities,
+        status: 'BREAK',
+        hasMobilePunches: currentShift.hasMobilePunches || currentDev === 'mobile',
+        deviceType: meta.deviceType,
+        browser: meta.browser,
+        os: meta.os,
+        userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : currentShift.userAgent,
+        platform: typeof navigator !== 'undefined' ? navigator.platform : currentShift.platform,
+        maxTouchPoints: typeof navigator !== 'undefined' ? navigator.maxTouchPoints : currentShift.maxTouchPoints,
+        detectedDeviceType: meta.deviceType,
+        detectedBrowser: meta.browser,
+        detectedOS: meta.os,
+        shiftEventLedger: updatedLedger
+      };
+
+      setLocalOwnShift(updatedShift);
+      setCurrentShift(updatedShift);
+      setSelectedBreakInput(breakName);
+
+      const userRef = doc(db, 'users', user.uid);
+      await Promise.all([
+        saveShiftState(updatedShift),
+        setDoc(userRef, {
+          status: 'BREAK',
+          lastBreakType: breakName || 'Break'
+        }, { merge: true })
+      ]);
+
+      clearCache();
+      logTmsEvent('BREAK_START', {
+        userId: user.uid,
+        shiftId: updatedShift.id,
+        timestamp: nowISO,
+        reason: `Started break: ${breakName}`,
+        sourceFunction: 'TMSView.handleTakeBreak',
+        details: { breakType: breakName }
+      });
+      toast.success(`You are now on break: ${breakName}`);
+    } catch (e: any) {
+      console.error('Break start failed:', e);
+      toast.error('Failed to start break on server: ' + e.message);
+      setLocalOwnShift(previousShift ? previousShift : undefined);
+      setCurrentShift(previousShift);
+    } finally {
+      setIsProcessingPunch(false);
     }
   };
 
   const handleResumeWork = async (resumeProcess: string) => {
+    if (isProcessingPunch) return;
     if (!currentShift) return;
     if (currentShift.status !== 'BREAK') {
       toast.error('You are already working.');
@@ -1688,6 +2973,7 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
       return;
     }
 
+    setIsProcessingPunch(true);
     // Find the break activity we are currently on to see which resume permission we need
     const lastActivity = currentShift.activities[currentShift.activities.length - 1];
     const breakName = lastActivity ? (lastActivity.name || '') : '';
@@ -1718,19 +3004,41 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
       const currentDev = getDeviceType();
       const meta = getDetailedDeviceMetadata();
       const updatedActivities = [...currentShift.activities];
+      const lastActivity = updatedActivities[updatedActivities.length - 1];
+      const breakName = lastActivity ? (lastActivity.name || '') : '';
       
       // Terminate break segment
       if (updatedActivities.length > 0) {
-        updatedActivities[updatedActivities.length - 1].endTime = nowISO;
+        // Immutable ledger: endTime mutation removed
       }
 
       // Add new active segment
       updatedActivities.push({
-        type: 'productive',
-        name: resumeProcess,
+        activityId: crypto.randomUUID(),
+        action: (currentShift?.status === 'BREAK' ? 'BREAK_END' : 'PROCESS_SWITCH'),
         startTime: nowISO,
+        process: resumeProcess || 'Active Work',
+        actor: user?.email || user?.uid || 'Employee',
+        sourceService: 'TMS_UI',
+        type: 'productive',
+        name: resumeProcess || 'Active Work',
         device: currentDev
       });
+
+      const updatedLedger = appendShiftEvent(
+        currentShift.shiftEventLedger,
+        currentShift,
+        {
+          eventType: 'BREAK_END',
+          timestamp: nowISO,
+          performedBy: user.name || 'Employee',
+          source: 'TMS',
+          reason: `Resumed work from break ${breakName} on process ${resumeProcess}`,
+          oldValue: breakName,
+          newValue: resumeProcess,
+          metadata: { previousBreak: breakName, resumeProcess }
+        }
+      );
 
       const updatedShift: TMSShift = {
         ...currentShift,
@@ -1745,7 +3053,8 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
         maxTouchPoints: typeof navigator !== 'undefined' ? navigator.maxTouchPoints : currentShift.maxTouchPoints,
         detectedDeviceType: meta.deviceType,
         detectedBrowser: meta.browser,
-        detectedOS: meta.os
+        detectedOS: meta.os,
+        shiftEventLedger: updatedLedger
       };
 
       // 1. Optimistic Update
@@ -1758,12 +3067,21 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
       const userRef = doc(db, 'users', user.uid);
       await Promise.all([
         saveShiftState(updatedShift),
-        updateDoc(userRef, {
+        setDoc(userRef, {
           status: 'ONLINE',
           lastUsedProcess: resumeProcess
-        })
+        }, { merge: true })
       ]);
 
+      clearCache();
+      logTmsEvent('BREAK_END', {
+        userId: user.uid,
+        shiftId: updatedShift.id,
+        timestamp: nowISO,
+        reason: `Resumed work on process: ${resumeProcess}`,
+        sourceFunction: 'TMSView.handleResumeWork',
+        details: { process: resumeProcess || 'Active Work' }
+      });
       toast.success(`Resumed work on process: ${resumeProcess}`);
     } catch (e: any) {
       console.error('Resume failed:', e);
@@ -1771,6 +3089,8 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
       // Revert optimistic update
       setLocalOwnShift(previousShift ? previousShift : undefined);
       setCurrentShift(previousShift);
+    } finally {
+      setIsProcessingPunch(false);
     }
   };
 
@@ -1784,8 +3104,12 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
   };
 
   const performClockOut = async () => {
+    if (isProcessingPunch) return;
     if (!currentShift) return;
+    setIsProcessingPunch(true);
     const previousShift = currentShift;
+    
+
     try {
       const nowISO = getLiveTimeISO();
       const currentDev = getDeviceType();
@@ -1793,34 +3117,128 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
       
       // Terminate last activity
       if (updatedActivities.length > 0) {
-        updatedActivities[updatedActivities.length - 1].endTime = nowISO;
+        // Immutable ledger: endTime mutation removed
       }
 
+      // Determine last used process to remember for next shift
+      const lastProd = [...updatedActivities].reverse().find(a => a.type === 'productive');
+      const lastProc = lastProd ? lastProd.name : selectedProcessInput;
+
+      const userIdentifier = user?.email || user?.uid || 'Unknown' || user.uid;
+      const updatedLedger = appendShiftEvent(
+        currentShift.shiftEventLedger,
+        currentShift,
+        {
+          eventType: 'CLOCK_OUT',
+          timestamp: nowISO,
+          performedBy: user.name || 'Employee',
+          source: 'TMS',
+          reason: 'Manual clock out by user',
+          oldValue: currentShift.status,
+          newValue: 'COMPLETED',
+          remarks: currentShift.remarks || 'Manual clock out by user'
+        }
+      );
+
       const finalizedShift = {
-        ...currentShift,
-        activities: updatedActivities,
-        clockOutTime: nowISO,
-        status: 'COMPLETED' as const,
-        clockOutDevice: currentDev,
-        hasMobilePunches: currentShift.hasMobilePunches || currentDev === 'mobile'
+        ...createLockedCompletedShift(
+          currentShift,
+          nowISO,
+          userIdentifier,
+          currentShift.remarks || 'Manual clock out by user',
+          currentDev,
+          'COMPLETED',
+          presentThreshold
+        ),
+        shiftEventLedger: updatedLedger
       };
+
+      if (currentShift.hasMobilePunches || currentDev === 'mobile') {
+        finalizedShift.hasMobilePunches = true;
+      }
 
       // 1. Optimistic Update
       setLocalOwnShift(null);
       setCurrentShift(null);
       setShowClockOutConfirm(false);
+      if (lastProc) {
+        setSelectedProcessInput(lastProc);
+        safeStorage.set(`tms_last_used_process_${user.uid}`, lastProc);
+      }
 
-      // 2. Perform database writes concurrently in parallel
+      // 2. Perform database writes with atomic batch to close ALL active/break sessions for user
+      const batch = writeBatch(db);
+
+      // Query any open active/break shifts for this user
+      try {
+        const qOpen = query(
+          collection(db, 'tmsShifts'),
+          where('userId', '==', user.uid)
+        );
+        const openSnap = await getDocs(qOpen);
+        const openDocs = openSnap.docs.filter(d => {
+          const s = d.data().status;
+          return (s === 'ACTIVE' || s === 'BREAK') && d.id !== currentShift.id;
+        });
+        openDocs.forEach(shDoc => {
+          const shData = shDoc.data();
+          const dupLedger = appendShiftEvent(
+            shData.shiftEventLedger,
+            shData,
+            {
+              eventType: 'CLOCK_OUT',
+              timestamp: nowISO,
+              performedBy: user.name || 'Employee',
+              source: 'TMS',
+              reason: 'Manual clock out by user (duplicate cleanup)',
+              oldValue: shData.status || 'ACTIVE',
+              newValue: 'COMPLETED',
+              remarks: 'Auto-resolved duplicate open shift during clock-out'
+            }
+          );
+          const closedDuplicate = {
+            ...createLockedCompletedShift(
+              { id: shDoc.id, ...shData },
+              nowISO,
+              userIdentifier,
+              shData.remarks || 'Manual clock out by user (duplicate cleanup)',
+              currentDev,
+              'COMPLETED',
+              presentThreshold
+            ),
+            shiftEventLedger: dupLedger
+          };
+          batch.set(shDoc.ref, closedDuplicate, { merge: true });
+        });
+      } catch (err) {
+        console.warn('Error fetching duplicate active shifts during clock-out:', err);
+      }
+
+      // Explicitly set finalized shift
+      batch.set(doc(db, 'tmsShifts', currentShift.id), finalizedShift);
+
+      // Set user OFFLINE
       const userRef = doc(db, 'users', user.uid);
-      await Promise.all([
-        saveShiftState(finalizedShift as any),
-        syncShiftToAttendance({ id: currentShift.id, ...finalizedShift }),
-        updateDoc(userRef, {
-          status: 'OFFLINE',
-          lastLogoutAt: nowISO
-        })
-      ]);
+      batch.set(userRef, {
+        status: 'OFFLINE',
+        lastLogoutAt: nowISO,
+        ...(lastProc ? { lastUsedProcess: lastProc } : {})
+      }, { merge: true });
 
+      // Delete live_session
+      batch.delete(doc(db, 'live_sessions', user.uid));
+
+      await batch.commit();
+
+      clearCache();
+      logTmsEvent('CLOCK_OUT', {
+        userId: user.uid,
+        shiftId: currentShift.id,
+        timestamp: nowISO,
+        reason: 'Manual clock out by user',
+        sourceFunction: 'TMSView.performClockOut',
+        details: { clockOutDevice: currentDev }
+      });
       toast.success('Clocked Out successfully. Shift recorded.');
     } catch (e: any) {
       console.error('Clock-out failed:', e);
@@ -1828,54 +3246,27 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
       // Revert optimistic update
       setLocalOwnShift(previousShift);
       setCurrentShift(previousShift);
+    } finally {
+      setIsProcessingPunch(false);
     }
   };
 
   // Math: Calculate utilization metrics for a given shift
-  const computeShiftStats = (shift: TMSShift) => {
-    const endMs = shift.clockOutTime 
-      ? new Date(shift.clockOutTime).getTime() 
-      : getLiveTime().getTime();
-    const startMs = new Date(shift.clockInTime).getTime();
-    
-    // Total elapsed duration
-    const totalShiftMs = Math.max(0, endMs - startMs);
-    
-    let activeMs = 0;
-    let breakMs = 0;
-
-    shift.activities.forEach(act => {
-      const aStart = new Date(act.startTime).getTime();
-      const aEnd = act.endTime ? new Date(act.endTime).getTime() : endMs;
-      const duration = Math.max(0, aEnd - aStart);
-      const actName = (act.name || '').toLowerCase();
-      const isProductive = act.type === 'productive' || 
-                           actName.includes('meeting') || 
-                           actName.includes('coaching') || 
-                           actName.includes('training') || 
-                           actName.includes('alignment');
-      if (isProductive) {
-        activeMs += duration;
-      } else {
-        breakMs += duration;
-      }
+  const getWorkDateString = (date: Date | string) => {
+    const d = new Date(date);
+    // Logical offset: shifts starting between 00:00 and 04:00 belong to previous day
+    const logicalDate = new Date(d.getTime() - 4 * 60 * 60 * 1000);
+    const formatter = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Kolkata',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit'
     });
+    return formatter.format(logicalDate);
+  };
 
-    // Utilization % = (Productive Minutes / Present Threshold Minutes) * 100
-    // Starts from 0% at Clock-In and capped at 100%
-    const thresholdMins = presentThreshold || 480;
-    const productiveMins = activeMs / 60000;
-    const utilization = Number(Math.min(100, Math.max(0, (productiveMins / thresholdMins) * 100)).toFixed(1));
-
-    return {
-      totalShiftStr: formatMs(totalShiftMs),
-      activeStr: formatMs(activeMs),
-      breakStr: formatMs(breakMs),
-      utilization,
-      totalShiftMs,
-      activeMs,
-      breakMs
-    };
+  const computeShiftStats = (shift: TMSShift) => {
+    return calculateShiftMetrics(shift, now.getTime());
   };
 
   // Admin Process configuration handlers:
@@ -1905,12 +3296,12 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
         oldValue: JSON.stringify(processes),
         newValue: JSON.stringify(updatedList),
         updatedBy: user.uid,
-        updatedByName: user.name,
-        updatedAt: new Date().toISOString(),
+        updatedByName: user?.name || user?.fullName || 'User',
+        updatedAt: getLiveTimeISO(),
         action: 'create_process',
         details: `Process "${newProcessName.trim()}" created.`
       });
-      console.log(`[PROCESS CREATION] Process "${newProcessName.trim()}" successfully created by User ${user.name} (${user.email}) at ${new Date().toISOString()}`);
+      console.log(`[PROCESS CREATION] Process "${newProcessName.trim()}" successfully created by User ${user.name} (${user?.email || user?.uid || 'Unknown'}) at ${getLiveTimeISO()}`);
 
       setNewProcessName('');
       toast.success('New process added to console.');
@@ -1942,12 +3333,12 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
         oldValue: JSON.stringify(processes),
         newValue: JSON.stringify(updatedList),
         updatedBy: user.uid,
-        updatedByName: user.name,
-        updatedAt: new Date().toISOString(),
+        updatedByName: user?.name || user?.fullName || 'User',
+        updatedAt: getLiveTimeISO(),
         action: 'delete_process',
         details: `Process "${procToDelete}" deleted.`
       });
-      console.log(`[PROCESS DELETION] Process "${procToDelete}" successfully deleted by User ${user.name} (${user.email}) at ${new Date().toISOString()}`);
+      console.log(`[PROCESS DELETION] Process "${procToDelete}" successfully deleted by User ${user.name} (${user?.email || user?.uid || 'Unknown'}) at ${getLiveTimeISO()}`);
 
       toast.success('Process deleted successfully.');
     } catch (e) {
@@ -1984,12 +3375,12 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
         oldValue: JSON.stringify(processes),
         newValue: JSON.stringify(updatedList),
         updatedBy: user.uid,
-        updatedByName: user.name,
-        updatedAt: new Date().toISOString(),
+        updatedByName: user?.name || user?.fullName || 'User',
+        updatedAt: getLiveTimeISO(),
         action: 'edit_process',
         details: `Process updated from "${oldName}" to "${trimmed}".`
       });
-      console.log(`[PROCESS UPDATE] Process successfully changed from "${oldName}" to "${trimmed}" by User ${user.name} (${user.email})`);
+      console.log(`[PROCESS UPDATE] Process successfully changed from "${oldName}" to "${trimmed}" by User ${user.name} (${user?.email || user?.uid || 'Unknown'})`);
 
       toast.success(`Successfully updated process name to "${trimmed}".`);
     } catch (e) {
@@ -1998,27 +3389,11 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
     }
   };
 
-  const dashboardRoles = [
-    UserRole.TEAM_LEAD, 
-    UserRole.QTL, 
-    UserRole.STL, 
-    UserRole.OPS_TL, 
-    UserRole.TRAINER_TL, 
-    UserRole.MANAGER, 
-    UserRole.ADMIN, 
-    UserRole.MIS,
-    UserRole.OPS_HEAD,
-    UserRole.HR,
-    UserRole.IT_MANAGER,
-    UserRole.SME
-  ];
-  const isDashboardUser = dashboardRoles.includes(user.role as UserRole);
-
   const { deviceType, browser, os } = getDetailedDeviceMetadata();
   const isMobileOrTablet = deviceType !== 'Desktop';
 
   if (desktopOnlyMode && isMobileOrTablet && !adminBypass) {
-    const isAdmin = user.role === 'ADMIN' || user.role === UserRole.ADMIN;
+    const isAdmin = normRoleUser.includes('ADMIN');
     return (
       <div className="flex flex-col items-center justify-center min-h-[70vh] p-8 text-center bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-3xl shadow-xl max-w-2xl mx-auto my-12 space-y-6">
         <div className="w-20 h-20 rounded-full bg-rose-100 dark:bg-rose-950 flex items-center justify-center text-rose-600 dark:text-rose-450 animate-bounce">
@@ -2068,14 +3443,40 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
     );
   }
 
-  if (isDashboardUser) {
+  if (isDashboardUser && loadingHierarchy) {
+    return (
+      <div className="flex h-[400px] items-center justify-center bg-slate-50/50 dark:bg-slate-900/10 rounded-2xl border border-slate-100 dark:border-slate-800 m-6">
+        <div className="text-center">
+          <RefreshCw size={24} className="animate-spin text-indigo-600 dark:text-indigo-400 mx-auto mb-3" />
+          <p className="text-xs font-bold text-slate-500 dark:text-slate-400">Loading reporting hierarchy...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (isDashboardUser && currentSubView !== 'tms-agent') {
     return (
       <SupervisorDashboard 
         user={user} 
-        allUsers={allUsers} 
+        allUsers={filteredUsers} 
         onRefreshAllData={fetchAllShifts}
         externalTheme={externalTheme}
-        processes={processes}
+        processes={allAvailableProcesses}
+        currentSubView={currentSubView}
+        onNavigateSubView={onNavigateSubView}
+        currentShift={currentShift}
+        myPastShifts={myPastShifts}
+        recentProcesses={recentProcesses}
+        favoriteProcesses={favoriteProcesses}
+        toggleFavorite={toggleFavorite}
+        handleClockIn={handleClockIn}
+        handleClockOut={handleClockOut}
+        handleTakeBreak={handleTakeBreak}
+        handleResumeWork={handleResumeWork}
+        handleSwitchProcess={handleSwitchProcess}
+        handleExtendShift={handleExtendShift}
+        handleManualLocationOverride={handleManualLocationOverride}
+        isProcessingPunch={isProcessingPunch}
       />
     );
   }
@@ -2099,7 +3500,7 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
         const isSessionRunning = sh.status !== 'COMPLETED';
         
         // Define stale: ACTIVE/BREAK but clockInTime > 24 hours ago
-        const isStale = isSessionRunning && (new Date().getTime() - new Date(sh.clockInTime).getTime() > 24 * 60 * 60 * 1000);
+        const isStale = isSessionRunning && (getLiveTime().getTime() - new Date(sh.clockInTime).getTime() > 24 * 60 * 60 * 1000);
         
         if (isMappedUser && isSessionRunning && !isStale) {
            return true; 
@@ -2139,7 +3540,7 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
       setShowExportModal(true);
     };
 
-    const executeTeamExport = (
+    const executeTeamExport = async (
       start: Date, 
       end: Date, 
       format: 'csv' | 'excel', 
@@ -2151,7 +3552,7 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
         return;
       }
 
-      const isTodayOnly = start.toDateString() === end.toDateString() && start.toDateString() === new Date().toDateString();
+      const isTodayOnly = start.toDateString() === end.toDateString() && start.toDateString() === getLiveTime().toDateString();
       const includeSummary = selectedReportType === 'summary' || selectedReportType === 'both';
       const includeChrono = selectedReportType === 'chronological' || selectedReportType === 'both';
 
@@ -2160,7 +3561,6 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
         'Agent Name',
         'Agent Email',
         'Role',
-        'Manager of Manager',
         isTodayOnly ? 'Live Status' : 'Period Status',
         'Process/Break',
         'Shift Count in Period',
@@ -2172,21 +3572,44 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
         'Range Utilization (%)'
       ];
 
+      // O(1) User maps for fast lookups
+      const usersByIdMap = new Map<string, any>();
+      const usersByEmailMap = new Map<string, any>();
+      allUsers.forEach(u => {
+        if (u.uid) usersByIdMap.set(u.uid, u);
+        if (u.email) usersByEmailMap.set(u.email.toLowerCase().trim(), u);
+      });
+
       // Filter fetchedShifts strictly by range and user mapping
       const teamUserIds = mappedUsers.map(u => u.uid);
+      
+      const requestedStartDateStr = start.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+      const requestedEndDateStr = end.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+
       const teamRangeShifts = fetchedShifts.filter(sh => {
-        const clockInDate = new Date(sh.clockInTime);
-        const isInRange = clockInDate >= start && clockInDate <= end;
+        const workDate = getWorkDateString(sh.clockInTime);
+        const isInRange = workDate >= requestedStartDateStr && workDate <= requestedEndDateStr;
         return isInRange && teamUserIds.includes(sh.userId);
       });
 
+      // Pre-group all fetched shifts by userId to avoid inner loop filters
+      const shiftsByUserId: Record<string, TMSShift[]> = {};
+      fetchedShifts.forEach(sh => {
+        if (sh.userId) {
+          if (!shiftsByUserId[sh.userId]) {
+            shiftsByUserId[sh.userId] = [];
+          }
+          shiftsByUserId[sh.userId].push(sh);
+        }
+      });
+
       const summaryRows = includeSummary ? mappedUsers.map(u => {
-        const userShifts = fetchedShifts.filter(sh => sh.userId === u.uid);
+        const userShifts = shiftsByUserId[u.uid] || [];
         const activeShift = userShifts.find(sh => sh.status === 'ACTIVE' || sh.status === 'BREAK');
         
         const rangeShifts = userShifts.filter(sh => {
-          const clockInDate = new Date(sh.clockInTime);
-          return clockInDate >= start && clockInDate <= end;
+          const workDate = getWorkDateString(sh.clockInTime);
+          return workDate >= requestedStartDateStr && workDate <= requestedEndDateStr;
         });
 
         let currentStatus = 'Offline';
@@ -2236,7 +3659,6 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
           u.name,
           u.email,
           u.role,
-          getManagerOfManager(u, allUsers),
           currentStatus,
           currentProcess,
           rangeShifts.length,
@@ -2253,7 +3675,6 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
         'Emp ID',
         'Agent Name',
         'Agent Email',
-        'Manager of Manager',
         'Date (IST)',
         'Action Sequence',
         'Duration Type',
@@ -2268,31 +3689,28 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
         const sortedShifts = [...shifts].sort((a, b) => new Date(a.clockInTime).getTime() - new Date(b.clockInTime).getTime());
 
         sortedShifts.forEach(sh => {
-          const dateStr = new Date(sh.clockInTime).toLocaleDateString('en-US', { timeZone: 'Asia/Kolkata' });
-          const uProfile = allUsers.find(x => x.uid === sh.userId || x.email === sh.userEmail);
+          const workDate = getWorkDateString(sh.clockInTime);
+          let uProfile = sh.userId ? usersByIdMap.get(sh.userId) : undefined;
+          if (!uProfile && sh.userEmail) {
+            uProfile = usersByEmailMap.get(sh.userEmail.toLowerCase().trim());
+          }
           const empId = uProfile?.employeeId || 'N/A';
-          const mom = uProfile ? getManagerOfManager(uProfile, allUsers) : 'N/A';
           
-          sh.activities.forEach((act, idx) => {
+          const reconstructed = buildTimelineFromActivityLedger(sh.activities || [], sh.status || 'ACTIVE', sh.clockOutTime, getLiveTime().getTime());
+          reconstructed.forEach((act, idx) => {
             const startTimeIST = new Date(act.startTime).toLocaleString('en-US', { timeZone: 'Asia/Kolkata' });
-            const endTimeIST = act.endTime 
-              ? new Date(act.endTime).toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }) 
-              : 'Ongoing';
+            const endTimeIST = act.isLive 
+              ? 'Ongoing'
+              : new Date(act.endTime).toLocaleString('en-US', { timeZone: 'Asia/Kolkata' });
             
-            let durationMin = 0;
-            if (act.endTime) {
-              durationMin = (new Date(act.endTime).getTime() - new Date(act.startTime).getTime()) / (1000 * 60);
-            } else {
-              durationMin = (getLiveTime().getTime() - new Date(act.startTime).getTime()) / (1000 * 60);
-              if (durationMin < 0) durationMin = 0;
-            }
+            const durationMs = new Date(act.endTime).getTime() - new Date(act.startTime).getTime();
+            const durationMin = durationMs / (1000 * 60);
 
             chronoRows.push([
               empId,
               sh.userName || 'N/A',
               sh.userEmail || 'N/A',
-              mom,
-              dateStr,
+              workDate,
               idx + 1,
               act.type === 'productive' ? 'Productive Work' : 'Break',
               act.name || 'N/A',
@@ -2307,7 +3725,60 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
 
       const chronoRows = includeChrono ? buildChronoRows(teamRangeShifts) : [];
 
-      console.log(`[REPORT EXPORT] Team Lead report exported by ${user.name} (${user.email}). Date range: ${start.toISOString()} to ${end.toISOString()} in format: ${format}, reportType: ${selectedReportType}`);
+      const ledgerHeaders = [
+        'Employee', 'User Email', 'Shift Date', 'Event Sequence', 'Event Time',
+        'Event Type', 'Old Value', 'New Value', 'Reason', 'Source',
+        'Performed By', 'Confidence', 'Remarks'
+      ];
+
+      const buildLedgerRows = (shifts: TMSShift[]) => {
+        const rows: any[] = [];
+        shifts.forEach(sh => {
+          const reportRows = formatShiftLedgerForReport(sh);
+          reportRows.forEach(r => {
+            rows.push([
+              r['Employee'],
+              r['User Email'],
+              r['Shift Date'],
+              r['Event Sequence'],
+              r['Event Time'],
+              r['Event Type'],
+              r['Old Value'],
+              r['New Value'],
+              r['Reason'],
+              r['Source'],
+              r['Performed By'],
+              r['Confidence'],
+              r['Remarks']
+            ]);
+          });
+        });
+        return rows;
+      };
+
+      const ledgerRows = includeChrono ? buildLedgerRows(teamRangeShifts) : [];
+
+      // Attendance logic sheet
+      const attendanceHeaders = ['Emp ID', 'Agent Name', 'Agent Email', 'Process', 'Date', 'Productive Mins', 'Status'];
+      const buildAttendanceRows = (shifts: TMSShift[]) => {
+        const mergedRecords = aggregateShiftsForHistoryAndReports(shifts, now.getTime());
+        return mergedRecords.map(m => {
+          let uP = m.userId ? usersByIdMap.get(m.userId) : undefined;
+          if (!uP && m.userEmail) {
+            uP = usersByEmailMap.get(m.userEmail.toLowerCase().trim());
+          }
+          const empId = uP?.employeeId || 'N/A';
+          const proc = m.process || uP?.process || 'N/A';
+          const productiveMins = m.productiveMs / 60000;
+          let status = 'Absent';
+          if (productiveMins > 480) status = 'Present';
+          else if (productiveMins >= 240) status = 'Half Day';
+          return [empId, m.userName, m.userEmail, proc, m.attendanceDate, productiveMins.toFixed(1), status];
+        });
+      };
+      const attendanceRows = buildAttendanceRows(teamRangeShifts);
+
+      console.log(`[REPORT EXPORT] Team Lead report exported by ${user.name} (${user?.email || user?.uid || 'Unknown'}). Date range: ${start.toISOString()} to ${end.toISOString()} in format: ${format}, reportType: ${selectedReportType}`);
 
       if (format === 'excel') {
         const workbook = XLSX.utils.book_new();
@@ -2320,59 +3791,94 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
           const wsChrono = XLSX.utils.aoa_to_sheet([chronoHeaders, ...chronoRows]);
           wsChrono['!cols'] = chronoHeaders.map(() => ({ wch: 18 }));
           XLSX.utils.book_append_sheet(workbook, wsChrono, "Chronological Activity Logs");
+
+          const wsLedger = XLSX.utils.aoa_to_sheet([ledgerHeaders, ...ledgerRows]);
+          wsLedger['!cols'] = ledgerHeaders.map(() => ({ wch: 18 }));
+          XLSX.utils.book_append_sheet(workbook, wsLedger, "Immutable Event Ledger");
+          
+          const wsAttendance = XLSX.utils.aoa_to_sheet([attendanceHeaders, ...attendanceRows]);
+          wsAttendance['!cols'] = attendanceHeaders.map(() => ({ wch: 18 }));
+          XLSX.utils.book_append_sheet(workbook, wsAttendance, "Attendance Report");
         } else if (selectedReportType === 'summary') {
           const wsMain = XLSX.utils.aoa_to_sheet([summaryHeaders, ...summaryRows]);
           wsMain['!cols'] = summaryHeaders.map(() => ({ wch: 18 }));
           XLSX.utils.book_append_sheet(workbook, wsMain, "Team Utilization");
+          
+          const wsAttendance = XLSX.utils.aoa_to_sheet([attendanceHeaders, ...attendanceRows]);
+          wsAttendance['!cols'] = attendanceHeaders.map(() => ({ wch: 18 }));
+          XLSX.utils.book_append_sheet(workbook, wsAttendance, "Attendance Report");
         } else if (selectedReportType === 'chronological') {
           const wsChrono = XLSX.utils.aoa_to_sheet([chronoHeaders, ...chronoRows]);
           wsChrono['!cols'] = chronoHeaders.map(() => ({ wch: 18 }));
           XLSX.utils.book_append_sheet(workbook, wsChrono, "Chronological Activity Logs");
+
+          const wsLedger = XLSX.utils.aoa_to_sheet([ledgerHeaders, ...ledgerRows]);
+          wsLedger['!cols'] = ledgerHeaders.map(() => ({ wch: 18 }));
+          XLSX.utils.book_append_sheet(workbook, wsLedger, "Immutable Event Ledger");
+          
+          const wsAttendance = XLSX.utils.aoa_to_sheet([attendanceHeaders, ...attendanceRows]);
+          wsAttendance['!cols'] = attendanceHeaders.map(() => ({ wch: 18 }));
+          XLSX.utils.book_append_sheet(workbook, wsAttendance, "Attendance Report");
         }
 
         const excelBuffer = XLSX.write(workbook, { bookType: 'xlsx', type: 'array' });
-        const blob = new Blob([excelBuffer], { type: 'application/octet-stream' });
-        const url = URL.createObjectURL(blob);
-        const link = document.createElement('a');
-        link.setAttribute('href', url);
-
+        
+        const zip = new JSZip();
         let filenameSuffix = "Team_Report";
         if (selectedReportType === 'both') filenameSuffix = "Team_Summary_and_Chronological_Report";
         else if (selectedReportType === 'summary') filenameSuffix = "Team_Summary_Report";
         else if (selectedReportType === 'chronological') filenameSuffix = "Team_Chronological_Activity_Logs";
 
-        link.setAttribute('download', `TMS_Team_${filenameSuffix}_${user.name.split(' ').join('_')}.xlsx`);
+        const safeUserSuffix = (user.name || user.fullName || 'User').split(' ').join('_');
+        const fileName = `TMS_Team_${filenameSuffix}_${safeUserSuffix}`;
+
+        zip.file(`${fileName}.xlsx`, excelBuffer);
+        const zipContent = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
+        
+        const url = URL.createObjectURL(zipContent);
+        const link = document.createElement('a');
+        link.setAttribute('href', url);
+        link.setAttribute('download', `${fileName}.zip`);
         document.body.appendChild(link);
         link.click();
         document.body.removeChild(link);
+        URL.revokeObjectURL(url);
       } else {
+        const safeUserSuffix = (user.name || user.fullName || 'User').split(' ').join('_');
+        const zip = new JSZip();
+        
         if (selectedReportType === 'summary') {
           const csvContent = "\uFEFF" + [summaryHeaders.join(','), ...summaryRows.map(r => r.map(val => `"${String(val).replace(/"/g, '""')}"`).join(','))].join('\n');
-          const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-          const url = URL.createObjectURL(blob);
+          const fileName = `TMS_Team_Summary_Report_${safeUserSuffix}`;
+          zip.file(`${fileName}.csv`, csvContent);
+          const zipContent = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
+          const url = URL.createObjectURL(zipContent);
           const link = document.createElement('a');
           link.setAttribute('href', url);
-          link.setAttribute('download', `TMS_Team_Summary_Report_${user.name.split(' ').join('_')}.csv`);
+          link.setAttribute('download', `${fileName}.zip`);
           document.body.appendChild(link);
           link.click();
           document.body.removeChild(link);
+          URL.revokeObjectURL(url);
         } else {
           const csvContent = "\uFEFF" + [chronoHeaders.join(','), ...chronoRows.map(r => r.map(val => `"${String(val).replace(/"/g, '""')}"`).join(','))].join('\n');
-          const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-          const url = URL.createObjectURL(blob);
+          const fileName = `TMS_Team_Chronological_Activity_Logs_${safeUserSuffix}`;
+          zip.file(`${fileName}.csv`, csvContent);
+          const zipContent = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
+          const url = URL.createObjectURL(zipContent);
           const link = document.createElement('a');
           link.setAttribute('href', url);
-          link.setAttribute('download', `TMS_Team_Chronological_Activity_Logs_${user.name.split(' ').join('_')}.csv`);
+          link.setAttribute('download', `${fileName}.zip`);
           document.body.appendChild(link);
           link.click();
           document.body.removeChild(link);
+          URL.revokeObjectURL(url);
         }
       }
-      
       toast.success('Utilization Report exported successfully!');
     };
 
-    const handleGenerateExport = async () => {
+  const handleGenerateExport = async () => {
       if (selectedRangePreset === 'custom' && (!startDateStr || !endDateStr)) {
         toast.error('Please select both start and end dates for custom range.');
         return;
@@ -2383,26 +3889,44 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
         return;
       }
 
-      toast.info('Fetching comprehensive shift data for requested range...');
+      // Expand query range by 6 hours on each side to catch overnight shifts crossing midnight
+      const expandedStart = new Date(start.getTime() - 6 * 60 * 60 * 1000);
+      const expandedEnd = new Date(end.getTime() + 6 * 60 * 60 * 1000);
+
+      toast.info('Generating utilization report...');
       try {
-        // Fetch data directly from Firestore for the export to bypass local state limits
-        const qRange = query(
-          collection(db, 'tmsShifts'),
-          where('clockInTime', '>=', start.toISOString()),
-          where('clockInTime', '<=', end.toISOString())
-        );
-        const snap = await getDocs(qRange);
-        const rangeShifts = snap.docs.map(d => ({ id: d.id, ...d.data() } as TMSShift));
+        let rangeShifts: TMSShift[] = [];
+        try {
+          const qRange = query(
+            collection(db, 'tmsShifts'),
+            where('clockInTime', '>=', expandedStart.toISOString()),
+            where('clockInTime', '<=', expandedEnd.toISOString())
+          );
+          const snap = await getDocsOptimized(qRange, 'export_range_tms_shifts');
+          const rawShifts = snap.docs.map(doc => ({ id: doc.id, ...(doc.data() as any) } as TMSShift));
+          rangeShifts = rawShifts.map(sh => sh as TMSShift);
+        } catch (firestoreErr) {
+          console.warn('Firestore range query failed or timed out, falling back to in-memory shifts:', firestoreErr);
+        }
+
+        if (rangeShifts.length === 0 && allShifts.length > 0) {
+          rangeShifts = allShifts
+            .filter(s => {
+              const t = new Date(s.clockInTime).getTime();
+              return t >= expandedStart.getTime() && t <= expandedEnd.getTime();
+            })
+            .map(sh => sh as TMSShift);
+        }
 
         setShowExportModal(false);
         if (exportType === 'team') {
-          executeTeamExport(start, end, exportFormat, rangeShifts, reportType);
+          await executeTeamExport(start, end, exportFormat, rangeShifts, reportType);
         } else {
-          executeOrganizationExport(start, end, exportFormat, rangeShifts, reportType);
+          await executeOrganizationExport(start, end, exportFormat, rangeShifts, reportType);
         }
       } catch (err) {
-        console.error('Export fetch failed:', err);
-        toast.error('Failed to fetch data for export. Please try a smaller range.');
+        console.error('Export generation failed:', err);
+        toast.error('Failed to generate report. Please try a smaller range.');
       }
     };
 
@@ -2421,6 +3945,14 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
         (s.status === 'ACTIVE' || s.status === 'BREAK')
       );
 
+      // 3. Filter by Tab selection
+      if (tmsAdminTab === 'exceeded_12h') {
+        if (!activeShift) return false;
+        const referenceTime = getLiveTime().getTime();
+        const productiveMs = getShiftProductiveMs(activeShift, referenceTime);
+        return productiveMs > 12 * 60 * 60 * 1000;
+      }
+
       if (activeShiftFilter === 'all') return true;
       if (activeShiftFilter === 'offline') return !activeShift;
       if (activeShiftFilter === 'active') return !!(activeShift && activeShift.status === 'ACTIVE');
@@ -2430,7 +3962,7 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
     });
 
     return (
-      <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
+      <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500 overflow-y-auto h-full pr-1">
         {/* Upper header segment */}
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-6 bg-white p-6 rounded-2xl border border-slate-200 shadow-sm text-slate-800">
           <div className="flex items-center gap-4">
@@ -2541,6 +4073,59 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
               </div>
             </div>
           </CardHeader>
+          
+          {/* Dashboard Sub-Tabs */}
+          <div className="flex border-b border-slate-100 bg-slate-50/50 px-6">
+            <button
+              onClick={() => {
+                setTmsAdminTab('roster');
+                setCurrentPage(1);
+              }}
+              className={`py-3 px-4 text-[10px] sm:text-xs font-black uppercase tracking-wider border-b-2 transition-colors flex items-center gap-2 cursor-pointer ${
+                tmsAdminTab === 'roster'
+                  ? 'border-sky-500 text-sky-600 font-extrabold'
+                  : 'border-transparent text-slate-400 hover:text-slate-600 hover:border-slate-200'
+              }`}
+            >
+              <User size={14} />
+              Roster Session Audit
+            </button>
+            <button
+              onClick={() => {
+                setTmsAdminTab('exceeded_12h');
+                setCurrentPage(1);
+              }}
+              className={`py-3 px-4 text-[10px] sm:text-xs font-black uppercase tracking-wider border-b-2 transition-colors flex items-center gap-2 relative cursor-pointer ${
+                tmsAdminTab === 'exceeded_12h'
+                  ? 'border-red-500 text-red-600 font-extrabold'
+                  : 'border-transparent text-slate-400 hover:text-slate-600 hover:border-slate-200'
+              }`}
+            >
+              <AlertTriangle size={14} className={tmsAdminTab === 'exceeded_12h' ? 'text-red-500' : 'text-slate-400'} />
+              Exceeded 12 Hours Productive
+              {(() => {
+                const count = mappedUsers.filter((u) => {
+                  const activeShift = allShifts.find(s => 
+                    s.userEmail?.toLowerCase() === u.email?.toLowerCase() && 
+                    (s.status === 'ACTIVE' || s.status === 'BREAK')
+                  );
+                  if (!activeShift) return false;
+                  const referenceTime = getLiveTime().getTime();
+                  const productiveMs = getShiftProductiveMs(activeShift, referenceTime);
+                  return productiveMs > 12 * 60 * 60 * 1000;
+                }).length;
+                if (count > 0) {
+                  return (
+                    <span className="bg-red-100 text-red-700 text-[9px] font-black px-1.5 py-0.5 rounded-full leading-none">
+                      {count}
+                    </span>
+                  );
+                }
+                return null;
+              })()}
+            </button>
+          </div>
+
           <CardContent className="p-0">
             <div className="overflow-auto max-h-[600px] border border-slate-100 rounded-lg scrollbar-thin">
               <table className="w-full text-left text-xs border-collapse">
@@ -2798,30 +4383,6 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
     );
   }
 
-  // Filtering admin shift records - memoized to prevent constant recalculation during clock ticks
-  const filteredAllShifts = React.useMemo(() => {
-    const search = (adminSearch || '').toLowerCase().trim();
-    if (!search) return allShifts;
-    return allShifts.filter(s => {
-      return (s.userName || '').toLowerCase().includes(search) ||
-             (s.userEmail || '').toLowerCase().includes(search) ||
-             (s.activities || []).some(act => (act.name || '').toLowerCase().includes(search));
-    });
-  }, [allShifts, adminSearch]);
-
-  const itemsPerPage = 30;
-
-  const totalPages = React.useMemo(() => {
-    return Math.ceil(filteredAllShifts.length / itemsPerPage) || 1;
-  }, [filteredAllShifts.length]);
-
-  const paginatedShifts = React.useMemo(() => {
-    return filteredAllShifts.slice(
-      (currentPage - 1) * itemsPerPage,
-      currentPage * itemsPerPage
-    );
-  }, [filteredAllShifts, currentPage]);
-
   const handleExportAllShifts = () => {
     setExportType('organization');
     setSelectedRangePreset('last30');
@@ -2832,22 +4393,24 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
     setShowExportModal(true);
   };
 
-  const executeOrganizationExport = (
+  const executeOrganizationExport = async (
     start: Date, 
     end: Date, 
     format: 'csv' | 'excel', 
     fetchedShifts: TMSShift[] = allShifts,
     selectedReportType: 'summary' | 'chronological' | 'both' = 'both'
   ) => {
-    // Filter fetchedShifts strictly by date range
-    const startISO = start.toISOString();
-    const endISO = end.toISOString();
+    // Filter fetchedShifts by work date logic (shifts starting before 4 AM belong to previous day)
+    const requestedStartDateStr = start.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+    const requestedEndDateStr = end.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+
     const rangeShifts = fetchedShifts.filter(sh => {
-      return sh.clockInTime >= startISO && sh.clockInTime <= endISO;
+      const shWorkDate = getWorkDateString(sh.clockInTime);
+      return shWorkDate >= requestedStartDateStr && shWorkDate <= requestedEndDateStr;
     });
 
     if (rangeShifts.length === 0) {
-      toast.error("No shift logs found in the selected date range");
+      toast.error("No shift logs found for the selected work date(s)");
       return;
     }
 
@@ -2858,7 +4421,6 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
       'Emp ID',
       'Name',
       'Email ID',
-      'Manager of Manager',
       'Shift Status',
       'Process Name',
       'Last Activity',
@@ -2867,8 +4429,21 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
       'Total Duration (Min)',
       'Productive Duration (Min)',
       'Break Duration (Min)',
-      'Utilization (%)'
+      'Utilization (%)',
+      'Work Location',
+      'Detection Method',
+      'Office Name',
+      'Public IP',
+      'Location Captured At'
     ];
+
+    // O(1) User maps for fast lookups
+    const usersByIdMap = new Map<string, any>();
+    const usersByEmailMap = new Map<string, any>();
+    allUsers.forEach(u => {
+      if (u.uid) usersByIdMap.set(u.uid, u);
+      if (u.email) usersByEmailMap.set(u.email.toLowerCase().trim(), u);
+    });
 
     const summaryRows = includeSummary ? rangeShifts.map(sh => {
       const stats = computeShiftStats(sh);
@@ -2881,21 +4456,23 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
       const totalProductiveMins = (stats.activeMs / (60 * 1000)).toFixed(1);
       const totalBreakMins = (stats.breakMs / (60 * 1000)).toFixed(1);
 
-      const productiveAct = [...sh.activities].reverse().find(act => act.type === 'productive');
+      const shActs = sh.activities || [];
+      const productiveAct = [...shActs].reverse().find(act => act.type === 'productive');
       const processName = productiveAct ? productiveAct.name : 'N/A';
-      const lastAct = sh.activities.length > 0 ? sh.activities[sh.activities.length - 1] : null;
+      const lastAct = shActs.length > 0 ? shActs[shActs.length - 1] : null;
       const lastActivity = lastAct ? lastAct.name : 'N/A';
 
-      const uProfile = allUsers.find(x => x.uid === sh.userId || x.email === sh.userEmail);
+      let uProfile = sh.userId ? usersByIdMap.get(sh.userId) : undefined;
+      if (!uProfile && sh.userEmail) {
+        uProfile = usersByEmailMap.get(sh.userEmail.toLowerCase().trim());
+      }
       const empId = uProfile?.employeeId || 'N/A';
-      const mom = uProfile ? getManagerOfManager(uProfile, allUsers) : 'N/A';
 
       return [
         empId,
-        sh.userName,
-        sh.userEmail,
-        mom,
-        sh.status,
+        sh.userName || 'N/A',
+        sh.userEmail || 'N/A',
+        sh.status || 'N/A',
         processName,
         lastActivity,
         clockIn,
@@ -2903,7 +4480,12 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
         totalShiftMins,
         totalProductiveMins,
         totalBreakMins,
-        stats.utilization + '%'
+        stats.utilization + '%',
+        sh.workLocation || 'Home',
+        sh.workLocationSource || 'IP Detection',
+        sh.officeName || 'N/A',
+        sh.publicIP || 'N/A',
+        sh.locationCapturedAt ? new Date(sh.locationCapturedAt).toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }) : 'N/A'
       ];
     }) : [];
 
@@ -2911,7 +4493,6 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
       'Emp ID',
       'Agent Name',
       'Agent Email',
-      'Manager of Manager',
       'Date (IST)',
       'Action Sequence',
       'Duration Type',
@@ -2926,31 +4507,28 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
       const sortedShifts = [...shifts].sort((a, b) => new Date(a.clockInTime).getTime() - new Date(b.clockInTime).getTime());
 
       sortedShifts.forEach(sh => {
-        const dateStr = new Date(sh.clockInTime).toLocaleDateString('en-US', { timeZone: 'Asia/Kolkata' });
-        const uProfile = allUsers.find(x => x.uid === sh.userId || x.email === sh.userEmail);
+        const workDate = getWorkDateString(sh.clockInTime);
+        let uProfile = sh.userId ? usersByIdMap.get(sh.userId) : undefined;
+        if (!uProfile && sh.userEmail) {
+          uProfile = usersByEmailMap.get(sh.userEmail.toLowerCase().trim());
+        }
         const empId = uProfile?.employeeId || 'N/A';
-        const mom = uProfile ? getManagerOfManager(uProfile, allUsers) : 'N/A';
         
-        sh.activities.forEach((act, idx) => {
+        const reconstructed = buildTimelineFromActivityLedger(sh.activities || [], sh.status || 'ACTIVE', sh.clockOutTime, getLiveTime().getTime());
+        reconstructed.forEach((act, idx) => {
           const startTimeIST = new Date(act.startTime).toLocaleString('en-US', { timeZone: 'Asia/Kolkata' });
-          const endTimeIST = act.endTime 
-            ? new Date(act.endTime).toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }) 
-            : 'Ongoing';
+          const endTimeIST = act.isLive 
+            ? 'Ongoing'
+            : new Date(act.endTime).toLocaleString('en-US', { timeZone: 'Asia/Kolkata' });
           
-          let durationMin = 0;
-          if (act.endTime) {
-            durationMin = (new Date(act.endTime).getTime() - new Date(act.startTime).getTime()) / (1000 * 60);
-          } else {
-            durationMin = (getLiveTime().getTime() - new Date(act.startTime).getTime()) / (1000 * 60);
-            if (durationMin < 0) durationMin = 0;
-          }
+          const durationMs = new Date(act.endTime).getTime() - new Date(act.startTime).getTime();
+          const durationMin = durationMs / (1000 * 60);
 
           chronoRows.push([
             empId,
             sh.userName || 'N/A',
             sh.userEmail || 'N/A',
-            mom,
-            dateStr,
+            workDate,
             idx + 1,
             act.type === 'productive' ? 'Productive Work' : 'Break',
             act.name || 'N/A',
@@ -2965,7 +4543,83 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
 
     const chronoRows = includeChrono ? buildChronoRowsForOrg(rangeShifts) : [];
 
-    console.log(`[REPORT EXPORT] Admin/Manager organization report exported by ${user.name} (${user.email}). Date range: ${start.toISOString()} to ${end.toISOString()} in format: ${format}, reportType: ${selectedReportType}`);
+    const ledgerHeaders = [
+      'Employee', 'User Email', 'Shift Date', 'Event Sequence', 'Event Time',
+      'Event Type', 'Old Value', 'New Value', 'Reason', 'Source',
+      'Performed By', 'Confidence', 'Remarks'
+    ];
+
+    const buildLedgerRows = (shifts: TMSShift[]) => {
+      const rows: any[] = [];
+      shifts.forEach(sh => {
+        const reportRows = formatShiftLedgerForReport(sh);
+        reportRows.forEach(r => {
+          rows.push([
+            r['Employee'],
+            r['User Email'],
+            r['Shift Date'],
+            r['Event Sequence'],
+            r['Event Time'],
+            r['Event Type'],
+            r['Old Value'],
+            r['New Value'],
+            r['Reason'],
+            r['Source'],
+            r['Performed By'],
+            r['Confidence'],
+            r['Remarks']
+          ]);
+        });
+      });
+      return rows;
+    };
+
+    const ledgerRows = includeChrono ? buildLedgerRows(rangeShifts) : [];
+
+    // NEW: Attendance Logic grouping by user and date
+    const attendanceHeaders = [
+      'Emp ID',
+      'Name',
+      'Email ID',
+      'Process',
+      'Date',
+      'Productive Mins',
+      'Attendance Status'
+    ];
+
+    const buildAttendanceRows = (shifts: TMSShift[]) => {
+      const mergedRecords = aggregateShiftsForHistoryAndReports(shifts, now.getTime());
+      return mergedRecords.map(m => {
+        let uProfile = m.userId ? usersByIdMap.get(m.userId) : undefined;
+        if (!uProfile && m.userEmail) {
+          uProfile = usersByEmailMap.get(m.userEmail.toLowerCase().trim());
+        }
+        const empId = uProfile?.employeeId || 'N/A';
+        const proc = m.process || uProfile?.process || 'N/A';
+        const prodMins = m.productiveMs / 60000;
+
+        let status = 'Absent';
+        if (prodMins > 480) {
+          status = 'Present';
+        } else if (prodMins >= 240) {
+          status = 'Half Day';
+        }
+
+        return [
+          empId,
+          m.userName,
+          m.userEmail,
+          proc,
+          m.attendanceDate,
+          prodMins.toFixed(1),
+          status
+        ];
+      });
+    };
+
+    const attendanceRows = buildAttendanceRows(rangeShifts);
+
+    console.log(`[REPORT EXPORT] Admin/Manager organization report exported by ${user.name} (${user?.email || user?.uid || 'Unknown'}). Date range: ${start.toISOString()} to ${end.toISOString()} in format: ${format}, reportType: ${selectedReportType}`);
 
     if (format === 'excel') {
       const workbook = XLSX.utils.book_new();
@@ -2978,55 +4632,84 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
         const wsChrono = XLSX.utils.aoa_to_sheet([chronoHeaders, ...chronoRows]);
         wsChrono['!cols'] = chronoHeaders.map(() => ({ wch: 18 }));
         XLSX.utils.book_append_sheet(workbook, wsChrono, "Chronological Activity Logs");
+
+        const wsLedger = XLSX.utils.aoa_to_sheet([ledgerHeaders, ...ledgerRows]);
+        wsLedger['!cols'] = ledgerHeaders.map(() => ({ wch: 18 }));
+        XLSX.utils.book_append_sheet(workbook, wsLedger, "Immutable Event Ledger");
+        
+        const wsAttendance = XLSX.utils.aoa_to_sheet([attendanceHeaders, ...attendanceRows]);
+        wsAttendance['!cols'] = attendanceHeaders.map(() => ({ wch: 18 }));
+        XLSX.utils.book_append_sheet(workbook, wsAttendance, "Attendance Report");
       } else if (selectedReportType === 'summary') {
         const wsMain = XLSX.utils.aoa_to_sheet([summaryHeaders, ...summaryRows]);
         wsMain['!cols'] = summaryHeaders.map(() => ({ wch: 18 }));
         XLSX.utils.book_append_sheet(workbook, wsMain, "Organization Utilization");
+
+        const wsAttendance = XLSX.utils.aoa_to_sheet([attendanceHeaders, ...attendanceRows]);
+        wsAttendance['!cols'] = attendanceHeaders.map(() => ({ wch: 18 }));
+        XLSX.utils.book_append_sheet(workbook, wsAttendance, "Attendance Report");
       } else if (selectedReportType === 'chronological') {
         const wsChrono = XLSX.utils.aoa_to_sheet([chronoHeaders, ...chronoRows]);
         wsChrono['!cols'] = chronoHeaders.map(() => ({ wch: 18 }));
         XLSX.utils.book_append_sheet(workbook, wsChrono, "Chronological Activity Logs");
+
+        const wsLedger = XLSX.utils.aoa_to_sheet([ledgerHeaders, ...ledgerRows]);
+        wsLedger['!cols'] = ledgerHeaders.map(() => ({ wch: 18 }));
+        XLSX.utils.book_append_sheet(workbook, wsLedger, "Immutable Event Ledger");
+
+        const wsAttendance = XLSX.utils.aoa_to_sheet([attendanceHeaders, ...attendanceRows]);
+        wsAttendance['!cols'] = attendanceHeaders.map(() => ({ wch: 18 }));
+        XLSX.utils.book_append_sheet(workbook, wsAttendance, "Attendance Report");
       }
-
       const excelBuffer = XLSX.write(workbook, { bookType: 'xlsx', type: 'array' });
-      const blob = new Blob([excelBuffer], { type: 'application/octet-stream' });
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.setAttribute('href', url);
-
+      const zip = new JSZip();
       let filenameSuffix = "Org_Report";
       if (selectedReportType === 'both') filenameSuffix = "Summary_and_Chronological_Report";
       else if (selectedReportType === 'summary') filenameSuffix = "Summary_Report";
       else if (selectedReportType === 'chronological') filenameSuffix = "Chronological_Activity_Logs";
 
-      link.setAttribute('download', `TMS_Org_${filenameSuffix}.xlsx`);
+      const fileName = `TMS_Org_${filenameSuffix}`;
+      zip.file(`${fileName}.xlsx`, excelBuffer);
+      const zipContent = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
+      
+      const url = URL.createObjectURL(zipContent);
+      const link = document.createElement('a');
+      link.setAttribute('href', url);
+      link.setAttribute('download', `${fileName}.zip`);
       document.body.appendChild(link);
       link.click();
       document.body.removeChild(link);
+      URL.revokeObjectURL(url);
     } else {
+      const zip = new JSZip();
       if (selectedReportType === 'summary') {
         const csvContent = "\uFEFF" + [summaryHeaders.join(','), ...summaryRows.map(r => r.map(val => `"${String(val).replace(/"/g, '""')}"`).join(','))].join('\n');
-        const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-        const url = URL.createObjectURL(blob);
+        const fileName = `TMS_Org_Summary_Report`;
+        zip.file(`${fileName}.csv`, csvContent);
+        const zipContent = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
+        const url = URL.createObjectURL(zipContent);
         const link = document.createElement('a');
         link.setAttribute('href', url);
-        link.setAttribute('download', `TMS_Org_Summary_Report.csv`);
+        link.setAttribute('download', `${fileName}.zip`);
         document.body.appendChild(link);
         link.click();
         document.body.removeChild(link);
+        URL.revokeObjectURL(url);
       } else {
         const csvContent = "\uFEFF" + [chronoHeaders.join(','), ...chronoRows.map(r => r.map(val => `"${String(val).replace(/"/g, '""')}"`).join(','))].join('\n');
-        const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-        const url = URL.createObjectURL(blob);
+        const fileName = `TMS_Org_Chronological_Activity_Logs`;
+        zip.file(`${fileName}.csv`, csvContent);
+        const zipContent = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
+        const url = URL.createObjectURL(zipContent);
         const link = document.createElement('a');
         link.setAttribute('href', url);
-        link.setAttribute('download', `TMS_Org_Chronological_Activity_Logs.csv`);
+        link.setAttribute('download', `${fileName}.zip`);
         document.body.appendChild(link);
         link.click();
         document.body.removeChild(link);
+        URL.revokeObjectURL(url);
       }
     }
-    
     toast.success('Organization Report exported successfully!');
   };
 
@@ -3041,22 +4724,36 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
       return;
     }
 
-    toast.info('Fetching comprehensive shift data for requested range...');
+    toast.info('Generating organization report...');
     try {
-      // Query data directly from Firestore to ensure exactness and reliability
-      const qRange = query(
-        collection(db, 'tmsShifts'),
-        where('clockInTime', '>=', start.toISOString()),
-        where('clockInTime', '<=', end.toISOString())
-      );
-      const snap = await getDocs(qRange);
-      const rangeShifts = snap.docs.map(d => ({ id: d.id, ...d.data() } as TMSShift));
+      let rangeShifts: TMSShift[] = [];
+      try {
+        const qRange = query(
+          collection(db, 'tmsShifts'),
+          where('clockInTime', '>=', start.toISOString()),
+          where('clockInTime', '<=', end.toISOString())
+        );
+        const snap = await getDocsOptimized(qRange, 'org_export_range_tms_shifts');
+        const rawShifts = snap.docs.map(doc => ({ id: doc.id, ...(doc.data() as any) } as TMSShift));
+        rangeShifts = rawShifts.map(sh => sh as TMSShift);
+      } catch (firestoreErr) {
+        console.warn('Firestore org range query failed, falling back to in-memory shifts:', firestoreErr);
+      }
+
+      if (rangeShifts.length === 0 && allShifts.length > 0) {
+        rangeShifts = allShifts
+          .filter(s => {
+            const t = new Date(s.clockInTime).getTime();
+            return t >= start.getTime() && t <= end.getTime();
+          })
+          .map(sh => sh as TMSShift);
+      }
 
       setShowExportModal(false);
-      executeOrganizationExport(start, end, exportFormat, rangeShifts, reportType);
+      await executeOrganizationExport(start, end, exportFormat, rangeShifts, reportType);
     } catch (err) {
-      console.error('Export fetch failed:', err);
-      toast.error('Failed to fetch data for export. Please try a smaller range.');
+      console.error('Organization export generation failed:', err);
+      toast.error('Failed to generate organization report. Please try a smaller range.');
     }
   };
 
@@ -3070,36 +4767,36 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
   const timelineColSpan = showSelfService ? "lg:col-span-7" : "lg:col-span-12";
 
   return (
-    <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
+    <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500 overflow-y-auto h-full pr-1">
       
       {/* Upper header segment */}
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-6 bg-white p-6 rounded-2xl border border-slate-200 shadow-sm">
-        <div className="flex items-center gap-4">
-          <div className="w-12 h-12 rounded-xl bg-sky-500 flex items-center justify-center text-white shadow-lg shadow-sky-200">
-            <Clock size={24} />
+      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 bg-white p-4.5 rounded-2xl border border-slate-200 shadow-sm">
+        <div className="flex items-center gap-3.5">
+          <div className="w-10 h-10 rounded-xl bg-sky-500 flex items-center justify-center text-white shadow-md shadow-sky-200 shrink-0">
+            <Clock size={20} />
           </div>
           <div>
-            <h2 className="text-2xl font-black text-slate-900 tracking-tight">Workforce Time Management</h2>
-            <p className="text-sm font-medium text-slate-500">Punch shifts, breaks, processes, and track real-time utilization</p>
+            <h2 className="text-[24px] font-black text-slate-900 tracking-tight leading-tight">Workforce Time Management</h2>
+            <p className="text-xs font-medium text-slate-500">Punch shifts, breaks, processes, and track real-time utilization</p>
           </div>
         </div>
 
-        <div className="flex flex-wrap items-center gap-3">
-          {canViewReports && ![UserRole.AGENT, UserRole.QA, UserRole.SME, UserRole.TRAINER, UserRole.MIS].includes(user.role as UserRole) && (
+        <div className="flex flex-wrap items-center gap-2.5">
+          {canViewReports && isDashboardUser && (
             <Button
               onClick={handleExportAllShifts}
-              className="bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold py-2.5 px-4 rounded-xl flex items-center gap-1.5 shadow-sm shadow-emerald-200 cursor-pointer"
+              className="bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold py-2 px-3.5 rounded-xl flex items-center gap-1.5 shadow-sm shadow-emerald-200 cursor-pointer h-9"
             >
-              <FileSpreadsheet size={16} /> Export Organization Report
+              <FileSpreadsheet size={15} /> Export Organization Report
             </Button>
           )}
 
           {/* Current system clock */}
-          <div className="flex items-center gap-4 bg-slate-50 border border-slate-200 px-5 py-2.5 rounded-xl">
-            <Activity className="text-emerald-500 animate-pulse shrink-0" size={18} />
+          <div className="flex items-center gap-3 bg-slate-50 border border-slate-200 px-4 py-1.5 rounded-xl">
+            <Activity className="text-emerald-500 animate-pulse shrink-0" size={16} />
             <div className="text-right">
               <p className="text-[9px] uppercase font-bold tracking-widest text-slate-400">Live Server Time (IST)</p>
-              <p className="font-mono text-xs font-bold text-slate-800 leading-none mt-1">
+              <p className="font-mono text-xs font-bold text-slate-800 leading-none mt-0.5">
                 <LiveHeaderClock />
               </p>
             </div>
@@ -3107,71 +4804,74 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
         </div>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
         
         {/* Punch Control / Agent Panel */}
         {showSelfService && (
-          <div className={`${punchColSpan} space-y-6`}>
-          <Card className="border-none shadow-md shadow-slate-200 overflow-visible">
-            <CardHeader className="bg-slate-900 text-white rounded-t-2xl pb-6">
+          <div className={`${punchColSpan} space-y-4`}>
+          <Card className="border-none shadow-md shadow-slate-200 overflow-visible bg-white">
+            <CardHeader className="bg-slate-900 text-white rounded-t-2xl py-2.5 px-3.5">
               <div className="flex items-center justify-between">
                 <div>
-                  <CardTitle className="text-lg font-black tracking-tight leading-none text-white">Punch Station</CardTitle>
-                  <CardDescription className="text-slate-400 text-xs leading-none mt-1.5">Shift controls and process routing</CardDescription>
+                  <CardTitle className="text-base font-black tracking-tight leading-none text-white">Punch Station</CardTitle>
+                  <CardDescription className="text-slate-400 text-[10px] leading-none mt-1">Shift controls and process routing</CardDescription>
                 </div>
-                <Badge className={`px-2.5 py-1 ${
+                <Badge className={`px-2 py-0.5 text-[9px] ${
                   !currentShift ? 'bg-red-500/20 text-red-400 border-red-500/30' :
                   currentShift.status === 'BREAK' ? 'bg-amber-500/20 text-amber-400 border-amber-500/30' :
                   'bg-emerald-500/20 text-emerald-400 border-emerald-500/30'
-                } border font-bold uppercase`}>
+                } border font-bold uppercase tracking-wider`}>
                   {!currentShift ? 'CLOCKED OUT' : currentShift.status === 'BREAK' ? 'ON BREAK' : 'ACTIVE WORK'}
                 </Badge>
               </div>
             </CardHeader>
-            <CardContent className="pt-6 space-y-6">
+            <CardContent className="p-3 space-y-2.5">
               
               {/* Ticking Clock Status inside Punch station */}
               <LiveAgentDurations 
                 currentShift={currentShift} 
                 myPastShifts={myPastShifts} 
                 formatMs={formatMs} 
+                now={now}
               />
 
-              {/* Device Verification Status */}
-              <div className="flex items-center justify-between px-4 py-2.5 bg-slate-50/80 rounded-xl border border-slate-200 border-dashed">
-                <div className="flex items-center gap-2.5">
-                  <div className={`p-1.5 rounded-lg ${deviceType === 'Desktop' ? 'bg-emerald-50 text-emerald-600' : 'bg-fuchsia-50 text-fuchsia-600'}`}>
-                    {deviceType === 'Desktop' ? <Monitor size={14} /> : <Smartphone size={14} />}
-                  </div>
-                  <div>
-                    <p className="text-[9px] font-black uppercase text-slate-400 leading-none">Access Point</p>
-                    <p className="text-[11px] font-extrabold text-slate-700 mt-0.5 leading-none">{deviceType} Verified</p>
-                  </div>
+              {/* Compact Device & Location Info Strip */}
+              <div className="flex items-center justify-between px-2.5 py-1.5 bg-slate-50 rounded-lg border border-slate-200/80 text-[11px]">
+                <div className="flex items-center gap-1.5 text-slate-600 font-semibold">
+                  {deviceType === 'Desktop' ? <Monitor size={12} className="text-emerald-600" /> : <Smartphone size={12} className="text-fuchsia-600" />}
+                  <span className="text-[10px]">{deviceType} • {os}</span>
                 </div>
-                <div className="text-right">
-                   <p className="text-[8px] font-black uppercase text-slate-400 leading-none">Platform OS</p>
-                   <p className="text-[10px] font-bold text-slate-500 mt-0.5 leading-none">{os}</p>
-                </div>
+                {currentShift && (
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-[10px] text-slate-600 font-bold">
+                      {(currentShift.workLocation || 'Home') === 'Office' ? '🏢 Office' : '🏠 Home'}
+                    </span>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="h-5 px-1.5 text-[9px] font-bold text-amber-600 hover:text-amber-700 hover:bg-amber-50 rounded cursor-pointer"
+                      onClick={async () => {
+                        const currentLoc = currentShift.workLocation || 'Home';
+                        const newLoc = currentLoc === 'Office' ? 'Home' : 'Office';
+                        await handleManualLocationOverride(newLoc);
+                      }}
+                    >
+                      Change
+                    </Button>
+                  </div>
+                )}
               </div>
 
-              {!currentShift && (
-                <div className="flex flex-col items-center justify-center p-6 bg-slate-50 border border-slate-200 border-dashed rounded-xl">
-                  <Clock className="text-slate-350 mb-1.5" size={24} />
-                  <p className="text-xs font-bold text-slate-500">You are currently clocked out.</p>
-                  <p className="text-[10px] text-slate-400 mt-0.5">Please select a process and clock in to begin.</p>
-                </div>
-              )}
-
-              {/* State Machine Flow Buttons */}
+              {/* State Machine Action Controls */}
               {!currentShift ? (
                 // 1. Clocked Out Interface
-                <div className="space-y-4">
-                  <div className="space-y-1.5">
-                    <Label className="text-xs font-bold text-slate-500 uppercase tracking-wider">Select Start Process</Label>
+                <div className="space-y-2 pt-0.5">
+                  <div className="space-y-1">
+                    <Label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Select Start Process</Label>
                     <ProcessSelector
-                      allProcesses={processes}
+                      allProcesses={allAvailableProcesses}
                       currentProcess={selectedProcessInput}
-                      onSelectProcess={setSelectedProcessInput}
+                      onSelectProcess={handleSelectProcess}
                       recentProcesses={recentProcesses}
                       favoriteProcesses={favoriteProcesses}
                       onToggleFavorite={toggleFavorite}
@@ -3179,83 +4879,79 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
                   </div>
                   <Button 
                     disabled={isProcessingPunch}
-                    className="w-full h-12 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-sm rounded-xl flex items-center justify-center gap-2 shadow-sm shadow-emerald-200 cursor-pointer disabled:opacity-50"
+                    className="w-full h-9 bg-emerald-600 hover:bg-emerald-700 text-white font-black text-xs rounded-lg flex items-center justify-center gap-1.5 shadow-sm shadow-emerald-200 cursor-pointer disabled:opacity-50"
                     onClick={handleClockIn}
                   >
                     {isProcessingPunch ? (
-                      <RefreshCw size={16} className="animate-spin" />
+                      <RefreshCw size={14} className="animate-spin" />
                     ) : (
-                      <Play size={16} />
+                      <Play size={14} />
                     )}
                     {isProcessingPunch ? 'CLOCKING IN...' : 'GO TO WORK & CLOCK IN'}
                   </Button>
                 </div>
               ) : currentShift.status === 'BREAK' ? (
                 // 2. Break Interface (Resume Controls)
-                <div className="space-y-4">
-                  <div className="p-3.5 bg-amber-50 border border-amber-200 rounded-lg text-xs leading-relaxed text-amber-800 flex items-start gap-2">
-                    <Coffee className="shrink-0 mt-0.5 text-amber-500" size={16} />
-                    <div>
-                      <p className="font-bold">You are on a Break: {currentShift.activities[currentShift.activities.length - 1].name}</p>
-                      <p className="mt-1 font-medium select-none">To resume working, choose your process and click Resume.</p>
-                    </div>
+                <div className="space-y-2 pt-0.5">
+                  <div className="p-2 bg-amber-50 border border-amber-200/80 rounded-lg text-[11px] text-amber-800 flex items-center gap-2 font-medium">
+                    <Coffee className="shrink-0 text-amber-500" size={14} />
+                    <span className="truncate">On Break: <strong className="font-bold">{currentShift.activities[currentShift.activities.length - 1]?.name || 'Break'}</strong></span>
                   </div>
-                  <div className="space-y-1.5">
-                    <Label className="text-xs font-bold text-slate-500 uppercase tracking-wider">Resume Process</Label>
+                  <div className="space-y-1">
+                    <Label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Resume Process</Label>
                     <ProcessSelector
-                      allProcesses={processes}
+                      allProcesses={allAvailableProcesses}
                       currentProcess={selectedProcessInput}
-                      onSelectProcess={setSelectedProcessInput}
+                      onSelectProcess={handleSelectProcess}
                       recentProcesses={recentProcesses}
                       favoriteProcesses={favoriteProcesses}
                       onToggleFavorite={toggleFavorite}
                     />
                   </div>
-                  <div className="grid grid-cols-2 gap-3">
+                  <div className="grid grid-cols-2 gap-2 pt-0.5">
                     <Button 
-                      className="h-11 bg-teal-600 hover:bg-teal-700 text-white font-black text-xs rounded-lg flex items-center justify-center gap-1.5 cursor-pointer"
+                      className="h-8.5 bg-teal-600 hover:bg-teal-700 text-white font-black text-xs rounded-lg flex items-center justify-center gap-1.5 cursor-pointer"
                       onClick={() => handleResumeWork(selectedProcessInput)}
                     >
-                      <CheckCircle size={14} /> RESUME WORK
+                      <CheckCircle size={13} /> RESUME
                     </Button>
                     <Button 
                       variant="destructive"
-                      className="h-11 font-black text-xs rounded-lg flex items-center justify-center gap-1.5 cursor-pointer"
+                      className="h-8.5 font-black text-xs rounded-lg flex items-center justify-center gap-1.5 cursor-pointer"
                       onClick={handleClockOut}
                     >
-                      <LogOut size={14} /> CLOCK OUT
+                      <LogOut size={13} /> CLOCK OUT
                     </Button>
                   </div>
                 </div>
               ) : (
                 // 3. Active Work Interface (Break/Switch Controls)
-                <div className="space-y-5">
-                  <div className="bg-sky-50 border border-sky-100 p-3.5 rounded-lg text-xs text-sky-800">
-                    <p className="font-bold">Current Active Process: <span className="underline">{selectedProcessInput}</span></p>
-                    <p className="mt-0.5">Switch processes anytime or punch a break from the controls below.</p>
+                <div className="space-y-2 pt-0.5">
+                  {/* Active Process Header */}
+                  <div className="bg-sky-50 border border-sky-100 px-2.5 py-1.5 rounded-lg text-[11px] text-sky-900 flex items-center justify-between">
+                    <span className="font-medium text-slate-500">Active Process:</span>
+                    <span className="font-extrabold text-sky-700 truncate max-w-[200px]">{currentActiveProcessName || selectedProcessInput}</span>
                   </div>
 
-                  {/* Switch process inline dropdown */}
-                  <div className="space-y-1.5 border-t border-slate-100 pt-4">
-                    <Label className="text-xs font-bold text-slate-500 uppercase tracking-wider">Switch To:</Label>
-                    <div className="flex gap-2">
+                  {/* Switch Process Row */}
+                  <div className="space-y-1">
+                    <Label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Switch Process</Label>
                     <ProcessSelector
-                      allProcesses={processes}
+                      allProcesses={allAvailableProcesses}
                       currentProcess={""}
                       onSelectProcess={handleSwitchProcess}
                       recentProcesses={recentProcesses}
                       favoriteProcesses={favoriteProcesses}
                       onToggleFavorite={toggleFavorite}
                     />
-                    </div>
                   </div>
 
-                  {/* Punch Break controls */}
-                  <div className="space-y-1.5 border-t border-slate-100 pt-4">
-                    <Label className="text-xs font-bold text-slate-500 uppercase tracking-wider">Take a Break</Label>
+                  {/* Take Break Row */}
+                  <div className="space-y-1">
+                    <Label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Take Break</Label>
                     <div className="flex gap-2">
                       <select
-                        className="flex-1 h-10 bg-white border border-slate-200 rounded-lg px-3 text-xs text-slate-800 font-semibold focus:ring-2 focus:ring-sky-500 focus:outline-none"
+                        className="flex-1 h-8.5 bg-white border border-slate-200 rounded-lg px-2 text-xs text-slate-800 font-semibold focus:ring-2 focus:ring-sky-500 focus:outline-none"
                         value={selectedBreakInput}
                         onChange={(e) => setSelectedBreakInput(e.target.value)}
                       >
@@ -3265,21 +4961,22 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
                       </select>
                       <Button 
                         size="sm" 
-                        className="bg-amber-500 hover:bg-amber-600 font-bold text-xs h-10 px-4 shrink-0 cursor-pointer text-white flex items-center gap-1"
+                        className="bg-amber-500 hover:bg-amber-600 font-bold text-xs h-8.5 px-3 shrink-0 cursor-pointer text-white flex items-center gap-1 rounded-lg"
                         onClick={handleStartBreak}
                       >
-                        <Coffee size={14} /> Punch Break
+                        <Coffee size={13} /> Break
                       </Button>
                     </div>
                   </div>
 
-                  <div className="border-t border-slate-100 pt-4">
+                  {/* End Work / Clock Out */}
+                  <div className="pt-1">
                     <Button 
                       variant="destructive"
-                      className="w-full h-11 font-black text-sm rounded-xl flex items-center justify-center gap-2 cursor-pointer shadow-sm shadow-red-200"
+                      className="w-full h-8.5 font-black text-xs rounded-lg flex items-center justify-center gap-1.5 cursor-pointer shadow-sm shadow-red-200"
                       onClick={handleClockOut}
                     >
-                      <LogOut size={16} /> END WORK & CLOCK OUT
+                      <LogOut size={14} /> END WORK & CLOCK OUT
                     </Button>
                   </div>
                 </div>
@@ -3288,80 +4985,128 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
           </Card>
 
           {/* Today's Shift Metrics Summary */}
-          {showOwnShiftSummary && currentShift && (
-            <Card className="border-none shadow-md shadow-slate-200 bg-white">
-              <CardHeader className="border-b border-rose-50/50 pb-3">
-                <CardTitle className="text-sm font-black text-slate-800">Shift Math & Utilization Summary</CardTitle>
-                <CardDescription className="text-[10px]">Real-time shift math (24/7 cross-day logic applied)</CardDescription>
-              </CardHeader>
-              <CardContent className="pt-4 flex items-center justify-between gap-4">
-                <div className="flex-1 space-y-3">
-                  <div className="flex items-center justify-between text-xs font-medium border-b border-slate-100 pb-1.5">
-                    <span className="text-slate-500">Utilization Rate:</span>
-                    <span className="font-extrabold text-teal-600 text-sm">
-                      {computeShiftStats(currentShift).utilization}%
-                    </span>
-                  </div>
-                  <LiveSummaryStats shift={currentShift} formatMs={formatMs} computeShiftStats={computeShiftStats} />
-                </div>
-
-                {/* Aesthetic Circular Progress */}
-                <div className="relative w-20 h-20 shrink-0 flex items-center justify-center">
-                  <LiveSummaryProgress shift={currentShift} computeShiftStats={computeShiftStats} />
-                </div>
-              </CardContent>
-            </Card>
+          {showOwnShiftSummary && (currentShift || (myPastShifts && myPastShifts.length > 0)) && (
+            <LiveShiftMathSummaryCard 
+              currentShift={currentShift}
+              myPastShifts={myPastShifts}
+              now={now}
+            />
           )}
         </div>
         )}
 
         {/* Shift Timeline / Session History Column */}
         {showTimelineCol && (
-        <div className={`${timelineColSpan} space-y-6`}>
+        <div className={`${timelineColSpan} space-y-4`}>
           {showOwnShiftSummary && (
           <Card className="border-none shadow-md shadow-slate-200">
-            <CardHeader className="border-b border-slate-100 pb-4">
+            <CardHeader className="border-b border-slate-100 py-2.5 px-4">
               <div className="flex items-center justify-between">
-                <div>
-                  <CardTitle className="text-lg font-black text-slate-900 tracking-tight">Active Timeline List</CardTitle>
-                  <CardDescription className="text-xs">Your segmented chronological punch log</CardDescription>
+                <div className="space-y-0.5">
+                  <CardTitle className="text-[17px] font-black text-slate-900 tracking-tight uppercase">Active Timeline List</CardTitle>
+                  <CardDescription className="text-[11px] font-bold text-slate-500 uppercase tracking-tight">Your segmented chronological punch log</CardDescription>
                 </div>
-                <Activity size={20} className="text-sky-400" />
+                <Activity size={18} className="text-sky-400" />
               </div>
             </CardHeader>
-            <CardContent className="pt-6">
+            <CardContent className="py-2 px-3.5 max-h-[440px] overflow-y-auto">
               {currentShift ? (
-                <div className="relative border-l border-slate-200 ml-4 pl-6 space-y-6">
-                  {currentShift.activities.map((act, index) => {
-                    const isProductive = act.type === 'productive';
-                    const actDuration = act.endTime 
-                      ? formatMs(new Date(act.endTime).getTime() - new Date(act.startTime).getTime())
-                      : 'Active Now';
+                <div className="relative border-l-2 border-slate-200 ml-3.5 pl-5 space-y-1 py-0.5">
+                  {sanitizeActivities(
+                    currentShift.activities || currentShift.shiftEventLedger || [], 
+                    currentShift.clockInTime, 
+                    currentShift.clockOutTime ? new Date(currentShift.clockOutTime).getTime() : getLiveTime().getTime(),
+                    currentShift.status,
+                    currentShift.clockOutTime
+                  ).map((act, index) => {
+                    const isAudit = isAuditOrDiagnosticEvent(act.action) || act.type === 'system';
+                    const isBreak = !isAudit && isBreakActivity(act.name, act.type);
+                    const isMeeting = !isAudit && isMeetingActivity(act.name);
+                    const isTraining = !isAudit && isTrainingActivity(act.name);
+                      
+                    let badgeColor = 'bg-emerald-100 text-emerald-800';
+                    let dotColor = 'bg-emerald-500';
+                    let badgeLabel = 'Productive';
+                    let Icon = CheckCircle;
+
+                    if (isAudit) {
+                      badgeColor = 'bg-slate-200 text-slate-700';
+                      dotColor = 'bg-slate-500';
+                      badgeLabel = 'System Event';
+                      Icon = AlertTriangle;
+                    } else if (isBreak) {
+                      badgeColor = 'bg-amber-100 text-amber-800';
+                      dotColor = 'bg-amber-500';
+                      badgeLabel = 'Break';
+                      Icon = Coffee;
+                    } else if (isMeeting) {
+                      badgeColor = 'bg-blue-100 text-blue-800';
+                      dotColor = 'bg-blue-500';
+                      badgeLabel = 'Meeting';
+                      Icon = Users;
+                    } else if (isTraining) {
+                      badgeColor = 'bg-purple-100 text-purple-800';
+                      dotColor = 'bg-purple-500';
+                      badgeLabel = 'Training';
+                      Icon = GraduationCap;
+                    }
+
+                    if (!isAudit) {
+                      if (act.action === 'CLOCK_IN') {
+                        badgeLabel = 'Clock In';
+                      } else if (act.action === 'PROCESS_SWITCH') {
+                        badgeLabel = 'Switch';
+                      } else if (act.action === 'RESUME_SHIFT' || act.action === 'BREAK_END') {
+                        badgeLabel = 'Resume';
+                      }
+                    }
+
+                    const displayDuration = act.isLive
+                      ? formatMs(getLiveTime().getTime() - new Date(act.startTime).getTime())
+                      : formatMs(act.durationMs || 0);
 
                     return (
-                      <div key={index} className="relative group">
+                      <div key={act.activityId || index} className="relative group animate-in fade-in slide-in-from-left-2 duration-300">
                         {/* Timeline dot */}
-                        <div className={`absolute -left-10 top-0.5 w-8 h-8 rounded-full border-4 border-white flex items-center justify-center text-white ${
-                          !act.endTime ? 'bg-sky-500 ring-4 ring-sky-100 animate-pulse' :
-                          isProductive ? 'bg-emerald-500' : 'bg-amber-500'
+                        <div className={`absolute -left-[27px] top-2 w-5 h-5 rounded-full border-2 border-white flex items-center justify-center text-white z-10 shadow-sm ${
+                          act.isLive ? 'bg-sky-600 ring-4 ring-sky-100 animate-pulse' : dotColor
                         }`}>
-                          {isProductive ? <CheckCircle size={10} /> : <Coffee size={10} />}
+                          <Icon size={10} strokeWidth={3} />
                         </div>
 
-                        <div>
-                          <div className="flex flex-wrap items-center gap-2">
-                            <span className="font-extrabold text-slate-950 text-sm">{act.name}</span>
-                            <Badge className={`${isProductive ? 'bg-emerald-100 text-emerald-800 hover:bg-emerald-100' : 'bg-amber-100 text-amber-800 hover:bg-amber-100'} text-[9px] uppercase font-extrabold pb-0.5`}>
-                              {act.type}
-                            </Badge>
-                            {!act.endTime && (
-                              <span className="text-[10px] bg-red-600 text-white font-bold px-1.5 rounded-full select-none">Active Timer</span>
-                            )}
+                        <div className="bg-slate-50/50 hover:bg-slate-50 px-3 py-1.5 rounded-lg border border-slate-100 transition-all">
+                          <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-0.5">
+                            <div className="flex items-center gap-1.5">
+                              <span className="font-black text-slate-900 text-[13px] tracking-tight">{act.name || act.process || 'Activity'}</span>
+                              <Badge className={`${badgeColor} text-[10px] uppercase font-black px-1.5 py-0 border-none shadow-none`}>
+                                {badgeLabel}
+                              </Badge>
+                              {act.isLive && (
+                                <span className="flex items-center gap-1 text-[10px] bg-red-600 text-white font-black px-1.5 py-0 rounded animate-pulse">
+                                  <div className="w-1 h-1 bg-white rounded-full"></div>
+                                  LIVE
+                                </span>
+                              )}
+                            </div>
+                            <div className="flex items-baseline gap-1.5">
+                              <span className="text-[9px] uppercase font-black text-slate-400 tracking-wider">Dur:</span>
+                              <span className="font-mono font-black text-xs text-slate-700">{displayDuration}</span>
+                            </div>
                           </div>
-                          <div className="flex items-center gap-4 text-xs font-medium text-slate-500 mt-1">
-                            <span>{formatTimeStr(act.startTime)} - {act.endTime ? formatTimeStr(act.endTime) : 'Present'}</span>
-                            <span className="text-slate-300">|</span>
-                            <span className="font-mono font-bold text-slate-700">{actDuration}</span>
+                          
+                          <div className="flex items-center gap-2 text-xs font-semibold text-slate-500 mt-0.5">
+                            <div className="flex items-center gap-1">
+                              <Clock size={11} className="text-slate-400" />
+                              <span>{formatTimeStr(act.startTime)}</span>
+                            </div>
+                            <span className="text-slate-300">→</span>
+                            <div className="flex items-center gap-1">
+                              {act.isLive ? (
+                                <span className="text-sky-600 font-black text-xs">CURRENT</span>
+                              ) : (
+                                <span>{formatTimeStr(act.endTime)}</span>
+                              )}
+                            </div>
                           </div>
                         </div>
                       </div>
@@ -3369,9 +5114,9 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
                   })}
                 </div>
               ) : (
-                <div className="text-center py-20">
-                  <div className="flex flex-col items-center gap-3 opacity-35 max-w-sm mx-auto">
-                    <History size={40} className="text-slate-400" />
+                <div className="text-center py-16">
+                  <div className="flex flex-col items-center gap-2 opacity-35 max-w-sm mx-auto">
+                    <History size={36} className="text-slate-400" />
                     <p className="text-xs uppercase tracking-widest font-black text-slate-600">No shift currently active</p>
                     <p className="text-[11px] font-medium text-slate-500">Your chronologic session intervals will compile here when clocked in.</p>
                   </div>
@@ -3384,42 +5129,82 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
           {/* Past Shift History Logs */}
           {showOwnAttendance && (
           <Card className="border-none shadow-md shadow-slate-200">
-            <CardHeader className="border-b border-slate-100 pb-4">
+            <CardHeader className="border-b border-slate-100 py-2.5 px-4">
               <CardTitle className="text-base font-black text-slate-900">Your Shift History</CardTitle>
-              <CardDescription className="text-xs">Archive of your completed workforce punches</CardDescription>
+              <CardDescription className="text-[11px] font-bold text-slate-500 uppercase tracking-tight">Archive of your completed workforce punches</CardDescription>
             </CardHeader>
-            <CardContent className="p-0 max-h-80 overflow-y-auto">
+            <CardContent className="p-0 max-h-[300px] overflow-y-auto">
               <div className="divide-y divide-slate-100">
-                {myPastShifts.filter(s => s.status === 'COMPLETED' && (Date.now() - new Date(s.clockInTime).getTime()) <= 7 * 24 * 60 * 60 * 1000).map((sh) => {
-                  const stats = computeShiftStats(sh);
-                  return (
-                    <div key={sh.id} className="p-4 hover:bg-slate-50 transition-colors flex items-center justify-between text-xs">
-                      <div className="space-y-1">
-                        <div className="flex items-center gap-2">
-                          <span className="font-extrabold text-slate-800">
-                            {formatDateStr(sh.clockInTime)}
-                          </span>
-                          <span className="text-slate-300">|</span>
-                          <span className="text-slate-500 font-semibold">
-                            {formatTimeStr(sh.clockInTime)} - {sh.clockOutTime ? formatTimeStr(sh.clockOutTime) : 'Ongoing'}
-                          </span>
-                        </div>
-                        <div className="text-[10px] text-slate-500 font-semibold">
-                          Total Productive: <span className="font-bold text-teal-600">{stats.activeStr}</span> &middot; Breaks: <span className="font-bold text-amber-600">{stats.breakStr}</span>
-                        </div>
+                {(() => {
+                  const completedStatuses = ['COMPLETED', 'AUTO_CLOSED', 'COMPLETED_FORCED', 'CLOCKED_OUT', 'CLOSED', 'ENDED'];
+                  const pastShiftsFiltered = myPastShifts.filter(s => {
+                    const normStatus = (s.status || '').toUpperCase();
+                    const isCompleted = completedStatuses.includes(normStatus) || Boolean(s.clockOutTime && normStatus !== 'ACTIVE' && normStatus !== 'BREAK');
+                    if (!isCompleted) return false;
+
+                    // GHOST SHIFT FILTER: Duration < 5 mins AND Productive < 1 min
+                    const startMs = parseTimestampMs(s.clockInTime);
+                    const endMs = s.clockOutTime ? parseTimestampMs(s.clockOutTime) : startMs;
+                    const durationMins = (endMs - startMs) / 60000;
+                    const prodMins = s.productiveMinutes || 0;
+                    if (durationMins < 5 && prodMins < 1) return false;
+
+                    const inMs = parseTimestampMs(s.clockInTime);
+                    if (!inMs) return false;
+                    // Past 14 days
+                    return (Date.now() - inMs) <= 14 * 24 * 60 * 60 * 1000;
+                  });
+
+                  if (pastShiftsFiltered.length === 0) {
+                    return (
+                      <div className="text-center py-8 opacity-40 text-[10px] uppercase font-black tracking-widest text-slate-600">
+                        No completed shift logs found (past 14 days)
                       </div>
-                      <div className="text-right">
-                        <p className="text-[9px] uppercase font-black text-slate-400 tracking-wider">Shift Utilization</p>
-                        <p className="font-mono font-black text-sm text-slate-900 mt-0.5">{stats.utilization}%</p>
+                    );
+                  }
+
+                  const mergedRecords = aggregateShiftsForHistoryAndReports(pastShiftsFiltered, now.getTime());
+
+                  // Group by Date for cleaner UI
+                  const groupedByDate = new Map<string, MergedShiftRecord[]>();
+                  mergedRecords.forEach(rec => {
+                    const date = formatDateStr(rec.clockInTime);
+                    if (!groupedByDate.has(date)) groupedByDate.set(date, []);
+                    groupedByDate.get(date)?.push(rec);
+                  });
+
+                  return Array.from(groupedByDate.entries()).map(([date, records]) => (
+                    <div key={date} className="border-b border-slate-50 last:border-0">
+                      <div className="bg-slate-50/50 px-3.5 py-0.5 text-[9px] uppercase font-black text-slate-400 tracking-wider">
+                        {date}
+                      </div>
+                      <div className="divide-y divide-slate-50">
+                        {records.map((rec) => {
+                          const activeStr = formatMs(rec.productiveMs);
+                          const breakStr = formatMs(rec.breakMs);
+                          return (
+                            <div key={rec.id} className="px-3.5 py-1.5 hover:bg-slate-50 transition-colors flex items-center justify-between text-xs">
+                              <div className="space-y-0">
+                                <div className="flex items-center gap-2">
+                                  <span className="text-slate-600 font-bold text-xs">
+                                    {formatTimeStr(rec.clockInTime)} - {rec.clockOutTime ? formatTimeStr(rec.clockOutTime) : 'Ongoing'}
+                                  </span>
+                                </div>
+                                <div className="text-[10px] text-slate-500 font-bold uppercase tracking-tight">
+                                  Prod: <span className="text-teal-600">{activeStr}</span> &middot; Breaks: <span className="text-amber-600">{breakStr}</span>
+                                </div>
+                              </div>
+                              <div className="text-right">
+                                <p className="text-[9px] uppercase font-black text-slate-400 tracking-wider leading-none">Utilization</p>
+                                <p className="font-mono font-black text-xs text-slate-900">{rec.utilization}%</p>
+                              </div>
+                            </div>
+                          );
+                        })}
                       </div>
                     </div>
-                  );
-                })}
-                {myPastShifts.filter(s => s.status === 'COMPLETED' && (Date.now() - new Date(s.clockInTime).getTime()) <= 7 * 24 * 60 * 60 * 1000).length === 0 && (
-                  <div className="text-center py-10 opacity-40 text-[10px] uppercase font-black tracking-widest text-slate-600">
-                    No completed shift logs found (past 7 days)
-                  </div>
-                )}
+                  ));
+                })()}
               </div>
             </CardContent>
           </Card>
@@ -3429,170 +5214,7 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
 
       </div>
 
-      {/* ADMIN PANEL - LIVE TRACKER (Process settings moved to Admin Console) */}
-      {canViewReports && (
-        <div className="border-t border-slate-200 pt-8 space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
-          <div className="flex items-center gap-3 bg-red-50/50 p-4 border border-red-100 rounded-xl">
-            <LockIcon className="text-red-500 shrink-0" size={18} />
-            <div>
-              <h3 className="text-sm font-black text-red-950 uppercase tracking-wide">Workforce Control: Clock Master Consolidation</h3>
-              <p className="text-[11px] font-bold text-red-800 leading-none mt-1">Supervise organization-wide utilization and live activity maps</p>
-            </div>
-          </div>
 
-          <div className="grid grid-cols-1 gap-8">
-            
-            {/* Realtime workforce dashboard & logs for Admin */}
-            <div className="space-y-6">
-              <Card className="border-none shadow-md shadow-slate-200">
-                <CardHeader className="border-b border-slate-100 pb-4">
-                  <div className="flex items-center justify-between">
-                    <div>
-                      <CardTitle className="text-sm font-extrabold text-slate-900 uppercase tracking-widest">Team Session Audit Logs</CardTitle>
-                      <CardDescription className="text-xs">Supervise shifts, chronological timelines, and real-time utilization index</CardDescription>
-                    </div>
-                    <div className="relative group w-36 sm:w-48 text-xs">
-                      <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400" size={13} />
-                      <Input 
-                        placeholder="Search users..." 
-                        className="pl-8 h-8 rounded-lg text-[11px] bg-slate-50/50"
-                        value={adminSearch}
-                        onChange={(e) => {
-                          setAdminSearch(e.target.value);
-                          setCurrentPage(1);
-                        }}
-                      />
-                    </div>
-                  </div>
-                </CardHeader>
-                <CardContent className="p-0 max-h-[500px] overflow-auto scrollbar-thin border border-slate-150 rounded-xl">
-                  <table className="w-full text-left text-xs border-collapse">
-                    <thead className="sticky top-0 z-10 bg-slate-50 shadow-xs">
-                      <tr className="bg-slate-50 text-slate-500 border-b border-slate-100 font-bold uppercase tracking-widest text-[9px] select-none">
-                          <th className="p-4 pl-6">Profile</th>
-                          <th className="p-4">Process / Status</th>
-                          <th className="p-4">Clocked Interval</th>
-                          <th className="p-4 text-center">Calculated Utilization</th>
-                          <th className="p-4 text-center">Action</th>
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-slate-100">
-                        {paginatedShifts.map((sh) => {
-                          const stats = computeShiftStats(sh);
-                          const currentActiveActivity = sh.activities[sh.activities.length - 1];
-
-                          return (
-                            <tr key={sh.id} className="hover:bg-slate-50/50 transition-colors">
-                              <td className="p-4 pl-6">
-                                <div className="flex items-center gap-3">
-                                  <div className="w-8 h-8 rounded-full overflow-hidden bg-slate-100 flex items-center justify-center font-bold text-[10px] text-slate-500 shrink-0 border border-slate-200">
-                                    {(() => {
-                                      const up = allUsers.find(u => u.uid === sh.userId || u.email === sh.userEmail);
-                                      if (up?.photoURL) {
-                                        return <img src={up.photoURL} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" />;
-                                      }
-                                      return sh.userName ? sh.userName.split(' ').map(n => n[0]).slice(0, 2).join('') : '??';
-                                    })()}
-                                  </div>
-                                  <div>
-                                    <div className="font-bold text-slate-800">{sh.userName}</div>
-                                    <div className="text-[10px] font-mono text-slate-400 font-medium leading-none mt-0.5">{sh.userEmail}</div>
-                                  </div>
-                                </div>
-                              </td>
-                              <td className="p-4">
-                                <div className="flex items-center gap-1.5">
-                                  <Badge className={`text-[10px] font-black uppercase ${
-                                    sh.status === 'COMPLETED' ? 'bg-slate-100 text-slate-700' :
-                                    sh.status === 'BREAK' ? 'bg-amber-100 text-amber-800 border-amber-200' :
-                                    'bg-sky-100 text-sky-800 border-sky-200'
-                                  }`}>
-                                    {sh.status === 'COMPLETED' ? 'COMPLETED' : `LIVE - ${sh.status}`}
-                                  </Badge>
-                                </div>
-                                <div className="text-[10px] text-slate-400 font-medium mt-1">
-                                  Last Activity: <span className="font-bold text-slate-600">{currentActiveActivity?.name || 'N/A'}</span>
-                                </div>
-                              </td>
-                              <td className="p-4 font-medium text-slate-500">
-                                <div className="flex flex-col gap-0.5 text-[11px]">
-                                  <span>Clock In: {formatTimeStr(sh.clockInTime)}</span>
-                                  <span>Clock Out: {sh.clockOutTime ? formatTimeStr(sh.clockOutTime) : 'Active'}</span>
-                                </div>
-                              </td>
-                              <td className="p-4 text-center font-bold text-sm text-[#0F172A] font-mono">
-                                {hasTmsPermission('view_team_productivity') ? (
-                                  <>
-                                    <div>{stats.utilization}%</div>
-                                    <div className="text-[10px] text-slate-400 font-normal leading-none mt-1">
-                                      Productive: {stats.activeStr} / {stats.totalShiftStr}
-                                    </div>
-                                  </>
-                                ) : (
-                                  <span className="text-slate-400 font-normal text-xs">-</span>
-                                )}
-                              </td>
-                              <td className="p-4 text-center">
-                                {(sh.status === 'ACTIVE' || sh.status === 'BREAK') && canUserForceLogoutTarget(user, sh.userId) ? (
-                                  <Button 
-                                    size="sm" 
-                                    variant="ghost" 
-                                    className="text-[10px] text-red-500 hover:text-red-700 hover:bg-red-50 border border-transparent hover:border-red-200 rounded-lg font-bold" 
-                                    onClick={() => startForceLogoutFlow(sh.id, sh.userId, sh.userName)}
-                                  >
-                                    Force Out
-                                  </Button>
-                                ) : (
-                                  <span className="text-slate-400 font-normal text-xs">-</span>
-                                )}
-                              </td>
-                            </tr>
-                          );
-                        })}
-                        {filteredAllShifts.length === 0 && (
-                          <tr>
-                            <td colSpan={5} className="p-10 text-center opacity-40 font-bold uppercase tracking-widest text-[10px] text-slate-400">
-                              No team records or matching logs found
-                            </td>
-                          </tr>
-                        )}
-                      </tbody>
-                    </table>
-                </CardContent>
-                <CardFooter className="py-3 px-6 border-t border-slate-100 flex flex-col sm:flex-row items-center justify-between text-xs text-slate-500 bg-slate-50/50 rounded-b-xl gap-3">
-                  <div>
-                    Showing <span className="font-extrabold text-slate-850">{filteredAllShifts.length === 0 ? 0 : (currentPage - 1) * itemsPerPage + 1}-{Math.min(filteredAllShifts.length, currentPage * itemsPerPage)}</span> of <span className="font-extrabold text-slate-850">{filteredAllShifts.length}</span> resources
-                  </div>
-                  <div className="flex items-center gap-1">
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      className="h-8 text-[11px] text-slate-705 font-bold bg-white hover:bg-slate-100 border-slate-200 rounded-lg shrink-0 cursor-pointer"
-                      onClick={() => setCurrentPage(prev => Math.max(1, prev - 1))}
-                      disabled={currentPage === 1}
-                    >
-                      <ChevronLeft size={14} className="mr-1" /> Prev
-                    </Button>
-                    <span className="font-bold text-slate-700 mx-2 text-[11px] select-none">
-                      Page {currentPage} of {totalPages}
-                    </span>
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      className="h-8 text-[11px] text-slate-705 font-bold bg-white hover:bg-slate-100 border-slate-200 rounded-lg shrink-0 cursor-pointer"
-                      onClick={() => setCurrentPage(prev => Math.min(totalPages, prev + 1))}
-                      disabled={currentPage === totalPages}
-                    >
-                      Next <ChevronRight size={14} className="ml-1" />
-                    </Button>
-                  </div>
-                </CardFooter>
-              </Card>
-            </div>
-
-          </div>
-        </div>
-      )}
 
       {/* Custom clock-out confirmation overlay modal */}
       {showClockOutConfirm && (
@@ -3895,6 +5517,121 @@ export default React.memo(function TMSView({ user, allUsers, onRefreshAllData, e
           </div>
         </div>
       )}
+
+      {/* Auto Logout Warning Warning Modal overlay */}
+      <AnimatePresence>
+        {autoLogoutWarning.show && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[9999] bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4"
+          >
+            <motion.div
+              initial={{ scale: 0.95, y: 10 }}
+              animate={{ scale: 1, y: 0 }}
+              exit={{ scale: 0.95, y: 10 }}
+              className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-3xl p-6 shadow-2xl max-w-md w-full space-y-6"
+            >
+              <div className="flex items-center gap-4 text-amber-500">
+                <div className="p-3 bg-amber-50 dark:bg-amber-950/40 rounded-full">
+                  <AlertCircle size={32} />
+                </div>
+                <div>
+                  <h3 className="text-lg font-bold text-slate-900 dark:text-white">
+                    Inactivity / Shift Warning
+                  </h3>
+                  <p className="text-xs text-slate-500 dark:text-slate-400">
+                    {autoLogoutWarning.reason === 'limit'
+                      ? 'You are approaching your 10-hour productive time limit.'
+                      : 'Your current session has been idle or active for a long duration.'}
+                  </p>
+                </div>
+              </div>
+
+              <div className="bg-amber-50/50 dark:bg-amber-950/10 border border-amber-100 dark:border-amber-900/20 rounded-2xl p-4 text-center">
+                <div className="text-[10px] font-bold text-amber-600 dark:text-amber-400 uppercase tracking-widest mb-1">
+                  Automatic Clock-out In
+                </div>
+                <div className="text-4xl font-black font-mono text-slate-800 dark:text-slate-100">
+                  {Math.floor(autoLogoutWarning.timeLeft / 60)}:
+                  {(autoLogoutWarning.timeLeft % 60).toString().padStart(2, '0')}
+                </div>
+                <p className="text-[11px] text-slate-400 mt-2">
+                  Are you still actively working? Click below to keep your session open.
+                </p>
+              </div>
+
+              <div className="flex gap-3 pt-2">
+                <Button
+                  className="w-full bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-800 dark:text-slate-200 font-bold py-2.5 rounded-xl text-xs cursor-pointer animate-in fade-in zoom-in-95 duration-150"
+                  onClick={async () => {
+                    // Force logout immediately if they choose to log out
+                    setAutoLogoutWarning({ show: false, timeLeft: 120, reason: 'limit' });
+                    // Trigger manual complete shift
+                    const limitMs = getShiftProductiveMs(currentShift!, getLiveTime().getTime());
+                    const { activities: updatedActivities, clockOutTime } = truncateShiftToProductiveTime(currentShift!, limitMs);
+                    const finalizedShift = {
+                      ...currentShift!,
+                      activities: updatedActivities,
+                      clockOutTime,
+                      status: 'COMPLETED' as const,
+                      remarks: 'Manually clocked out during warning dialog'
+                    };
+                    await saveShiftState(finalizedShift);
+                    const userRef = doc(db, 'users', user.uid);
+                    await setDoc(userRef, {
+                      status: 'OFFLINE',
+                      lastLogoutAt: clockOutTime
+                    }, { merge: true });
+                    setCurrentShift(null);
+                    setLocalOwnShift(undefined);
+                    clearCache();
+                    toast.info('Session closed successfully.', { duration: 5000 });
+                  }}
+                >
+                  Clock Out Now
+                </Button>
+                <Button
+                  className="w-full bg-amber-500 hover:bg-amber-600 text-white font-bold py-2.5 rounded-xl text-xs shadow-md shadow-amber-500/10 cursor-pointer animate-in fade-in zoom-in-95 duration-150"
+                  onClick={async () => {
+                    setLocalSessionExtended(true);
+                    setAutoLogoutWarning({ show: false, timeLeft: 120, reason: 'limit' });
+                    toast.success('Session extended. You can continue working safely.', { duration: 5000 });
+                    
+                    const activeShift = currentShiftRef.current;
+                    if (activeShift) {
+                      const updatedLedger = appendShiftEvent(
+                        activeShift.shiftEventLedger,
+                        activeShift,
+                        {
+                          eventType: 'SHIFT_EXTENSION',
+                          timestamp: new Date().toISOString(),
+                          performedBy: user.name || 'Employee',
+                          source: 'TMS',
+                          reason: 'User extended shift on warning dialog',
+                          oldValue: 'ACTIVE_WARNING',
+                          newValue: 'ACTIVE_EXTENDED',
+                          remarks: 'Manual shift extension to bypass active limit'
+                        }
+                      );
+                      const updatedShift = {
+                        ...activeShift,
+                        sessionExtended: true,
+                        extended: true,
+                        shiftEventLedger: updatedLedger
+                      };
+                      await saveShiftState(updatedShift);
+                    }
+                  }}
+                >
+                  Keep Session Active
+                </Button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
     </div>
   );

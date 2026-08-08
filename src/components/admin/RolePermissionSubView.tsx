@@ -31,34 +31,33 @@ import {
   where 
 } from 'firebase/firestore';
 import { toast } from 'sonner';
+import { useRoster } from '../../contexts/RosterContext';
 import { getDefaultTmsPermissions, TMSPermissions } from '../PermissionContext';
 
 // Defined standard roles matching UserRole
 const KNOWN_ROLES = [
   'ADMIN',
   'MANAGER',
-  'STL',
-  'OPS_TL',
+  'ASSISTANT_MANAGER',
+  'OPS_HEAD',
+  'HR',
+  'IT_MANAGER',
   'SME',
-  'QTL',
   'QA',
-  'TEAM_LEAD',
+  'Team Lead',
   'TRAINER',
-  'TRAINER_TL',
   'MIS',
   'AGENT'
 ];
 
 const ALL_MASTER_MODULES = [
   'Workforce TMS',
-  'KPI Scorecard',
   'Warnings',
   'PIP Management',
   'Historical Records',
   'Important Quality Links',
   'Console',
-  'Attendance',
-  'IT Help Desk'
+  'Attendance'
 ];
 
 interface RolePermissionSubViewProps {
@@ -94,11 +93,33 @@ export interface RolePermissionDoc {
 }
 
 export const RolePermissionSubView: React.FC<RolePermissionSubViewProps> = ({ adminTheme, logAdminEvent }) => {
+  const { roles } = useRoster();
   const [modules, setModules] = useState<string[]>(ALL_MASTER_MODULES);
   const [rolesList, setRolesList] = useState<string[]>(KNOWN_ROLES);
   const [permissions, setPermissions] = useState<Record<string, Record<string, Omit<RolePermissionDoc, 'role_name' | 'module_name'>>>>({});
   const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState(false);
+
+  useEffect(() => {
+    if (roles && roles.length > 0) {
+      const normalizeRoleName = (r: string): string => {
+        const trimmed = r.trim();
+        const upper = trimmed.toUpperCase();
+        if (upper === 'TEAM LEAD' || upper === 'TEAM_LEAD') {
+          return 'Team Lead';
+        }
+        return upper;
+      };
+      const filtered = roles
+        .map(normalizeRoleName)
+        .filter(r => {
+          const upper = r.toUpperCase();
+          const oldTLVariations = ['STL', 'OPS_TL', 'QTL', 'TRAINER_TL', 'TEAM_LEAD', 'TRAINER TL', 'OPS TL', 'OPS_TEAM_LEAD', 'TEAM_LEADER'];
+          return !oldTLVariations.includes(upper);
+        });
+      setRolesList(Array.from(new Set(filtered)));
+    }
+  }, [roles]);
 
   // Selector states
   const [selectedRole, setSelectedRole] = useState<string>('MANAGER');
@@ -135,18 +156,14 @@ export const RolePermissionSubView: React.FC<RolePermissionSubViewProps> = ({ ad
       }
       setModules(fetchedModules);
 
-      // 2. Fetch custom fields and roles
-      const rolesSnap = await getDocs(collection(db, 'roles'));
-      let fetchedRoles = Array.from(new Set(rolesSnap.docs.map(d => (d.data().name as string).toUpperCase())));
-      if (fetchedRoles.length === 0) {
-        const fbBatch = writeBatch(db);
-        KNOWN_ROLES.forEach(role => {
-          fbBatch.set(doc(db, 'roles', role), { id: role, name: role, description: `${role} Role`, createdAt: new Date().toISOString() });
-        });
-        await fbBatch.commit();
-        fetchedRoles = KNOWN_ROLES;
+      // 2. Fetch custom fields (Roles are managed via RosterContext)
+      // We don't fetch roles here anymore as they are provided by RosterContext
+      const fetchedRoles = rolesList.length > 0 ? rolesList : KNOWN_ROLES;
+      if (rolesList.length === 0) {
+        // Fallback to KNOWN_ROLES if roles not loaded yet, but usually they are
+        setRolesList(KNOWN_ROLES);
       }
-      setRolesList(fetchedRoles);
+
 
       // 3. Fetch permissions matrix map
       const permissionsSnap = await getDocs(collection(db, 'role_permissions'));
@@ -279,7 +296,7 @@ export const RolePermissionSubView: React.FC<RolePermissionSubViewProps> = ({ ad
                     assign: true,
                     bulk_action: true,
                   };
-                } else if (['TEAM_LEAD', 'STL', 'OPS_TL', 'TRAINER_TL', 'QTL'].includes(role)) {
+                } else if (role === 'Team Lead') {
                   defaults = {
                     ...defaults,
                     can_view: true,
@@ -386,7 +403,7 @@ export const RolePermissionSubView: React.FC<RolePermissionSubViewProps> = ({ ad
               can_export: true,
               can_approve: true,
             };
-          } else if (role === 'TEAM_LEAD' || role === 'STL' || role === 'OPS_TL') {
+          } else if (role === 'Team Lead') {
             const tlModules = ['Workforce TMS', 'KPI Scorecard', 'Warnings', 'PIP Management', 'Important Quality Links'];
             defaults = {
               can_view: tlModules.includes(mod),

@@ -35,6 +35,7 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { db, storage } from '../lib/firebase';
+import { getLiveTimeISO } from '../lib/timeSync';
 import { doc, getDoc, setDoc, updateDoc, collection, getDocs, query, where } from 'firebase/firestore';
 import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
 import { toast } from 'sonner';
@@ -103,20 +104,11 @@ interface EmployeeProfileState {
 
 export default React.memo(function MyProfileView({ user, allUsers, externalTheme, onRefreshAllData }: MyProfileViewProps) {
   const isAdminOrHR = user.role === 'ADMIN' || user.role === 'MANAGER' || user.role?.toUpperCase() === 'HR';
-  const canViewHRDirectory = user.role?.toUpperCase() === 'ADMIN' || user.role?.toUpperCase() === 'HR';
-  const [profileTab, setProfileTab] = useState<'my-profile' | 'hr-directory'>('my-profile');
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   
   // Current active view profile UID (usually standard is own uid, but Admin can select another user to inspect)
   const [inspectUserId, setInspectUserId] = useState<string>(user.uid);
-
-  // Redirect if insufficient permissions to view HR Directory
-  useEffect(() => {
-    if (!canViewHRDirectory && profileTab === 'hr-directory') {
-      setProfileTab('my-profile');
-    }
-  }, [canViewHRDirectory, profileTab]);
   
   // Profile state
   const [profile, setProfile] = useState<EmployeeProfileState>({
@@ -161,16 +153,6 @@ export default React.memo(function MyProfileView({ user, allUsers, externalTheme
   const [newSkill, setNewSkill] = useState('');
   const [newCert, setNewCert] = useState('');
   const [newLang, setNewLang] = useState('');
-
-  // HR/Admin Console directory states
-  const [searchQuery, setSearchQuery] = useState('');
-  const [filterMissingDoc, setFilterMissingDoc] = useState<'all' | 'pan' | 'aadhaar' | 'resume' | 'photo'>('all');
-  const [filterCompletion, setFilterCompletion] = useState<string>('all'); // all, <50, 50-80, >80
-  const [adminProfilesList, setAdminProfilesList] = useState<any[]>([]);
-
-  // Pagination states
-  const [currentPage, setCurrentPage] = useState(1);
-  const [pageSize, setPageSize] = useState(100);
 
   // Enhanced confirmation and diagnostic popups
   const [deletingDoc, setDeletingDoc] = useState<UploadedDocument | null>(null);
@@ -303,7 +285,7 @@ export default React.memo(function MyProfileView({ user, allUsers, externalTheme
             reportingManager: merged.reportingManager,
             accountStatus: merged.accountStatus,
             location: merged.location,
-            lastUpdatedAt: new Date().toISOString(),
+            lastUpdatedAt: getLiveTimeISO(),
             updatedBy: 'System Auto-Sync'
           }, { merge: true }).catch(err => {
             console.warn('Silent auto-sync skipped (potential offline/permissions warning):', err.message);
@@ -322,49 +304,6 @@ export default React.memo(function MyProfileView({ user, allUsers, externalTheme
 
     fetchProfile();
   }, [inspectUserId]);
-
-  // Load Admin Directory Profiles
-  useEffect(() => {
-    if (!canViewHRDirectory) return;
-
-    const loadAllProfiles = async () => {
-      try {
-        const snap = await getDocs(collection(db, 'employeeProfiles'));
-        const profilesMap = new Map();
-        snap.forEach(doc => {
-          profilesMap.set(doc.id, doc.data());
-        });
-
-        // Match with allUsers list to guarantee everyone has an overview
-        const fullList = allUsers.map(u => {
-          const dbProf = profilesMap.get(u.uid) || {};
-          const comp = calculateCompletion({ ...dbProf, employeeName: u.fullName, officialEmail: u.email });
-          return {
-            uid: u.uid,
-            fullName: u.fullName || u.name,
-            email: u.email,
-            role: u.role,
-            employeeId: u.employeeId || dbProf.employeeId || u.uid.slice(0, 8).toUpperCase(),
-            process: u.process || 'N/A',
-            department: u.department || 'Operations',
-            managerName: u.managerName || u.teamLeadName || 'Unassigned',
-            completion: comp,
-            documents: dbProf.documents || [],
-            profilePhotoUrl: dbProf.profilePhotoUrl || u.profilePhotoUrl || u.photoURL || '',
-            panNumber: dbProf.panNumber || '',
-            aadhaarNumber: dbProf.aadhaarNumber || '',
-            mobileNumber: dbProf.mobileNumber || ''
-          };
-        });
-
-        setAdminProfilesList(fullList);
-      } catch (err) {
-        console.error('Error loading directory files:', err);
-      }
-    };
-
-    loadAllProfiles();
-  }, [allUsers, inspectUserId, profileTab, canViewHRDirectory]);
 
   // Dynamic Profile Completion Calculation
   const calculateCompletion = (p: any) => {
@@ -483,7 +422,7 @@ export default React.memo(function MyProfileView({ user, allUsers, externalTheme
         name: file.name,
         type: fileType,
         url: downloadUrl,
-        uploadedAt: new Date().toISOString(),
+        uploadedAt: getLiveTimeISO(),
         size: (file.size / 1024 / 1024).toFixed(2) + ' MB'
       };
 
@@ -581,26 +520,26 @@ export default React.memo(function MyProfileView({ user, allUsers, externalTheme
       const payload = {
         ...profile,
         profileCompletionPercentage: completion,
-        lastUpdatedAt: new Date().toISOString(),
+        lastUpdatedAt: getLiveTimeISO(),
         updatedBy: user.name
       };
 
       // Also updates core user collection fields if user is administrator
       if (isAdminOrHR) {
-        const userRef = doc(db, 'users', inspectUserId);
+        const userRef = doc(db, 'employee_master', inspectUserId);
         await updateDoc(userRef, {
           fullName: profile.employeeName,
           status: liveAccountStatus,
           department: profile.department
         }).catch(() => console.log("Core users syncing skipped - non critical resource"));
 
-        // sync employee_master
+        // sync employee_master (already handled above now, but keeping consistency with any other triggers)
         const masterRef = doc(db, 'employee_master', inspectUserId);
         await setDoc(masterRef, {
           employeeName: profile.employeeName,
           status: liveAccountStatus,
           department: profile.department,
-          lastUpdated: new Date().toISOString()
+          lastUpdated: getLiveTimeISO()
         }, { merge: true }).catch(() => {});
       }
 
@@ -621,55 +560,6 @@ export default React.memo(function MyProfileView({ user, allUsers, externalTheme
       setSaving(false);
     }
   };
-
-  // Completion percentage filters calculation (extracted for reuse in stats)
-  const getFilteredList = () => {
-    return adminProfilesList.filter(p => {
-      const term = searchQuery.toLowerCase().trim();
-      const matchesSearch = 
-        p.fullName.toLowerCase().includes(term) ||
-        p.email.toLowerCase().includes(term) ||
-        p.employeeId.toLowerCase().includes(term) ||
-        p.managerName.toLowerCase().includes(term) ||
-        p.process.toLowerCase().includes(term);
-
-      // Missing doc validation filter
-      let matchesDoc = true;
-      if (filterMissingDoc === 'pan') {
-        matchesDoc = !p.documents.some((d: any) => d.type === 'pan');
-      } else if (filterMissingDoc === 'aadhaar') {
-        matchesDoc = !p.documents.some((d: any) => d.type === 'aadhaar');
-      } else if (filterMissingDoc === 'resume') {
-        matchesDoc = !p.documents.some((d: any) => d.type === 'resume');
-      } else if (filterMissingDoc === 'photo') {
-        matchesDoc = !p.profilePhotoUrl;
-      }
-
-      // Completion percentage filters
-      let matchesCompletion = true;
-      if (filterCompletion === 'low') matchesCompletion = p.completion < 50;
-      else if (filterCompletion === 'mid') matchesCompletion = p.completion >= 50 && p.completion <= 80;
-      else if (filterCompletion === 'high') matchesCompletion = p.completion > 80;
-
-      return matchesSearch && matchesDoc && matchesCompletion;
-    });
-  };
-
-  const filteredProfilesByCriteria = getFilteredList();
-  
-  // Total pages
-  const totalPages = Math.ceil(filteredProfilesByCriteria.length / pageSize);
-  
-  // Slice for current page
-  const paginatedProfiles = filteredProfilesByCriteria.slice(
-    (currentPage - 1) * pageSize,
-    currentPage * pageSize
-  );
-
-  // Reset to page 1 when filters change
-  useEffect(() => {
-    setCurrentPage(1);
-  }, [searchQuery, filterMissingDoc, filterCompletion, pageSize]);
 
   const cardClass = externalTheme === 'dark' 
     ? 'bg-slate-900 border-slate-800 text-slate-100 shadow-xl border rounded-2xl p-6' 
@@ -715,41 +605,10 @@ export default React.memo(function MyProfileView({ user, allUsers, externalTheme
               <p className="text-xs text-slate-400 mt-0.5">Manage official credentials, upload verification document transcripts, & monitor payroll integrations.</p>
             </div>
           </div>
-
-          {/* Tab Switcher if Admin or HR */}
-          {canViewHRDirectory && (
-            <div className="flex p-1 bg-slate-100 dark:bg-slate-950 border dark:border-slate-800 rounded-xl">
-              <button
-                onClick={() => {
-                  setInspectUserId(user.uid);
-                  setProfileTab('my-profile');
-                }}
-                className={`flex items-center gap-2 px-3 py-1.5 text-xs font-bold rounded-lg cursor-pointer transition-all ${
-                  profileTab === 'my-profile' && inspectUserId === user.uid
-                    ? 'bg-white dark:bg-slate-800 text-slate-850 dark:text-white shadow-sm'
-                    : 'text-slate-400 hover:text-slate-300'
-                }`}
-              >
-                <User size={13} /> My Personal Profile
-              </button>
-              {canViewHRDirectory && (
-                <button
-                  onClick={() => setProfileTab('hr-directory')}
-                  className={`flex items-center gap-2 px-3 py-1.5 text-xs font-bold rounded-lg cursor-pointer transition-all ${
-                    profileTab === 'hr-directory'
-                      ? 'bg-white dark:bg-slate-800 text-slate-850 dark:text-white shadow-sm'
-                      : 'text-slate-400 hover:text-slate-300'
-                  }`}
-                >
-                  <FolderLock size={13} /> HR Directory & Track ({adminProfilesList.length})
-                </button>
-              )}
-            </div>
-          )}
         </div>
 
         {/* Inspect Banner if active */}
-        {profileTab === 'my-profile' && inspectUserId !== user.uid && (
+        {inspectUserId !== user.uid && (
           <div className="mt-4 p-3 bg-indigo-650/10 border border-indigo-500/30 rounded-xl flex items-center justify-between text-xs text-indigo-400">
             <div className="flex items-center gap-2">
               <ShieldCheck size={16} />
@@ -769,7 +628,7 @@ export default React.memo(function MyProfileView({ user, allUsers, externalTheme
         <div className="h-64 flex items-center justify-center">
           <RefreshCw size={32} className="animate-spin text-indigo-500" />
         </div>
-      ) : profileTab === 'my-profile' ? (
+      ) : (
         <form onSubmit={handleSaveProfile} className="space-y-6">
           
           {/* 1. Overview and Completion Banner */}
@@ -1442,210 +1301,6 @@ export default React.memo(function MyProfileView({ user, allUsers, externalTheme
           </div>
 
         </form>
-      ) : (
-        /* Supervisor and HR Operator Visibility Center */
-        <div className="space-y-6 animate-in fade-in duration-300">
-          
-          {/* Main filters box */}
-          <div className={cardClass}>
-            <div className="flex flex-col lg:flex-row justify-between items-start lg:items-center gap-4">
-              <div className="flex items-center gap-2 text-xs font-black uppercase tracking-wider text-slate-400">
-                <Search size={15} className="text-indigo-500 animate-bounce" /> HR Operator Intelligence Controls ({filteredProfilesByCriteria.length} verified listings)
-              </div>
-              
-              <div className="flex flex-wrap gap-2.5 w-full lg:w-auto">
-                <div className="relative flex-1 lg:flex-none">
-                  <input 
-                    type="text" 
-                    value={searchQuery}
-                    onChange={e => setSearchQuery(e.target.value)}
-                    placeholder="Search name, email, employee id..."
-                    className="w-full lg:w-64 text-xs pl-8 pr-3 py-2.5 rounded-xl border border-slate-700/50 bg-slate-905 outline-none focus:ring-1 focus:ring-indigo-500 text-slate-100"
-                  />
-                  <Search size={13} className="absolute left-3 top-3 text-slate-400" />
-                </div>
-
-                <select
-                  value={filterMissingDoc}
-                  onChange={e => setFilterMissingDoc(e.target.value as any)}
-                  className="text-xs p-2.5 rounded-xl border border-slate-700/50 bg-slate-905 text-slate-200 outline-none"
-                >
-                  <option value="all">Check Documents (All)</option>
-                  <option value="pan">Missing PAN</option>
-                  <option value="aadhaar">Missing Aadhaar</option>
-                  <option value="resume">Missing Resume</option>
-                  <option value="photo">Missing Photo</option>
-                </select>
-
-                <select
-                  value={filterCompletion}
-                  onChange={e => setFilterCompletion(e.target.value)}
-                  className="text-xs p-2.5 rounded-xl border border-slate-700/50 bg-slate-905 text-slate-202 outline-none"
-                >
-                  <option value="all">Completion (All)</option>
-                  <option value="low">&lt; 50% Critical</option>
-                  <option value="mid">50% - 80% Partial</option>
-                  <option value="high">&gt; 80% Outstanding</option>
-                </select>
-
-                <div className="flex items-center gap-2 bg-slate-905 border border-slate-700/50 rounded-xl px-2">
-                  <span className="text-[10px] font-bold text-slate-500 uppercase px-1">Page Size</span>
-                  <select
-                    value={pageSize}
-                    onChange={e => setPageSize(Number(e.target.value))}
-                    className="text-xs py-2.5 bg-transparent text-slate-200 outline-none"
-                  >
-                    <option value={100}>100</option>
-                    <option value={200}>200</option>
-                    <option value={500}>500</option>
-                  </select>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* HR Profiles List Table */}
-          <div className={cardClass}>
-            <div className="overflow-x-auto rounded-xl">
-              <table className="w-full text-left text-xs border-collapse">
-                <thead>
-                  <tr className="bg-slate-950/20 text-slate-400 border-b border-slate-800">
-                    <th className="p-3">Employee Name</th>
-                    <th className="p-3">Employee ID</th>
-                    <th className="p-3">Supervisor</th>
-                    <th className="p-3">Campaign Process</th>
-                    <th className="p-3">PAN Status</th>
-                    <th className="p-3">Aadhaar Status</th>
-                    <th className="p-3">Profile Completion</th>
-                    <th className="p-3 text-center">Platform Override</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {paginatedProfiles.map((p) => {
-                    const hasPan = p.documents.some((d: any) => d.type === 'pan');
-                    const hasAadhaar = p.documents.some((d: any) => d.type === 'aadhaar');
-                    return (
-                      <tr key={p.uid} className="hover:bg-indigo-500/[0.02] border-b border-slate-800/40 transition-all duration-150">
-                        <td className="p-3 flex items-center gap-2.5">
-                          <div className="w-8 h-8 rounded-full overflow-hidden bg-slate-800 flex items-center justify-center font-bold text-xs shrink-0">
-                            {p.profilePhotoUrl ? (
-                              <img src={p.profilePhotoUrl} alt="Avatar" referrerPolicy="no-referrer" className="w-full h-full object-cover" />
-                            ) : (
-                              (p.fullName || '??').split(' ').filter(Boolean).map((n: string)=>n[0]).slice(0,2).join('').toUpperCase()
-                            )}
-                          </div>
-                          <div>
-                            <span className="font-bold block text-[#1E293B] dark:text-slate-100">{p.fullName}</span>
-                            <span className="text-[10px] text-slate-405 block">{p.email}</span>
-                          </div>
-                        </td>
-                        <td className="p-3 font-mono font-bold text-indigo-400">{p.employeeId}</td>
-                        <td className="p-3 text-slate-400 font-semibold">{p.managerName}</td>
-                        <td className="p-3"><span className="bg-emerald-500/10 text-emerald-400 text-[10px] px-2 py-0.5 rounded font-mono font-bold border border-emerald-500/10">{p.process}</span></td>
-                        <td className="p-3">
-                          {hasPan ? (
-                            <span className="text-[10px] text-emerald-400 font-bold bg-emerald-500/10 px-2 py-0.5 rounded">Uploaded</span>
-                          ) : (
-                            <span className="text-[10px] text-rose-455 font-bold bg-rose-500/10 px-2 py-0.5 rounded flex items-center gap-1 w-max"><AlertCircle size={10} /> Track Missing</span>
-                          )}
-                        </td>
-                        <td className="p-3">
-                          {hasAadhaar ? (
-                            <span className="text-[10px] text-emerald-400 font-bold bg-emerald-500/10 px-2 py-0.5 rounded">Uploaded</span>
-                          ) : (
-                            <span className="text-[10px] text-rose-455 font-bold bg-rose-500/10 px-2 py-0.5 rounded flex items-center gap-1 w-max"><AlertCircle size={10} /> Track Missing</span>
-                          )}
-                        </td>
-                        <td className="p-3">
-                          <div className="flex items-center gap-2">
-                            <div className="w-16 bg-slate-950 h-1.5 rounded-full overflow-hidden shadow-inner shrink-0">
-                              <div className="bg-indigo-500 h-full rounded-full" style={{ width: `${p.completion}%` }} />
-                            </div>
-                            <span className="font-mono font-bold text-slate-350">{p.completion}%</span>
-                          </div>
-                        </td>
-                        <td className="p-3 text-center">
-                          <button
-                            onClick={() => {
-                              setInspectUserId(p.uid);
-                              setProfileTab('my-profile');
-                            }}
-                            className="bg-indigo-650 hover:bg-indigo-700 text-white font-bold text-[10px] px-3 py-1.5 rounded-lg inline-flex items-center gap-1 cursor-pointer transition-all hover:scale-105 active:scale-95"
-                          >
-                            Inspect Profile <ArrowRight size={11} />
-                          </button>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                  {paginatedProfiles.length === 0 && (
-                    <tr>
-                      <td colSpan={8} className="p-8 text-center text-slate-500 italic font-medium">No verified directory listings matched your custom filters.</td>
-                    </tr>
-                  )}
-                </tbody>
-              </table>
-            </div>
-
-            {/* Pagination Controls */}
-            {totalPages > 1 && (
-              <div className="flex items-center justify-between mt-6 pt-6 border-t border-slate-800">
-                <div className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">
-                  Showing {(currentPage - 1) * pageSize + 1} to {Math.min(currentPage * pageSize, filteredProfilesByCriteria.length)} of {filteredProfilesByCriteria.length} Records
-                </div>
-                <div className="flex items-center gap-1.5">
-                  <button
-                    type="button"
-                    onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
-                    disabled={currentPage === 1}
-                    className="p-2 rounded-lg border border-slate-700 bg-slate-905 text-slate-400 hover:text-indigo-400 hover:border-indigo-500/50 disabled:opacity-30 disabled:hover:text-slate-400 disabled:hover:border-slate-700 transition-all cursor-pointer"
-                  >
-                    <ChevronLeft size={14} />
-                  </button>
-                  
-                  {/* Page numbers block */}
-                  <div className="flex items-center gap-1 mx-2">
-                    {Array.from({ length: Math.min(5, totalPages) }, (_, i) => {
-                      let pageNum = i + 1;
-                      if (totalPages > 5 && currentPage > 3) {
-                        pageNum = currentPage - 2 + i;
-                        if (pageNum + (5 - i - 1) > totalPages) {
-                          pageNum = totalPages - 4 + i;
-                        }
-                      }
-                      if (pageNum > totalPages || pageNum < 1) return null;
-                      
-                      return (
-                        <button
-                          key={pageNum}
-                          type="button"
-                          onClick={() => setCurrentPage(pageNum)}
-                          className={`w-8 h-8 rounded-lg text-xs font-bold transition-all cursor-pointer ${
-                            currentPage === pageNum
-                              ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-500/20'
-                              : 'text-slate-400 hover:bg-slate-805 hover:text-slate-200 border border-slate-800'
-                          }`}
-                        >
-                          {pageNum}
-                        </button>
-                      );
-                    })}
-                  </div>
-
-                  <button
-                    type="button"
-                    onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
-                    disabled={currentPage === totalPages}
-                    className="p-2 rounded-lg border border-slate-700 bg-slate-905 text-slate-400 hover:text-indigo-400 hover:border-indigo-500/50 disabled:opacity-30 disabled:hover:text-slate-400 disabled:hover:border-slate-700 transition-all cursor-pointer"
-                  >
-                    <ChevronRight size={14} />
-                  </button>
-                </div>
-              </div>
-            )}
-          </div>
-
-        </div>
       )}
 
       {/* 2. Deletion Confirmation Modal Overlay */}

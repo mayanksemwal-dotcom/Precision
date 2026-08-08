@@ -98,7 +98,7 @@ export const UserPicker = ({
   const loadAllUsers = useCallback(async () => {
     setLoading(true);
     try {
-      const q = query(collection(db, 'users'));
+      const q = query(collection(db, 'employee_master'));
       const snap = await getDocs(q);
       const results = snap.docs
         .map(d => {
@@ -142,7 +142,11 @@ export const UserPicker = ({
     }
 
     if (roleFilter && roleFilter.length > 0) {
-      list = list.filter(u => roleFilter.includes(u.role));
+      const normalizedFilters = roleFilter.map(r => r.toString().toUpperCase().trim());
+      list = list.filter(u => {
+        const uRole = (u.role || '').toString().toUpperCase().trim();
+        return normalizedFilters.includes(uRole) || normalizedFilters.some(f => uRole.includes(f));
+      });
     }
 
     // Return the matched listings, bounded for speed
@@ -154,7 +158,7 @@ export const UserPicker = ({
       {label && <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest pl-1">{label}</label>}
       
       <div 
-        className={`flex items-center justify-between w-full h-11 px-3 rounded-xl border transition-all cursor-pointer bg-white ${
+        className={`flex items-center justify-between w-full min-h-[52px] py-1.5 px-3 rounded-xl border transition-all cursor-pointer bg-white ${
           isOpen ? 'border-sky-500 ring-2 ring-sky-100 shadow-sm' : 'border-slate-200 hover:border-slate-300'
         }`}
         onClick={() => {
@@ -165,33 +169,38 @@ export const UserPicker = ({
           }
         }}
       >
-        <div className="flex items-center gap-2 overflow-hidden flex-1">
+        <div className="flex items-center gap-2.5 overflow-hidden flex-1 min-w-0">
           {selectedUser && selectedUser.photoURL ? (
-            <div className="w-6 h-6 rounded-full overflow-hidden shrink-0 border border-slate-200">
+            <div className="w-7 h-7 rounded-full overflow-hidden shrink-0 border border-slate-200">
               <img src={selectedUser.photoURL} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
             </div>
           ) : (
-            <UserIcon size={16} className={selectedUser ? 'text-sky-500' : 'text-slate-300'} />
+            <div className="w-7 h-7 rounded-full bg-slate-100 flex items-center justify-center shrink-0 border border-slate-200">
+              <UserIcon size={14} className={selectedUser ? 'text-sky-500' : 'text-slate-300'} />
+            </div>
           )}
           {selectedUser ? (
-                    <div className="flex flex-col items-start overflow-hidden">
-                       <span className="text-xs font-black text-slate-900 truncate leading-none">
-                         {selectedUser.employeeName || selectedUser.fullName || selectedUser.name}
-                       </span>
-                       <span className="text-[10px] text-slate-500 font-bold leading-none mt-1">
-                         {selectedUser.email}
-                       </span>
-                       <span className="text-[10px] text-slate-400 font-bold leading-none mt-1">
-                         {selectedUser.role} | {selectedUser.process || selectedUser.department || 'No Process'}
-                       </span>
-                    </div>
+            <div className="flex flex-col items-start overflow-hidden min-w-0 py-0.5">
+              <span className="text-xs font-black text-slate-900 truncate leading-tight w-full">
+                {selectedUser.employeeName || selectedUser.fullName || selectedUser.name}
+              </span>
+              {selectedUser.email && (
+                <span className="text-[10px] text-slate-500 font-bold truncate leading-tight mt-0.5 w-full">
+                  {selectedUser.email}
+                </span>
+              )}
+              <span className="text-[10px] text-slate-400 font-bold truncate leading-tight mt-0.5 w-full">
+                {selectedUser.role} {selectedUser.process || selectedUser.department ? `| ${selectedUser.process || selectedUser.department}` : ''}
+              </span>
+            </div>
           ) : (
-            <span className="text-xs text-slate-400 font-semibold">{placeholder}</span>
+            <span className="text-xs text-slate-400 font-semibold truncate">{placeholder}</span>
           )}
         </div>
         <div className="flex items-center gap-1 shrink-0 ml-2">
             {selectedUserId && (
                 <button 
+                  type="button"
                   onClick={(e) => {
                       e.stopPropagation();
                       onSelect({ uid: '' } as any);

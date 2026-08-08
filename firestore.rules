@@ -20,27 +20,35 @@ service cloud.firestore {
     
     // Role-based Access Helpers
     function getUserRole() {
-      return exists(/databases/$(database)/documents/users/$(request.auth.uid))
-             ? get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role
-             : 'AGENT';
+      return exists(/databases/$(database)/documents/employee_master/$(request.auth.uid))
+             ? get(/databases/$(database)/documents/employee_master/$(request.auth.uid)).data.role
+             : (exists(/databases/$(database)/documents/users/$(request.auth.uid))
+                ? get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role
+                : 'AGENT');
+    }
+
+    function isGlobalRole() {
+      let role = getUserRole().upper();
+      let globals = ['ADMIN', 'OPS_HEAD', 'MIS', 'MANAGER', 'HR', 'IT_MANAGER', 'ASSISTANT_MANAGER', 'OPS HEAD', 'EXECUTIVE', 'DIRECTOR', 'VP', 'SUPERVISOR'];
+      return isSignedIn() && (role in globals || isAdmin());
     }
     
     function isRole(role) { return isVerified() && getUserRole().upper() == role; }
     function isAdmin() {
       let role = getUserRole().upper();
       let isAdminEmail = request.auth.token.email != null && request.auth.token.email.lower() == 'mayank.semwal@bergtechnologies.co.in';
-      return isSignedIn() && (role == 'ADMIN' || (isAdminEmail && (role == 'AGENT' || role == '')));
+      return isSignedIn() && (role == 'ADMIN' || isAdminEmail);
     }
 
     function isManager() { 
       let role = getUserRole().upper();
-      let managerRoles = ['MANAGER', 'ASSISTANT_MANAGER', 'EXECUTIVE', 'OPS_HEAD', 'OPS HEAD', 'HR', 'HR MANAGER', 'IT_MANAGER', 'IT MANAGER'];
+      let managerRoles = ['MANAGER', 'ASSISTANT_MANAGER', 'EXECUTIVE', 'OPS_HEAD', 'OPS HEAD', 'HR', 'HR MANAGER', 'IT_MANAGER', 'IT MANAGER', 'SUPERVISOR'];
       return isAdmin() || role in managerRoles;
     }
     function isQA() { return isRole('QA') || isManager(); }
     function isTL() { 
       let role = getUserRole().upper();
-      let tlRoles = ['TEAM_LEAD', 'STL', 'OPS_TL', 'QTL', 'TRAINER_TL', 'TRAINER', 'MIS', 'SME', 'MANAGER', 'ASSISTANT_MANAGER', 'ADMIN', 'TEAM LEAD', 'TRAINER TL', 'OPS TL', 'OPS_HEAD', 'OPS HEAD', 'HR', 'HR MANAGER', 'IT_MANAGER', 'IT MANAGER'];
+      let tlRoles = ['TEAM_LEAD', 'STL', 'OPS_TL', 'QTL', 'TRAINER_TL', 'TRAINER', 'MIS', 'SME', 'MANAGER', 'ASSISTANT_MANAGER', 'ADMIN', 'TEAM LEAD', 'TRAINER TL', 'OPS TL', 'OPS_HEAD', 'OPS HEAD', 'HR', 'HR MANAGER', 'IT_MANAGER', 'IT MANAGER', 'SUPERVISOR'];
       return isAdmin() || role in tlRoles || isManager(); 
     }
     function isAgent() { return isRole('AGENT') || isTL() || isQA(); }
@@ -92,7 +100,7 @@ service cloud.firestore {
       allow get: if isVerified();
       allow list: if isVerified();
       allow create: if isVerified() && (isOwner(userId) || isAdmin() || isManager() || isRole('HR'));
-      allow update: if isVerified() && (isOwner(userId) || isAdmin() || isManager() || isRole('HR'));
+      allow update: if isVerified() && (isOwner(userId) || isAdmin() || isManager() || isRole('HR') || isTL());
       allow delete: if isAdmin();
     }
 
@@ -145,8 +153,10 @@ service cloud.firestore {
 
     function isITEngineer() {
       let role = getUserRole().upper();
-      let isEng = exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
-                  get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isITEngineer == true;
+      let isEng = (exists(/databases/$(database)/documents/employee_master/$(request.auth.uid)) && 
+                   get(/databases/$(database)/documents/employee_master/$(request.auth.uid)).data.isITEngineer == true) ||
+                  (exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
+                   get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isITEngineer == true);
       return isVerified() && (role == 'IT_MANAGER' || role == 'IT MANAGER' || role == 'IT_ENGINEER' || isEng);
     }
 
@@ -239,6 +249,12 @@ service cloud.firestore {
       allow write, delete: if isAdmin();
     }
 
+    match /kpi_scorecards/{scorecardId} {
+      allow read: if isVerified();
+      allow write: if isVerified() && (isManager() || isAdmin() || isTL() || isRole('MIS'));
+      allow delete: if isVerified() && (isManager() || isAdmin() || isRole('MIS'));
+    }
+
     match /kpi_templates/{id} {
       allow read: if isVerified();
       allow write: if isAdmin() || isManager();
@@ -289,20 +305,23 @@ service cloud.firestore {
     }
 
     match /tmsShifts/{shiftId} {
-      allow read: if isVerified() && (isTL() || isAdmin() || isOwner(existing().userId));
-      allow write: if isVerified() && (isTL() || isAdmin() || isOwner(incoming().userId) || isOwner(existing().userId));
+      allow read: if isVerified();
+      allow create: if isVerified() && (isTL() || isAdmin() || isOwner(incoming().userId));
+      allow update: if isVerified();
       allow delete: if isAdmin();
     }
 
+    match /shiftRecoveryAuditLogs/{id} {
+      allow read, write: if isVerified();
+    }
+
     match /live_sessions/{uid} {
-      allow read: if isVerified() && (
-        isOwner(uid) || 
-        isAdmin() || 
-        existing().managerId == request.auth.uid || 
-        existing().tlId == request.auth.uid
-      );
-      allow write: if isVerified() && (isOwner(uid) || isAdmin());
-      allow delete: if isVerified() && (isOwner(uid) || isAdmin());
+      allow read, write, delete: if isVerified();
+    }
+
+    match /live_sessions_all/{document=**} {
+      allow read: if isVerified();
+      allow write: if isAdmin();
     }
 
     match /attendanceSummary/{id} {
@@ -331,7 +350,16 @@ service cloud.firestore {
     }
 
     match /adminAuditLogs/{id} {
-      allow read, write: if false;
+      allow read: if isVerified() && isAdmin();
+      allow write: if isVerified();
+    }
+
+    match /attendance/{id} {
+      allow get: if isVerified() && (isTL() || isAdmin() || isOwner(existing().userId));
+      allow list: if isVerified();
+      allow create: if isVerified(); 
+      allow update: if isVerified() && (isTL() || isAdmin() || isOwner(existing().userId));
+      allow delete: if isAdmin();
     }
 
     match /admin_roles_config/{id} {
@@ -361,7 +389,7 @@ service cloud.firestore {
 
     match /employee_master/{id} {
       allow read: if isVerified();
-      allow create, update: if isAdmin() || isManager() || isTL() || isRole('HR');
+      allow create, update: if isAdmin() || isManager() || isTL() || isRole('HR') || isOwner(id);
       allow delete: if isAdmin();
     }
 
@@ -372,6 +400,9 @@ service cloud.firestore {
 
     match /admin_backups/{id} {
       allow read, write: if isAdmin();
+      match /{allChildren=**} {
+        allow read, write: if isAdmin();
+      }
     }
 
     match /mail/{id} {
@@ -385,7 +416,7 @@ service cloud.firestore {
     }
 
     match /employeeProfiles/{employeeId} {
-      allow read: if isVerified() && (isOwner(employeeId) || isAdmin() || isManager() || isRole('HR'));
+      allow read: if isVerified();
       allow create, update: if isVerified() && (isOwner(employeeId) || isAdmin() || isManager() || isRole('HR'));
       allow delete: if isAdmin();
     }

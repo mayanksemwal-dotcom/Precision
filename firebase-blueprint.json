@@ -384,6 +384,56 @@
         "createdAt": { "type": "string", "format": "date-time" }
       },
       "required": ["recipientId", "title", "body", "read", "createdAt"]
+    },
+    "AdminAuditLog": {
+      "title": "Admin Audit Log",
+      "description": "Log record for an administrative activity",
+      "type": "object",
+      "properties": {
+        "action": { "type": "string" },
+        "affectedUser": { "type": "string" },
+        "newValue": { "type": "string" },
+        "performedBy": { "type": "string" },
+        "previousValue": { "type": "string" },
+        "timestamp": { "type": "string", "format": "date-time" }
+      },
+      "required": ["action", "performedBy", "timestamp"]
+    },
+    "Attendance": {
+      "title": "Attendance",
+      "description": "User daily attendance status record",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "employeeName": { "type": "string" },
+        "attendanceDate": { "type": "string" },
+        "attendanceStatus": { "type": "string", "enum": ["Present", "Half Day", "Absent"] },
+        "timestamp": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "attendanceDate", "attendanceStatus"]
+    },
+    "AttendanceSummary": {
+      "title": "Attendance Summary",
+      "description": "Aggregated daily attendance details of user",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "employeeName": { "type": "string" },
+        "employeeEmail": { "type": "string" },
+        "mappedTL": { "type": "string" },
+        "mappedManager": { "type": "string" },
+        "process": { "type": "string" },
+        "shiftId": { "type": "string" },
+        "attendanceDate": { "type": "string" },
+        "attendanceStatus": { "type": "string", "enum": ["Present", "Half Day", "Absent"] },
+        "productiveMinutes": { "type": "number" },
+        "totalBreakMinutes": { "type": "number" },
+        "sessionStart": { "type": "string" },
+        "sessionEnd": { "type": "string" },
+        "generatedBySystem": { "type": "boolean" },
+        "isOvernight": { "type": "boolean" }
+      },
+      "required": ["userId", "employeeEmail", "attendanceDate", "attendanceStatus"]
     }
   },
   "firestore": {
@@ -498,6 +548,22 @@
     "itNotifications/{notifId}": {
       "schema": "ITNotification",
       "description": "In-app notifications for IT tickets"
+    },
+    "adminAuditLogs/{id}": {
+      "schema": "AdminAuditLog",
+      "description": "Admin activity logs"
+    },
+    "attendance/{id}": {
+      "schema": "Attendance",
+      "description": "Daily user attendances"
+    },
+    "attendanceSummary/{id}": {
+      "schema": "AttendanceSummary",
+      "description": "Daily attendance summaries"
+    },
+    "kpi_scorecards/{scorecardId}": {
+      "schema": "ScorecardRecord",
+      "description": "Uploaded KPI scorecards for reporting"
     }
   }
 }

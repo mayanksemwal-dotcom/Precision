@@ -13,7 +13,9 @@ import {
 import { 
   doc, 
   getDoc,
-  setDoc
+  setDoc,
+  getDocs,
+  collection
 } from 'firebase/firestore';
 import { db } from '../../lib/firebase';
 import { firestoreLogger } from '../../lib/firestoreLogger';
@@ -23,10 +25,12 @@ import { Button } from '../ui/button';
 import { Input } from '../ui/input';
 import { Label } from '../ui/label';
 import { toast } from 'sonner';
+import { useConfig } from '../../contexts/ConfigContext';
 
 interface ProcessManagementSubViewProps {
   user: UserProfile;
   adminTheme: 'light' | 'dark';
+  allUsers?: any[];
 }
 
 interface MiniProcess {
@@ -37,14 +41,14 @@ interface MiniProcess {
 
 const DEFAULT_PROCESSES: MiniProcess[] = [
   { name: 'HITL', status: 'Active', hidden: false },
-  { name: 'MPQC', status: 'Active', hidden: false },
   { name: 'OQC', status: 'Active', hidden: false },
   { name: 'SOP Training', status: 'Active', hidden: false },
   { name: 'QA Review', status: 'Active', hidden: false },
   { name: 'Team Alignment', status: 'Active', hidden: false }
 ];
 
-export const ProcessManagementSubView = ({ user, adminTheme }: ProcessManagementSubViewProps) => {
+export const ProcessManagementSubView = ({ user, adminTheme, allUsers }: ProcessManagementSubViewProps) => {
+  const { refreshAll } = useConfig();
   const [processes, setProcesses] = useState<MiniProcess[]>([]);
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
@@ -60,9 +64,9 @@ export const ProcessManagementSubView = ({ user, adminTheme }: ProcessManagement
       try {
         const snap = await getDoc(doc(db, 'config', 'tmsProcesses'));
         firestoreLogger.trackRead('config_tmsProcesses_getDoc', snap.exists() ? 1 : 0);
+        let loaded: MiniProcess[] = [];
         if (snap.exists()) {
           const data = snap.data();
-          let loaded: MiniProcess[] = [];
           if (Array.isArray(data.processes) && data.processes.length > 0) {
             loaded = data.processes;
           } else if (Array.isArray(data.list) && data.list.length > 0) {
@@ -71,14 +75,53 @@ export const ProcessManagementSubView = ({ user, adminTheme }: ProcessManagement
               status: 'Active' as const
             }));
           } else {
-            // Only use defaults if document has no data whatsoever
             loaded = DEFAULT_PROCESSES;
           }
-          setProcesses(loaded);
         } else {
-          const initial = DEFAULT_PROCESSES;
-          setProcesses(initial);
+          loaded = [...DEFAULT_PROCESSES];
         }
+
+        // Auto-sync missing processes from users
+        const userProcesses = new Set<string>();
+        if (allUsers && Array.isArray(allUsers)) {
+          allUsers.forEach(u => {
+            if (u.process && typeof u.process === 'string' && u.process.trim().length > 0) {
+              userProcesses.add(u.process.trim());
+            }
+          });
+        }
+
+        let updated = false;
+        const loadedNames = new Set(loaded.map(p => p.name.trim().toLowerCase()));
+        
+        userProcesses.forEach(p => {
+          if (!loadedNames.has(p.toLowerCase())) {
+            loaded.push({ name: p, status: 'Active', hidden: false });
+            loadedNames.add(p.toLowerCase());
+            updated = true;
+          }
+        });
+
+        const blocked = ['mpqc', 'mpqc-fk', 'mpqc-sh'];
+        const preFilterLength = loaded.length;
+        loaded = loaded.filter(p => !blocked.includes((p.name || '').toLowerCase().trim()));
+        if (loaded.length !== preFilterLength) {
+          updated = true;
+        }
+
+        setProcesses(loaded);
+
+        if (updated) {
+          // If we added new processes, automatically save to config
+          const activeList = loaded.filter(p => p.status === 'Active').map(p => p.name);
+          await setDoc(doc(db, 'config', 'tmsProcesses'), {
+            list: activeList,
+            processes: loaded
+          }, { merge: true });
+          await refreshAll();
+          toast.success('Auto-synced missing processes from users.');
+        }
+
       } catch (err) {
         console.error('Failed to fetch processes config', err);
         toast.error('Failed to load process list');
@@ -100,6 +143,9 @@ export const ProcessManagementSubView = ({ user, adminTheme }: ProcessManagement
         list: activeList,
         processes: updatedProcesses
       }, { merge: true });
+      
+      // Phase 5 Optimization: Update global config cache instantly
+      await refreshAll();
     } catch (err) {
       console.error(err);
       toast.error('Failed to save processes: ' + (err as Error).message);

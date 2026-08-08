@@ -12,13 +12,16 @@ import {
   Upload,
   RefreshCw,
   Activity,
-  Shield
+  Shield,
+  Wifi,
+  RotateCcw
 } from 'lucide-react';
 import { db, auth } from '../lib/firebase';
 import { doc, setDoc, addDoc, collection, writeBatch } from 'firebase/firestore';
 import { UserProfile, UserRole } from '../types';
 import { toast } from 'sonner';
 import { usePermission } from '../components/PermissionContext';
+import { useConfig } from '../contexts/ConfigContext';
 
 // Subview imports
 import { DashboardSubView } from '../components/admin/DashboardSubView';
@@ -30,23 +33,24 @@ import { BackupRestoreSubView } from '../components/admin/BackupRestoreSubView';
 import { ProcessManagementSubView } from '../components/admin/ProcessManagementSubView';
 import { AttendanceSettingsSubView } from '../components/admin/AttendanceSettingsSubView';
 import { HierarchySyncWizard } from '../components/admin/HierarchySyncWizard';
-import { EmailDashboardSubView } from '../components/admin/EmailDashboardSubView';
+import { OfficeNetworksSubView } from '../components/admin/OfficeNetworksSubView';
+import { ShiftRecoverySubView } from '../components/admin/ShiftRecoverySubView';
 
 // Subview type definition
-type SubTabType = 'dashboard' | 'users' | 'roles' | 'mapping' | 'process' | 'data' | 'backup' | 'attendancecfg' | 'hierarchy' | 'emailcfg';
+type SubTabType = 'dashboard' | 'users' | 'roles' | 'mapping' | 'process' | 'data' | 'backup' | 'attendancecfg' | 'hierarchy' | 'officenetworks' | 'shiftrecovery';
 
 interface AdminViewProps {
-  activeTab: string;
-  tasks: any[];
-  onTasksUpdate: (tasks: any[]) => void;
+  activeTab?: string;
+  tasks?: any[];
+  onTasksUpdate?: (tasks: any[]) => void;
   user: UserProfile;
-  alignments: any[];
-  onAlignmentsUpdate: (alignments: any[]) => Promise<void>;
-  productions: any[];
-  auditLogs: any[];
-  goToTab: (tab: string) => void;
+  alignments?: any[];
+  onAlignmentsUpdate?: (alignments: any[]) => Promise<void>;
+  productions?: any[];
+  auditLogs?: any[];
+  goToTab?: (tab: string) => void;
   allUsers: any[];
-  warnings: any[];
+  warnings?: any[];
   onRefresh?: () => void;
   externalTheme?: 'light' | 'dark';
 }
@@ -62,7 +66,10 @@ export default function AdminView({
   
   // Tab Routing inside Admin Console
   const [activeSubTab, setActiveSubTab] = useState<SubTabType>('dashboard');
+  const [isRefreshing, setIsRefreshing] = useState(false);
   
+  const { refreshAll, lastRefresh } = useConfig();
+
   // Theme Toggle: Sync with global theme if provided, else manage locally
   const [adminTheme, setAdminTheme] = useState<'light' | 'dark'>(externalTheme || 'light');
 
@@ -110,9 +117,9 @@ export default function AdminView({
     { id: 'process', label: 'Process Management', icon: Activity, visible: canEdit('Console') },
     { id: 'roles', label: 'Roles Matrix', icon: Settings, visible: canEdit('Console') },
     { id: 'mapping', label: 'Team Mapping', icon: RefreshCw, visible: canEdit('Console') },
+    { id: 'officenetworks', label: 'Office Networks', icon: Wifi, visible: true },
     { id: 'data', label: 'Data Management', icon: Database, visible: canDelete('Console') },
-    { id: 'attendancecfg', label: 'Attendance Rules', icon: FileText, visible: canEdit('Console') },
-    { id: 'emailcfg', label: 'Email Portal', icon: FileText, visible: canEdit('Console') },
+    { id: 'shiftrecovery', label: 'Shift Recovery', icon: RotateCcw, visible: requesterUser.role === 'ADMIN' || canEdit('Console') },
     { id: 'hierarchy', label: 'Hierarchy Repair', icon: Shield, visible: requesterUser.role === 'ADMIN' },
     { id: 'backup', label: 'Backup & Restore', icon: CloudLightning, visible: canEdit('Console') && canDelete('Console') }
   ] as const;
@@ -138,6 +145,36 @@ export default function AdminView({
 
         {/* Header Tools */}
         <div className="flex items-center gap-2 flex-wrap">
+          {/* Manual Config Refresh (Phase 5) */}
+          <button
+            onClick={async () => {
+              if (isRefreshing) return;
+              setIsRefreshing(true);
+              try {
+                await refreshAll();
+                if (onRefresh) onRefresh();
+              } catch (err: any) {
+                console.error('Failed to refresh system settings:', err);
+              } finally {
+                setIsRefreshing(false);
+              }
+            }}
+            className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-bold transition-all border shadow-sm cursor-pointer ${
+              adminTheme === 'dark' 
+                ? 'bg-slate-800/90 border-indigo-500/30 text-indigo-400 hover:bg-slate-700 hover:border-indigo-500/50 active:scale-95' 
+                : 'bg-white border-slate-200 text-indigo-600 hover:bg-indigo-50/50 hover:border-indigo-200 active:scale-95'
+            }`}
+            title={`Last refreshed: ${lastRefresh ? lastRefresh.toLocaleTimeString() : 'Never'}`}
+          >
+            <RefreshCw size={14} className={isRefreshing ? 'animate-spin text-indigo-500' : ''} />
+            <span>Refresh Settings</span>
+            {lastRefresh && (
+              <span className="text-[10px] px-1.5 py-0.5 rounded bg-indigo-50 dark:bg-indigo-950/60 text-indigo-600 dark:text-indigo-300 font-mono font-medium ml-0.5">
+                {lastRefresh.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+              </span>
+            )}
+          </button>
+
           {/* Theme switcher */}
           <button 
             onClick={() => setAdminTheme(prev => prev === 'light' ? 'dark' : 'light')}
@@ -199,7 +236,7 @@ export default function AdminView({
         )}
 
         {activeSubTab === 'process' && (
-          <ProcessManagementSubView user={requesterUser} adminTheme={adminTheme} />
+          <ProcessManagementSubView user={requesterUser} adminTheme={adminTheme} allUsers={allUsers} />
         )}
 
         {activeSubTab === 'data' && (
@@ -217,14 +254,6 @@ export default function AdminView({
             logAdminEvent={logAdminEvent} 
           />
         )}
-
-        {activeSubTab === 'emailcfg' && (
-          <EmailDashboardSubView adminTheme={adminTheme} />
-        )}
-
-        {activeSubTab === 'attendancecfg' && (
-          <AttendanceSettingsSubView />
-        )}
         
         {activeSubTab === 'hierarchy' && (
           <HierarchySyncWizard 
@@ -232,6 +261,21 @@ export default function AdminView({
             adminTheme={adminTheme} 
             onRefresh={onRefresh || (() => {})} 
             logAdminEvent={logAdminEvent} 
+          />
+        )}
+
+        {activeSubTab === 'officenetworks' && (
+          <OfficeNetworksSubView 
+            user={requesterUser} 
+            adminTheme={adminTheme} 
+          />
+        )}
+
+        {activeSubTab === 'shiftrecovery' && (
+          <ShiftRecoverySubView 
+            user={requesterUser} 
+            adminTheme={adminTheme} 
+            logAdminEvent={logAdminEvent}
           />
         )}
       </div>

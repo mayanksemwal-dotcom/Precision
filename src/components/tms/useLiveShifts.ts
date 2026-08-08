@@ -1,156 +1,202 @@
 import { useState, useEffect, useCallback } from 'react';
-import { collection, query, where, getDocs, limit, onSnapshot } from 'firebase/firestore';
-import { db } from '../../lib/firebase';
+import { collection, query, where, limit, onSnapshot, documentId } from 'firebase/firestore';
+import { db, handleFirestoreError, OperationType } from '../../lib/firebase';
 import { TMSShift } from '../../views/TMSView';
+import { getLatestUserActivity } from '../../lib/tmsUtils';
 
-// Local performance cache to avoid redundant database reads across components
-const liveShiftsCache = new Map<string, { shifts: TMSShift[]; timestamp: number }>();
-const CACHE_TTL_MS = 2 * 60 * 1000; // 2 minutes cache TTL
-
-export function useLiveShifts(uid?: string, role?: string, userIds?: string[], monitorAll = false) {
+export function useLiveShifts(uid?: string, role?: string, userIds?: string[], monitorAll = false, isGlobalOverride = false) {
   const [shifts, setShifts] = useState<TMSShift[]>([]);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState<Error | null>(null);
 
   const userIdsKey = userIds?.join(',');
 
+  const mapLiveSessionToShift = (data: any): TMSShift => {
+    let rawStatus = data.status || 'ACTIVE';
+    const isActuallyOnline = data.isOnline !== false; // Default true if field missing but doc exists
+    
+    const activities = Array.isArray(data.activities) ? data.activities : [];
+    const lastUserAct = getLatestUserActivity(activities);
+    
+    // Normalize status from last explicit user activity event
+    let resolvedStatus = rawStatus;
+    if (lastUserAct) {
+      if (lastUserAct.action === 'BREAK_START' || (lastUserAct.type === 'break' && !lastUserAct.endTime)) {
+        resolvedStatus = 'BREAK';
+      } else if (lastUserAct.action === 'BREAK_END' || lastUserAct.type === 'productive' || lastUserAct.action === 'CLOCK_IN' || lastUserAct.action === 'PROCESS_SWITCH') {
+        resolvedStatus = 'ACTIVE';
+      }
+    }
+    
+    return {
+      ...data,
+      id: data.sessionId || data.id || '',
+      userId: data.userId || data.uid || data.id || '',
+      userName: data.employeeName || data.userName || '',
+      userEmail: data.email || data.userEmail || '',
+      clockInTime: data.clockInTime || '',
+      status: isActuallyOnline ? resolvedStatus : 'OFFLINE',
+      activities: activities
+    } as TMSShift;
+  };
+
   useEffect(() => {
-    if (!uid) return;
+    if (!uid) {
+      setLoading(false);
+      return;
+    }
 
     setLoading(true);
     setError(null);
 
     const normRole = (role || '').toUpperCase().trim();
-    const isSupervisorOrTL = ['TEAM_LEAD', 'STL', 'QTL', 'OPS_TL', 'TRAINER_TL', 'ASSISTANT_MANAGER', 'SME', 'TEAM LEAD', 'OPS TL', 'TRAINER TL', 'OPS TEAM LEAD', 'TEAM LEADER', 'MANAGER', 'OPS_HEAD', 'HR', 'IT_MANAGER', 'EXECUTIVE', 'OPS HEAD'].includes(normRole);
+    const isSupervisorOrTL = ['TEAM_LEAD', 'STL', 'QTL', 'OPS_TL', 'TRAINER_TL', 'ASSISTANT_MANAGER', 'SME', 'TEAM LEAD', 'OPS TL', 'TRAINER TL', 'OPS TEAM LEAD', 'TEAM LEADER', 'MANAGER', 'OPS_HEAD', 'HR', 'IT_MANAGER', 'EXECUTIVE', 'OPS HEAD', 'SUPERVISOR', 'ADMIN', 'MIS'].includes(normRole);
 
-    let unsubscribers: (() => void)[] = [];
+    let unsubscribes: (() => void)[] = [];
+    const subMap = new Map<string, TMSShift[]>();
 
-    // Deduplicate helper to prevent duplicate/stale user entries
-    const deduplicateShifts = (shiftsList: TMSShift[]): TMSShift[] => {
-      const uniqueMap = new Map<string, TMSShift>();
-      shiftsList.forEach(s => {
-        if (!s.userId) return;
-        const existing = uniqueMap.get(s.userId);
-        if (!existing) {
-          uniqueMap.set(s.userId, s);
-        } else {
-          const existingTime = (existing as any).lastHeartbeat ? new Date((existing as any).lastHeartbeat).getTime() : 0;
-          const sTime = (s as any).lastHeartbeat ? new Date((s as any).lastHeartbeat).getTime() : 0;
-          // Keep the newer heartbeat record to avoid showing stale status details
-          if (sTime > existingTime) {
-            uniqueMap.set(s.userId, s);
+    // Helper to merge all subscription branches and update state
+    const handleSnapshotDocs = (docs: any[], subId: string) => {
+      const mapped = docs.map(d => {
+        const data = d.data();
+        return mapLiveSessionToShift({ id: d.id, ...data });
+      });
+      
+      subMap.set(subId, mapped);
+      
+      const allShifts: TMSShift[] = [];
+      const seen = new Set<string>();
+      
+      // Collect from all active subscriptions
+      subMap.forEach(list => {
+        list.forEach(s => {
+          const key = s.userId || s.id;
+          if (key && !seen.has(key)) {
+            seen.add(key);
+            allShifts.push(s);
           }
+        });
+      });
+      
+      setShifts([...allShifts]);
+      setLoading(false);
+    };
+
+    try {
+      const checkIsGlobalRole = (r: string) => {
+        const upper = r.toUpperCase().trim();
+        const globals = ['ADMIN', 'OPS_HEAD', 'MIS', 'HR', 'DIRECTOR', 'VP'];
+        return globals.some(g => upper.includes(g));
+      };
+
+      if (userIds && userIds.length > 0) {
+        // Targeted monitoring for mapped hierarchy team member UIDs
+        const rawIds = uid && !userIds.includes(uid) ? [...userIds, uid] : userIds;
+        const cleanIds = Array.from(new Set(rawIds.filter(id => id && typeof id === 'string' && id.trim() !== '')));
+
+        if (cleanIds.length > 0) {
+          const chunks: string[][] = [];
+          for (let i = 0; i < cleanIds.length; i += 30) {
+            chunks.push(cleanIds.slice(i, i + 30));
+          }
+
+          chunks.forEach((chunk, idx) => {
+            const qChunk = query(collection(db, 'live_sessions'), where(documentId(), 'in', chunk));
+            const subId = `chunk_${idx}`;
+            const unsubChunk = onSnapshot(qChunk, (snap) => {
+              handleSnapshotDocs(snap.docs, subId);
+            }, (err) => {
+              console.error(`[useLiveShifts] Subscription error for ${subId}:`, err);
+              handleFirestoreError(err, OperationType.GET, `live_sessions_${subId}`);
+            });
+            unsubscribes.push(unsubChunk);
+          });
         }
-      });
-      return Array.from(uniqueMap.values());
-    };
-
-    // Phase 4: Build session cards entirely from live_sessions
-    const mapLiveSessionToShift = (data: any): TMSShift => {
-      return {
-        id: data.sessionId || data.uid,
-        userId: data.uid,
-        userName: data.employeeName || '',
-        userEmail: data.email || '', 
-        clockInTime: data.clockInTime || '',
-        status: data.status as any,
-        activities: data.activities || [], 
-        lastHeartbeat: data.lastHeartbeat,
-        currentActivity: data.currentActivity,
-        currentActivityStartTime: data.currentActivityStartTime,
-        deviceName: data.deviceName || data.deviceType || 'Unknown',
-        deviceType: data.deviceType || (data.deviceName && data.deviceName !== 'Unknown' ? data.deviceName : 'Desktop'),
-        clockInDevice: data.clockInDevice || (data.deviceType === 'Mobile' ? 'mobile' : 'desktop'),
-        os: data.os || data.platform || 'Unknown',
-        productiveMs: data.productiveSeconds ? data.productiveSeconds * 1000 : 0,
-        breakMs: data.breakSeconds ? data.breakSeconds * 1000 : 0,
-        teamLeadUid: data.tlId || data.teamLeadUid || data.teamLeadId || '',
-        managerId: data.managerId || ''
-      } as unknown as TMSShift;
-    };
-
-    if (userIds && userIds.length > 0 && !monitorAll) {
-      // Phase 1 Optimization: Chunked Realtime UID queries for LIVE SESSIONS
-      const monitorIds = uid && !userIds.includes(uid) ? [...userIds, uid] : userIds;
-      console.log(`[useLiveShifts] Monitoring live_sessions for ${monitorIds.length} team members (chunked including self)`);
-      
-      const chunks: string[][] = [];
-      for (let i = 0; i < monitorIds.length; i += 30) {
-        chunks.push(monitorIds.slice(i, i + 30));
-      }
-
-      const activeListMap: Record<number, TMSShift[]> = {};
-      
-      unsubscribers = chunks.map((chunk, index) => {
-        const q = query(
-          collection(db, 'live_sessions'),
-          where('uid', 'in', chunk)
-        );
-        
-        return onSnapshot(q, (snap) => {
-          activeListMap[index] = snap.docs.map(d => mapLiveSessionToShift(d.data()));
-          
-          const allActive: TMSShift[] = [];
-          Object.values(activeListMap).forEach(list => allActive.push(...list));
-          setShifts(deduplicateShifts(allActive));
-          setLoading(false);
+      } else if (monitorAll || isGlobalOverride) {
+        // Fallback global query only if userIds is explicitly omitted/empty
+        const qAll = query(collection(db, 'live_sessions'), limit(2500));
+        const unsubAll = onSnapshot(qAll, (snap) => {
+          handleSnapshotDocs(snap.docs, 'all');
         }, (err) => {
-          console.error(`[useLiveShifts] live_sessions chunk ${index} error:`, err);
+          console.error('[useLiveShifts] All subscription error:', err);
+          handleFirestoreError(err, OperationType.GET, 'live_sessions_all');
         });
-      });
-    } else if (isSupervisorOrTL && !monitorAll) {
-      const isManagerRole = ['MANAGER', 'ASSISTANT_MANAGER', 'OPS_HEAD', 'HR', 'IT_MANAGER', 'EXECUTIVE', 'OPS HEAD'].includes(normRole);
-      const supervisorField = isManagerRole ? 'managerId' : 'tlId';
+        unsubscribes.push(unsubAll);
+      } else if (isSupervisorOrTL) {
+        // Non-global supervisors and TLs query by their own ID in both tlId and managerId fields,
+        // and also by reportee UIDs if available for absolute resilience.
+        const qTeam = query(collection(db, 'live_sessions'), where('tlId', '==', uid));
+        const qManager = query(collection(db, 'live_sessions'), where('managerId', '==', uid));
+        const qSelf = query(collection(db, 'live_sessions'), where('uid', '==', uid));
 
-      console.log(`[useLiveShifts] Monitoring live_sessions for supervisor: ${uid} (field: ${supervisorField}) and self`);
-      const qTeam = query(
-        collection(db, 'live_sessions'),
-        where(supervisorField, '==', uid)
-      );
-      const qSelf = query(
-        collection(db, 'live_sessions'),
-        where('uid', '==', uid)
-      );
-
-      const unsubTeam = onSnapshot(qTeam, (snap) => {
-        setShifts(prev => {
-          const others = prev.filter(s => isManagerRole ? (s as any).managerId !== uid : s.teamLeadUid !== uid);
-          const current = snap.docs.map(d => mapLiveSessionToShift(d.data()));
-          return deduplicateShifts([...others, ...current]);
+        const unsubTeam = onSnapshot(qTeam, (snap) => {
+          handleSnapshotDocs(snap.docs, 'team');
+        }, (err) => {
+          console.error('[useLiveShifts] Team subscription error:', err);
+          handleFirestoreError(err, OperationType.GET, 'live_sessions_team');
         });
-        setLoading(false);
-      });
+        unsubscribes.push(unsubTeam);
 
-      const unsubSelf = onSnapshot(qSelf, (snap) => {
-        setShifts(prev => {
-          const others = prev.filter(s => s.userId !== uid);
-          const current = snap.docs.map(d => mapLiveSessionToShift(d.data()));
-          return deduplicateShifts([...others, ...current]);
+        const unsubManager = onSnapshot(qManager, (snap) => {
+          handleSnapshotDocs(snap.docs, 'manager');
+        }, (err) => {
+          console.error('[useLiveShifts] Manager subscription error:', err);
+          handleFirestoreError(err, OperationType.GET, 'live_sessions_manager');
         });
-        setLoading(false);
-      });
+        unsubscribes.push(unsubManager);
 
-      unsubscribers = [unsubTeam, unsubSelf];
-    } else {
-      console.log(`[useLiveShifts] Monitoring all live_sessions`);
-      const qAll = query(
-        collection(db, 'live_sessions'),
-        limit(300)
-      );
-      const unsubAll = onSnapshot(qAll, (snap) => {
-        setShifts(deduplicateShifts(snap.docs.map(d => mapLiveSessionToShift(d.data()))));
-        setLoading(false);
-      });
-      unsubscribers = [unsubAll];
+        const unsubSelf = onSnapshot(qSelf, (snap) => {
+          handleSnapshotDocs(snap.docs, 'self');
+        }, (err) => {
+          console.error('[useLiveShifts] Self subscription error:', err);
+          handleFirestoreError(err, OperationType.GET, 'live_sessions_self');
+        });
+        unsubscribes.push(unsubSelf);
+
+        // Subscribing directly to team member UIDs via chunks ensures we get real status
+        // even if their database document does not have tlId / managerId synced yet
+        if (userIds && userIds.length > 0) {
+          const monitorIds = uid && !userIds.includes(uid) ? [...userIds, uid] : userIds;
+          const chunks: string[][] = [];
+          for (let i = 0; i < monitorIds.length; i += 30) {
+            chunks.push(monitorIds.slice(i, i + 30));
+          }
+
+          chunks.forEach((chunk, idx) => {
+            const qChunk = query(collection(db, 'live_sessions'), where(documentId(), 'in', chunk));
+            const subId = `chunk_${idx}`;
+            const unsubChunk = onSnapshot(qChunk, (snap) => {
+              handleSnapshotDocs(snap.docs, subId);
+            }, (err) => {
+              console.error(`[useLiveShifts] Subscription error for ${subId}:`, err);
+              handleFirestoreError(err, OperationType.GET, `live_sessions_${subId}`);
+            });
+            unsubscribes.push(unsubChunk);
+          });
+        }
+      } else {
+        // Fallback for standard users: only subscribe to themselves to prevent security errors and leaks
+        const qSelf = query(collection(db, 'live_sessions'), where('uid', '==', uid));
+        const unsubSelf = onSnapshot(qSelf, (snap) => {
+          handleSnapshotDocs(snap.docs, 'self');
+        }, (err) => {
+          console.error('[useLiveShifts] Self subscription error:', err);
+          handleFirestoreError(err, OperationType.GET, 'live_sessions_self');
+        });
+        unsubscribes.push(unsubSelf);
+      }
+    } catch (err: any) {
+      console.error('[useLiveShifts] Setup subscription error:', err);
+      setError(err);
+      setLoading(false);
     }
 
     return () => {
-      unsubscribers.forEach(unsub => unsub());
+      unsubscribes.forEach(unsub => unsub());
     };
-  }, [uid, role, userIdsKey, monitorAll]); // Stable dependencies including joined userIdsKey
+  }, [uid, role, userIdsKey, monitorAll]);
 
   const fetchLiveShifts = useCallback(async (forceRefresh = false) => {
-    // This is now handled by realtime listeners, but we keep the interface
     return shifts;
   }, [shifts]);
 

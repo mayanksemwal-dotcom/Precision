@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { db } from '../../lib/firebase';
-import { collection, getDocs, doc, setDoc, deleteDoc, writeBatch, query, limit } from 'firebase/firestore';
-import { Database, Trash2, Archive, RotateCcw, AlertTriangle, ShieldAlert, CheckSquare, Square, Inbox, Activity, RefreshCw } from 'lucide-react';
+import { db, auth } from '../../lib/firebase';
+import { collection, getDocs, doc, setDoc, deleteDoc, writeBatch, query, limit, where, getCountFromServer } from 'firebase/firestore';
+import { Database, Trash2, Archive, RotateCcw, AlertTriangle, ShieldAlert, CheckSquare, Square, Inbox, Activity, RefreshCw, Users, Clock } from 'lucide-react';
 import { toast } from 'sonner';
 
 interface DataManagementSubViewProps {
@@ -17,6 +17,90 @@ export const DataManagementSubView: React.FC<DataManagementSubViewProps> = ({
 }) => {
   const [activeSegment, setActiveSegment] = useState<'active' | 'archived'>('active');
   const [selectedCollection, setSelectedCollection] = useState<'audits' | 'tasks' | 'dailyPerformance' | 'disciplinaryLogs' | 'pips'>('audits');
+  const [isPruningConfirming, setIsPruningConfirming] = useState(false);
+  const [logStats, setLogStats] = useState<{
+    auditLogsTotal: number;
+    auditLogsOlder: number;
+    attendanceLogsTotal: number;
+    attendanceLogsOlder: number;
+    qualityAuditsTotal: number;
+    qualityAuditsOlder: number;
+  } | null>(null);
+
+  const fetchLogStats = async () => {
+    try {
+      const sevenDaysAgo = new Date();
+      sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+      const sevenDaysAgoISO = sevenDaysAgo.toISOString();
+
+      // 1. audit_logs count aggregation
+      let auditLogsTotal = 0;
+      let auditLogsOlder = 0;
+      try {
+        const totalSnap = await getCountFromServer(collection(db, 'audit_logs'));
+        auditLogsTotal = totalSnap.data().count;
+        try {
+          const olderSnap = await getCountFromServer(query(collection(db, 'audit_logs'), where('modifiedAt', '<', sevenDaysAgoISO)));
+          auditLogsOlder = olderSnap.data().count;
+        } catch {
+          auditLogsOlder = 0;
+        }
+      } catch (e) {
+        console.warn('Error fetching audit_logs stats:', e);
+      }
+
+      // 2. attendanceAuditLogs count aggregation
+      let attendanceLogsTotal = 0;
+      let attendanceLogsOlder = 0;
+      try {
+        const totalSnap = await getCountFromServer(collection(db, 'attendanceAuditLogs'));
+        attendanceLogsTotal = totalSnap.data().count;
+        try {
+          const olderSnap = await getCountFromServer(query(collection(db, 'attendanceAuditLogs'), where('timestamp', '<', sevenDaysAgoISO)));
+          attendanceLogsOlder = olderSnap.data().count;
+        } catch {
+          attendanceLogsOlder = 0;
+        }
+      } catch (e) {
+        console.warn('Error fetching attendanceAuditLogs stats:', e);
+      }
+
+      // 3. Quality Audits ('audits') count aggregation
+      let qualityAuditsTotal = 0;
+      let qualityAuditsOlder = 0;
+      try {
+        const totalSnap = await getCountFromServer(collection(db, 'audits'));
+        qualityAuditsTotal = totalSnap.data().count;
+        try {
+          const olderSnap = await getCountFromServer(query(collection(db, 'audits'), where('auditDate', '<', sevenDaysAgoISO)));
+          qualityAuditsOlder = olderSnap.data().count;
+        } catch {
+          qualityAuditsOlder = 0;
+        }
+      } catch (e) {
+        console.warn('Error fetching audits collection stats:', e);
+      }
+
+      setLogStats({
+        auditLogsTotal,
+        auditLogsOlder,
+        attendanceLogsTotal,
+        attendanceLogsOlder,
+        qualityAuditsTotal,
+        qualityAuditsOlder
+      });
+    } catch (err) {
+      console.error('Error fetching overall log stats:', err);
+    }
+  };
+
+  useEffect(() => {
+    if (!isPruningConfirming) return;
+    const timer = setTimeout(() => {
+      setIsPruningConfirming(false);
+    }, 5000);
+    return () => clearTimeout(timer);
+  }, [isPruningConfirming]);
   
   // Real Firestore documents
   const [records, setRecords] = useState<any[]>([]);
@@ -34,6 +118,7 @@ export const DataManagementSubView: React.FC<DataManagementSubViewProps> = ({
       const snap = await getDocs(query(collection(db, selectedCollection), limit(100)));
       const list = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
       setRecords(list);
+      fetchLogStats();
     } catch (err: any) {
       toast.error(`Error querying active items: ${err.message}`);
     } finally {
@@ -49,6 +134,7 @@ export const DataManagementSubView: React.FC<DataManagementSubViewProps> = ({
       const snap = await getDocs(query(collection(db, 'archived_records'), limit(150)));
       const list = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
       setArchived(list);
+      fetchLogStats();
     } catch (err: any) {
       toast.error(`Error querying archived entries: ${err.message}`);
     } finally {
@@ -213,6 +299,140 @@ export const DataManagementSubView: React.FC<DataManagementSubViewProps> = ({
       toast.error(`Restoration failed: ${err.message}`);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handlePruneAuditLogs = async () => {
+    if (!isPruningConfirming) {
+      setIsPruningConfirming(true);
+      toast.info('Click the prune button again within 5 seconds to confirm deletion of older logs.');
+      return;
+    }
+
+    setIsPruningConfirming(false);
+    const loader = toast.loading('Pruning system audit logs...');
+    try {
+      const sevenDaysAgo = new Date();
+      sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+      
+      let prunedAuditLogsCount = 0;
+      let prunedAttendanceLogsCount = 0;
+      let prunedQualityAuditsCount = 0;
+
+      // 1. Prune 'audit_logs'
+      const auditLogsSnap = await getDocs(collection(db, 'audit_logs'));
+      let batch1 = writeBatch(db);
+      let batchCount1 = 0;
+
+      for (const d of auditLogsSnap.docs) {
+        const data = d.data();
+        let logDate: Date | null = null;
+        
+        if (data.modifiedAt) {
+          if (typeof data.modifiedAt.toDate === 'function') {
+            logDate = data.modifiedAt.toDate();
+          } else if (typeof data.modifiedAt === 'string') {
+            logDate = new Date(data.modifiedAt);
+          } else if (data.modifiedAt.seconds) {
+            logDate = new Date(data.modifiedAt.seconds * 1000);
+          }
+        }
+
+        if (logDate && logDate < sevenDaysAgo) {
+          batch1.delete(d.ref);
+          batchCount1++;
+          prunedAuditLogsCount++;
+          
+          if (batchCount1 === 500) {
+            await batch1.commit();
+            batch1 = writeBatch(db);
+            batchCount1 = 0;
+          }
+        }
+      }
+      if (batchCount1 > 0) {
+        await batch1.commit();
+      }
+
+      // 2. Prune 'attendanceAuditLogs'
+      const attendanceLogsSnap = await getDocs(collection(db, 'attendanceAuditLogs'));
+      let batch2 = writeBatch(db);
+      let batchCount2 = 0;
+
+      for (const d of attendanceLogsSnap.docs) {
+        const data = d.data();
+        let logDate: Date | null = null;
+
+        if (data.timestamp) {
+          if (typeof data.timestamp.toDate === 'function') {
+            logDate = data.timestamp.toDate();
+          } else if (typeof data.timestamp === 'string') {
+            logDate = new Date(data.timestamp);
+          } else if (data.timestamp.seconds) {
+            logDate = new Date(data.timestamp.seconds * 1000);
+          }
+        }
+
+        if (logDate && logDate < sevenDaysAgo) {
+          batch2.delete(d.ref);
+          batchCount2++;
+          prunedAttendanceLogsCount++;
+
+          if (batchCount2 === 500) {
+            await batch2.commit();
+            batch2 = writeBatch(db);
+            batchCount2 = 0;
+          }
+        }
+      }
+      if (batchCount2 > 0) {
+        await batch2.commit();
+      }
+
+      // 3. Prune 'audits'
+      const qualityAuditsSnap = await getDocs(collection(db, 'audits'));
+      let batch3 = writeBatch(db);
+      let batchCount3 = 0;
+
+      for (const d of qualityAuditsSnap.docs) {
+        const data = d.data();
+        let logDate: Date | null = null;
+        const dateVal = data.auditDate || data.createdAt || data.date;
+
+        if (dateVal) {
+          if (typeof dateVal.toDate === 'function') {
+            logDate = dateVal.toDate();
+          } else if (typeof dateVal === 'string') {
+            logDate = new Date(dateVal);
+          } else if (dateVal.seconds) {
+            logDate = new Date(dateVal.seconds * 1000);
+          }
+        }
+
+        if (logDate && logDate < sevenDaysAgo) {
+          batch3.delete(d.ref);
+          batchCount3++;
+          prunedQualityAuditsCount++;
+
+          if (batchCount3 === 500) {
+            await batch3.commit();
+            batch3 = writeBatch(db);
+            batchCount3 = 0;
+          }
+        }
+      }
+      if (batchCount3 > 0) {
+        await batch3.commit();
+      }
+
+      toast.success(`Prune complete: Permanently deleted ${prunedAuditLogsCount} system audit logs, ${prunedAttendanceLogsCount} attendance logs, and ${prunedQualityAuditsCount} quality audits older than 7 days.`);
+      await logAdminEvent('Prune Admin Audit Logs', 'System Logs', 'Database Maintenance', `Pruned ${prunedAuditLogsCount + prunedAttendanceLogsCount + prunedQualityAuditsCount} entries`);
+      await fetchLogStats();
+      onRefresh();
+    } catch (err: any) {
+      toast.error(`Prune failed: ${err.message}`);
+    } finally {
+      toast.dismiss(loader);
     }
   };
 
@@ -387,7 +607,72 @@ export const DataManagementSubView: React.FC<DataManagementSubViewProps> = ({
           </div>
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+          <div className="p-4 rounded-xl border border-slate-100 dark:border-slate-800 space-y-3">
+            <h5 className="text-xs font-bold flex items-center gap-2"><Users size={14} className="text-blue-500" /> Auth Account Sync</h5>
+            <p className="text-[10px] text-slate-500 leading-relaxed">
+              Import missing users from Firebase Authentication to the local database roster. Fixes count mismatch between Auth and UI.
+            </p>
+            <button 
+              onClick={async () => {
+                const loader = toast.loading('Synchronizing with Firebase Auth...');
+                try {
+                  const token = await auth.currentUser?.getIdToken();
+                  if (!token) throw new Error('Unauthorized: No active session');
+
+                  const response = await fetch('/api/sync-users', {
+                    method: 'POST',
+                    headers: {
+                      'Authorization': `Bearer ${token}`,
+                      'Content-Type': 'application/json'
+                    }
+                  });
+
+                  const contentType = response.headers.get('content-type');
+                  if (!contentType || !contentType.includes('application/json')) {
+                    const text = await response.text();
+                    const snippet = text.substring(0, 80).trim();
+                    throw new Error(`Server returned non-JSON response (${response.status}): ${snippet}...`);
+                  }
+
+                  const result = await response.json();
+                  if (!response.ok) {
+                    if (response.status === 403 && result.link) {
+                      toast.error(
+                        <div className="space-y-2">
+                          <p className="font-bold">{result.error}</p>
+                          <p className="text-[10px]">{result.details}</p>
+                          <a 
+                            href={result.link} 
+                            target="_blank" 
+                            rel="noopener noreferrer" 
+                            className="inline-block px-3 py-1 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded text-[10px] font-bold text-blue-600"
+                          >
+                            Enable API in Google Console
+                          </a>
+                        </div>,
+                        { duration: 10000 }
+                      );
+                      return;
+                    }
+                    throw new Error(result.error || 'Sync failed');
+                  }
+
+                  toast.success(`Success: Synced ${result.syncedCount} new users. Total Auth Users: ${result.totalAuthUsers}`);
+                  logAdminEvent('Firebase Auth Sync', 'Employee Master', 'Auth Count Mismatch', `Imported ${result.syncedCount} users`);
+                  onRefresh();
+                } catch (err: any) {
+                  toast.error(`Sync failed: ${err.message}`);
+                } finally {
+                  toast.dismiss(loader);
+                }
+              }}
+              className="w-full py-2 bg-blue-600 hover:bg-blue-700 text-white font-bold text-[10px] rounded-lg shadow-sm transition-all cursor-pointer"
+            >
+              Sync from Firebase Auth
+            </button>
+          </div>
+
           <div className="p-4 rounded-xl border border-slate-100 dark:border-slate-800 space-y-3">
             <h5 className="text-xs font-bold flex items-center gap-2"><Activity size={14} className="text-indigo-500" /> Database Health Checks</h5>
             <p className="text-[10px] text-slate-500 leading-relaxed">
@@ -397,7 +682,7 @@ export const DataManagementSubView: React.FC<DataManagementSubViewProps> = ({
               onClick={async () => {
                 const loader = toast.loading('Running User Database health scan...');
                 try {
-                  const usersSnap = await getDocs(collection(db, 'users'));
+                  const usersSnap = await getDocs(collection(db, 'employee_master'));
                   const batch = writeBatch(db);
                   let repairCount = 0;
                   
@@ -445,7 +730,7 @@ export const DataManagementSubView: React.FC<DataManagementSubViewProps> = ({
               onClick={async () => {
                 const loader = toast.loading('Reconciling Roster collections...');
                 try {
-                  const usersSnap = await getDocs(collection(db, 'users'));
+                  const usersSnap = await getDocs(collection(db, 'employee_master'));
                   const batch = writeBatch(db);
                   
                   usersSnap.docs.forEach(d => {
@@ -471,6 +756,49 @@ export const DataManagementSubView: React.FC<DataManagementSubViewProps> = ({
               className="w-full py-2 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-[10px] rounded-lg shadow-sm transition-all cursor-pointer"
             >
               Trigger Full Collection Mirror
+            </button>
+          </div>
+
+          <div className="p-4 rounded-xl border border-rose-100 dark:border-rose-950 bg-rose-50/20 dark:bg-rose-950/5 space-y-3">
+            <h5 className="text-xs font-bold flex items-center gap-2"><Clock size={14} className="text-rose-500 animate-pulse" /> Audit Log Pruning</h5>
+            <p className="text-[10px] text-slate-500 leading-relaxed">
+              Permanently delete records older than 7 days across admin, attendance, and quality audit logs.
+            </p>
+
+            {logStats ? (
+              <div className="space-y-1.5 py-1.5 border-y border-rose-100/30 dark:border-rose-900/30">
+                <div className="flex justify-between items-center text-[10px]">
+                  <span className="text-slate-500 dark:text-slate-400 font-medium">Admin Logs (audit_logs):</span>
+                  <span className="font-mono font-bold text-slate-700 dark:text-slate-300">
+                    {logStats.auditLogsTotal} <span className="text-rose-500 font-medium">({logStats.auditLogsOlder} older)</span>
+                  </span>
+                </div>
+                <div className="flex justify-between items-center text-[10px]">
+                  <span className="text-slate-500 dark:text-slate-400 font-medium">Attendance Overrides:</span>
+                  <span className="font-mono font-bold text-slate-700 dark:text-slate-300">
+                    {logStats.attendanceLogsTotal} <span className="text-rose-500 font-medium">({logStats.attendanceLogsOlder} older)</span>
+                  </span>
+                </div>
+                <div className="flex justify-between items-center text-[10px]">
+                  <span className="text-slate-500 dark:text-slate-400 font-medium">Quality Audits (audits):</span>
+                  <span className="font-mono font-bold text-slate-700 dark:text-slate-300">
+                    {logStats.qualityAuditsTotal} <span className="text-rose-500 font-medium">({logStats.qualityAuditsOlder} older)</span>
+                  </span>
+                </div>
+              </div>
+            ) : (
+              <div className="text-[10px] text-slate-400 animate-pulse py-1">Loading database diagnostic metrics...</div>
+            )}
+
+            <button 
+              onClick={handlePruneAuditLogs}
+              className={`w-full py-2 font-bold text-[10px] rounded-lg shadow-sm transition-all cursor-pointer ${
+                isPruningConfirming 
+                  ? 'bg-amber-500 hover:bg-amber-600 text-white animate-pulse' 
+                  : 'bg-rose-600 hover:bg-rose-700 text-white'
+              }`}
+            >
+              {isPruningConfirming ? '⚠️ Confirm Prune? (Irreversible)' : 'Prune Audit Logs (>7 Days)'}
             </button>
           </div>
         </div>

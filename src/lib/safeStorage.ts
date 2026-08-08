@@ -7,6 +7,40 @@
 
 const memoryCache: Record<string, string> = {};
 
+const DB_NAME = 'precision360_db';
+const STORE_NAME = 'cache_store';
+
+const openDB = (): Promise<IDBDatabase> => {
+  return new Promise((resolve, reject) => {
+    if (typeof window === 'undefined' || !window.indexedDB) {
+      reject(new Error('IndexedDB not available'));
+      return;
+    }
+    const timer = setTimeout(() => {
+      reject(new Error('IndexedDB open timed out'));
+    }, 1000);
+    try {
+      const request = indexedDB.open(DB_NAME, 1);
+      request.onupgradeneeded = () => {
+        try {
+          request.result.createObjectStore(STORE_NAME);
+        } catch (e) {}
+      };
+      request.onsuccess = () => {
+        clearTimeout(timer);
+        resolve(request.result);
+      };
+      request.onerror = () => {
+        clearTimeout(timer);
+        reject(request.error);
+      };
+    } catch (err) {
+      clearTimeout(timer);
+      reject(err);
+    }
+  });
+};
+
 export const safeStorage = {
   set: (key: string, value: any): boolean => {
     try {
@@ -53,7 +87,7 @@ export const safeStorage = {
             localStorage.setItem(key, stringValue);
             return true;
           } catch (retryError) {
-            console.error(`[SafeStorage] Persistent quota failure for key: ${key}. Falling back to memory-only storage.`);
+            console.warn(`[SafeStorage] Persistent quota failure for key: ${key}. Falling back to memory-only storage.`);
             // We already updated memoryCache, so we just return true to indicate it "saved" (somewhere)
             return true; 
           }
@@ -93,6 +127,92 @@ export const safeStorage = {
     } catch (error) {
       console.error(`[SafeStorage] Error getting key ${key}:`, error);
       return null;
+    }
+  },
+
+  setIndexedDB: async <T>(key: string, value: T): Promise<void> => {
+    try {
+      const db = await openDB();
+      const tx = db.transaction(STORE_NAME, 'readwrite');
+      const store = tx.objectStore(STORE_NAME);
+      const data = { value, timestamp: Date.now() };
+      store.put(data, key);
+      return new Promise((resolve, reject) => {
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      });
+    } catch (error) {
+      console.error(`[SafeStorage] Error setting IndexedDB key ${key}:`, error);
+    }
+  },
+
+  getIndexedDB: async <T>(key: string, ttlMs: number): Promise<T | null> => {
+    try {
+      const db = await openDB();
+      const tx = db.transaction(STORE_NAME, 'readonly');
+      const store = tx.objectStore(STORE_NAME);
+      const request = store.get(key);
+      
+      return new Promise((resolve, reject) => {
+        request.onsuccess = () => {
+          const result = request.result;
+          if (!result) {
+            resolve(null);
+            return;
+          }
+          if (Date.now() - result.timestamp > ttlMs) {
+            resolve(null);
+            return;
+          }
+          resolve(result.value as T);
+        };
+        request.onerror = () => reject(request.error);
+      });
+    } catch (error) {
+      console.error(`[SafeStorage] Error getting IndexedDB key ${key}:`, error);
+      return null;
+    }
+  },
+
+  deleteIndexedDB: async (key: string): Promise<void> => {
+    try {
+      const db = await openDB();
+      const tx = db.transaction(STORE_NAME, 'readwrite');
+      const store = tx.objectStore(STORE_NAME);
+      store.delete(key);
+      return new Promise((resolve, reject) => {
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      });
+    } catch (error) {
+      console.error(`[SafeStorage] Error deleting IndexedDB key ${key}:`, error);
+    }
+  },
+
+  clearAllIndexedDBByPrefix: async (prefix: string): Promise<void> => {
+    try {
+      const db = await openDB();
+      const tx = db.transaction(STORE_NAME, 'readwrite');
+      const store = tx.objectStore(STORE_NAME);
+      const request = store.openCursor();
+      
+      return new Promise((resolve, reject) => {
+        request.onsuccess = (event: any) => {
+          const cursor = event.target.result;
+          if (cursor) {
+            const key = cursor.key.toString();
+            if (key.startsWith(prefix)) {
+              cursor.delete();
+            }
+            cursor.continue();
+          } else {
+            resolve();
+          }
+        };
+        request.onerror = () => reject(request.error);
+      });
+    } catch (error) {
+      console.error(`[SafeStorage] Error clearing IndexedDB prefix ${prefix}:`, error);
     }
   },
 

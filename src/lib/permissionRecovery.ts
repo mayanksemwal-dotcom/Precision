@@ -30,7 +30,7 @@ export const runPermissionDiagnostic = async (): Promise<DiagnosticResult> => {
     });
 
     // 2. Check Users
-    const usersSnap = await getDocs(collection(db, 'users'));
+    const usersSnap = await getDocs(collection(db, 'employee_master'));
     usersSnap.docs.forEach(d => {
       const u = d.data();
       if (!expectedRoles.includes(u.role)) {
@@ -78,7 +78,7 @@ export const performPermissionRecovery = async () => {
 
   // 1. Roles
   const roles = [
-    'ADMIN', 'Manager', 'Team_Lead', 'QA', 'Agent', 'SME', 'Ops_TL', 'STL', 'QTL', 'Trainer', 'Trainer_TL', 'MIS'
+    'ADMIN', 'MANAGER', 'Team Lead', 'QA', 'AGENT', 'SME', 'TRAINER', 'MIS', 'HR', 'IT_MANAGER', 'OPS_HEAD', 'ASSISTANT_MANAGER'
   ];
 
   for (const role of roles) {
@@ -91,26 +91,12 @@ export const performPermissionRecovery = async () => {
     await addOp();
   }
 
-  // Upper Roles
-  const upperRoles = roles.map(r => r.toUpperCase());
-  for (const role of upperRoles) {
-    if (!roles.includes(role)) {
-       batch.set(doc(db, 'roles', role), {
-        id: role,
-        name: role,
-        description: `Default system role for ${role}`,
-        createdAt: now
-      }, { merge: true });
-      await addOp();
-    }
-  }
-
   // 2. Role Permissions
   const modules = [
     'Workforce TMS', 'KPI Scorecard', 'Employee Relations', 'Historical Records', 'Important Quality Links', 'Console'
   ];
 
-  const allRoleKeys = Array.from(new Set([...roles, ...upperRoles]));
+  const allRoleKeys = roles;
 
   for (const role of allRoleKeys) {
     for (const mod of modules) {
@@ -133,7 +119,7 @@ export const performPermissionRecovery = async () => {
       if (upperRole === 'ADMIN') {
         perms = { ...perms, can_view: true, can_create: true, can_edit: true, can_delete: true, can_export: true, can_approve: true };
       } 
-      else if (['MANAGER', 'OPS_TL', 'STL', 'TRAINER_TL', 'MIS'].includes(upperRole)) {
+      else if (['MANAGER', 'MIS'].includes(upperRole)) {
         perms.can_view = true;
         perms.can_export = true;
         perms.can_approve = true;
@@ -144,7 +130,7 @@ export const performPermissionRecovery = async () => {
             perms.can_view = true;
         }
       }
-      else if (['TEAM_LEAD', 'QTL', 'QA', 'SME', 'TRAINER'].includes(upperRole)) {
+      else if (['TEAM LEAD', 'QTL', 'QA', 'SME', 'TRAINER'].includes(upperRole)) {
         perms.can_view = true;
         if (mod === 'Employee Relations' || mod === 'Workforce TMS' || mod === 'KPI Scorecard') {
             perms.can_create = true;
@@ -164,7 +150,7 @@ export const performPermissionRecovery = async () => {
   }
 
   // 3. Sync Employee Master
-  const usersSnap = await getDocs(collection(db, 'users'));
+  const usersSnap = await getDocs(collection(db, 'employee_master'));
   for (const uDoc of usersSnap.docs) {
     const u = uDoc.data();
     const masterData = {

@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback } from 'react';
-import { collection, query, where, orderBy, limit, startAfter, getDocs, QueryDocumentSnapshot } from 'firebase/firestore';
-import { db } from '../../lib/firebase';
+import { collection, query, where, orderBy, limit, startAfter, QueryDocumentSnapshot } from 'firebase/firestore';
+import { db, getDocsOptimized } from '../../lib/firebase';
 import { TMSShift } from '../../views/TMSView';
+import { repairAndNormalizeShift } from '../../services/tmsCleanupService';
 
 // Cache map for first page of historical shifts per Team Lead / Supervisor
 const firstPageCache = new Map<string, { shifts: TMSShift[]; lastDoc: any; timestamp: number }>();
@@ -33,26 +34,31 @@ export function useHistoricalShifts(uid?: string, role?: string, itemsPerPage: n
       setError(null);
 
       const normRole = (role || '').toUpperCase().trim();
-      const isSupervisorOrTL = ['TEAM_LEAD', 'STL', 'QTL', 'OPS_TL', 'TRAINER_TL', 'ASSISTANT_MANAGER', 'SME', 'MANAGER', 'OPS_HEAD', 'HR', 'IT_MANAGER', 'EXECUTIVE', 'OPS HEAD'].includes(normRole);
+      const checkIsGlobalRole = (r: string) => {
+        const upper = r.toUpperCase().trim();
+        const globals = ['ADMIN', 'OPS_HEAD', 'MIS', 'HR', 'DIRECTOR', 'VP'];
+        return globals.some(g => upper.includes(g));
+      };
+
+      const isGlobalRole = checkIsGlobalRole(normRole);
+      const isSupervisorOrTL = isGlobalRole || ['TEAM_LEAD', 'STL', 'QTL', 'OPS_TL', 'TRAINER_TL', 'SME', 'TEAM LEAD', 'OPS TL', 'TEAM LEADER'].includes(normRole);
 
       let q;
       if (userIds && userIds.length > 0) {
         // Phase 1 Optimization: Chunked UID queries for historical data
-        // Note: Firestore doesn't support 'in' with 'orderBy' easily across chunks for a single result set with limit
-        // For historical data, we'll fetch the most recent shifts for these specific users
         const chunks: string[][] = [];
         for (let i = 0; i < userIds.length; i += 30) {
           chunks.push(userIds.slice(i, i + 30));
         }
 
-        const chunkPromises = chunks.map(chunk => {
+        const chunkPromises = chunks.map((chunk, idx) => {
           const cq = query(
             collection(db, 'tmsShifts'),
             where('userId', 'in', chunk),
             orderBy('clockInTime', 'desc'),
             limit(itemsPerPage)
           );
-          return getDocs(cq);
+          return getDocsOptimized(cq, `historical_shifts_chunk_${idx}`, forceRefresh);
         });
 
         const snapshots = await Promise.all(chunkPromises);
@@ -70,7 +76,8 @@ export function useHistoricalShifts(uid?: string, role?: string, itemsPerPage: n
 
         // Take the first itemsPerPage
         const finalDocs = combinedDocs.slice(0, itemsPerPage);
-        const fetchedShifts = finalDocs.map(d => ({ id: d.id, ...d.data() } as TMSShift));
+        const rawShifts = finalDocs.map(d => ({ id: d.id, ...d.data() } as TMSShift));
+        const fetchedShifts = rawShifts.map(sh => sh as TMSShift);
         const lastVisible = finalDocs[finalDocs.length - 1] || null;
 
         setShifts(fetchedShifts);
@@ -83,30 +90,37 @@ export function useHistoricalShifts(uid?: string, role?: string, itemsPerPage: n
           timestamp: Date.now()
         });
         return;
-      } else if (isSupervisorOrTL) {
-        const isManagerRole = ['MANAGER', 'ASSISTANT_MANAGER', 'OPS_HEAD', 'HR', 'IT_MANAGER', 'EXECUTIVE', 'OPS HEAD'].includes(normRole);
-        const supervisorField = isManagerRole ? 'managerId' : 'teamLeadUid';
-        console.log(`[useHistoricalShifts] Fetching first page for supervisor: ${uid} (field: ${supervisorField})`);
+      } else if (isGlobalRole) {
+        // Global roles see entire organization
         q = query(
           collection(db, 'tmsShifts'),
-          where(supervisorField, '==', uid),
+          orderBy('clockInTime', 'desc'),
+          limit(itemsPerPage)
+        );
+      } else if (isSupervisorOrTL) {
+        // Restricted to their own team
+        q = query(
+          collection(db, 'tmsShifts'),
+          where('teamLeadUid', '==', uid),
           orderBy('clockInTime', 'desc'),
           limit(itemsPerPage)
         );
       } else {
-        console.log(`[useHistoricalShifts] Fetching first page (organization-wide)`);
+        // Fallback for regular agents (see only self)
         q = query(
           collection(db, 'tmsShifts'),
+          where('userId', '==', uid),
           orderBy('clockInTime', 'desc'),
           limit(itemsPerPage)
         );
       }
 
-      const snapshot = await getDocs(q);
-      const fetchedShifts = snapshot.docs.map(doc => ({
+      const snapshot = await getDocsOptimized(q, `historical_shifts_first_page_${uid}`, forceRefresh);
+      const rawShifts = snapshot.docs.map(doc => ({
         id: doc.id,
         ...(doc.data() as any)
       })) as TMSShift[];
+      const fetchedShifts = rawShifts.map(sh => sh as TMSShift);
 
       const lastVisible = snapshot.docs[snapshot.docs.length - 1] || null;
 
@@ -135,7 +149,7 @@ export function useHistoricalShifts(uid?: string, role?: string, itemsPerPage: n
       setError(null);
 
       const normRole = (role || '').toUpperCase().trim();
-      const isSupervisorOrTL = ['TEAM_LEAD', 'STL', 'QTL', 'OPS_TL', 'TRAINER_TL', 'ASSISTANT_MANAGER', 'SME', 'MANAGER', 'OPS_HEAD', 'HR', 'IT_MANAGER', 'EXECUTIVE', 'OPS HEAD'].includes(normRole);
+      const isSupervisorOrTL = ['TEAM_LEAD', 'TEAM LEAD', 'STL', 'QTL', 'OPS_TL', 'TRAINER_TL', 'ASSISTANT_MANAGER', 'SME', 'MANAGER', 'OPS_HEAD', 'HR', 'IT_MANAGER', 'EXECUTIVE', 'OPS HEAD'].includes(normRole);
 
       let q;
       if (isSupervisorOrTL) {
@@ -157,11 +171,12 @@ export function useHistoricalShifts(uid?: string, role?: string, itemsPerPage: n
         );
       }
 
-      const snapshot = await getDocs(q);
-      const fetchedShifts = snapshot.docs.map(doc => ({
+      const snapshot = await getDocsOptimized(q, `historical_shifts_next_page_${uid}_${shifts.length}`);
+      const rawShifts = snapshot.docs.map(doc => ({
         id: doc.id,
         ...(doc.data() as any)
       })) as TMSShift[];
+      const fetchedShifts = rawShifts.map(sh => sh as TMSShift);
 
       const lastVisible = snapshot.docs[snapshot.docs.length - 1] || null;
 

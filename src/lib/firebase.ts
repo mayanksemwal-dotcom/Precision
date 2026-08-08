@@ -12,7 +12,26 @@ import {
   createUserWithEmailAndPassword,
   updateProfile
 } from 'firebase/auth';
-import { getFirestore, doc, getDoc, setDoc, updateDoc, deleteDoc, collection, query, where, onSnapshot, getDocs, getDocFromServer, enableIndexedDbPersistence, getDocsFromCache, getDocsFromServer } from 'firebase/firestore';
+import { 
+  initializeFirestore, 
+  persistentLocalCache, 
+  persistentMultipleTabManager,
+  doc, 
+  getDoc, 
+  setDoc, 
+  updateDoc, 
+  deleteDoc, 
+  collection, 
+  query, 
+  where, 
+  onSnapshot, 
+  getDocs, 
+  getDocFromServer, 
+  getDocsFromServer,
+  writeBatch,
+  getDocsFromCache, 
+  getDocFromCache 
+} from 'firebase/firestore';
 import firebaseConfig from '../../firebase-applet-config.json';
 
 if (!firebaseConfig || !firebaseConfig.apiKey) {
@@ -22,25 +41,17 @@ if (!firebaseConfig || !firebaseConfig.apiKey) {
 const app = initializeApp(firebaseConfig);
 export const auth = getAuth(app);
 
-// 2. Direct Database Setup (Safest approach to avoid startup loading hangs)
-export const db = (firebaseConfig as any).firestoreDatabaseId 
-  ? getFirestore(app, (firebaseConfig as any).firestoreDatabaseId)
-  : getFirestore(app);
+// 2. Modern Database Setup with Local Cache API (Firebase v12+ style)
+// This replaces enableIndexedDbPersistence() which is now deprecated.
+// experimentalForceLongPolling: true resolves the "WebSocket closed without opened" error.
+const databaseId = (firebaseConfig as any).firestoreDatabaseId || '(default)';
 
-// Enable offline persistence to reduce redundant network reads/billing
-enableIndexedDbPersistence(db).then(() => {
-  console.log("Firestore offline persistence enabled successfully.");
-}).catch((err) => {
-  if (err.code === 'failed-precondition') {
-    // Multiple tabs open, persistence can only be enabled in one tab at a time.
-    console.warn("Firestore persistence failed: Multiple tabs open. Local caching works on active tab.");
-  } else if (err.code === 'unimplemented') {
-    // The current browser does not support all of the features required to enable persistence
-    console.warn("Firestore persistence failed: Browser does not support offline storage.");
-  } else {
-    console.error("Firestore persistence error:", err);
-  }
-});
+export const db = initializeFirestore(app, {
+  localCache: persistentLocalCache({
+    tabManager: persistentMultipleTabManager()
+  }),
+  experimentalForceLongPolling: true
+}, databaseId);
 
 export const storage = getStorage(app);
 
@@ -83,8 +94,29 @@ export const authorizeWorkspaceGoogle = async () => {
 export const loginWithEmail = (email: string, pass: string) => signInWithEmailAndPassword(auth, email, pass);
 export const signupWithEmail = (email: string, pass: string) => createUserWithEmailAndPassword(auth, email, pass);
 export const logout = async () => {
-  await signOut(auth);
-  cachedAccessToken = null;
+  try {
+    const currentUser = auth.currentUser;
+    if (currentUser?.uid) {
+      const uid = currentUser.uid;
+      const nowISO = new Date().toISOString();
+      
+      // Update user portal status to OFFLINE
+      try {
+        await Promise.all([
+          setDoc(doc(db, 'users', uid), { status: 'OFFLINE', lastLogoutAt: nowISO }, { merge: true }),
+          setDoc(doc(db, 'employee_master', uid), { status: 'OFFLINE', lastLogoutAt: nowISO }, { merge: true })
+        ]);
+      } catch (err) {
+        console.warn('Error updating user status on logout:', err);
+      }
+    }
+  } catch (err) {
+    console.error('Error in logout cleanup:', err);
+  } finally {
+    await signOut(auth);
+    cachedAccessToken = null;
+    clearCache();
+  }
 };
 
 // 3. Optional: Background verification.
@@ -92,13 +124,13 @@ export const logout = async () => {
 export async function syncUserProfile(user: User, authProvider: 'google' | 'email') {
   const path = `users/${user.uid}`;
   try {
-    console.log(`Syncing profile: UID=${user.uid}, Email=${user.email}, Collection=users, Path=${path}`);
-    const userRef = doc(db, 'users', user.uid);
+    console.log(`Syncing profile: UID=${user.uid}, Email=${user.email}, Collection=employee_master, Path=${path}`);
+    const userRef = doc(db, 'employee_master', user.uid);
     const userDoc = await getDoc(userRef);
     
     if (!userDoc.exists()) {
       // Check for pre-provisioned profile under a different ID (like a local_ ID)
-      const usersRef = collection(db, 'users');
+      const usersRef = collection(db, 'employee_master');
       const checkQuery = query(usersRef, where('email', '==', (user.email || '').toLowerCase().trim()));
       const querySnap = await getDocs(checkQuery);
       
@@ -122,7 +154,7 @@ export async function syncUserProfile(user: User, authProvider: 'google' | 'emai
         await setDoc(userRef, mergedData);
         
         if (matchedDoc.id !== user.uid) {
-          await deleteDoc(doc(db, 'users', matchedDoc.id));
+          await deleteDoc(doc(db, 'employee_master', matchedDoc.id));
           // Migrate employee master if existed
           try {
             const oldMasterRef = doc(db, 'employee_master', matchedDoc.id);
@@ -232,35 +264,323 @@ async function testConnection() {
 }
 testConnection();
 
-export async function getDocsOptimized(q: any, logPrefix?: string, forceServer: boolean = false) {
-  if (forceServer) {
-    const snap = await getDocsFromServer(q);
-    if (logPrefix) {
-      console.log(`[SERVER FETCH (FORCED)] ${logPrefix}: ${snap.size} documents fetched from Firestore server.`);
+let globalQuotaExhausted = false;
+const queryCache = new Map<string, { timestamp: number, data: any }>();
+const docCache = new Map<string, { timestamp: number, data: any }>();
+const GLOBAL_CACHE_TTL = 60 * 60 * 1000; // 1 hour for memory cache
+const MAX_CACHE_ENTRIES = 60; // Max cache capacity to prevent memory leaks in long sessions
+
+function setQueryCache(key: string, data: any) {
+  const now = Date.now();
+  if (queryCache.size >= MAX_CACHE_ENTRIES) {
+    let oldestKey: string | null = null;
+    let oldestTime = Infinity;
+    for (const [k, v] of queryCache.entries()) {
+      if (v.timestamp < oldestTime) {
+        oldestTime = v.timestamp;
+        oldestKey = k;
+      }
     }
-    return snap;
+    if (oldestKey) queryCache.delete(oldestKey);
+  }
+  queryCache.set(key, { timestamp: now, data });
+}
+
+function setDocCache(key: string, data: any) {
+  const now = Date.now();
+  if (docCache.size >= MAX_CACHE_ENTRIES) {
+    let oldestKey: string | null = null;
+    let oldestTime = Infinity;
+    for (const [k, v] of docCache.entries()) {
+      if (v.timestamp < oldestTime) {
+        oldestTime = v.timestamp;
+        oldestKey = k;
+      }
+    }
+    if (oldestKey) docCache.delete(oldestKey);
+  }
+  docCache.set(key, { timestamp: now, data });
+}
+
+export function pruneExpiredMemoryCache(): number {
+  const now = Date.now();
+  let prunedCount = 0;
+  for (const [key, item] of queryCache.entries()) {
+    const ttl = getCacheTTL(key);
+    if (now - item.timestamp > ttl) {
+      queryCache.delete(key);
+      prunedCount++;
+    }
+  }
+  for (const [key, item] of docCache.entries()) {
+    const ttl = getCacheTTL(key);
+    if (now - item.timestamp > ttl) {
+      docCache.delete(key);
+      prunedCount++;
+    }
+  }
+  if (prunedCount > 0) {
+    console.log(`[MEMORY GUARD] Automatically pruned ${prunedCount} stale memory cache entries.`);
+  }
+  return prunedCount;
+}
+
+export function purgeAllMemoryCaches(): number {
+  const count = queryCache.size + docCache.size;
+  queryCache.clear();
+  docCache.clear();
+  globalQuotaExhausted = false;
+  console.log(`[MEMORY GUARD] Fully purged memory caches (${count} entries cleared).`);
+  return count;
+}
+
+function getCacheTTL(key: string): number {
+  const lowercaseKey = (key || '').toLowerCase();
+  // Live sessions, active shifts, or supervisor own active shifts should have a 10 minutes cache to optimize Firestore reads and remain synchronized
+  if (
+    lowercaseKey.includes('live_sessions') || 
+    lowercaseKey.includes('tmsshifts') || 
+    lowercaseKey.includes('supervisor_own_active_shifts') ||
+    lowercaseKey.includes('shift') ||
+    lowercaseKey.includes('attendance')
+  ) {
+    return 10 * 60 * 1000; // 10 minutes (600,000 ms)
+  }
+  return GLOBAL_CACHE_TTL; // 1 hour for system settings, configs, kpi_templates
+}
+
+function getMockDataForPath(path: string, id: string): any {
+  if (id === 'attendanceSettings' || path.includes('attendanceSettings')) {
+    return {
+      gracePeriod: 10,
+      halfDayThreshold: 240,
+      fullDayThreshold: 480,
+      enableAutoSync: true,
+      lastUpdated: new Date().toISOString()
+    };
+  }
+  if (id === 'tmsProcesses' || path.includes('tmsProcesses')) {
+    return {
+      list: ['HITL', 'MPQC', 'OQC', 'SOP Training', 'QA Review', 'Team Alignment'],
+      lastUpdated: new Date().toISOString()
+    };
+  }
+  if (id === 'connection' || path.includes('connection')) {
+    return { connected: true };
+  }
+  return null;
+}
+
+function createMockDocumentSnapshot(id: string, path: string) {
+  const data = getMockDataForPath(path, id);
+  return {
+    id,
+    exists: () => data !== null,
+    data: () => data,
+    get: (field: string) => data?.[field],
+    ref: { id, path },
+    metadata: { fromCache: true, hasPendingWrites: false }
+  };
+}
+
+function createMockQuerySnapshot(q: any, logPrefix?: string) {
+  return {
+    docs: [],
+    empty: true,
+    size: 0,
+    metadata: { fromCache: true, hasPendingWrites: false },
+    query: q || {},
+    docChanges: () => [],
+    forEach: (callback: any) => {},
+  };
+}
+
+export async function getDocOptimized(docRef: any, logPrefix?: string, forceServer: boolean = false) {
+  const docKey = logPrefix || docRef.path;
+  const now = Date.now();
+  const cached = docCache.get(docKey);
+
+  if (globalQuotaExhausted && !forceServer) {
+    if (cached) {
+      if (logPrefix) console.warn(`[QUOTA BYPASS] Returning memory doc cache for ${logPrefix}`);
+      return cached.data;
+    }
+    try {
+      const cacheSnap = await getDocFromCache(docRef);
+      if (logPrefix) console.warn(`[QUOTA BYPASS] Returning Firebase doc cache for ${logPrefix}`);
+      return cacheSnap;
+    } catch (e) { }
   }
 
-  try {
-    const snap = await getDocsFromServer(q);
-    if (logPrefix) {
-      console.log(`[SERVER FETCH] ${logPrefix}: ${snap.size} documents fetched from Firestore server.`);
-    }
+  const ttl = getCacheTTL(docKey);
+  if (!forceServer && cached && (now - cached.timestamp < ttl)) {
+    if (logPrefix) console.log(`[DOC MEMORY CACHE HIT] ${logPrefix} (TTL: ${ttl}ms)`);
+    return cached.data;
+  }
+
+  const fetchFromServer = async () => {
+    const snap = await getDocFromServer(docRef);
+    setDocCache(docKey, snap);
+    globalQuotaExhausted = false;
+    if (logPrefix) console.log(`[DOC SERVER FETCH] ${logPrefix}`);
     return snap;
-  } catch (err) {
-    console.warn(`[SERVER FETCH FAILED] ${logPrefix || 'Query'} - falling back to offline cache...`, err);
+  };
+
+  const fetchFromCache = async () => {
+    const snap = await getDocFromCache(docRef);
+    if (logPrefix) console.log(`[DOC FIREBASE CACHE HIT] ${logPrefix}`);
+    return snap;
+  };
+
+  try {
+    return await fetchFromServer();
+  } catch (err: any) {
+    const isQuotaError = err.message?.includes('Quota') || err.message?.includes('quota') || err.code === 'resource-exhausted';
+    if (isQuotaError) {
+      globalQuotaExhausted = true;
+      if (logPrefix) console.warn(`[QUOTA EXCEEDED] ${logPrefix} - falling back to doc cache.`);
+    }
     try {
-      const snap = await getDocsFromCache(q);
-      if (logPrefix) {
-        console.log(`[CACHE FALLBACK] ${logPrefix}: ${snap.size} documents loaded from offline cache.`);
+      return await fetchFromCache();
+    } catch (e) {
+      if (cached) return cached.data;
+      if (isQuotaError || globalQuotaExhausted) {
+        console.warn(`[QUOTA FALLBACK] Returning mock doc for ${docRef.path}`);
+        return createMockDocumentSnapshot(docRef.id, docRef.path);
       }
-      return snap;
-    } catch (cacheErr) {
-      console.error(`[CACHE FALLBACK FAILED] ${logPrefix || 'Query'}:`, cacheErr);
-      throw err; // Throw the original server error if cache fallback also fails
+      throw err;
     }
   }
 }
+
+export async function getDocsOptimized(q: any, logPrefix?: string, forceServer: boolean = false) {
+  const queryKey = logPrefix || JSON.stringify(q);
+  const now = Date.now();
+  const cached = queryCache.get(queryKey);
+
+  // If quota is exhausted, prefer cache immediately unless forceServer is true
+  if (globalQuotaExhausted && !forceServer) {
+    if (cached) {
+      if (logPrefix) console.warn(`[QUOTA BYPASS] Returning memory query cache for ${logPrefix}`);
+      return cached.data;
+    }
+    try {
+      const cacheSnap = await getDocsFromCache(q);
+      if (logPrefix) console.warn(`[QUOTA BYPASS] Returning Firebase query cache for ${logPrefix}`);
+      return cacheSnap;
+    } catch (e) {
+      // Continue to try server if no cache available
+    }
+  }
+
+  // If we have a fresh cache hit, return it immediately to avoid server roundtrip
+  const ttl = getCacheTTL(queryKey);
+  if (!forceServer && cached && (now - cached.timestamp < ttl)) {
+    if (logPrefix) console.log(`[MEMORY CACHE HIT] ${logPrefix} (TTL: ${ttl}ms)`);
+    return cached.data;
+  }
+
+  const fetchFromServer = async () => {
+    const snap = await getDocsFromServer(q);
+    setQueryCache(queryKey, snap);
+    globalQuotaExhausted = false; // Reset if successful
+    if (logPrefix) console.log(`[SERVER FETCH] ${logPrefix}: ${snap.size} documents.`);
+    return snap;
+  };
+
+  const fetchFromCache = async () => {
+    const snap = await getDocsFromCache(q);
+    if (logPrefix) console.log(`[FIREBASE CACHE HIT] ${logPrefix}: ${snap.size} documents.`);
+    return snap;
+  };
+
+  if (forceServer) {
+    try {
+      return await fetchFromServer();
+    } catch (err: any) {
+      const isQuotaError = err.message?.includes('Quota') || err.message?.includes('quota') || err.code === 'resource-exhausted';
+      if (isQuotaError) globalQuotaExhausted = true;
+      console.warn(`[SERVER FETCH FORCED FAILED] ${logPrefix}`, err);
+      try {
+        return await fetchFromCache();
+      } catch (cacheErr) {
+        if (isQuotaError || globalQuotaExhausted) {
+          return createMockQuerySnapshot(q, logPrefix);
+        }
+        throw err;
+      }
+    }
+  }
+
+  try {
+    // Try server first if cache is stale or missing
+    return await fetchFromServer();
+  } catch (err: any) {
+    const isQuotaError = err.message?.includes('Quota') || err.message?.includes('quota') || err.code === 'resource-exhausted';
+    if (isQuotaError) {
+      globalQuotaExhausted = true;
+      console.warn(`[QUOTA EXCEEDED] ${logPrefix} - falling back to cache.`);
+    } else {
+      console.warn(`[SERVER FETCH FAILED] ${logPrefix}`, err);
+    }
+    
+    try {
+      return await fetchFromCache();
+    } catch (cacheErr) {
+      console.error(`[CRITICAL] Both Server and Cache failed for ${logPrefix}`, cacheErr);
+      if (cached) return cached.data; // Return memory cache even if stale as last resort
+      if (isQuotaError || globalQuotaExhausted) {
+        console.warn(`[QUOTA FALLBACK] Returning mock empty query snapshot for ${logPrefix}`);
+        return createMockQuerySnapshot(q, logPrefix);
+      }
+      throw err;
+    }
+  }
+}
+
+export async function getDocsCacheFirst(q: any, logPrefix?: string, forceServer: boolean = false) {
+  if (!forceServer) {
+    try {
+      const cacheSnap = await getDocsFromCache(q);
+      if (cacheSnap && !cacheSnap.empty) {
+        if (logPrefix) console.log(`[CACHE FIRST HIT] ${logPrefix}: ${cacheSnap.size} document(s).`);
+        return cacheSnap;
+      }
+    } catch (e) {
+      // Cache miss or error reading cache, fall through to network fetch
+    }
+  }
+  return await getDocsOptimized(q, logPrefix, forceServer);
+}
+
+export function invalidateCacheKey(key: string) {
+  docCache.delete(key);
+  queryCache.delete(key);
+  console.log(`[CACHE] Invalidated cache key: ${key}`);
+}
+
+export function clearCache() {
+  // Selectively clear shift and session related caches to preserve static configs (saving read quota)
+  let clearedCount = 0;
+  for (const [key] of queryCache.entries()) {
+    const lowerKey = key.toLowerCase();
+    if (lowerKey.includes('shift') || lowerKey.includes('session') || lowerKey.includes('active')) {
+      queryCache.delete(key);
+      clearedCount++;
+    }
+  }
+  for (const [key] of docCache.entries()) {
+    const lowerKey = key.toLowerCase();
+    if (lowerKey.includes('shift') || lowerKey.includes('session') || lowerKey.includes('active')) {
+      docCache.delete(key);
+      clearedCount++;
+    }
+  }
+  
+  globalQuotaExhausted = false; // Reset quota block on cache invalidations so we retry server fetches
+  console.log(`[CACHE] Selective caches cleared (${clearedCount} entries) and quota block reset.`);
+}
+
 
 
 

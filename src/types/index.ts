@@ -10,7 +10,7 @@ export enum UserRole {
   SME = 'SME',
   QTL = 'QTL',
   QA = 'QA',
-  TEAM_LEAD = 'TEAM_LEAD',
+  TEAM_LEAD = 'Team Lead',
   TRAINER = 'TRAINER',
   TRAINER_TL = 'TRAINER_TL',
   MIS = 'MIS',
@@ -36,9 +36,11 @@ export interface UserProfile {
   team?: string;
   teamLeadId?: string;
   teamLeadUid?: string;
+  tlId?: string;
   teamLeadName?: string;
   teamLeadEmail?: string;
   managerId?: string; // Master field
+  managerUid?: string;
   managerName?: string; // Master field
   managerEmail?: string;
   mappedManagerId?: string; // Legacy/Auth field
@@ -349,6 +351,39 @@ export interface ITTicket {
   slaDeadline: any;
 }
 
+export interface KPIScorecard {
+  id: string; // `${reportingPeriod}_${employeeUid}`
+  reportingPeriod: string;
+  employeeUid: string;
+  employeeEmail: string;
+  employeeName: string;
+  employeeId?: string;
+  role: string;
+  process: string;
+  targetProductivity: number | string;
+  actualProductivity: number | string;
+  targetQuality: number | string;
+  actualQuality: number | string;
+  targetAttendance: number | string;
+  actualAttendance: number | string;
+  targetAPT: number | string;
+  actualAPT: number | string;
+  bonus: number;
+  penalty: number;
+  comments: string;
+  productivityScore: number;
+  qualityScore: number;
+  attendanceScore: number;
+  aptScore: number;
+  totalScore: number;
+  rank?: number | string;
+  processRank?: number | string;
+  roleRank?: number | string;
+  organizationRank?: number | string;
+  uploadedBy: string;
+  uploadedAt: string;
+}
+
 export interface ITAsset {
   id: string;
   assetType: string;
@@ -358,6 +393,44 @@ export interface ITAsset {
   issueDate?: string;
   status: 'Active' | 'In Maintenance' | 'Replaced' | 'Retired';
 }
+
+export type ShiftEventType = 
+  | 'CLOCK_IN'
+  | 'CLOCK_OUT'
+  | 'BREAK_START'
+  | 'BREAK_END'
+  | 'PROCESS_SWITCH'
+  | 'SHIFT_EXTENSION'
+  | 'AUTO_CLOSE'
+  | 'AUTO_PRODUCTIVE_LIMIT'
+  | 'SUPERVISOR_FORCE_LOGOUT'
+  | 'MANUAL_CORRECTION'
+  | 'SHIFT_RECOVERY'
+  | 'SHIFT_RESUME'
+  | 'ATTENDANCE_REPAIR'
+  | 'STATUS_CHANGE'
+  | 'ROLE_OVERRIDE'
+  | 'DEVICE_CHANGE'
+  | 'LOGIN'
+  | 'LOGOUT'
+  | 'HEARTBEAT_LOST'
+  | 'HEARTBEAT_RESTORED'
+  | 'LEGACY_IMPORT';
+
+export interface ShiftEvent {
+  sequence: number;
+  eventType: ShiftEventType;
+  timestamp: string; // ISO format
+  performedBy: string; // "Employee" | "Admin" | "Supervisor" | "System" | User name/email
+  source: string; // "TMS" | "Recovery Tool" | "Cleanup Service" | "Attendance Repair" | "Supervisor Panel" | etc.
+  reason?: string | null;
+  oldValue?: string | null;
+  newValue?: string | null;
+  metadata?: Record<string, any>;
+  confidence?: number;
+  remarks?: string;
+}
+
 
 
 

@@ -1,12 +1,16 @@
 import React, { useState, useEffect, useMemo, useDeferredValue, useRef } from 'react';
-import { db, auth } from '../../lib/firebase';
+import { db, auth, getDocsOptimized, getDocOptimized, handleFirestoreError, OperationType } from '../../lib/firebase';
 import { firestoreLogger } from '../../lib/firestoreLogger';
+import { getLiveTime, getLiveTimeISO } from '../../lib/timeSync';
 import { collection, query, getDocs, doc, setDoc, writeBatch, where, orderBy, getDoc, addDoc, onSnapshot, limit, startAfter } from 'firebase/firestore';
 import { UserProfile, UserRole } from '../../types';
+import { isSupervisorOf } from '../../lib/hierarchy';
 import { usePermission } from '../PermissionContext';
+import { useConfig } from '../../contexts/ConfigContext';
 import { toast } from 'sonner';
 import { Calendar, RefreshCw, FileText, Download, CheckCircle, ClockAlert, XCircle, Search, Save, AlertCircle, Clock } from 'lucide-react';
 import * as XLSX from 'xlsx';
+import JSZip from 'jszip';
 import { motion } from 'motion/react';
 import { MultiSelectDropdown } from '../ui/multi-select';
 
@@ -45,12 +49,14 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
   const isTopAdmin = ['ADMIN', 'MANAGER', 'MIS', 'OPS_HEAD', 'HR', 'IT_MANAGER'].includes(roleNormalized);
   const isStrictAdminOrManager = ['ADMIN', 'MANAGER', 'MIS', 'ASSISTANT_MANAGER', 'OPS_HEAD', 'HR', 'IT_MANAGER'].includes(roleNormalized);
   const isTLRole = ['QTL', 'STL', 'OPS_TL', 'TRAINER_TL', 'TEAM_LEAD', 'TRAINER', 'SME', 'OPS_TEAM_LEAD', 'TEAM_LEADER'].includes(roleNormalized);
+  const { attendanceSettings: centralAttendance } = useConfig();
 
   const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState(false);
   const [records, setRecords] = useState<AttendanceSummary[]>([]);
   const [config, setConfig] = useState<AttendanceConfig>({ presentThreshold: 480, halfDayThreshold: 240, countBreakTime: false });
   const [dateRange, setDateRange] = useState<'today' | 'yesterday' | 'week' | 'month' | 'current_month' | 'previous_month' | 'custom'>('today');
+  const [forceRefresh, setForceRefresh] = useState(false);
   
   // Filter / Pagination state
   const [searchTerm, setSearchTerm] = useState('');
@@ -65,8 +71,12 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
   const deferredSearchTerm = useDeferredValue(searchTerm);
 
   // Date Range state for Custom
-  const [customStartDate, setCustomStartDate] = useState(new Date().toISOString().split('T')[0]);
-  const [customEndDate, setCustomEndDate] = useState(new Date().toISOString().split('T')[0]);
+  const getISTDateStr = (date: Date) => {
+    return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(date);
+  };
+
+  const [customStartDate, setCustomStartDate] = useState(getISTDateStr(getLiveTime()));
+  const [customEndDate, setCustomEndDate] = useState(getISTDateStr(getLiveTime()));
   const [lastDoc, setLastDoc] = useState<any>(null);
   const [hasMore, setHasMore] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
@@ -95,17 +105,29 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
 
 
   const enhancedRecords = useMemo(() => {
-    // 1. Group by employeeEmail + attendanceDate
+    // 1. Group by employeeEmail + logical attendanceDate (handling overnight shifts)
     const groups: Record<string, AttendanceSummary[]> = {};
     records.forEach(r => {
-        const key = `${r.employeeEmail}_${r.attendanceDate}`;
+        // Calculate logical work date: shifts starting before 4 AM belong to previous day
+        const sessionStart = new Date(r.sessionStart);
+        const logicalDate = new Date(sessionStart.getTime() - 4 * 60 * 60 * 1000);
+        const logicalDateStr = getISTDateStr(logicalDate);
+        
+        const key = `${r.employeeEmail}_${logicalDateStr}`;
         if (!groups[key]) groups[key] = [];
         groups[key].push(r);
     });
 
     // 2. Consolidate
     const consolidated = Object.values(groups).map(group => {
-        if (group.length === 1) return group[0];
+        // Calculate logical work date for the group (shifts starting between 00:00 and 04:00 belong to previous day)
+        const sessionStart = new Date(group[0].sessionStart);
+        const logicalDate = new Date(sessionStart.getTime() - 4 * 60 * 60 * 1000);
+        const logicalDateStr = getISTDateStr(logicalDate);
+
+        if (group.length === 1) {
+            return { ...group[0], attendanceDate: logicalDateStr };
+        }
         
         const totalProd = group.reduce((sum, r) => sum + r.productiveMinutes, 0);
         const totalBreak = group.reduce((sum, r) => sum + r.totalBreakMinutes, 0);
@@ -123,6 +145,7 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
         
         return {
             ...base,
+            attendanceDate: logicalDateStr,
             productiveMinutes: totalProd,
             totalBreakMinutes: totalBreak,
             attendanceStatus: status,
@@ -149,7 +172,13 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
   }, [records, userLookup, config]);
 
   const filteredRecords = useMemo(() => {
+    const { startStr: requestedStart, endStr: requestedEnd } = getDateRangeStr();
+
     return enhancedRecords.filter(r => {
+      // 0. Filter by requested logical date range
+      const matchesDateRange = r.attendanceDate >= requestedStart && r.attendanceDate <= requestedEnd;
+      if (!matchesDateRange) return false;
+
       // 1. Base Security: If not top admin, enforce visibility rules
       if (!isTopAdmin) {
         const userEmail = (user.email || '').toLowerCase().trim();
@@ -295,97 +324,7 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
     allUsersRef.current = allUsers;
   }, [allUsers]);
 
-  const fetchAttendanceRecords = async (isLoadMore = false) => {
-    if (!isLoadMore) return ''; // Managed in real-time by the active useEffect listener!
-    setLoadingMore(true);
-
-    try {
-      const getLocalDateString = (d: Date): string => {
-        const yyyy = d.getFullYear();
-        const mm = String(d.getMonth() + 1).padStart(2, '0');
-        const dd = String(d.getDate()).padStart(2, '0');
-        return `${yyyy}-${mm}-${dd}`;
-      };
-
-      let startStr = '';
-      let endStr = '';
-
-      if (dateRange === 'today') {
-        const todayStr = getLocalDateString(new Date());
-        startStr = todayStr;
-        endStr = todayStr;
-      } else if (dateRange === 'yesterday') {
-        const d = new Date();
-        d.setDate(d.getDate() - 1);
-        const yesterdayStr = getLocalDateString(d);
-        startStr = yesterdayStr;
-        endStr = yesterdayStr;
-      } else if (dateRange === 'week') {
-        const d = new Date();
-        d.setDate(d.getDate() - 7);
-        startStr = getLocalDateString(d);
-        endStr = getLocalDateString(new Date());
-      } else if (dateRange === 'month') {
-        const d = new Date();
-        d.setDate(d.getDate() - 30);
-        startStr = getLocalDateString(d);
-        endStr = getLocalDateString(new Date());
-      } else if (dateRange === 'current_month') {
-        const d = new Date();
-        const firstDay = new Date(d.getFullYear(), d.getMonth(), 1);
-        startStr = getLocalDateString(firstDay);
-        endStr = getLocalDateString(d);
-      } else if (dateRange === 'previous_month') {
-        const d = new Date();
-        const firstDayOfPrev = new Date(d.getFullYear(), d.getMonth() - 1, 1);
-        const lastDayOfPrev = new Date(d.getFullYear(), d.getMonth(), 0);
-        startStr = getLocalDateString(firstDayOfPrev);
-        endStr = getLocalDateString(lastDayOfPrev);
-      } else if (dateRange === 'custom') {
-        startStr = customStartDate;
-        endStr = customEndDate;
-      }
-
-      const isStaff = isTopAdmin || isStrictAdminOrManager || isTLRole;
-      const attRef = collection(db, 'attendanceSummary');
-      
-      const PAGE_SIZE = 100;
-      let q = isStaff
-        ? query(attRef, where('attendanceDate', '>=', startStr), where('attendanceDate', '<=', endStr), orderBy('attendanceDate', 'desc'), limit(PAGE_SIZE))
-        : query(attRef, where('userId', '==', user.uid), where('attendanceDate', '>=', startStr), where('attendanceDate', '<=', endStr), orderBy('attendanceDate', 'desc'), limit(PAGE_SIZE));
-
-      if (lastDoc) {
-        q = query(q, startAfter(lastDoc));
-      }
-
-      const snap = await getDocs(q);
-      firestoreLogger.trackRead('attendance_records_paged_getDocs', snap.size);
-      
-      const attData = snap.docs.map(d => ({ ...d.data(), id: d.id } as AttendanceSummary));
-      
-      setRecords(prev => {
-        const existingIds = new Set(prev.map(p => p.id));
-        const filteredNew = attData.filter(d => !existingIds.has(d.id));
-        return [...prev, ...filteredNew];
-      });
-
-      setLastDoc(snap.docs[snap.docs.length - 1] || null);
-      setHasMore(snap.size === PAGE_SIZE);
-      setLoadingMore(false);
-      return startStr;
-    } catch (error: any) {
-      console.error('Error loading more attendance records:', error);
-      setLoadingMore(false);
-      return '';
-    }
-  };
-
-  useEffect(() => {
-    if (!user?.uid) return;
-
-    let unsubscribe: (() => void) | null = null;
-    setLoading(true);
-
+  const getDateRangeStr = () => {
     const getLocalDateString = (d: Date): string => {
       const yyyy = d.getFullYear();
       const mm = String(d.getMonth() + 1).padStart(2, '0');
@@ -397,32 +336,32 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
     let endStr = '';
 
     if (dateRange === 'today') {
-      const todayStr = getLocalDateString(new Date());
+      const todayStr = getLocalDateString(getLiveTime());
       startStr = todayStr;
       endStr = todayStr;
     } else if (dateRange === 'yesterday') {
-      const d = new Date();
+      const d = getLiveTime();
       d.setDate(d.getDate() - 1);
       const yesterdayStr = getLocalDateString(d);
       startStr = yesterdayStr;
       endStr = yesterdayStr;
     } else if (dateRange === 'week') {
-      const d = new Date();
+      const d = getLiveTime();
       d.setDate(d.getDate() - 7);
       startStr = getLocalDateString(d);
-      endStr = getLocalDateString(new Date());
+      endStr = getLocalDateString(getLiveTime());
     } else if (dateRange === 'month') {
-      const d = new Date();
+      const d = getLiveTime();
       d.setDate(d.getDate() - 30);
       startStr = getLocalDateString(d);
-      endStr = getLocalDateString(new Date());
+      endStr = getLocalDateString(getLiveTime());
     } else if (dateRange === 'current_month') {
-      const d = new Date();
+      const d = getLiveTime();
       const firstDay = new Date(d.getFullYear(), d.getMonth(), 1);
       startStr = getLocalDateString(firstDay);
       endStr = getLocalDateString(d);
     } else if (dateRange === 'previous_month') {
-      const d = new Date();
+      const d = getLiveTime();
       const firstDayOfPrev = new Date(d.getFullYear(), d.getMonth() - 1, 1);
       const lastDayOfPrev = new Date(d.getFullYear(), d.getMonth(), 0);
       startStr = getLocalDateString(firstDayOfPrev);
@@ -432,50 +371,230 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
       endStr = customEndDate;
     }
 
-    // Load config first
-    getDoc(doc(db, 'config', 'attendanceSettings')).then((configSnap) => {
-      if (configSnap.exists()) {
-        const c = configSnap.data();
-        setConfig({
-          presentThreshold: c.presentThreshold ?? 480,
-          halfDayThreshold: c.halfDayThreshold ?? 240,
-          countBreakTime: c.countBreakTime ?? false
-        });
-      }
-    }).catch(err => console.error("Error fetching config:", err));
+    return { startStr, endStr };
+  };
 
-    const isStaff = isTopAdmin || isStrictAdminOrManager || isTLRole;
-    const attRef = collection(db, 'attendanceSummary');
-    
-    const PAGE_SIZE = 100;
-    const q = isStaff
-      ? query(attRef, where('attendanceDate', '>=', startStr), where('attendanceDate', '<=', endStr), orderBy('attendanceDate', 'desc'), limit(PAGE_SIZE))
-      : query(attRef, where('userId', '==', user.uid), where('attendanceDate', '>=', startStr), where('attendanceDate', '<=', endStr), orderBy('attendanceDate', 'desc'), limit(PAGE_SIZE));
-
-    unsubscribe = onSnapshot(q, (snap) => {
-      firestoreLogger.trackRead('attendance_records_onSnapshot', snap.size);
-      const attData = snap.docs.map(d => ({ ...d.data(), id: d.id } as AttendanceSummary));
-      
-      setRecords(attData);
-      setLastDoc(snap.docs[snap.docs.length - 1] || null);
-      setHasMore(snap.size === PAGE_SIZE);
-      setLoading(false);
-    }, (error) => {
-      console.error('Error in attendance summary onSnapshot:', error);
-      setLoading(false);
-    });
-
-    if (startStr) {
-      silentSyncAttendance(startStr);
+  const getTargetUserIds = () => {
+    const isAdmin = roleNormalized === 'ADMIN';
+    if (isAdmin) {
+      return null; // Admin can fetch organization-wide (unscoped)
     }
 
-    return () => {
-      if (unsubscribe) unsubscribe();
+    const targetUserIds: string[] = [];
+
+    // Managers: Only fetch their team
+    // TLs: Only fetch assigned users
+    // Agents: Only fetch themselves
+    const isManager = ['MANAGER', 'ASSISTANT_MANAGER', 'OPS_HEAD', 'HR', 'IT_MANAGER', 'MIS'].includes(roleNormalized);
+    const isTL = ['QTL', 'STL', 'OPS_TL', 'TRAINER_TL', 'TEAM_LEAD', 'TRAINER', 'SME', 'OPS_TEAM_LEAD', 'TEAM_LEADER'].includes(roleNormalized);
+
+    if (isManager || isTL) {
+      allUsers.forEach((u: any) => {
+        if (!u.uid || u.uid === user.uid) return;
+        const isDirectReport = 
+          u.managerId === user.uid || 
+          u.mappedManagerUid === user.uid ||
+          u.teamLeadId === user.uid ||
+          u.teamLeadUid === user.uid ||
+          u.tlId === user.uid;
+        
+        const isSub = isDirectReport || isSupervisorOf(user, u, allUsers);
+        if (isSub) {
+          targetUserIds.push(u.uid);
+        }
+      });
+    }
+
+    // Always include the logged-in user themselves
+    if (!targetUserIds.includes(user.uid)) {
+      targetUserIds.push(user.uid);
+    }
+
+    return targetUserIds;
+  };
+
+  const fetchAttendanceRecords = async (isLoadMore = false) => {
+    if (!isLoadMore) {
+      // Force a refresh of the active list
+      setForceRefresh(true);
+      return '';
+    }
+
+    setLoadingMore(true);
+
+    try {
+      const { startStr, endStr } = getDateRangeStr();
+      
+      // Expand query range by 1 day on each side to ensure we capture segments of overnight shifts
+      const qStart = new Date(startStr);
+      qStart.setDate(qStart.getDate() - 1);
+      const qStartStr = getISTDateStr(qStart);
+      
+      const qEnd = new Date(endStr);
+      qEnd.setDate(qEnd.getDate() + 1);
+      const qEndStr = getISTDateStr(qEnd);
+
+      const attRef = collection(db, 'attendanceSummary');
+      const PAGE_SIZE = 50; // Increased size to handle wider query range
+
+      const targetUserIds = getTargetUserIds();
+
+      if (targetUserIds === null) {
+        // Admin: Unscoped query
+        let q = query(attRef, where('attendanceDate', '>=', qStartStr), where('attendanceDate', '<=', qEndStr), orderBy('attendanceDate', 'desc'), limit(PAGE_SIZE));
+        if (lastDoc) {
+          q = query(q, startAfter(lastDoc));
+        }
+
+        const snap = await getDocsOptimized(q, `attendance_records_paged_${dateRange}_expanded`, forceRefresh);
+        const attData = snap.docs.map((d: any) => ({ ...d.data(), id: d.id } as AttendanceSummary));
+
+        setRecords(prev => {
+          const existingIds = new Set(prev.map(p => p.id));
+          const filteredNew = attData.filter(d => !existingIds.has(d.id));
+          return [...prev, ...filteredNew];
+        });
+
+        setLastDoc(snap.docs[snap.docs.length - 1] || null);
+        setHasMore(snap.size === PAGE_SIZE);
+      } else {
+        // Scoped query for Managers, TLs, and Agents
+        // Chunk userIds into batches of 30
+        const chunks: string[][] = [];
+        for (let i = 0; i < targetUserIds.length; i += 30) {
+          chunks.push(targetUserIds.slice(i, i + 30));
+        }
+
+        const promises = chunks.map(async (chunk, index) => {
+          let q = chunk.length === 1
+            ? query(attRef, where('userId', '==', chunk[0]), where('attendanceDate', '>=', qStartStr), where('attendanceDate', '<=', qEndStr), orderBy('attendanceDate', 'desc'), limit(PAGE_SIZE))
+            : query(attRef, where('userId', 'in', chunk), where('attendanceDate', '>=', qStartStr), where('attendanceDate', '<=', qEndStr), orderBy('attendanceDate', 'desc'), limit(PAGE_SIZE));
+
+          if (lastDoc && chunks.length === 1) {
+            q = query(q, startAfter(lastDoc));
+          }
+
+          const snap = await getDocsOptimized(q, `attendance_records_paged_${dateRange}_expanded_chunk_${index}`, forceRefresh);
+          return snap.docs;
+        });
+
+        const results = await Promise.all(promises);
+        const allDocs = results.flat();
+        const attData = allDocs.map((d: any) => ({ ...d.data(), id: d.id } as AttendanceSummary));
+
+        // Sort by attendanceDate desc in-memory
+        attData.sort((a, b) => new Date(b.attendanceDate).getTime() - new Date(a.attendanceDate).getTime());
+
+        setRecords(prev => {
+          const existingIds = new Set(prev.map(p => p.id));
+          const filteredNew = attData.filter(d => !existingIds.has(d.id));
+          return [...prev, ...filteredNew];
+        });
+
+        const lastDocObj = allDocs[allDocs.length - 1] || null;
+        setLastDoc(lastDocObj);
+        setHasMore(allDocs.length >= PAGE_SIZE);
+      }
+
+      setLoadingMore(false);
+      return startStr;
+    } catch (error: any) {
+      console.error('Error loading more attendance records:', error);
+      setLoadingMore(false);
+      return '';
+    }
+  };
+
+  useEffect(() => {
+    if (centralAttendance) {
+      setConfig({
+        presentThreshold: centralAttendance.presentThreshold ?? 480,
+        halfDayThreshold: centralAttendance.halfDayThreshold ?? 240,
+        countBreakTime: centralAttendance.countBreakTime ?? false
+      });
+    }
+  }, [centralAttendance]);
+
+  useEffect(() => {
+    if (!user?.uid) return;
+
+    setLoading(true);
+    const { startStr, endStr } = getDateRangeStr();
+
+    // Config is now managed by ConfigContext and used in useEffect above
+
+    const attRef = collection(db, 'attendanceSummary');
+    const PAGE_SIZE = 30;
+
+    const fetchData = async () => {
+      try {
+        const targetUserIds = getTargetUserIds();
+
+        if (targetUserIds === null) {
+          // Admin: Unscoped query
+          const q = query(attRef, where('attendanceDate', '>=', startStr), where('attendanceDate', '<=', endStr), orderBy('attendanceDate', 'desc'), limit(PAGE_SIZE));
+          const snap = await getDocsOptimized(q, `attendance_records_fetch_${dateRange}`, forceRefresh);
+          const attData = snap.docs.map((d: any) => ({ ...d.data(), id: d.id } as AttendanceSummary));
+          
+          setRecords(attData);
+          setLastDoc(snap.docs[snap.docs.length - 1] || null);
+          setHasMore(snap.size === PAGE_SIZE);
+        } else {
+          // Scoped query for Managers, TLs, and Agents
+          const chunks: string[][] = [];
+          for (let i = 0; i < targetUserIds.length; i += 30) {
+            chunks.push(targetUserIds.slice(i, i + 30));
+          }
+
+          const promises = chunks.map(async (chunk, index) => {
+            const q = chunk.length === 1
+              ? query(attRef, where('userId', '==', chunk[0]), where('attendanceDate', '>=', startStr), where('attendanceDate', '<=', endStr), orderBy('attendanceDate', 'desc'), limit(PAGE_SIZE))
+              : query(attRef, where('userId', 'in', chunk), where('attendanceDate', '>=', startStr), where('attendanceDate', '<=', endStr), orderBy('attendanceDate', 'desc'), limit(PAGE_SIZE));
+
+            const snap = await getDocsOptimized(q, `attendance_records_fetch_${dateRange}_chunk_${index}`, forceRefresh);
+            return snap.docs;
+          });
+
+          const results = await Promise.all(promises);
+          const allDocs = results.flat();
+          const attData = allDocs.map((d: any) => ({ ...d.data(), id: d.id } as AttendanceSummary));
+
+          // Sort descending in-memory
+          attData.sort((a, b) => new Date(b.attendanceDate).getTime() - new Date(a.attendanceDate).getTime());
+
+          setRecords(attData);
+          const lastDocObj = allDocs[allDocs.length - 1] || null;
+          setLastDoc(lastDocObj);
+          setHasMore(allDocs.length >= PAGE_SIZE);
+        }
+
+        setLoading(false);
+        if (forceRefresh) {
+          setForceRefresh(false);
+        }
+      } catch (error) {
+        console.error('Error in attendance summary fetch:', error);
+        setLoading(false);
+        if (forceRefresh) {
+          setForceRefresh(false);
+        }
+      }
     };
-  }, [dateRange, customStartDate, customEndDate, user?.uid, isTopAdmin, isStrictAdminOrManager, isTLRole]);
+
+    fetchData();
+    
+    // Auto refresh every 30 minutes only if the dashboard is visible
+    const interval = setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        fetchData();
+      }
+    }, 30 * 60 * 1000); 
+
+    return () => clearInterval(interval);
+  }, [dateRange, customStartDate, customEndDate, user?.uid, isTopAdmin, isStrictAdminOrManager, isTLRole, forceRefresh]);
 
   const loadData = async () => {
-    await fetchAttendanceRecords();
+    setForceRefresh(true);
   };
 
   const calculateStatus = (productiveMins: number, thresholdConf: AttendanceConfig): 'Present' | 'Half Day' | 'Absent' => {
@@ -486,7 +605,7 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
 
   const silentSyncAttendance = async (startStr: string) => {
     try {
-      let syncSinceDate = new Date();
+      let syncSinceDate = getLiveTime();
       syncSinceDate.setDate(syncSinceDate.getDate() - 14);
       if (startStr) {
         const parsed = new Date(startStr);
@@ -496,30 +615,28 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
         }
       }
       const syncSinceISO = syncSinceDate.toISOString();
-      const syncSinceDateStr = syncSinceDate.toISOString().split('T')[0];
+      const syncSinceDateStr = getISTDateStr(syncSinceDate);
 
       const shiftsRef = collection(db, 'tmsShifts');
       const qShifts = query(shiftsRef, where('clockInTime', '>=', syncSinceISO));
-      const shiftsSnap = await getDocs(qShifts);
+      const shiftsSnap = await getDocsOptimized(qShifts, `silent_sync_shifts_fetch_${syncSinceDateStr}`);
       
       const completedShifts = shiftsSnap.docs
-        .map(d => ({ ...d.data(), id: d.id }))
+        .map((d: any) => ({ ...d.data(), id: d.id }))
         .filter((s: any) => s.status === 'COMPLETED' || s.status === 'AUTO_CLOSED' || s.status === 'COMPLETED_FORCED');
 
       if (completedShifts.length === 0) return;
 
-      const attSnap = await getDocs(query(collection(db, 'attendanceSummary'), where('attendanceDate', '>=', syncSinceDateStr)));
-      const existingShiftIds = new Set(attSnap.docs.map(d => d.data().shiftId));
+      const attSnap = await getDocsOptimized(query(collection(db, 'attendanceSummary'), where('attendanceDate', '>=', syncSinceDateStr)), `silent_sync_existing_att_fetch_${syncSinceDateStr}`);
+      const existingShiftIds = new Set(attSnap.docs.map((d: any) => d.data().shiftId));
 
-      // Fetch the config to ensure correct threshold calculations
-      const confSnap = await getDoc(doc(db, 'config', 'attendanceSettings'));
+      // Use central config to ensure correct threshold calculations (Phase 5)
       let activeConfig = config;
-      if (confSnap.exists()) {
-        const c = confSnap.data();
+      if (centralAttendance) {
         activeConfig = {
-          presentThreshold: c.presentThreshold ?? 480,
-          halfDayThreshold: c.halfDayThreshold ?? 240,
-          countBreakTime: c.countBreakTime ?? false
+          presentThreshold: centralAttendance.presentThreshold ?? 480,
+          halfDayThreshold: centralAttendance.halfDayThreshold ?? 240,
+          countBreakTime: centralAttendance.countBreakTime ?? false
         };
       }
 
@@ -541,10 +658,7 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
           const dur = Math.max(0, aEnd - aStart);
           const actName = (act.name || '').toLowerCase();
           const isProductive = act.type === 'productive' || 
-                               actName.includes('meeting') || 
-                               actName.includes('coaching') || 
-                               actName.includes('training') || 
-                               actName.includes('alignment');
+                       ['meeting', 'coaching', 'training', 'alignment'].some(k => (act.name || '').toLowerCase().includes(k));
           if (isProductive) prodMs += dur;
           else breakMs += dur;
         });
@@ -626,7 +740,8 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
       }
 
       // Fetch existing attendances to prevent duplicate logic
-      const attSnap = await getDocs(query(collection(db, 'attendanceSummary'), where('attendanceDate', '>=', lastWeek.toISOString().split('T')[0])));
+      const lastWeekStr = getISTDateStr(lastWeek);
+      const attSnap = await getDocs(query(collection(db, 'attendanceSummary'), where('attendanceDate', '>=', lastWeekStr)));
       firestoreLogger.trackRead('attendance_sync_existing_summary_fetch', attSnap.size);
       const existingShiftIds = new Set(attSnap.docs.map(d => d.data().shiftId));
 
@@ -649,10 +764,7 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
           const dur = Math.max(0, aEnd - aStart);
           const actName = (act.name || '').toLowerCase();
           const isProductive = act.type === 'productive' || 
-                               actName.includes('meeting') || 
-                               actName.includes('coaching') || 
-                               actName.includes('training') || 
-                               actName.includes('alignment');
+                       ['meeting', 'coaching', 'training', 'alignment'].some(k => (act.name || '').toLowerCase().includes(k));
           if (isProductive) prodMs += dur;
           else breakMs += dur;
         });
@@ -725,7 +837,7 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
       const updateData = {
         attendanceStatus: editStatus,
         lastModifiedBy: user.email,
-        lastModifiedTimestamp: new Date().toISOString(),
+        lastModifiedTimestamp: getLiveTimeISO(),
         isManuallyOverridden: true
       };
 
@@ -740,7 +852,7 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
         newStatus: editStatus,
         reason: editComment,
         modifiedBy: `${user.name} (${user.email})`,
-        timestamp: new Date().toISOString()
+        timestamp: getLiveTimeISO()
       });
 
       toast.success('Attendance updated successfully.');
@@ -754,7 +866,7 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
     }
   };
 
-  const runExport = (format: 'csv' | 'xlsx') => {
+  const runExport = async (format: 'csv' | 'xlsx') => {
     let data = filteredRecords.map(r => ({
       'Employee Name': r.employeeName,
       'Email': r.employeeEmail,
@@ -775,12 +887,27 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
     const ws = XLSX.utils.json_to_sheet(data);
     XLSX.utils.book_append_sheet(wb, ws, 'Attendance_Data');
     
-    const fileName = `Attendance_Report_${new Date().toISOString().split('T')[0]}`;
+    const fileName = `Attendance_Report_${getISTDateStr(getLiveTime())}`;
+    const zip = new JSZip();
+
     if (format === 'csv') {
-       XLSX.writeFile(wb, `${fileName}.csv`, { bookType: 'csv' });
+       const csvContent = XLSX.write(wb, { bookType: 'csv', type: 'string' });
+       zip.file(`${fileName}.csv`, csvContent);
     } else {
-       XLSX.writeFile(wb, `${fileName}.xlsx`);
+       const excelBuffer = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
+       zip.file(`${fileName}.xlsx`, excelBuffer);
     }
+
+    const zipContent = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
+    const url = URL.createObjectURL(zipContent);
+    const link = document.createElement('a');
+    link.setAttribute('href', url);
+    link.setAttribute('download', `${fileName}.zip`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+
     setExportFormatModal(false);
   };
 
@@ -814,15 +941,16 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
               <Download size={12} /> Export
             </button>
           )}
-          <button onClick={() => {
-            if (isTopAdmin) {
-              handleSyncAttendance();
-            } else {
-              toast.error('Only Admins or Managers can perform a full sync.');
-            }
-          }} disabled={syncing} className="flex items-center gap-1.5 px-2.5 py-1.5 bg-indigo-500 text-white hover:bg-indigo-600 rounded-lg font-bold text-[11px] transition-colors">
-            <RefreshCw size={12} className={syncing ? 'animate-spin' : ''} /> {syncing ? 'Syncing...' : 'Sync From TMS'}
-          </button>
+          {roleNormalized === 'ADMIN' && (
+            <button 
+              id="run-attendance-sync-btn"
+              onClick={handleSyncAttendance} 
+              disabled={syncing} 
+              className="flex items-center gap-1.5 px-2.5 py-1.5 bg-indigo-500 text-white hover:bg-indigo-600 rounded-lg font-bold text-[11px] transition-colors"
+            >
+              <RefreshCw size={12} className={syncing ? 'animate-spin' : ''} /> {syncing ? 'Syncing...' : 'Run Attendance Sync'}
+            </button>
+          )}
         </div>
       </div>
 

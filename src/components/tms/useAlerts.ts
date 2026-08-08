@@ -1,5 +1,7 @@
 import { useMemo } from 'react';
+import { getLiveTime } from '../../lib/timeSync';
 import { TMSShift } from '../../views/TMSView';
+import { calculateShiftMetrics } from '../../lib/ledgerCalculations';
 
 export interface AlertItem {
   id: string;
@@ -15,7 +17,7 @@ export interface AlertItem {
 export function useAlerts(activeShifts: TMSShift[], historicalShifts: TMSShift[]) {
   return useMemo(() => {
     const alerts: AlertItem[] = [];
-    const now = Date.now();
+    const now = getLiveTime().getTime();
 
     // 1. Scan active/break shifts for real-time break anomalies and stale sessions
     activeShifts.forEach((sh) => {
@@ -82,16 +84,9 @@ export function useAlerts(activeShifts: TMSShift[], historicalShifts: TMSShift[]
         const clockInTime = new Date(sh.clockInTime).getTime();
         const activeHours = (now - clockInTime) / 3600000;
         
-        // Calculate productive time so far
-        let productiveMs = 0;
-        (sh.activities || []).forEach(act => {
-          if (act.type === 'productive' || act.name?.toLowerCase().includes('work')) {
-            const start = new Date(act.startTime).getTime();
-            const end = act.endTime ? new Date(act.endTime).getTime() : now;
-            productiveMs += (end - start);
-          }
-        });
-        const productiveHours = productiveMs / 3600000;
+        // Calculate productive time so far using the single source of truth engine
+        const metrics = calculateShiftMetrics(sh, now);
+        const productiveHours = metrics.productiveMs / 3600000;
 
         if (productiveHours > 10) {
           alerts.push({

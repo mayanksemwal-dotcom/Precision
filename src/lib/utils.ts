@@ -124,3 +124,122 @@ export function convertExcelPeriod(serial: any): string {
   
   return str;
 }
+
+
+/**
+ * Robustly formats any period (Excel serial date, ISO string, or custom text) 
+ * into standard display form: "June-2026".
+ */
+export function formatPeriodForDisplay(period: any): string {
+  if (period === null || period === undefined) return '-';
+  const str = String(period).trim();
+  if (!str || str === '-' || str === 'ALL') return str;
+
+  // 1. Try if it is an Excel serial number (e.g. 46174)
+  const num = Number(str);
+  if (!isNaN(num) && num > 1000) {
+    try {
+      // Excel base date is Dec 30, 1899. 
+      // The number of days between 1899-12-30 and 1970-01-01 is 25569.
+      const date = new Date(Math.round((num - 25569) * 86400 * 1000));
+      if (!isNaN(date.getTime())) {
+        const MONTH_NAMES = [
+          "January", "February", "March", "April", "May", "June",
+          "July", "August", "September", "October", "November", "December"
+        ];
+        const year = date.getUTCFullYear();
+        const month = MONTH_NAMES[date.getUTCMonth()];
+        return `${month}-${year}`;
+      }
+    } catch (e) {}
+  }
+
+  // 2. Try parsing YYYY-MM-DD or YYYY-MM explicitly to avoid timezone shifting
+  const ymdMatch = str.match(/^(\d{4})-(\d{2})(-\d{2})?$/);
+  if (ymdMatch) {
+    const year = parseInt(ymdMatch[1], 10);
+    const monthIdx = parseInt(ymdMatch[2], 10) - 1;
+    const MONTH_NAMES = [
+      "January", "February", "March", "April", "May", "June",
+      "July", "August", "September", "October", "November", "December"
+    ];
+    if (monthIdx >= 0 && monthIdx < 12) {
+      return `${MONTH_NAMES[monthIdx]}-${year}`;
+    }
+  }
+
+  // 3. Try parsing common formats using date-fns
+  const formats = [
+    'MMM-yyyy', 'MMM yyyy', 'MMMM yyyy', 'MMM-yy', 'MMM yy', 'MMMM yy',
+    'MM-yyyy', 'MM/yyyy', 'M/yyyy', 'yyyy-MM', 'yyyy-MM-dd',
+    'dd/MM/yyyy', 'MM/dd/yyyy', 'dd-MM-yyyy', 'd-MMM-yyyy', 'dd-MMM-yyyy'
+  ];
+
+  for (const f of formats) {
+    try {
+      const parsed = parse(str, f, new Date());
+      if (isValid(parsed)) {
+        const MONTH_NAMES = [
+          "January", "February", "March", "April", "May", "June",
+          "July", "August", "September", "October", "November", "December"
+        ];
+        return `${MONTH_NAMES[parsed.getMonth()]}-${parsed.getFullYear()}`;
+      }
+    } catch (e) {}
+  }
+
+  // 4. Try parsing as standard JS date string
+  try {
+    const parsed = new Date(str);
+    if (!isNaN(parsed.getTime())) {
+      const MONTH_NAMES = [
+        "January", "February", "March", "April", "May", "June",
+        "July", "August", "September", "October", "November", "December"
+      ];
+      return `${MONTH_NAMES[parsed.getMonth()]}-${parsed.getFullYear()}`;
+    }
+  } catch (e) {}
+
+  // 5. If it's something like "June-26" or "Jun-26" or "June'26", handle manually
+  const hyphenMatch = str.match(/^([a-zA-Z]+)[-'\s](\d{2,4})$/);
+  if (hyphenMatch) {
+    let monthPart = hyphenMatch[1].toLowerCase();
+    let yearPart = hyphenMatch[2];
+    
+    const MONTH_MAP: Record<string, string> = {
+      jan: "January", feb: "February", mar: "March", apr: "April",
+      may: "May", jun: "June", jul: "July", aug: "August",
+      sep: "September", oct: "October", nov: "November", dec: "December"
+    };
+
+    let matchedMonth = "";
+    for (const key of Object.keys(MONTH_MAP)) {
+      if (monthPart.startsWith(key)) {
+        matchedMonth = MONTH_MAP[key];
+        break;
+      }
+    }
+
+    if (matchedMonth) {
+      let year = parseInt(yearPart, 10);
+      if (yearPart.length === 2) {
+        year = year < 50 ? 2000 + year : 1900 + year;
+      }
+      return `${matchedMonth}-${year}`;
+    }
+  }
+
+  return str;
+}
+
+/**
+ * Formats numeric KPI values to 2 decimal places.
+ * e.g. 97.52267151 -> "97.52", 40 -> "40.00"
+ */
+export function formatKpiNumber(val: any, fallback = '-'): string {
+  if (val === null || val === undefined || val === '') return fallback;
+  const num = typeof val === 'number' ? val : Number(val);
+  if (isNaN(num)) return String(val);
+  return num.toFixed(2);
+}
+

@@ -47,8 +47,10 @@ export const TeamProcessMappingSubView: React.FC<TeamProcessMappingSubViewProps>
         }
         // Include default dynamic fallback if empty
         if (list.length === 0) {
-            list = ['HITL', 'MPQC', 'OQC', 'SOP Training', 'QA Review', 'Team Alignment'];
+            list = ['HITL', 'OQC', 'SOP Training', 'QA Review', 'Team Alignment'];
         }
+        const blocked = ['mpqc', 'mpqc-fk', 'mpqc-sh'];
+        list = list.filter(p => !blocked.includes((p || '').toLowerCase().trim()));
         setRegisteredProcesses(list);
       } catch (err) {
         console.warn('Failed to load registered processes', err);
@@ -132,7 +134,9 @@ export const TeamProcessMappingSubView: React.FC<TeamProcessMappingSubViewProps>
 
       selectedList.forEach(u => {
         const uRef = doc(db, 'users', u.uid);
-        const payload: Record<string, any> = { ...u };
+        const payload: Record<string, any> = {
+          lastModifiedAt: new Date().toISOString()
+        };
 
         if (targetTL) {
           payload.teamLeadId = targetTL;
@@ -156,7 +160,7 @@ export const TeamProcessMappingSubView: React.FC<TeamProcessMappingSubViewProps>
           payload.process = targetProcess;
         }
 
-        batch.set(uRef, payload);
+        batch.update(uRef, payload);
 
         // SYNC Team Mappings (Ongoing Auto-Sync)
         const mappingRef = doc(db, 'teamMappings', u.uid);
@@ -597,7 +601,7 @@ export const TeamProcessMappingSubView: React.FC<TeamProcessMappingSubViewProps>
                     <option value="">All Roles</option>
                     <option value="AGENT">Agents only</option>
                     <option value="QA">QAs only</option>
-                    <option value="TEAM_LEAD">Team Leads only</option>
+                    <option value="TEAM LEAD">Team Leads only</option>
                     <option value="SME">SMEs only</option>
                   </select>
                 </div>
@@ -678,7 +682,7 @@ export const TeamProcessMappingSubView: React.FC<TeamProcessMappingSubViewProps>
                 onSelect={(u) => setTargetTL(u.uid)}
                 selectedUserId={targetTL}
                 placeholder="Select supervisor..."
-                roleFilter={['TEAM_LEAD', 'STL', 'OPS_TL', 'QTL', 'TRAINER_TL', 'TEAM LEAD']}
+                roleFilter={['Team Lead', 'TEAM LEAD', 'STL', 'OPS_TL', 'QTL', 'TRAINER_TL', 'TEAM_LEAD', 'OPS_TEAM_LEAD', 'TEAM_LEADER']}
                 allUsers={allUsers}
               />
 
