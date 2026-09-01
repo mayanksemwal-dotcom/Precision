@@ -1,4 +1,6 @@
 
+export const HEARTBEAT_INTERVAL_MS = 300000; // 5 minutes throttled interval for live_sessions presence (saves ~75% write costs)
+
 export const CORE_USER_ACTIONS = ['CLOCK_IN', 'PROCESS_SWITCH', 'BREAK_START', 'BREAK_END', 'CLOCK_OUT'];
 
 export const AUDIT_DIAGNOSTIC_EVENTS = [
@@ -67,11 +69,10 @@ export const buildTimelineFromActivityLedger = (
   const isCompleted = isShiftCompleted(status);
   const endThresholdMs = (isCompleted && clockOutTime) ? new Date(clockOutTime).getTime() : nowMs;
 
-  // Sort by startTime. For identical timestamps, keep insertion order if possible or stable sort.
+  // Sort by startTime
   const sorted = [...activities].sort((a, b) => new Date(a.startTime).getTime() - new Date(b.startTime).getTime());
   
-  // Exclude activities where isAuditOrDiagnosticEvent(act.action) is true.
-  // Exclude activities where act.type === 'system'.
+  // Exclude activities where isAuditOrDiagnosticEvent(act.action) is true or act.type === 'system'.
   const filtered = sorted.filter(act => !isAuditOrDiagnosticEvent(act.action) && act.type !== 'system');
 
   const segments: any[] = [];
@@ -80,26 +81,28 @@ export const buildTimelineFromActivityLedger = (
     const act = filtered[i];
     const startMs = new Date(act.startTime).getTime();
     
-    let endMs = endThresholdMs;
-    
-    // A segment lasts until the next valid segment-defining event
+    let nextStartMs = endThresholdMs;
     for (let j = i + 1; j < filtered.length; j++) {
-      endMs = new Date(filtered[j].startTime).getTime();
+      nextStartMs = new Date(filtered[j].startTime).getTime();
       break;
     }
     
-    // If this is the last state-defining segment and the shift is completed, it should end at clockOutTime
     if (i === filtered.length - 1 && isCompleted && clockOutTime) {
-      endMs = new Date(clockOutTime).getTime();
+      nextStartMs = new Date(clockOutTime).getTime();
     }
     
-    // Protection against negative duration due to clock drift or manual edits
-    const effectiveEndMs = Math.max(startMs, endMs);
+    let actEndMs = nextStartMs;
+    if (act.endTime) {
+      const explicitEnd = new Date(act.endTime).getTime();
+      if (!isNaN(explicitEnd) && explicitEnd > startMs) {
+        actEndMs = Math.min(explicitEnd, nextStartMs);
+      }
+    }
     
-    // Is this segment currently active?
-    // It is active if the shift is NOT completed AND this is the last state-defining segment
+    const effectiveEndMs = Math.max(startMs, actEndMs);
+    
     let isLive = false;
-    if (!isCompleted && i === filtered.length - 1) {
+    if (!isCompleted && i === filtered.length - 1 && effectiveEndMs >= endThresholdMs) {
       isLive = true;
     }
 
@@ -110,6 +113,20 @@ export const buildTimelineFromActivityLedger = (
       durationMs: effectiveEndMs - startMs,
       isLive
     });
+
+    // If this activity ended before the next activity starts, insert an active work interval
+    if (effectiveEndMs < nextStartMs) {
+      segments.push({
+        activityId: `gap_${i}_${effectiveEndMs}`,
+        action: 'ACTIVITY',
+        type: 'productive',
+        name: 'Active Work',
+        startTime: new Date(effectiveEndMs).toISOString(),
+        endTime: new Date(nextStartMs).toISOString(),
+        durationMs: nextStartMs - effectiveEndMs,
+        isLive: !isCompleted && (i === filtered.length - 1)
+      });
+    }
   }
 
   return segments;

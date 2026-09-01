@@ -1,7 +1,6 @@
 import { UserProfile } from '../../types';
-import { sanitizeActivities } from '../../services/tmsCleanupService';
 import { getLatestUserActivity, isAuditOrDiagnosticEvent } from '../../lib/tmsUtils';
-import { calculateShiftMetrics } from '../../lib/ledgerCalculations';
+import { calculateShiftMetrics } from '../../lib/tmsCalculationEngine';
 
 export const BREAK_KEYWORDS = [
   'lunch',
@@ -23,10 +22,14 @@ export function isBreakActivity(activityName?: string, activityType?: string): b
   if (!activityName) return false;
   const nameLower = activityName.toLowerCase().trim();
   if (nameLower.includes('system_repair') || nameLower.includes('system repair') || nameLower.includes('clock out repair') || nameLower.includes('audit')) return false;
-  return BREAK_KEYWORDS.some(k => {
-    const regex = new RegExp(`\\b${k}\\b`, 'i');
-    return regex.test(nameLower);
-  });
+  
+  // Match only explicit standalone break names / phrases, never substring in processes like 'Biotechnology' or 'Breakfast Logistics'
+  const explicitBreakPhrases = [
+    'lunch', 'lunch break', 'tea', 'tea break', 'bio', 'bio break', 'bathroom', 'restroom',
+    'break', 'coffee', 'coffee break', 'meal', 'meal break', 'snack', 'snack break',
+    'recess', 'refreshment', 'short break', 'official break', 'unpaid break', 'paid break'
+  ];
+  return explicitBreakPhrases.includes(nameLower);
 }
 
 export function isMeetingActivity(activityName?: string): boolean {
@@ -297,21 +300,27 @@ export function mapToLiveSessionRow(u: Partial<UserProfile> & { uid: string }, l
     };
   }
 
+  const isLocationValue = (val?: string) => {
+    if (!val) return false;
+    const v = val.toLowerCase().trim();
+    return v === 'office' || v === 'home' || v === 'wfh' || v === 'work from office' || v === 'work from home' || v === 'onsite' || v === 'remote';
+  };
+
   // --- User HAS an active clock-in session ---
   const lastAct = getLatestUserActivity(activities);
 
   // 1. Current Activity Resolution
   let rawActivityName = '';
-  if (lastAct && lastAct.name && lastAct.name !== 'Offline' && lastAct.name !== 'N/A') {
+  if (lastAct && lastAct.name && lastAct.name !== 'Offline' && lastAct.name !== 'N/A' && !isLocationValue(lastAct.name)) {
     rawActivityName = lastAct.name;
-  } else if (liveDoc.currentActivity && liveDoc.currentActivity !== 'Offline' && liveDoc.currentActivity !== 'N/A') {
+  } else if (liveDoc.currentActivity && liveDoc.currentActivity !== 'Offline' && liveDoc.currentActivity !== 'N/A' && !isLocationValue(liveDoc.currentActivity)) {
     rawActivityName = liveDoc.currentActivity;
-  } else if (liveDoc.process && liveDoc.process !== 'N/A') {
+  } else if (liveDoc.process && liveDoc.process !== 'N/A' && !isLocationValue(liveDoc.process)) {
     rawActivityName = liveDoc.process;
-  } else if (u.process) {
+  } else if (u.process && !isLocationValue(u.process)) {
     rawActivityName = u.process;
   } else {
-    rawActivityName = 'Active Work';
+    rawActivityName = '';
   }
 
   const isOnlyPortalLoggedIn = rawActivityName.toLowerCase().includes('portal logged in') || 
@@ -352,31 +361,38 @@ export function mapToLiveSessionRow(u: Partial<UserProfile> & { uid: string }, l
   const rawActivityType = lastAct?.type || '';
 
   // 2. State Enforcement
-  // An activity is ONLY an active break if lastAct exists, has NO endTime (!lastAct.endTime), AND is a break activity.
-  const isLastActOpenBreak = lastAct ? (!lastAct.endTime && (lastAct.action === 'BREAK_START' || lastAct.type === 'break' || isBreakActivity(rawActivityName, rawActivityType))) : false;
+  // An activity is ONLY an active break if lastAct exists, has NO endTime (!lastAct.endTime), AND is an explicit break action/type.
+  const isLastActOpenBreak = lastAct ? (!lastAct.endTime && (lastAct.action === 'BREAK_START' || lastAct.type === 'break' || (lastAct.type !== 'productive' && isBreakActivity(rawActivityName, rawActivityType)))) : false;
   const isBreak = lastAct
     ? isLastActOpenBreak
     : (rawStatus === 'BREAK' || rawStatus === 'ON_BREAK');
 
   let status: 'PRODUCTIVE' | 'BREAK' | 'MEETING' | 'TRAINING' | 'LOGGED_IN' | 'OFFLINE' = 'PRODUCTIVE';
-  let currentActivity = rawActivityName;
+  let currentActivity = rawActivityName || 'Productive';
 
   if (isBreak) {
     status = 'BREAK';
-    currentActivity = rawActivityName || 'Break';
+    currentActivity = (rawActivityName && !isLocationValue(rawActivityName)) ? rawActivityName : 'Break';
   } else {
     if (isMeetingActivity(rawActivityName)) {
       status = 'MEETING';
+      currentActivity = rawActivityName || 'Meeting';
     } else if (isTrainingActivity(rawActivityName)) {
       status = 'TRAINING';
+      currentActivity = rawActivityName || 'Training';
     } else {
       status = 'PRODUCTIVE';
+      currentActivity = (rawActivityName && !isLocationValue(rawActivityName)) ? rawActivityName : 'Productive';
     }
   }
 
   // 3. Current Process
-  const lastProductiveAct = activities.slice().reverse().find((a: any) => a.type === 'productive' && !isBreakActivity(a.name));
-  const currentProcess = liveDoc.process || liveDoc.currentProcess || lastProductiveAct?.name || u.process || 'General';
+  const lastProductiveAct = activities.slice().reverse().find((a: any) => a.type === 'productive' && !isBreakActivity(a.name) && !isLocationValue(a.name));
+  const currentProcess = (liveDoc.process && !isLocationValue(liveDoc.process)) ? liveDoc.process
+    : (liveDoc.currentProcess && !isLocationValue(liveDoc.currentProcess)) ? liveDoc.currentProcess
+    : (lastProductiveAct?.name && !isLocationValue(lastProductiveAct.name)) ? lastProductiveAct.name
+    : (u.process && !isLocationValue(u.process)) ? u.process
+    : 'General';
 
   // 4. Since Time (Shift Clock-In Time)
   const shiftClockInMs = parseTimestampMs(liveDoc.clockInTime) ||
@@ -429,6 +445,9 @@ export function mapToLiveSessionRow(u: Partial<UserProfile> & { uid: string }, l
     diagnosticError = `Invalid Raw State: Status is '${rawStatus}' but activity is '${rawActivityName}' (Rectified to BREAK)`;
   }
 
+  const effectiveClockInIso = liveDoc.clockInTime ||
+    (shiftClockInMs > 0 ? new Date(shiftClockInMs).toISOString() : undefined);
+
   const enrichedLiveDoc = {
     ...liveDoc,
     currentShiftProductiveMs: metrics.productiveMs,
@@ -437,7 +456,7 @@ export function mapToLiveSessionRow(u: Partial<UserProfile> & { uid: string }, l
     utilization: metrics.utilization,
     shiftElapsedMs: metrics.elapsedMs,
     activeWorkMs: metrics.activeWorkMs,
-    clockInTime: liveDoc.clockInTime,
+    clockInTime: effectiveClockInIso,
     clockOutTime: liveDoc.clockOutTime,
   };
 
@@ -479,7 +498,7 @@ export function mapToLiveSessionRow(u: Partial<UserProfile> & { uid: string }, l
     utilization: metrics.utilization,
     shiftElapsedMs: metrics.elapsedMs,
     activeWorkMs: metrics.activeWorkMs,
-    clockInTime: liveDoc.clockInTime,
+    clockInTime: effectiveClockInIso,
     clockOutTime: liveDoc.clockOutTime,
 
     rawDoc: enrichedLiveDoc

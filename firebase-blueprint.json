@@ -434,6 +434,62 @@
         "isOvernight": { "type": "boolean" }
       },
       "required": ["userId", "employeeEmail", "attendanceDate", "attendanceStatus"]
+    },
+    "TMSHistoricalCorrection": {
+      "title": "TMS Historical Correction Audit",
+      "description": "Immutable audit log of historical TMS corrections",
+      "type": "object",
+      "properties": {
+        "correctionId": { "type": "string" },
+        "shiftId": { "type": "string" },
+        "userId": { "type": "string" },
+        "userName": { "type": "string" },
+        "attendanceDate": { "type": "string" },
+        "performedBy": { "type": "string" },
+        "performedAt": { "type": "string" },
+        "reason": { "type": "string" },
+        "originalMetrics": { "type": "object" },
+        "recalculatedMetrics": { "type": "object" },
+        "changedFields": { "type": "object" },
+        "sourceVersion": { "type": "number" }
+      },
+      "required": ["correctionId", "shiftId", "userId", "performedBy", "performedAt"]
+    },
+    "DailyKpiRecord": {
+      "title": "Daily KPI Record",
+      "description": "Day-wise performance KPI record partitioned by month and employee",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "reportingDate": { "type": "string" },
+        "yearMonth": { "type": "string" },
+        "employeeUid": { "type": "string" },
+        "employeeEmail": { "type": "string" },
+        "employeeName": { "type": "string" },
+        "role": { "type": "string" },
+        "process": { "type": "string" },
+        "team": { "type": "string" },
+        "totalScore": { "type": "number" },
+        "kpiRating": { "type": "string" },
+        "productivityScore": { "type": "number" },
+        "targetProductivity": { "type": "number" },
+        "actualProductivity": { "type": "number" },
+        "qualityScore": { "type": "number" },
+        "targetQuality": { "type": "number" },
+        "actualQuality": { "type": "number" },
+        "attendanceScore": { "type": "number" },
+        "targetAttendance": { "type": "number" },
+        "actualAttendance": { "type": "number" },
+        "aptScore": { "type": "number" },
+        "targetAPT": { "type": "number" },
+        "actualAPT": { "type": "number" },
+        "bonus": { "type": "number" },
+        "penalty": { "type": "number" },
+        "comments": { "type": "string" },
+        "uploadedBy": { "type": "string" },
+        "uploadedAt": { "type": "string" }
+      },
+      "required": ["id", "reportingDate", "yearMonth", "employeeEmail", "process", "totalScore"]
     }
   },
   "firestore": {
@@ -564,6 +620,18 @@
     "kpi_scorecards/{scorecardId}": {
       "schema": "ScorecardRecord",
       "description": "Uploaded KPI scorecards for reporting"
+    },
+    "kpiArchive/{yearMonth}/employees/{employeeUid}/days/{dayProcessKey}": {
+      "schema": "DailyKpiRecord",
+      "description": "Partitioned day-wise KPI archives"
+    },
+    "tmsHistoricalCorrections/{correctionId}": {
+      "schema": "TMSHistoricalCorrection",
+      "description": "Historical TMS corrections audit logs"
+    },
+    "system_meta/{metaId}": {
+      "schema": { "type": "object" },
+      "description": "System metadata including hierarchy version sync"
     }
   }
 }

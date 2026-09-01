@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { db, auth } from '../../lib/firebase';
+import { db, auth, getDocsCacheFirst } from '../../lib/firebase';
 import { 
   collection, 
   getDocs, 
@@ -273,7 +273,8 @@ export const ShiftRecoverySubView: React.FC<ShiftRecoverySubViewProps> = ({
           );
         }
 
-        const pageSnap = await getDocs(q);
+        // IndexedDB persistence read optimization for historical data
+        const pageSnap = await getDocsCacheFirst(q, 'adminShiftRecoveryScan_tmsShifts');
         if (pageSnap.empty) {
           setScanCompleted(true);
           toast.success('Scan completed: All historical shifts analyzed!');
@@ -1378,7 +1379,7 @@ export const ShiftRecoverySubView: React.FC<ShiftRecoverySubViewProps> = ({
                 ) : (
                   <div className="space-y-2 max-h-60 overflow-y-auto pr-1">
                     {selectedCandidateDetail.activities.map((act, idx) => (
-                      <div key={idx} className="p-3 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-900/50 text-xs flex justify-between items-center">
+                      <div key={act.id || `${act.name || act.type || 'act'}_${act.startTime || ''}_${idx}`} className="p-3 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-900/50 text-xs flex justify-between items-center">
                         <div>
                           <div className="font-bold text-slate-800 dark:text-slate-200">{act.name || act.type || 'Activity'}</div>
                           <div className="text-[10px] text-slate-400 font-mono mt-0.5">

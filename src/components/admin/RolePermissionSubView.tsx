@@ -19,7 +19,7 @@ import {
   AlertTriangle,
   Heart
 } from 'lucide-react';
-import { db } from '../../lib/firebase';
+import { db, getDocsOptimized } from '../../lib/firebase';
 import { 
   collection, 
   doc, 
@@ -143,7 +143,7 @@ export const RolePermissionSubView: React.FC<RolePermissionSubViewProps> = ({ ad
     setErrorStatus(null);
     try {
       // 1. Fetch modules
-      const modulesSnap = await getDocs(collection(db, 'module_master'));
+      const modulesSnap = await getDocsOptimized(collection(db, 'module_master'), 'module_master_global_list');
       let fetchedModules = modulesSnap.docs.map(d => d.data().name as string).filter(mod => ALL_MASTER_MODULES.includes(mod));
       if (fetchedModules.length < ALL_MASTER_MODULES.length) {
         // Auto-seed modules
@@ -166,7 +166,7 @@ export const RolePermissionSubView: React.FC<RolePermissionSubViewProps> = ({ ad
 
 
       // 3. Fetch permissions matrix map
-      const permissionsSnap = await getDocs(collection(db, 'role_permissions'));
+      const permissionsSnap = await getDocsOptimized(collection(db, 'role_permissions'), 'role_permissions_global_matrix');
       
       if (permissionsSnap.empty) {
         // Auto seed dynamic permission matrix
@@ -346,7 +346,7 @@ export const RolePermissionSubView: React.FC<RolePermissionSubViewProps> = ({ ad
       }
 
       // 4. Fetch templates
-      const templatesSnap = await getDocs(collection(db, 'permission_templates'));
+      const templatesSnap = await getDocsOptimized(collection(db, 'permission_templates'), 'permission_templates_global_list');
       setTemplates(templatesSnap.docs.map(d => ({ id: d.id, ...d.data() })));
 
     } catch (err) {

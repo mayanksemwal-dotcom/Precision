@@ -160,10 +160,10 @@ export const performPermissionRecovery = async () => {
       role: u.role || '',
       department: u.department || 'Operations',
       process: u.process || '',
-      teamLeadId: u.teamLeadId || '',
+      teamLeadId: u.teamLeadId || u.teamLeadUid || u.tlId || '',
       teamLeadName: u.teamLeadName || '',
-      managerId: u.mappedManagerId || '',
-      managerName: u.mappedManagerName || '',
+      managerId: u.mappedManagerId || u.managerId || u.mappedManagerUid || u.managerUid || '',
+      managerName: u.mappedManagerName || u.managerName || '',
       status: u.status || 'Active',
       dateJoined: u.dateJoined || '',
       lastUpdated: now

@@ -291,12 +291,14 @@ export const ProcessManagementSubView = ({ user, adminTheme, allUsers }: Process
               </thead>
               <tbody className="divide-y divide-slate-100/10">
                 {filtered.length > 0 ? (
-                  filtered.map((proc, idx) => (
-                    <tr key={idx} className={`${isDark ? 'hover:bg-slate-800/40 text-slate-200' : 'hover:bg-slate-50/50 text-slate-700'} transition-colors group`}>
+                  filtered.map((proc) => {
+                    const origIndex = processes.findIndex(p => p.name === proc.name);
+                    return (
+                    <tr key={proc.name} className={`${isDark ? 'hover:bg-slate-800/40 text-slate-200' : 'hover:bg-slate-50/50 text-slate-700'} transition-colors group`}>
                       <td className="p-4 pl-6">
                         <div className="flex items-center gap-3">
                           <div className={`w-8 h-8 rounded-lg flex items-center justify-center font-bold text-[10px] uppercase shadow-sm ${
-                            proc.status === 'Active' ? 'bg-indigo-500/10 text-indigo-505' : 'bg-slate-500/10 text-slate-404'
+                            proc.status === 'Active' ? 'bg-indigo-500/10 text-indigo-500' : 'bg-slate-500/10 text-slate-400'
                           }`}>
                             {proc.name.slice(0, 2)}
                           </div>
@@ -309,7 +311,7 @@ export const ProcessManagementSubView = ({ user, adminTheme, allUsers }: Process
                       <td className="p-4 text-center">
                         <div className="flex flex-col gap-2 items-center">
                           <button 
-                            onClick={() => toggleStatus(idx)}
+                            onClick={() => origIndex !== -1 && toggleStatus(origIndex)}
                             className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-wide transition-colors ${
                               proc.status === 'Active' 
                                 ? 'bg-emerald-500/10 text-emerald-500 hover:bg-emerald-500/20' 
@@ -321,7 +323,7 @@ export const ProcessManagementSubView = ({ user, adminTheme, allUsers }: Process
                           </button>
                           
                           <button 
-                            onClick={() => toggleHidden(idx)}
+                            onClick={() => origIndex !== -1 && toggleHidden(origIndex)}
                             className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-wide transition-colors ${
                               !proc.hidden
                                 ? 'bg-sky-500/10 text-sky-500 hover:bg-sky-500/20' 
@@ -337,11 +339,13 @@ export const ProcessManagementSubView = ({ user, adminTheme, allUsers }: Process
                           <Button 
                             variant="ghost" 
                             size="icon" 
-                            className="h-8 w-8 text-sky-500 rounded-lg hover:bg-sky-505/10"
+                            className="h-8 w-8 text-sky-500 rounded-lg hover:bg-sky-500/10"
                             onClick={() => {
-                              setEditIndex(idx);
-                              setFormName(proc.name);
-                              setIsAddingOrEditing(true);
+                              if (origIndex !== -1) {
+                                setEditIndex(origIndex);
+                                setFormName(proc.name);
+                                setIsAddingOrEditing(true);
+                              }
                             }}
                           >
                             <Edit2 size={13} />
@@ -349,15 +353,16 @@ export const ProcessManagementSubView = ({ user, adminTheme, allUsers }: Process
                           <Button 
                             variant="ghost" 
                             size="icon" 
-                            className="h-8 w-8 text-rose-500 rounded-lg hover:bg-rose-505/10"
-                            onClick={() => deleteProcess(idx)}
+                            className="h-8 w-8 text-rose-500 rounded-lg hover:bg-rose-500/10"
+                            onClick={() => origIndex !== -1 && deleteProcess(origIndex)}
                           >
                             <Trash2 size={13} />
                           </Button>
                         </div>
                       </td>
                     </tr>
-                  ))
+                  );
+                })
                 ) : (
                   <tr>
                     <td colSpan={3} className="p-12 text-center text-slate-400 font-bold uppercase tracking-wider text-[11px]">

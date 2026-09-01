@@ -1,8 +1,9 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { db, auth } from '../../lib/firebase';
 import { collection, getDocs, doc, setDoc, deleteDoc, writeBatch, query, limit, where, getCountFromServer } from 'firebase/firestore';
-import { Database, Trash2, Archive, RotateCcw, AlertTriangle, ShieldAlert, CheckSquare, Square, Inbox, Activity, RefreshCw, Users, Clock } from 'lucide-react';
+import { Database, Trash2, Archive, RotateCcw, AlertTriangle, ShieldAlert, CheckSquare, Square, Inbox, Activity, RefreshCw, Users, Clock, Edit3 } from 'lucide-react';
 import { toast } from 'sonner';
+import { ShiftCorrectionModule } from './ShiftCorrectionModule';
 
 interface DataManagementSubViewProps {
   adminTheme: 'light' | 'dark';
@@ -15,7 +16,9 @@ export const DataManagementSubView: React.FC<DataManagementSubViewProps> = ({
   onRefresh, 
   logAdminEvent 
 }) => {
-  const [activeSegment, setActiveSegment] = useState<'active' | 'archived'>('active');
+  const [forceOutUid, setForceOutUid] = useState('');
+  const [isForcingOut, setIsForcingOut] = useState(false);
+  const [activeSegment, setActiveSegment] = useState<'shiftCorrection' | 'active' | 'archived'>('shiftCorrection');
   const [selectedCollection, setSelectedCollection] = useState<'audits' | 'tasks' | 'dailyPerformance' | 'disciplinaryLogs' | 'pips'>('audits');
   const [isPruningConfirming, setIsPruningConfirming] = useState(false);
   const [logStats, setLogStats] = useState<{
@@ -436,6 +439,58 @@ export const DataManagementSubView: React.FC<DataManagementSubViewProps> = ({
     }
   };
 
+  const handleForceClockOut = async (rawUid: string) => {
+    const uid = rawUid.trim();
+    console.log('[DEBUG] handleForceClockOut called with UID:', uid);
+    if (!uid) {
+      toast.error('Please enter a User UID');
+      return;
+    }
+
+    const loader = toast.loading(`Forcing clock-out for ${uid}...`);
+    setIsForcingOut(true);
+    try {
+      console.log('[DEBUG] Querying for active shifts for UID:', uid);
+      const q = query(collection(db, 'tmsShifts'), where('userId', '==', uid), where('status', 'in', ['ACTIVE', 'BREAK']), limit(1));
+      const snap = await getDocs(q);
+      
+      if (snap.empty) {
+        console.log('[DEBUG] No active/break shifts found for UID:', uid);
+        toast.error('No active or break shift found for this user UID. They might already be clocked out.');
+        setIsForcingOut(false);
+        toast.dismiss(loader);
+        return;
+      }
+      
+      const docRef = snap.docs[0].ref;
+      console.log('[DEBUG] Found shift to force out:', snap.docs[0].id);
+      
+      const batch = writeBatch(db);
+      batch.update(docRef, {
+        status: 'COMPLETED_FORCED',
+        clockOutTime: new Date().toISOString(),
+        endShiftTime: new Date().toISOString(),
+        remarks: 'Admin force logout via emergency tool'
+      });
+      batch.update(doc(db, 'users', uid), { lastLogoutAt: new Date().toISOString() });
+      batch.delete(doc(db, 'tmsActiveLocks', uid));
+      
+      console.log('[DEBUG] Committing batch write...');
+      await batch.commit();
+      console.log('[DEBUG] Batch commit successful');
+
+      toast.success(`User ${uid} successfully clocked out`);
+      await logAdminEvent('Force Clock-Out Executed', uid, 'ACTIVE/BREAK', 'COMPLETED_FORCED');
+      onRefresh();
+    } catch (e: any) {
+      console.error('[DEBUG] Force clock-out error:', e);
+      toast.error(`Failed to force clock-out: ${e.message}`);
+    } finally {
+      setIsForcingOut(false);
+      toast.dismiss(loader);
+    }
+  };
+
   const cardClass = adminTheme === 'dark' 
     ? 'bg-slate-805 border-slate-700 shadow-xl p-6 rounded-2xl border text-slate-100 bg-slate-800' 
     : 'bg-white border-slate-200 shadow-md p-6 rounded-2xl border text-slate-800';
@@ -459,12 +514,21 @@ export const DataManagementSubView: React.FC<DataManagementSubViewProps> = ({
         <div className="flex justify-between items-center border-b pb-4 mb-4 border-slate-150/10">
           <div className="flex gap-2">
             <button 
+              id="tab-shift-correction-segment"
+              onClick={() => setActiveSegment('shiftCorrection')}
+              className={`px-3 py-1.5 text-xs font-bold rounded-lg cursor-pointer flex items-center gap-1.5 ${activeSegment === 'shiftCorrection' ? 'bg-indigo-600 text-white' : 'bg-slate-100 dark:bg-slate-900 border border-transparent hover:bg-slate-200'}`}
+            >
+              <Edit3 size={14} /> Shift Correction Tool
+            </button>
+            <button 
+              id="tab-active-db-segment"
               onClick={() => setActiveSegment('active')}
               className={`px-3 py-1.5 text-xs font-bold rounded-lg cursor-pointer flex items-center gap-1.5 ${activeSegment === 'active' ? 'bg-indigo-600 text-white' : 'bg-slate-100 dark:bg-slate-900 border border-transparent hover:bg-slate-200'}`}
             >
               <Database size={14} /> Active Database Center
             </button>
             <button 
+              id="tab-vault-archive-segment"
               onClick={() => setActiveSegment('archived')}
               className={`px-3 py-1.5 text-xs font-bold rounded-lg cursor-pointer flex items-center gap-1.5 ${activeSegment === 'archived' ? 'bg-amber-600 text-white' : 'bg-slate-100 dark:bg-slate-900 border border-transparent hover:bg-slate-200'}`}
             >
@@ -490,110 +554,116 @@ export const DataManagementSubView: React.FC<DataManagementSubViewProps> = ({
           )}
         </div>
 
-        {/* Action utility bar */}
-        <div className="flex justify-between items-center gap-4 mb-4 text-xs font-semibold">
-          <div className="flex items-center gap-2">
-            <span>Selected <strong className="text-indigo-500">{selectedIds.size} records</strong>. Target Operations:</span>
-          </div>
+        {activeSegment === 'shiftCorrection' ? (
+          <ShiftCorrectionModule adminTheme={adminTheme} logAdminEvent={logAdminEvent} />
+        ) : (
+          <>
+            {/* Action utility bar */}
+            <div className="flex justify-between items-center gap-4 mb-4 text-xs font-semibold">
+              <div className="flex items-center gap-2">
+                <span>Selected <strong className="text-indigo-500">{selectedIds.size} records</strong>. Target Operations:</span>
+              </div>
 
-          <div className="flex items-center gap-2">
-            {activeSegment === 'active' ? (
-              <>
-                <button onClick={handleArchiveSelected} className="px-3 py-1.5 text-xs font-bold font-mono rounded bg-amber-600 hover:bg-amber-700 text-white cursor-pointer flex items-center gap-1"><Archive size={12} /> Move to Vault Archive</button>
-                <button onClick={handlePermanentDelete} className="px-3 py-1.5 text-xs font-bold font-mono rounded bg-rose-600 hover:bg-rose-705 text-white cursor-pointer flex items-center gap-1"><Trash2 size={12} /> Permanent Purge</button>
-              </>
-            ) : (
-              <>
-                <button onClick={handleRestoreSelected} className="px-3 py-1.5 text-xs font-bold font-mono rounded bg-indigo-600 hover:bg-indigo-705 text-white cursor-pointer flex items-center gap-1"><RotateCcw size={12} /> Restore Back</button>
-                <button onClick={handlePermanentDelete} className="px-3 py-1.5 text-xs font-bold font-mono rounded bg-rose-600 hover:bg-rose-705 text-white cursor-pointer flex items-center gap-1"><Trash2 size={12} /> Permanent Destruction</button>
-              </>
-            )}
-          </div>
-        </div>
-
-        {/* Display grid */}
-        <div className="overflow-hidden border border-slate-205 dark:border-slate-700 rounded-xl max-h-[350px] overflow-y-auto">
-          <table className="w-full text-left text-xs border-collapse">
-            <thead className={adminTheme === 'dark' ? 'bg-slate-900 sticky top-0' : 'bg-slate-50 sticky top-0'}>
-              <tr className="border-b border-slate-200 dark:border-slate-700">
-                <th className="p-3 w-10 text-center">
-                  <button onClick={toggleSelectAll} className="p-0.5 text-slate-405">
-                    {(() => {
-                      const list = activeSegment === 'active' ? records : archived;
-                      return selectedIds.size === list.length && list.length > 0 ? (
-                        <CheckSquare size={14} className="text-indigo-500" />
-                      ) : (
-                        <Square size={14} />
-                      );
-                    })()}
-                  </button>
-                </th>
-                <th className="p-3">Reference DocID</th>
+              <div className="flex items-center gap-2">
                 {activeSegment === 'active' ? (
                   <>
-                    <th className="p-3">Audit Details / Descriptor Name</th>
-                    <th className="p-3">Mapped StaffID</th>
-                    <th className="p-3">Campaign Group</th>
-                    <th className="p-3">Recorded Date</th>
+                    <button onClick={handleArchiveSelected} className="px-3 py-1.5 text-xs font-bold font-mono rounded bg-amber-600 hover:bg-amber-700 text-white cursor-pointer flex items-center gap-1"><Archive size={12} /> Move to Vault Archive</button>
+                    <button onClick={handlePermanentDelete} className="px-3 py-1.5 text-xs font-bold font-mono rounded bg-rose-600 hover:bg-rose-705 text-white cursor-pointer flex items-center gap-1"><Trash2 size={12} /> Permanent Purge</button>
                   </>
                 ) : (
                   <>
-                    <th className="p-3">Original Table</th>
-                    <th className="p-3">Index Date</th>
-                    <th className="p-3">Archived Timestamp</th>
+                    <button onClick={handleRestoreSelected} className="px-3 py-1.5 text-xs font-bold font-mono rounded bg-indigo-600 hover:bg-indigo-705 text-white cursor-pointer flex items-center gap-1"><RotateCcw size={12} /> Restore Back</button>
+                    <button onClick={handlePermanentDelete} className="px-3 py-1.5 text-xs font-bold font-mono rounded bg-rose-600 hover:bg-rose-705 text-white cursor-pointer flex items-center gap-1"><Trash2 size={12} /> Permanent Destruction</button>
                   </>
                 )}
-              </tr>
-            </thead>
-            <tbody>
-              {loading ? (
-                <tr>
-                  <td colSpan={6} className="p-8 text-center text-slate-400 font-mono">Parsing Database collections...</td>
-                </tr>
-              ) : (
-                (() => {
-                  const list = activeSegment === 'active' ? records : archived;
-                  if (list.length === 0) {
-                    return (
-                      <tr>
-                        <td colSpan={6} className="p-12 text-center text-slate-400 font-medium">
-                          No database records currently stored matching this collection.
-                        </td>
-                      </tr>
-                    );
-                  }
-                  return list.map(item => {
-                    const isS = selectedIds.has(item.id);
-                    return (
-                      <tr key={item.id} className={adminTheme === 'dark' ? 'hover:bg-slate-905 border-b border-slate-800/40' : 'hover:bg-slate-50/50 border-b border-slate-100'}>
-                        <td className="p-3 text-center">
-                          <button onClick={() => toggleSelectOne(item.id)} className="p-0.5 text-slate-400">
-                            {isS ? <CheckSquare size={14} className="text-indigo-500" /> : <Square size={14} />}
-                          </button>
-                        </td>
-                        <td className="p-3 font-mono font-bold text-slate-500">{item.id}</td>
-                        {activeSegment === 'active' ? (
-                          <>
-                            <td className="p-3 font-bold">{item.qvName || item.agentName || item.sellerId || item.title || 'N/A'}</td>
-                            <td className="p-3 font-mono font-bold text-[11px] opacity-75">{item.agentId || item.assignedQaId || 'N/A'}</td>
-                            <td className="p-3 font-medium opacity-85">{item.process || item.vertical || 'N/A'}</td>
-                            <td className="p-3 opacity-75">{item.auditDate || item.createdAt || item.date || 'N/A'}</td>
-                          </>
-                        ) : (
-                          <>
-                            <td className="p-3 font-bold text-amber-500 uppercase">{item.originalCollection}</td>
-                            <td className="p-3 font-mono text-[11px] opacity-85">{item.originalId}</td>
-                            <td className="p-3 font-mono text-[10px] opacity-75">{new Date(item.archivedAt).toLocaleString()}</td>
-                          </>
-                        )}
-                      </tr>
-                    );
-                  });
-                })()
-              )}
-            </tbody>
-          </table>
-        </div>
+              </div>
+            </div>
+
+            {/* Display grid */}
+            <div className="overflow-hidden border border-slate-205 dark:border-slate-700 rounded-xl max-h-[350px] overflow-y-auto">
+              <table className="w-full text-left text-xs border-collapse">
+                <thead className={adminTheme === 'dark' ? 'bg-slate-900 sticky top-0' : 'bg-slate-50 sticky top-0'}>
+                  <tr className="border-b border-slate-200 dark:border-slate-700">
+                    <th className="p-3 w-10 text-center">
+                      <button onClick={toggleSelectAll} className="p-0.5 text-slate-405">
+                        {(() => {
+                          const list = activeSegment === 'active' ? records : archived;
+                          return selectedIds.size === list.length && list.length > 0 ? (
+                            <CheckSquare size={14} className="text-indigo-500" />
+                          ) : (
+                            <Square size={14} />
+                          );
+                        })()}
+                      </button>
+                    </th>
+                    <th className="p-3">Reference DocID</th>
+                    {activeSegment === 'active' ? (
+                      <>
+                        <th className="p-3">Audit Details / Descriptor Name</th>
+                        <th className="p-3">Mapped StaffID</th>
+                        <th className="p-3">Campaign Group</th>
+                        <th className="p-3">Recorded Date</th>
+                      </>
+                    ) : (
+                      <>
+                        <th className="p-3">Original Table</th>
+                        <th className="p-3">Index Date</th>
+                        <th className="p-3">Archived Timestamp</th>
+                      </>
+                    )}
+                  </tr>
+                </thead>
+                <tbody>
+                  {loading ? (
+                    <tr>
+                      <td colSpan={6} className="p-8 text-center text-slate-400 font-mono">Parsing Database collections...</td>
+                    </tr>
+                  ) : (
+                    (() => {
+                      const list = activeSegment === 'active' ? records : archived;
+                      if (list.length === 0) {
+                        return (
+                          <tr>
+                            <td colSpan={6} className="p-12 text-center text-slate-400 font-medium">
+                              No database records currently stored matching this collection.
+                            </td>
+                          </tr>
+                        );
+                      }
+                      return list.map(item => {
+                        const isS = selectedIds.has(item.id);
+                        return (
+                          <tr key={item.id} className={adminTheme === 'dark' ? 'hover:bg-slate-905 border-b border-slate-800/40' : 'hover:bg-slate-50/50 border-b border-slate-100'}>
+                            <td className="p-3 text-center">
+                              <button onClick={() => toggleSelectOne(item.id)} className="p-0.5 text-slate-400">
+                                {isS ? <CheckSquare size={14} className="text-indigo-500" /> : <Square size={14} />}
+                              </button>
+                            </td>
+                            <td className="p-3 font-mono font-bold text-slate-500">{item.id}</td>
+                            {activeSegment === 'active' ? (
+                              <>
+                                <td className="p-3 font-bold">{item.qvName || item.agentName || item.sellerId || item.title || 'N/A'}</td>
+                                <td className="p-3 font-mono font-bold text-[11px] opacity-75">{item.agentId || item.assignedQaId || 'N/A'}</td>
+                                <td className="p-3 font-medium opacity-85">{item.process || item.vertical || 'N/A'}</td>
+                                <td className="p-3 opacity-75">{item.auditDate || item.createdAt || item.date || 'N/A'}</td>
+                              </>
+                            ) : (
+                              <>
+                                <td className="p-3 font-bold text-amber-500 uppercase">{item.originalCollection}</td>
+                                <td className="p-3 font-mono text-[11px] opacity-85">{item.originalId}</td>
+                                <td className="p-3 font-mono text-[10px] opacity-75">{new Date(item.archivedAt).toLocaleString()}</td>
+                              </>
+                            )}
+                          </tr>
+                        );
+                      });
+                    })()
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </>
+        )}
       </div>
 
       <div className={cardClass}>
@@ -670,6 +740,26 @@ export const DataManagementSubView: React.FC<DataManagementSubViewProps> = ({
               className="w-full py-2 bg-blue-600 hover:bg-blue-700 text-white font-bold text-[10px] rounded-lg shadow-sm transition-all cursor-pointer"
             >
               Sync from Firebase Auth
+            </button>
+          </div>
+
+          <div className="p-4 rounded-xl border border-slate-100 dark:border-slate-800 space-y-3">
+            <h5 className="text-xs font-bold flex items-center gap-2"><ShieldAlert size={14} className="text-rose-500" /> Force Clock-Out</h5>
+            <input 
+              type="text" 
+              placeholder="Enter User UID" 
+              className="w-full p-2 text-xs rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900"
+              value={forceOutUid}
+              onChange={e => setForceOutUid(e.target.value)}
+            />
+            <button 
+              onClick={() => handleForceClockOut(forceOutUid)}
+              disabled={isForcingOut}
+              className={`w-full py-2 text-white font-bold text-[10px] rounded-lg shadow-sm transition-all cursor-pointer ${
+                isForcingOut ? 'bg-slate-400 cursor-not-allowed' : 'bg-rose-600 hover:bg-rose-700'
+              }`}
+            >
+              {isForcingOut ? 'Processing...' : 'Execute Force Clock-Out'}
             </button>
           </div>
 

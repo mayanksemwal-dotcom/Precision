@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { 
   Users, 
   Settings, 
@@ -23,21 +23,21 @@ import { toast } from 'sonner';
 import { usePermission } from '../components/PermissionContext';
 import { useConfig } from '../contexts/ConfigContext';
 
+import { useRoster } from '../contexts/RosterContext';
+
 // Subview imports
 import { DashboardSubView } from '../components/admin/DashboardSubView';
 import { UserManagementSubView } from '../components/admin/UserManagementSubView';
 import { RolePermissionSubView } from '../components/admin/RolePermissionSubView';
-import { TeamProcessMappingSubView } from '../components/admin/TeamProcessMappingSubView';
 import { DataManagementSubView } from '../components/admin/DataManagementSubView';
 import { BackupRestoreSubView } from '../components/admin/BackupRestoreSubView';
 import { ProcessManagementSubView } from '../components/admin/ProcessManagementSubView';
 import { AttendanceSettingsSubView } from '../components/admin/AttendanceSettingsSubView';
 import { HierarchySyncWizard } from '../components/admin/HierarchySyncWizard';
 import { OfficeNetworksSubView } from '../components/admin/OfficeNetworksSubView';
-import { ShiftRecoverySubView } from '../components/admin/ShiftRecoverySubView';
 
 // Subview type definition
-type SubTabType = 'dashboard' | 'users' | 'roles' | 'mapping' | 'process' | 'data' | 'backup' | 'attendancecfg' | 'hierarchy' | 'officenetworks' | 'shiftrecovery';
+type SubTabType = 'dashboard' | 'users' | 'roles' | 'process' | 'data' | 'backup' | 'attendancecfg' | 'hierarchy' | 'officenetworks';
 
 interface AdminViewProps {
   activeTab?: string;
@@ -69,6 +69,19 @@ export default function AdminView({
   const [isRefreshing, setIsRefreshing] = useState(false);
   
   const { refreshAll, lastRefresh } = useConfig();
+  const { refreshRoster, globalRoster, fetchGlobalRoster } = useRoster();
+
+  // Effective users for Admin Console (prioritizes global roster if loaded/cached)
+  const effectiveUsers = useMemo(() => {
+    return globalRoster && globalRoster.length > 0 ? globalRoster : allUsers;
+  }, [globalRoster, allUsers]);
+
+  // When User Directory is visited, load global roster using cache memory first
+  useEffect(() => {
+    if (activeSubTab === 'users' || activeSubTab === 'dashboard') {
+      fetchGlobalRoster(false).catch(err => console.warn('[AdminView] Global roster load warning:', err));
+    }
+  }, [activeSubTab, fetchGlobalRoster]);
 
   // Theme Toggle: Sync with global theme if provided, else manage locally
   const [adminTheme, setAdminTheme] = useState<'light' | 'dark'>(externalTheme || 'light');
@@ -98,29 +111,33 @@ export default function AdminView({
         ? newValue.substring(0, MAX_LOG_LENGTH) + '... [TRUNCATED DUE TO SIZE]'
         : (newValue || 'None');
 
-      console.log('[ADMIN EVENT LOG] (Firestore Logging Disabled):', {
+      const logPayload = {
         timestamp: new Date().toISOString(),
         performedBy: `${actorName} (${actorEmail})`,
         affectedUser: affectedUser || 'System/N/A',
         action,
         previousValue: safePrev,
         newValue: safeNext
-      });
+      };
+
+      console.log('[ADMIN EVENT LOG] Writing to Firestore:', logPayload);
+      
+      await addDoc(collection(db, 'adminAuditLogs'), logPayload);
     } catch (err) {
       console.error('Failed to handle administration audit trail log: ', err);
     }
   };
+
+  const isConsoleAdmin = (requesterUser.role || '').toString().toUpperCase().includes('ADMIN') || (requesterUser.role || '').toString().toUpperCase().includes('MIS');
 
   const subTabs = [
     { id: 'dashboard', label: 'Dashboard', icon: ShieldCheck, visible: true },
     { id: 'users', label: 'User Directory', icon: Users, visible: canEdit('Console') || canCreate('Console') },
     { id: 'process', label: 'Process Management', icon: Activity, visible: canEdit('Console') },
     { id: 'roles', label: 'Roles Matrix', icon: Settings, visible: canEdit('Console') },
-    { id: 'mapping', label: 'Team Mapping', icon: RefreshCw, visible: canEdit('Console') },
     { id: 'officenetworks', label: 'Office Networks', icon: Wifi, visible: true },
     { id: 'data', label: 'Data Management', icon: Database, visible: canDelete('Console') },
-    { id: 'shiftrecovery', label: 'Shift Recovery', icon: RotateCcw, visible: requesterUser.role === 'ADMIN' || canEdit('Console') },
-    { id: 'hierarchy', label: 'Hierarchy Repair', icon: Shield, visible: requesterUser.role === 'ADMIN' },
+    { id: 'hierarchy', label: 'Hierarchy Repair', icon: Shield, visible: isConsoleAdmin },
     { id: 'backup', label: 'Backup & Restore', icon: CloudLightning, visible: canEdit('Console') && canDelete('Console') }
   ] as const;
 
@@ -210,12 +227,12 @@ export default function AdminView({
       {/* Render selected view */}
       <div className="animate-in fade-in-25 duration-300">
         {activeSubTab === 'dashboard' && (
-          <DashboardSubView allUsers={allUsers} adminTheme={adminTheme} />
+          <DashboardSubView allUsers={effectiveUsers} adminTheme={adminTheme} />
         )}
         
         {activeSubTab === 'users' && (
           <UserManagementSubView 
-            allUsers={allUsers} 
+            allUsers={effectiveUsers} 
             adminTheme={adminTheme} 
             onRefresh={onRefresh || (() => {})} 
             logAdminEvent={logAdminEvent}
@@ -226,17 +243,8 @@ export default function AdminView({
           <RolePermissionSubView adminTheme={adminTheme} logAdminEvent={logAdminEvent} />
         )}
 
-        {activeSubTab === 'mapping' && (
-          <TeamProcessMappingSubView 
-            allUsers={allUsers} 
-            adminTheme={adminTheme} 
-            onRefresh={onRefresh || (() => {})} 
-            logAdminEvent={logAdminEvent} 
-          />
-        )}
-
         {activeSubTab === 'process' && (
-          <ProcessManagementSubView user={requesterUser} adminTheme={adminTheme} allUsers={allUsers} />
+          <ProcessManagementSubView user={requesterUser} adminTheme={adminTheme} allUsers={effectiveUsers} />
         )}
 
         {activeSubTab === 'data' && (
@@ -257,7 +265,7 @@ export default function AdminView({
         
         {activeSubTab === 'hierarchy' && (
           <HierarchySyncWizard 
-            allUsers={allUsers} 
+            allUsers={effectiveUsers} 
             adminTheme={adminTheme} 
             onRefresh={onRefresh || (() => {})} 
             logAdminEvent={logAdminEvent} 
@@ -268,14 +276,6 @@ export default function AdminView({
           <OfficeNetworksSubView 
             user={requesterUser} 
             adminTheme={adminTheme} 
-          />
-        )}
-
-        {activeSubTab === 'shiftrecovery' && (
-          <ShiftRecoverySubView 
-            user={requesterUser} 
-            adminTheme={adminTheme} 
-            logAdminEvent={logAdminEvent}
           />
         )}
       </div>

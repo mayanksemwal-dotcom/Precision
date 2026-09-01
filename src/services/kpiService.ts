@@ -1,8 +1,9 @@
-import { collection, doc, getDoc, getDocs, setDoc, deleteDoc, writeBatch, query, where, orderBy, getDocsFromCache } from 'firebase/firestore';
+import { collection, doc, getDoc, getDocs, setDoc, deleteDoc, writeBatch, query, where, orderBy, getDocsFromCache, limit } from 'firebase/firestore';
 import * as XLSX from 'xlsx';
 import { db, getDocsOptimized, getDocsCacheFirst, getDocOptimized, OperationType } from '../lib/firebase';
 import { formatPeriodForDisplay } from '../lib/utils';
 import { handleFirestoreError } from '../lib/safeFirestore';
+import { safeStorage } from '../lib/safeStorage';
 import { KPIScorecard, UserProfile } from '../types';
 
 export interface KpiInvalidRecord {
@@ -126,6 +127,209 @@ function normalizeKey(key: string): string {
 }
 
 /**
+ * Clean metric name for target/actual pairing matching
+ */
+function cleanMetricName(name: string): string {
+  return String(name || '')
+    .toLowerCase()
+    .replace(/\btarget\b/gi, '')
+    .replace(/\bactual\b/gi, '')
+    .replace(/[^a-z0-9]/gi, '')
+    .replace(/s+$/, ''); // Remove trailing s for minor typos like "Scoress" vs "Scores"
+}
+
+export interface KpiHeaderMapping {
+  targetProductivityKey: string;
+  actualProductivityKey: string;
+  productivityLabel: string;
+  productivityScoreKey: string;
+
+  targetQualityKey: string;
+  actualQualityKey: string;
+  qualityLabel: string;
+  qualityScoreKey: string;
+
+  targetAttendanceKey: string;
+  actualAttendanceKey: string;
+  attendanceLabel: string;
+  attendanceScoreKey: string;
+
+  targetAptKey: string;
+  actualAptKey: string;
+  aptLabel: string;
+  aptScoreKey: string;
+}
+
+export function detectKpiHeaders(headers: string[]): KpiHeaderMapping {
+  const mapping: KpiHeaderMapping = {
+    targetProductivityKey: 'Target Productivity',
+    actualProductivityKey: 'Actual Productivity',
+    productivityLabel: 'Productivity',
+    productivityScoreKey: 'Productivity Score',
+
+    targetQualityKey: 'Target Quality',
+    actualQualityKey: 'Actual Quality',
+    qualityLabel: 'Quality',
+    qualityScoreKey: 'Quality Score',
+
+    targetAttendanceKey: 'Target Attendance',
+    actualAttendanceKey: 'Actual Attendance',
+    attendanceLabel: 'Attendance',
+    attendanceScoreKey: 'Attendance Score',
+
+    targetAptKey: 'Target APT',
+    actualAptKey: 'Actual APT',
+    aptLabel: 'APT',
+    aptScoreKey: 'APT Score'
+  };
+
+  if (!headers || headers.length === 0) return mapping;
+
+  const targetHeaders = headers.filter(h => h && String(h).toLowerCase().includes('target'));
+  const pairs: { target: string; actual: string; label: string }[] = [];
+
+  targetHeaders.forEach(tHeader => {
+    const baseClean = cleanMetricName(tHeader);
+    if (!baseClean) return;
+
+    // Find matching actual header
+    const matchingActual = headers.find(h => {
+      if (!h || h === tHeader) return false;
+      const hLower = String(h).toLowerCase();
+      if (!hLower.includes('actual')) return false;
+      return cleanMetricName(h) === baseClean;
+    });
+
+    if (matchingActual) {
+      // Extract label from targetHeader by stripping "target" and excess symbols
+      let label = tHeader.replace(/target/i, '').trim();
+      // Strip leading/trailing non-alphanumeric except %
+      label = label.replace(/^[^a-zA-Z0-9%]+|[^a-zA-Z0-9%]+$/g, '').trim();
+      if (!label) label = tHeader;
+
+      pairs.push({
+        target: tHeader,
+        actual: matchingActual,
+        label
+      });
+    }
+  });
+
+  // Now assign detected pairs to slots
+  if (pairs.length > 0) {
+    const assignedIndices = new Set<number>();
+
+    // Helper to find best matching pair by keyword
+    const findBestPair = (keywords: string[]): { pair: typeof pairs[0]; idx: number } | null => {
+      for (let i = 0; i < pairs.length; i++) {
+        if (assignedIndices.has(i)) continue;
+        const labelLower = pairs[i].label.toLowerCase();
+        if (keywords.some(kw => labelLower.includes(kw))) {
+          return { pair: pairs[i], idx: i };
+        }
+      }
+      return null;
+    };
+
+    // Slot 1: Productivity
+    const prodMatch = findBestPair(['prod']);
+    if (prodMatch) {
+      mapping.targetProductivityKey = prodMatch.pair.target;
+      mapping.actualProductivityKey = prodMatch.pair.actual;
+      mapping.productivityLabel = prodMatch.pair.label;
+      assignedIndices.add(prodMatch.idx);
+    } else {
+      // Fallback to first available
+      const firstAvailIdx = pairs.findIndex((_, idx) => !assignedIndices.has(idx));
+      if (firstAvailIdx !== -1) {
+        mapping.targetProductivityKey = pairs[firstAvailIdx].target;
+        mapping.actualProductivityKey = pairs[firstAvailIdx].actual;
+        mapping.productivityLabel = pairs[firstAvailIdx].label;
+        assignedIndices.add(firstAvailIdx);
+      }
+    }
+
+    // Slot 2: Quality
+    const qualMatch = findBestPair(['qual', 'ata', 'score', 'audit', 'error']);
+    if (qualMatch) {
+      mapping.targetQualityKey = qualMatch.pair.target;
+      mapping.actualQualityKey = qualMatch.pair.actual;
+      mapping.qualityLabel = qualMatch.pair.label;
+      assignedIndices.add(qualMatch.idx);
+    } else {
+      const firstAvailIdx = pairs.findIndex((_, idx) => !assignedIndices.has(idx));
+      if (firstAvailIdx !== -1) {
+        mapping.targetQualityKey = pairs[firstAvailIdx].target;
+        mapping.actualQualityKey = pairs[firstAvailIdx].actual;
+        mapping.qualityLabel = pairs[firstAvailIdx].label;
+        assignedIndices.add(firstAvailIdx);
+      }
+    }
+
+    // Slot 3: Attendance
+    const attMatch = findBestPair(['attend', 'compl', 'escalat', 'leave', 'shift']);
+    if (attMatch) {
+      mapping.targetAttendanceKey = attMatch.pair.target;
+      mapping.actualAttendanceKey = attMatch.pair.actual;
+      mapping.attendanceLabel = attMatch.pair.label;
+      assignedIndices.add(attMatch.idx);
+    } else {
+      const firstAvailIdx = pairs.findIndex((_, idx) => !assignedIndices.has(idx));
+      if (firstAvailIdx !== -1) {
+        mapping.targetAttendanceKey = pairs[firstAvailIdx].target;
+        mapping.actualAttendanceKey = pairs[firstAvailIdx].actual;
+        mapping.attendanceLabel = pairs[firstAvailIdx].label;
+        assignedIndices.add(firstAvailIdx);
+      }
+    }
+
+    // Slot 4: APT
+    const aptMatch = findBestPair(['apt', 'doc', 'accurac', 'handling', 'time']);
+    if (aptMatch) {
+      mapping.targetAptKey = aptMatch.pair.target;
+      mapping.actualAptKey = aptMatch.pair.actual;
+      mapping.aptLabel = aptMatch.pair.label;
+      assignedIndices.add(aptMatch.idx);
+    } else {
+      const firstAvailIdx = pairs.findIndex((_, idx) => !assignedIndices.has(idx));
+      if (firstAvailIdx !== -1) {
+        mapping.targetAptKey = pairs[firstAvailIdx].target;
+        mapping.actualAptKey = pairs[firstAvailIdx].actual;
+        mapping.aptLabel = pairs[firstAvailIdx].label;
+        assignedIndices.add(firstAvailIdx);
+      }
+    }
+  }
+
+  // Find score keys dynamically based on our selected labels
+  const findScoreKey = (label: string, defaultKey: string): string => {
+    const labelLower = label.toLowerCase();
+    // 1. Exact match for "<Label> Score"
+    const exactMatch = headers.find(h => h && String(h).toLowerCase() === `${labelLower} score`);
+    if (exactMatch) return exactMatch;
+
+    // 2. Contains both label and "score"
+    const partialMatch = headers.find(h => {
+      if (!h) return false;
+      const hLower = String(h).toLowerCase();
+      return hLower.includes(labelLower) && hLower.includes('score');
+    });
+    if (partialMatch) return partialMatch;
+
+    // 3. Fallback to standard key if it exists in sheet headers
+    const standardMatch = headers.find(h => h && String(h).toLowerCase() === defaultKey.toLowerCase());
+    return standardMatch || defaultKey;
+  };
+
+  mapping.productivityScoreKey = findScoreKey(mapping.productivityLabel, 'Productivity Score');
+  mapping.qualityScoreKey = findScoreKey(mapping.qualityLabel, 'Quality Score');
+  mapping.attendanceScoreKey = findScoreKey(mapping.attendanceLabel, 'Attendance Score');
+  mapping.aptScoreKey = findScoreKey(mapping.aptLabel, 'APT Score');
+
+  return mapping;
+}
+
+/**
  * Safely converts value to clean number
  */
 function parseNumber(val: any, fallback: number = 0): number {
@@ -148,11 +352,15 @@ export async function parseAndValidateKpiExcel(
   const firstSheetName = workbook.SheetNames[0];
   const worksheet = workbook.Sheets[firstSheetName];
 
-  const rawRows: Record<string, any>[] = XLSX.utils.sheet_to_json(worksheet, { defval: '' });
+  const rawRows: Record<string, any>[] = XLSX.utils.sheet_to_json(worksheet, { defval: '', raw: false });
+
+  // Get raw headers from the first row of worksheet
+  const sheetHeaders: string[] = (XLSX.utils.sheet_to_json(worksheet, { header: 1, raw: false })[0] || []) as string[];
+  const detectedHeaders = detectKpiHeaders(sheetHeaders);
 
   const validRecords: KPIScorecard[] = [];
   const invalidRecords: KpiInvalidRecord[] = [];
-  const seenEmailsInFile = new Set<string>();
+  const seenDocIdsMap = new Map<string, number>();
 
   // Helper map for roster email -> user profile
   const rosterMap = new Map<string, UserProfile>();
@@ -190,23 +398,24 @@ export async function parseAndValidateKpiExcel(
     const role = String(keyMap['role'] || 'AGENT').trim();
     const process = String(keyMap['processname'] || keyMap['process'] || 'Operations').trim();
 
-    const targetProductivity = keyMap['targetproductivity'] || keyMap['prodtarget'] || '-';
-    const actualProductivity = keyMap['actualproductivity'] || keyMap['prodactual'] || '-';
-    const targetQuality = keyMap['targetquality'] || keyMap['qualitytarget'] || '-';
-    const actualQuality = keyMap['actualquality'] || keyMap['qualityactual'] || '-';
-    const targetAttendance = keyMap['targetattendance'] || keyMap['attendancetarget'] || '-';
-    const actualAttendance = keyMap['actualattendance'] || keyMap['attendanceactual'] || '-';
-    const targetAPT = keyMap['targetapt'] || keyMap['apttarget'] || '-';
-    const actualAPT = keyMap['actualapt'] || keyMap['aptactual'] || '-';
+    // Use detected header keys or standard fallback
+    const targetProductivity = row[detectedHeaders.targetProductivityKey] ?? keyMap['targetproductivity'] ?? keyMap['prodtarget'] ?? '-';
+    const actualProductivity = row[detectedHeaders.actualProductivityKey] ?? keyMap['actualproductivity'] ?? keyMap['prodactual'] ?? '-';
+    const targetQuality = row[detectedHeaders.targetQualityKey] ?? keyMap['targetquality'] ?? keyMap['qualitytarget'] ?? '-';
+    const actualQuality = row[detectedHeaders.actualQualityKey] ?? keyMap['actualquality'] ?? keyMap['qualityactual'] ?? '-';
+    const targetAttendance = row[detectedHeaders.targetAttendanceKey] ?? keyMap['targetattendance'] ?? keyMap['attendancetarget'] ?? '-';
+    const actualAttendance = row[detectedHeaders.actualAttendanceKey] ?? keyMap['actualattendance'] ?? keyMap['attendanceactual'] ?? '-';
+    const targetAPT = row[detectedHeaders.targetAptKey] ?? keyMap['targetapt'] ?? keyMap['apttarget'] ?? '-';
+    const actualAPT = row[detectedHeaders.actualAptKey] ?? keyMap['actualapt'] ?? keyMap['aptactual'] ?? '-';
 
     const bonus = parseNumber(keyMap['bonus'], 0);
     const penalty = parseNumber(keyMap['penalty'], 0);
     const comments = String(keyMap['comments'] || keyMap['remarks'] || '').trim();
 
-    const productivityScore = parseNumber(keyMap['productivityscore'] || keyMap['prodscore'], 0);
-    const qualityScore = parseNumber(keyMap['qualityscore'], 0);
-    const attendanceScore = parseNumber(keyMap['attendancescore'], 0);
-    const aptScore = parseNumber(keyMap['aptscore'], 0);
+    const productivityScore = parseNumber(row[detectedHeaders.productivityScoreKey] ?? keyMap['productivityscore'] ?? keyMap['prodscore'], 0);
+    const qualityScore = parseNumber(row[detectedHeaders.qualityScoreKey] ?? keyMap['qualityscore'], 0);
+    const attendanceScore = parseNumber(row[detectedHeaders.attendanceScoreKey] ?? keyMap['attendancescore'], 0);
+    const aptScore = parseNumber(row[detectedHeaders.aptScoreKey] ?? keyMap['aptscore'], 0);
     const totalScore = parseNumber(keyMap['totalscore'] || keyMap['score'] || keyMap['finalscore'], 0);
     
     // Extract Multi-dimension Ranks
@@ -235,24 +444,14 @@ export async function parseAndValidateKpiExcel(
       }
     }
 
-    // 2. Check for duplicate email in current file batch
-    const duplicateKey = `${period.toLowerCase()}_${rawEmail}`;
-    if (rawEmail && period) {
-      if (seenEmailsInFile.has(duplicateKey)) {
-        reasons.push(`Duplicate email found in file for period "${period}": ${rawEmail}`);
-      } else {
-        seenEmailsInFile.add(duplicateKey);
-      }
-    }
-
-    // 3. User lookup from roster
+    // 2. User lookup from roster
     const matchedUser = rosterMap.get(rawEmail);
     const employeeUid = matchedUser ? matchedUser.uid : `email_${rawEmail.replace(/[^a-z0-9]/gi, '_')}`;
     const employeeName = matchedUser
       ? (matchedUser.fullName || matchedUser.name || matchedUser.employeeName || rawEmail.split('@')[0])
       : rawEmail.split('@')[0];
 
-    // 4. Validate numerical constraints
+    // 3. Validate numerical constraints
     if (isNaN(totalScore)) {
       reasons.push('Invalid Total Score value');
     }
@@ -266,9 +465,13 @@ export async function parseAndValidateKpiExcel(
         rawData: row,
       });
     } else {
-      // Clean period string for document ID: e.g., May-25 -> May-25
+      // Clean period string & process for collision-free document ID
       const cleanPeriod = period.replace(/[^a-zA-Z0-9_-]/g, '');
-      const docId = `${cleanPeriod}_${employeeUid}`;
+      const cleanProcess = (process || 'Operations').replace(/[^a-zA-Z0-9_-]/g, '_');
+      const baseDocId = `${cleanPeriod}_${employeeUid}_${cleanProcess}`;
+      const docOccurrence = (seenDocIdsMap.get(baseDocId) || 0) + 1;
+      seenDocIdsMap.set(baseDocId, docOccurrence);
+      const docId = docOccurrence === 1 ? baseDocId : `${baseDocId}_${docOccurrence}`;
 
       validRecords.push({
         id: docId,
@@ -300,6 +503,10 @@ export async function parseAndValidateKpiExcel(
         organizationRank,
         uploadedBy: '', // Set during import
         uploadedAt: new Date().toISOString(),
+        kpiNameProductivity: detectedHeaders.productivityLabel,
+        kpiNameQuality: detectedHeaders.qualityLabel,
+        kpiNameAttendance: detectedHeaders.attendanceLabel,
+        kpiNameAPT: detectedHeaders.aptLabel,
       });
     }
   });
@@ -362,28 +569,33 @@ export async function importKpiScorecards(
 export async function fetchEmployeeKpiScorecards(
   employeeUid: string,
   employeeEmail: string,
-  forceServer: boolean = false
+  forceServer: boolean = false,
+  currentUserRole?: string
 ): Promise<KPIScorecard[]> {
   try {
     const colRef = collection(db, 'kpi_scorecards');
+    const recordsMap = new Map<string, KPIScorecard>();
     
     // Fetch by UID using cache-first strategy
-    const qUid = query(colRef, where('employeeUid', '==', employeeUid));
-    const snapUid = await getDocsCacheFirst(qUid, `kpi_emp_${employeeUid}`, forceServer);
-    
-    let records: KPIScorecard[] = [];
-    snapUid.forEach(d => {
-      records.push({ id: d.id, ...d.data() } as KPIScorecard);
-    });
-
-    // Also fallback check by email if UID returned 0
-    if (records.length === 0 && employeeEmail) {
-      const qEmail = query(colRef, where('employeeEmail', '==', employeeEmail.toLowerCase().trim()));
-      const snapEmail = await getDocsCacheFirst(qEmail, `kpi_emp_email_${employeeEmail}`, forceServer);
-      snapEmail.forEach(d => {
-        records.push({ id: d.id, ...d.data() } as KPIScorecard);
+    if (employeeUid) {
+      const qUid = query(colRef, where('employeeUid', '==', employeeUid));
+      const snapUid = await getDocsCacheFirst(qUid, `kpi_emp_${employeeUid}`, forceServer);
+      snapUid.forEach(d => {
+        recordsMap.set(d.id, { id: d.id, ...d.data() } as KPIScorecard);
       });
     }
+
+    // Also check by email to retrieve any records saved with email ID or other UID
+    if (employeeEmail) {
+      const cleanEmail = employeeEmail.toLowerCase().trim();
+      const qEmail = query(colRef, where('employeeEmail', '==', cleanEmail));
+      const snapEmail = await getDocsCacheFirst(qEmail, `kpi_emp_email_${cleanEmail}`, forceServer);
+      snapEmail.forEach(d => {
+        recordsMap.set(d.id, { id: d.id, ...d.data() } as KPIScorecard);
+      });
+    }
+
+    const records = Array.from(recordsMap.values());
 
     // Sort by uploadedAt descending
     records.sort((a, b) => new Date(b.uploadedAt || 0).getTime() - new Date(a.uploadedAt || 0).getTime());
@@ -401,14 +613,30 @@ export interface KpiMetadata {
 }
 
 /**
- * Fetches lightweight KPI metadata document for instant dropdown population
+ * Fetches lightweight KPI metadata document for instant dropdown population (with 4-hour IndexedDB cache lock)
  */
-export async function fetchKpiMetadata(): Promise<KpiMetadata> {
+export async function fetchKpiMetadata(forceRefresh = false): Promise<KpiMetadata> {
+  const cacheKey = 'precision360_kpi_metadata_summary';
+  const FOUR_HOURS_MS = 4 * 60 * 60 * 1000;
+
+  if (!forceRefresh) {
+    try {
+      const cached = await safeStorage.getIndexedDB<KpiMetadata>(cacheKey, FOUR_HOURS_MS);
+      if (cached) {
+        return cached;
+      }
+    } catch {
+      // ignore cache read failure and fallback to DB
+    }
+  }
+
   try {
     const metaRef = doc(db, 'kpi_metadata', 'summary');
-    const snap = await getDocOptimized(metaRef, 'kpi_meta_summary');
+    const snap = await getDocOptimized(metaRef, 'kpi_meta_summary', forceRefresh);
     if (snap.exists()) {
-      return snap.data() as KpiMetadata;
+      const data = snap.data() as KpiMetadata;
+      safeStorage.setIndexedDB(cacheKey, data).catch(() => {});
+      return data;
     }
   } catch (e) {
     console.warn('Metadata document not found, fallback to dynamic derivation:', e);
@@ -421,8 +649,14 @@ export async function fetchKpiMetadata(): Promise<KpiMetadata> {
  */
 export async function fetchAllKpiScorecards(
   reportingPeriod?: string,
-  forceServer: boolean = false
+  forceServer: boolean = false,
+  currentUserRole?: string
 ): Promise<KPIScorecard[]> {
+  const normRole = String(currentUserRole || '').toUpperCase().trim();
+  if (currentUserRole && normRole !== 'ADMIN' && normRole !== 'MIS') {
+    console.warn(`[kpiService] Blocked fetchAllKpiScorecards query for non-authorized role: ${currentUserRole}`);
+    return [];
+  }
   try {
     const colRef = collection(db, 'kpi_scorecards');
     let q: any = colRef;
@@ -431,6 +665,9 @@ export async function fetchAllKpiScorecards(
     if (reportingPeriod && reportingPeriod !== 'ALL') {
       q = query(colRef, where('reportingPeriod', '==', reportingPeriod));
       cacheKey = `kpi_period_${reportingPeriod}`;
+    } else {
+      q = query(colRef, orderBy('uploadedAt', 'desc'));
+      cacheKey = 'kpi_all_scorecards_unlimited';
     }
 
     const snap = await getDocsCacheFirst(q, cacheKey, forceServer);
@@ -474,6 +711,22 @@ export async function deleteKpiScorecardsBulk(docIds: string[]): Promise<void> {
     }
   } catch (err) {
     handleFirestoreError(err, OperationType.DELETE, `kpi_scorecards/bulk`);
+  }
+}
+
+/**
+ * Deletes all scorecard records
+ */
+export async function deleteAllKpiScorecards(): Promise<void> {
+  try {
+    const colRef = collection(db, 'kpi_scorecards');
+    const snap = await getDocs(colRef);
+    const allIds = snap.docs.map(doc => doc.id);
+    if (allIds.length > 0) {
+      await deleteKpiScorecardsBulk(allIds);
+    }
+  } catch (err) {
+    handleFirestoreError(err, OperationType.DELETE, 'kpi_scorecards/all');
   }
 }
 

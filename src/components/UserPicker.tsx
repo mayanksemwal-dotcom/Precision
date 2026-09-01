@@ -13,7 +13,7 @@ import {
   doc,
   getDoc
 } from 'firebase/firestore';
-import { db } from '../lib/firebase';
+import { db, getDocOptimized, getDocsOptimized } from '../lib/firebase';
 import { UserProfile } from '../types';
 import { Input } from './ui/input';
 import { Button } from './ui/button';
@@ -82,7 +82,7 @@ export const UserPicker = ({
         if (found) {
           setSelectedUser(found);
         } else {
-          const uDoc = await getDoc(doc(db, 'users', selectedUserId));
+          const uDoc = await getDocOptimized(doc(db, 'users', selectedUserId), `user_picker_user_doc_${selectedUserId}`);
           if (uDoc.exists()) {
             setSelectedUser({ uid: uDoc.id, ...uDoc.data() } as UserProfile);
           }
@@ -99,7 +99,7 @@ export const UserPicker = ({
     setLoading(true);
     try {
       const q = query(collection(db, 'employee_master'));
-      const snap = await getDocs(q);
+      const snap = await getDocsOptimized(q, 'roster_global_fetch_shared');
       const results = snap.docs
         .map(d => {
           const data = d.data() as any;
@@ -110,7 +110,10 @@ export const UserPicker = ({
             role: (data.role || '').toUpperCase()
           } as UserProfile;
         })
-        .filter(u => !u.status || u.status.toLowerCase().trim() === 'active' || u.isActive === true);
+        .filter(u => {
+          if ((u as any).isDeleted === true || u.status === 'Archived' || u.status === 'Deleted') return false;
+          return !u.status || u.status.toLowerCase().trim() === 'active' || u.isActive === true;
+        });
 
       results.sort((a, b) => {
         const nameA = (a.fullName || a.name || a.employeeName || '').toLowerCase();

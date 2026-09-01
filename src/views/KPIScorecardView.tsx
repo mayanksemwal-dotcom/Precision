@@ -3,7 +3,7 @@ import { UserProfile, UserRole } from '../types';
 import EmployeeKpiDashboard from '../components/kpi/EmployeeKpiDashboard';
 import ManagerKpiDashboard from '../components/kpi/ManagerKpiDashboard';
 import { Button } from '../components/ui/button';
-import { Award, Users, User } from 'lucide-react';
+import { Award, Users, User, ShieldAlert } from 'lucide-react';
 
 interface KPIScorecardViewProps {
   user: UserProfile;
@@ -16,29 +16,30 @@ export default function KPIScorecardView({
   allUsers,
   externalTheme = 'light',
 }: KPIScorecardViewProps) {
-  // Check if user has management/upload permissions
-  const roleStr = String(user.role || '').toUpperCase();
-  const canManage =
+  // Team view is accessible to Managers, Leaders, Admins, and MIS
+  const roleStr = String(user?.role || '').toUpperCase();
+  const isManagerOrLeader =
+    roleStr.includes('MANAGER') ||
+    roleStr.includes('LEAD') ||
     roleStr === UserRole.ADMIN ||
-    roleStr === UserRole.MANAGER ||
     roleStr === UserRole.MIS ||
-    roleStr === UserRole.TEAM_LEAD ||
-    roleStr === UserRole.OPS_TL ||
-    roleStr === UserRole.STL ||
-    roleStr === UserRole.QTL ||
     roleStr === 'ADMIN' ||
-    roleStr === 'MANAGER' ||
     roleStr === 'MIS' ||
-    roleStr === 'TEAM LEAD';
+    roleStr === 'OPS_HEAD' ||
+    roleStr === 'SUPERVISOR' ||
+    roleStr === 'STL' ||
+    roleStr === 'OPS_TL' ||
+    roleStr === 'QTL' ||
+    roleStr === 'TRAINER_TL';
 
   const [activeTab, setActiveTab] = useState<'manager' | 'employee'>(
-    canManage ? 'manager' : 'employee'
+    isManagerOrLeader ? 'manager' : 'employee'
   );
 
   return (
     <div className="p-4 md:p-6 min-h-screen bg-slate-50/50 dark:bg-slate-950/50 text-slate-900 dark:text-slate-100">
-      {/* Role Switcher Toggle for Managers / Admins / MIS */}
-      {canManage && (
+      {/* Role Switcher Toggle for Managers / Leaders / Admins / MIS */}
+      {isManagerOrLeader && (
         <div className="max-w-7xl mx-auto mb-4 flex items-center justify-between">
           <div className="flex items-center gap-1.5 p-1 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl shadow-xs">
             <button
@@ -68,7 +69,7 @@ export default function KPIScorecardView({
       )}
 
       {/* Render View */}
-      {activeTab === 'manager' && canManage ? (
+      {activeTab === 'manager' && isManagerOrLeader ? (
         <ManagerKpiDashboard user={user} roster={allUsers} />
       ) : (
         <EmployeeKpiDashboard user={user} />

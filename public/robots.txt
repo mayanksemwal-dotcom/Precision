@@ -1,0 +1,14 @@
+User-agent: *
+Allow: /
+Allow: /login
+Disallow: /app/
+Disallow: /dashboard/
+Disallow: /tms/
+Disallow: /admin/
+Disallow: /reports/
+Disallow: /profile/
+Disallow: /kpi/
+Disallow: /resource/
+Disallow: /api/
+
+Sitemap: https://gen-lang-client-0825134332.firebaseapp.com/sitemap.xml

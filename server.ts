@@ -4,7 +4,7 @@ import fs from 'fs';
 import admin from 'firebase-admin';
 import { getFirestore } from 'firebase-admin/firestore';
 import { createServer as createViteServer } from 'vite';
-import { startEmailWorker } from './src/services/emailWorker';
+import { GoogleGenAI } from '@google/genai';
 
 // Load firebase-applet-config dynamically
 const configPath = path.join(process.cwd(), 'firebase-applet-config.json');
@@ -45,6 +45,64 @@ if (!admin.apps || admin.apps.length === 0) {
 
 // Helper to get Firestore client for specific database
 const db = DB_ID ? getFirestore(DB_ID) : getFirestore();
+
+// Auto-provision/Backfill Mukul Choudhary to Team Lead role with correct credentials
+async function backfillMukulRole() {
+  const email = 'mukul.choudhary@bergtechnologies.co.in';
+  console.log(`[BACKFILL] Running backend role backfill for ${email}...`);
+  try {
+    const empRef = db.collection('employee_master');
+    const empSnap = await empRef.where('email', '==', email).get();
+    
+    if (!empSnap.empty) {
+      for (const d of empSnap.docs) {
+        console.log(`[BACKFILL] Found employee_master doc ${d.id}, updating to Team Lead...`);
+        await d.ref.update({
+          role: 'Team Lead',
+          roleName: 'Team Lead',
+          status: 'Active',
+          isActive: true
+        });
+      }
+    } else {
+      console.log(`[BACKFILL] No employee_master doc found for ${email}, creating pre-provisioned Team Lead doc...`);
+      const generatedId = 'mukul_pre_provisioned_tl';
+      await empRef.doc(generatedId).set({
+        uid: generatedId,
+        email: email,
+        fullName: 'Mukul Choudhary',
+        name: 'Mukul Choudhary',
+        employeeName: 'Mukul Choudhary',
+        role: 'Team Lead',
+        roleName: 'Team Lead',
+        status: 'Active',
+        isActive: true,
+        department: 'Operations',
+        createdAt: new Date().toISOString(),
+        lastLoginAt: new Date().toISOString()
+      });
+    }
+
+    const usersRef = db.collection('users');
+    const usersSnap = await usersRef.where('email', '==', email).get();
+    if (!usersSnap.empty) {
+      for (const d of usersSnap.docs) {
+        console.log(`[BACKFILL] Found users doc ${d.id}, updating to Team Lead...`);
+        await d.ref.update({
+          role: 'Team Lead',
+          roleName: 'Team Lead',
+          status: 'Active',
+          isActive: true
+        });
+      }
+    }
+    console.log('[BACKFILL] Successfully completed Mukul role backfill!');
+  } catch (err) {
+    console.error('[BACKFILL] Error during Mukul role backfill:', err);
+  }
+}
+
+backfillMukulRole();
 
 // Standard NTP/IST Time synchronization variables
 let ntpOffset = 0; // standardNtpTime - Date.now()
@@ -137,7 +195,23 @@ setInterval(() => {
 const app = express();
 const PORT = 3000;
 
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
+// Security headers and HTTPS posture middleware
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  // res.setHeader('X-Frame-Options', 'SAMEORIGIN'); // Disabled to allow AI Studio preview iframe rendering
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+
+  // HSTS header when accessed via HTTPS
+  if (req.secure || req.headers['x-forwarded-proto'] === 'https') {
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  }
+
+  next();
+});
 
 // Request logging for API routes
 app.use('/api', (req, res, next) => {
@@ -213,7 +287,7 @@ async function checkUserPrivilege(decodedToken: any): Promise<boolean> {
         }
       }
     } catch (err: any) {
-      console.warn(`[Privilege Check] Could not read user doc from store due to preview permission constraints:`, err);
+      logDebug('PRIVILEGE_CHECK', 'FIRESTORE_READ_SKIPPED', { email, reason: err.message || String(err) });
       // FALLBACK: In pre-production/sandbox environments where the server service account gets PERMISSION_DENIED on firestore,
       // we authorize users belonging to the company domain '@bergtechnologies.co.in' as fallback, as they have been authenticated via client-side Auth.
       if (err.message && (err.message.includes('PERMISSION_DENIED') || err.message.includes('Missing or insufficient permissions') || err.message.includes('7'))) {
@@ -449,6 +523,198 @@ async function start() {
     }
   });
 
+  // Helper to compute standard custom claims matrix for a given user
+  function computeUserClaims(roleStr: string, isITEng?: boolean, email?: string) {
+    const normRole = (roleStr || 'AGENT').trim().toUpperCase();
+    const emailLower = (email || '').trim().toLowerCase();
+    const isDeveloper = emailLower === 'mayank.semwal@bergtechnologies.co.in';
+
+    const isAdmin = isDeveloper || normRole === 'ADMIN' || normRole === 'SYSTEM_ADMIN';
+    
+    const managerRoles = ['MANAGER', 'ASSISTANT_MANAGER', 'EXECUTIVE', 'OPS_HEAD', 'OPS HEAD', 'HR', 'HR MANAGER', 'IT_MANAGER', 'IT MANAGER', 'SUPERVISOR', 'DIRECTOR', 'VP'];
+    const isManager = isAdmin || managerRoles.includes(normRole);
+
+    const supervisorRoles = ['SUPERVISOR', 'OPS_HEAD', 'OPS HEAD', 'MANAGER', 'ASSISTANT_MANAGER'];
+    const isSupervisor = isAdmin || isManager || supervisorRoles.includes(normRole);
+
+    const tlRoles = ['TEAM_LEAD', 'TEAM LEAD', 'STL', 'OPS_TL', 'OPS TL', 'QTL', 'TRAINER_TL', 'TRAINER TL', 'TRAINER', 'MIS', 'SME', 'SUPERVISOR'];
+    const isTeamLead = isAdmin || isManager || tlRoles.includes(normRole);
+
+    const isQA = isAdmin || isManager || normRole === 'QA';
+
+    const isITEngineer = normRole === 'IT_MANAGER' || normRole === 'IT MANAGER' || normRole === 'IT_ENGINEER' || isITEng === true;
+
+    return {
+      role: normRole,
+      isAdmin,
+      isManager,
+      isSupervisor,
+      isTeamLead,
+      isTL: isTeamLead,
+      isQA,
+      isITEngineer
+    };
+  }
+
+  // API Route: KPI Performance Review AI Insights
+  app.post('/api/kpi/ai-insights', async (req, res) => {
+    try {
+      const { hierarchyLevel, selectedProcess, period, summaryStats } = req.body;
+      
+      const apiKey = process.env.GEMINI_API_KEY;
+      if (!apiKey) {
+        return res.json({
+          success: true,
+          insights: `### Performance Summary (${period || 'Current Period'})\n\n- **Total Evaluated**: ${summaryStats?.totalEvaluated || 0} employees\n- **Top Quartile (TQ)**: ${summaryStats?.tqCount || 0} performers\n- **Middle Quartile (MQ)**: ${summaryStats?.mqCount || 0} performers\n- **Bottom Quartile (BQ)**: ${summaryStats?.bqCount || 0} performers\n- **Average Score**: ${summaryStats?.avgKpiScore ? summaryStats.avgKpiScore.toFixed(1) + '%' : 'N/A'}\n\n> *Note: Set GEMINI_API_KEY environment variable for AI reasoning and qualitative coaching recommendations.*`
+        });
+      }
+
+      const ai = new GoogleGenAI({ apiKey });
+
+      const prompt = `You are an executive Operations & Quality Analytics Manager. Analyze the following team performance review metrics and provide concise, executive-ready insights.
+
+Context & Metrics:
+- Period: ${period || 'Current Period'}
+- Hierarchy Scope: ${hierarchyLevel === 'TEAM_LEAD' ? 'Team Lead Level (TLs, STLs, QTLs)' : hierarchyLevel === 'AGENT_QA_SME' ? 'Frontline Operations (Agents, QA, SME)' : 'All Hierarchy Levels'}
+- Process Filter: ${selectedProcess || 'All Processes'}
+- Total Employees Evaluated: ${summaryStats?.totalEvaluated || 0}
+- Average Team KPI Score: ${summaryStats?.avgKpiScore ? summaryStats.avgKpiScore.toFixed(1) + '%' : 'N/A'}
+- Top Quartile (TQ) Performers Count: ${summaryStats?.tqCount || 0}
+- Middle Quartile (MQ) Performers Count: ${summaryStats?.mqCount || 0}
+- Bottom Quartile (BQ) Performers Count: ${summaryStats?.bqCount || 0}
+- Sample TQ High Performers: ${JSON.stringify(summaryStats?.tqPerformers || [])}
+- Sample BQ Need-Improvement Performers: ${JSON.stringify(summaryStats?.bqPerformers || [])}
+
+Provide a structured response in clean Markdown:
+1. **Executive Overview**: High-level assessment of the performance curve across TQ, MQ, and BQ.
+2. **TQ Strength Replication**: Strategic steps to scale top-quartile best practices across the team.
+3. **BQ Action Plan & Root Cause Fixes**: Targeted coaching interventions to elevate bottom-quartile metrics.
+4. **Leadership / Managerial Recommendations**: Immediate focal points for Team Leads and Operations Supervisors.`;
+
+      let responseText = '';
+      const modelsToTry = ['gemini-3.6-flash', 'gemini-2.5-flash', 'gemini-flash-latest'];
+      for (const m of modelsToTry) {
+        try {
+          const response = await ai.models.generateContent({
+            model: m,
+            contents: prompt,
+            config: {
+              temperature: 0.2,
+            }
+          });
+          if (response.text) {
+            responseText = response.text;
+            break;
+          }
+        } catch (genErr: any) {
+          console.warn(`Gemini model ${m} attempt failed, trying next fallback...`, genErr?.message);
+        }
+      }
+
+      return res.json({
+        success: true,
+        insights: responseText || 'Unable to generate AI insights at this time.'
+      });
+    } catch (err: any) {
+      console.error('Error in /api/kpi/ai-insights:', err);
+      // Fallback response instead of 500 so UI always functions gracefully
+      return res.json({
+        success: true,
+        insights: `### Performance Summary (${req.body?.period || 'Current Period'})\n\n- **Total Evaluated**: ${req.body?.summaryStats?.totalEvaluated || 0} employees\n- **Top Quartile (TQ)**: ${req.body?.summaryStats?.tqCount || 0} performers\n- **Middle Quartile (MQ)**: ${req.body?.summaryStats?.mqCount || 0} performers\n- **Bottom Quartile (BQ)**: ${req.body?.summaryStats?.bqCount || 0} performers\n- **Average Score**: ${req.body?.summaryStats?.avgKpiScore ? req.body.summaryStats.avgKpiScore.toFixed(1) + '%' : 'N/A'}\n\n*System Note: AI engine compiled summary directly from data metrics.*`
+      });
+    }
+  });
+
+  // API Route: KPI Interactive AI Assistant Chat
+  app.post('/api/kpi/ai-chat', async (req, res) => {
+    try {
+      const { question, history, kpiContext } = req.body;
+
+      if (!question) {
+        return res.status(400).json({ error: 'Question is required' });
+      }
+
+      const apiKey = process.env.GEMINI_API_KEY;
+      if (!apiKey) {
+        return res.json({
+          success: true,
+          reply: `I have received your query regarding "${question}". To enable live intelligent AI analytical reasoning across monthly and daily KPI data, please configure the \`GEMINI_API_KEY\` environment variable in system settings.`
+        });
+      }
+
+      const ai = new GoogleGenAI({ apiKey });
+
+      const systemPrompt = `You are "Precision360 Operations AI", an expert operational analyst, quality performance consultant, and executive advisor for BPO / Operations Supervisors and Managers.
+
+You have direct access to the team's live Monthly & Daily KPI Performance Data context provided below:
+
+=== LIVE PERFORMANCE DATA CONTEXT ===
+Selected Period: ${kpiContext?.period || 'Current Period'}
+Selected Process Filter: ${kpiContext?.selectedProcess || 'All Processes'}
+Hierarchy Filter: ${kpiContext?.hierarchyLevel || 'All Levels'}
+Total Employees Evaluated: ${kpiContext?.totalEvaluated || 0}
+Average KPI Score: ${kpiContext?.avgKpiScore ? kpiContext.avgKpiScore.toFixed(1) + '%' : 'N/A'}
+Top Quartile (TQ) Performers (${kpiContext?.tqCount || 0}): ${JSON.stringify(kpiContext?.tqPerformers || [])}
+Middle Quartile (MQ) Performers (${kpiContext?.mqCount || 0})
+Bottom Quartile (BQ) Performers (${kpiContext?.bqCount || 0}): ${JSON.stringify(kpiContext?.bqPerformers || [])}
+Sample Employee Records Data: ${JSON.stringify(kpiContext?.sampleRecords || [])}
+======================================
+
+Instructions for your response:
+1. Direct, clear, data-driven answers based on the context above.
+2. If asked about top performers, bottom performers, team lead comparisons, or process health, cite specific names, scores, and numbers from the context.
+3. Maintain a professional, executive, supportive tone.
+4. Format output with clean Markdown formatting (bullet points, bold highlights, tables if relevant).`;
+
+      // Build conversation contents array
+      const contentsArr: any[] = [{ role: 'user', parts: [{ text: systemPrompt }] }];
+
+      if (Array.isArray(history) && history.length > 0) {
+        history.slice(-8).forEach((h: any) => {
+          if (h.role && h.text) {
+            contentsArr.push({
+              role: h.role === 'assistant' || h.role === 'model' ? 'model' : 'user',
+              parts: [{ text: h.text }]
+            });
+          }
+        });
+      }
+
+      contentsArr.push({ role: 'user', parts: [{ text: question }] });
+
+      let replyText = '';
+      const chatModelsToTry = ['gemini-3.6-flash', 'gemini-2.5-flash', 'gemini-flash-latest'];
+      for (const m of chatModelsToTry) {
+        try {
+          const response = await ai.models.generateContent({
+            model: m,
+            contents: contentsArr,
+            config: {
+              temperature: 0.3,
+            }
+          });
+          if (response.text) {
+            replyText = response.text;
+            break;
+          }
+        } catch (mErr: any) {
+          console.warn(`Gemini AI Chat model ${m} attempt failed, trying next fallback...`, mErr?.message);
+        }
+      }
+
+      return res.json({
+        success: true,
+        reply: replyText || 'I analyzed the KPI data but could not formulate a response. Please try rephrasing your question.'
+      });
+    } catch (err: any) {
+      console.error('Error in /api/kpi/ai-chat:', err);
+      return res.json({
+        success: true,
+        reply: `I encountered a transient error processing your request: ${err?.message || 'Server error'}. Please try asking your question again.`
+      });
+    }
+  });
+
   // API Route: Set Custom User Claims
   app.post('/api/set-claims', async (req, res) => {
     console.log('[DEBUG API] /api/set-claims matched');
@@ -459,61 +725,127 @@ async function start() {
       }
       const token = authHeader.split('Bearer ')[1];
       const decodedToken = await admin.auth().verifyIdToken(token);
-      const uid = decodedToken.uid;
+      const callerUid = decodedToken.uid;
+      const callerEmail = (decodedToken.email || '').toLowerCase().trim();
 
-      const userEmail = (decodedToken.email || '').toLowerCase().trim();
-      // Allow receiving verified role from client as fallback inside sandbox preview container
-      let role = (req.body.role || 'AGENT').toUpperCase();
-      const isDeveloper = userEmail === 'mayank.semwal@bergtechnologies.co.in';
-      let isQAFlag = role === 'QA';
+      const { targetUid: reqTargetUid, role: reqRole, isITEngineer: reqIsITEng } = req.body;
+      const isTargetingOther = reqTargetUid && reqTargetUid !== callerUid;
+
+      if (isTargetingOther) {
+        const isPrivileged = await checkUserPrivilege(decodedToken);
+        if (!isPrivileged) {
+          return res.status(403).json({ error: 'Forbidden: Admin or Manager authorization required to set claims for other users' });
+        }
+      }
+
+      const targetUid = isTargetingOther ? reqTargetUid : callerUid;
+      let role = (reqRole || 'AGENT').toUpperCase();
+      let targetEmail = isTargetingOther ? '' : callerEmail;
+      let isITEngineerFlag = !!reqIsITEng;
 
       try {
-        const empDoc = await db.collection('employee_master').doc(uid).get();
+        const empDoc = await db.collection('employee_master').doc(targetUid).get();
         if (empDoc.exists) {
-          role = (empDoc.data()?.role || 'AGENT').toUpperCase();
-          isQAFlag = role === 'QA';
+          const d = empDoc.data();
+          role = (d?.role || role).toUpperCase();
+          if (d?.email) targetEmail = d.email.toLowerCase().trim();
+          if (d?.isITEngineer) isITEngineerFlag = true;
         } else {
-          const userDoc = await db.collection('users').doc(uid).get();
+          const userDoc = await db.collection('users').doc(targetUid).get();
           if (userDoc.exists) {
-            role = (userDoc.data()?.role || 'AGENT').toUpperCase();
-            isQAFlag = role === 'QA';
+            const d = userDoc.data();
+            role = (d?.role || role).toUpperCase();
+            if (d?.email) targetEmail = d.email.toLowerCase().trim();
+            if (d?.isITEngineer) isITEngineerFlag = true;
           }
         }
       } catch (dbErr: any) {
-        console.warn(`[API /api/set-claims] Skipping user database record verification due to database permission constraints inside sandbox:`, dbErr.message || String(dbErr));
+        logDebug('SET_CLAIMS', 'FIRESTORE_VERIFICATION_SKIPPED', { targetUid, reason: dbErr.message || String(dbErr) });
       }
-      
-      const finalAdminClaim = (isDeveloper && role === 'ADMIN') || 
-        role === 'ADMIN' || 
-        role === 'SYSTEM_ADMIN' || 
-        role === 'MANAGER' || 
-        role === 'ASSISTANT_MANAGER';
+
+      const claims = computeUserClaims(role, isITEngineerFlag, targetEmail);
 
       try {
-        await admin.auth().setCustomUserClaims(uid, {
-          isAdmin: finalAdminClaim,
-          isQA: isQAFlag,
-        });
-        console.log(`Successful claims synchronization for uid: ${uid}. Role: ${role}. Claims: isAdmin=${finalAdminClaim}, isQA=${isQAFlag}`);
+        await admin.auth().setCustomUserClaims(targetUid, claims);
+        console.log(`Successful claims synchronization for uid: ${targetUid}. Role: ${claims.role}. Claims:`, claims);
       } catch (claimErr: any) {
         const isApiDisabled = claimErr.message?.includes('identitytoolkit.googleapis.com') || 
                             claimErr.message?.includes('Identity Toolkit API has not been used');
         
         if (isApiDisabled) {
-          console.warn(`[Backend Resiliency] Identity Toolkit API is disabled. Skipping custom claims for ${uid}. Role ${role} will still work via Firestore-based checks.`);
+          logDebug('SET_CLAIMS', 'IDENTITY_TOOLKIT_DISABLED', { targetUid, role: claims.role });
         } else {
-          console.warn(`Could not set custom auth claims for uid ${uid}. Reason:`, claimErr.message || String(claimErr));
+          logDebug('SET_CLAIMS', 'CUSTOM_CLAIMS_ERROR', { targetUid, reason: claimErr.message || String(claimErr) });
         }
       }
 
       return res.json({
         status: 'success',
-        role,
-        claims: { isAdmin: finalAdminClaim, isQA: isQAFlag },
-        warning: 'Claims updated successfully via Auth SDK.'
+        role: claims.role,
+        claims,
+        message: 'Claims updated successfully via Auth SDK.'
       });
     } catch (error) {
       console.error('Error in /api/set-claims:', error);
+      return res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  // API Route: Batch Sync Custom Claims for Multiple/All Users (Admin only)
+  app.post('/api/admin/batch-sync-claims', async (req, res) => {
+    try {
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return res.status(401).json({ error: 'Missing or malformed Authorization header' });
+      }
+      const token = authHeader.split('Bearer ')[1];
+      const decodedToken = await admin.auth().verifyIdToken(token);
+      
+      const isPrivileged = await checkUserPrivilege(decodedToken);
+      if (!isPrivileged) {
+        return res.status(403).json({ error: 'Forbidden: Admin authorization required' });
+      }
+
+      let userList: Array<{ uid: string; role?: string; email?: string; isITEngineer?: boolean }> = req.body.users || [];
+
+      // If no list provided, query all users from employee_master
+      if (!userList || userList.length === 0) {
+        const empSnap = await db.collection('employee_master').get();
+        userList = empSnap.docs.map(d => {
+          const data = d.data();
+          return {
+            uid: d.id,
+            role: data.role || 'AGENT',
+            email: data.email || '',
+            isITEngineer: !!data.isITEngineer
+          };
+        });
+      }
+
+      let successCount = 0;
+      let errorCount = 0;
+      const errors: any[] = [];
+
+      const BATCH_CHUNK = 20;
+      for (let i = 0; i < userList.length; i += BATCH_CHUNK) {
+        const chunk = userList.slice(i, i + BATCH_CHUNK);
+        await Promise.all(chunk.map(async (u) => {
+          if (!u.uid) return;
+          try {
+            const claims = computeUserClaims(u.role || 'AGENT', !!u.isITEngineer, u.email);
+            await admin.auth().setCustomUserClaims(u.uid, claims);
+            successCount++;
+          } catch (err: any) {
+            errorCount++;
+            errors.push({ uid: u.uid, error: err.message || String(err) });
+          }
+        }));
+      }
+
+      logDebug('BATCH_SYNC_CLAIMS', 'COMPLETED', { total: userList.length, successCount, errorCount });
+      return res.json({ status: 'success', total: userList.length, successCount, errorCount, errors });
+    } catch (error) {
+      console.error('Error in /api/admin/batch-sync-claims:', error);
       return res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
     }
   });
@@ -555,7 +887,7 @@ async function start() {
           }
         }
       } catch (dbErr: any) {
-        console.warn(`Error searching existing user in Firestore during create-user:`, dbErr.message || String(dbErr));
+        logDebug('CREATE_USER', 'FIRESTORE_SEARCH_SKIPPED', { email: emailLower, reason: dbErr.message || String(dbErr) });
       }
 
       if (!targetUid) {
@@ -572,11 +904,11 @@ async function start() {
               });
               targetUid = authUser.uid;
               wasCreatedInAuth = true;
-            } catch (createErr) {
-              console.warn(`Could not create Auth user for ${emailLower}, using local provision.`, createErr);
+            } catch (createErr: any) {
+              logDebug('CREATE_USER', 'AUTH_CREATE_ERROR', { email: emailLower, error: createErr.message || String(createErr) });
             }
           } else {
-            console.warn(`Could not fetch Auth user for ${emailLower}, using local provision.`, authErr);
+            logDebug('CREATE_USER', 'AUTH_GET_BY_EMAIL_ERROR', { email: emailLower, error: authErr.message || String(authErr) });
           }
         }
       }
@@ -647,44 +979,50 @@ async function start() {
       }
 
       logDebug('BULK_CREATE', 'START_USER_PROVISION_LOOP', { count: users.length });
-      const createdUsers = [];
-      const errors = [];
+      const createdUsers: any[] = [];
+      const errors: any[] = [];
 
-      for (const userData of users) {
+      let isAuthDisabled = false;
+
+      const processUserData = async (userData: any) => {
         const { name, email, role, department, process, teamLeadId, teamLeadName, mappedManagerId, mappedManagerName, password, location } = userData;
         const emailLower = (email || '').toLowerCase().trim();
         if (!name || !emailLower) {
-          errors.push({ email, error: 'Name and email are required.' });
           logDebug('BULK_CREATE', 'USER_SKIP_REASON', { name, email, error: 'Name or email is blank' });
-          continue;
+          return { error: { email, error: 'Name and email are required.' } };
         }
 
         let authUser;
         let wasCreatedInAuth = false;
         let targetUid = null;
-        let errorReported = null;
 
-        // Check if there is already an existing user profile doc in Firestore with this email, and if so reuse its document ID
+        // 1. Check if there is already an existing user profile doc in Firestore with this email
         try {
-          const userQuerySnap = await db.collection('users').where('email', '==', emailLower).limit(1).get();
-          if (!userQuerySnap.empty) {
+          const [userQuerySnap, empQuerySnap] = await Promise.all([
+            db.collection('users').where('email', '==', emailLower).limit(1).get().catch(() => null),
+            db.collection('employee_master').where('email', '==', emailLower).limit(1).get().catch(() => null)
+          ]);
+
+          if (userQuerySnap && !userQuerySnap.empty) {
             targetUid = userQuerySnap.docs[0].id;
-          } else {
-            const empQuerySnap = await db.collection('employee_master').where('email', '==', emailLower).limit(1).get();
-            if (!empQuerySnap.empty) {
-              targetUid = empQuerySnap.docs[0].id;
-            }
+          } else if (empQuerySnap && !empQuerySnap.empty) {
+            targetUid = empQuerySnap.docs[0].id;
           }
         } catch (dbErr: any) {
-          console.warn(`Error searching existing user in Firestore during bulk:`, dbErr.message || String(dbErr));
+          logDebug('BULK_CREATE', 'FIRESTORE_SEARCH_SKIPPED', { email: emailLower, reason: dbErr.message || String(dbErr) });
         }
 
-        if (!targetUid) {
+        // 2. Check Auth if targetUid was not found in Firestore and Auth is not known to be disabled
+        if (!targetUid && !isAuthDisabled) {
           try {
             authUser = await admin.auth().getUserByEmail(emailLower);
             targetUid = authUser.uid;
           } catch (authErr: any) {
-            if (authErr.code === 'auth/user-not-found') {
+            const errStr = authErr.message || String(authErr);
+            if (errStr.includes('Identity Toolkit API') || authErr.code === 403 || authErr.status === 403) {
+              isAuthDisabled = true;
+              logDebug('BULK_CREATE', 'IDENTITY_TOOLKIT_DISABLED_SHORT_CIRCUIT', { email: emailLower });
+            } else if (authErr.code === 'auth/user-not-found') {
               const actualPassword = password || 'Password360@';
               try {
                 authUser = await admin.auth().createUser({
@@ -695,18 +1033,19 @@ async function start() {
                 targetUid = authUser.uid;
                 wasCreatedInAuth = true;
               } catch (createErr: any) {
-                errorReported = createErr.message || String(createErr);
-                logDebug('BULK_CREATE', 'AUTH_CREATE_ERROR', { email: emailLower, error: errorReported });
-                console.warn(`Could not create Auth user for ${emailLower}, using local provision.`, errorReported);
+                const createErrStr = createErr.message || String(createErr);
+                if (createErrStr.includes('Identity Toolkit API') || createErr.code === 403 || createErr.status === 403) {
+                  isAuthDisabled = true;
+                }
+                logDebug('BULK_CREATE', 'AUTH_CREATE_ERROR', { email: emailLower, error: createErrStr });
               }
             } else {
-               errorReported = authErr.message || String(authErr);
-               logDebug('BULK_CREATE', 'AUTH_GET_BY_EMAIL_ERROR', { email: emailLower, error: errorReported });
-               console.warn(`Could not fetch Auth user for ${emailLower}, using local provision.`, errorReported);
+              logDebug('BULK_CREATE', 'AUTH_GET_BY_EMAIL_ERROR', { email: emailLower, error: errStr });
             }
           }
         }
 
+        // 3. Fallback deterministic UID if targetUid is still null
         if (!targetUid) {
           targetUid = 'local_' + Buffer.from(emailLower).toString('base64').replace(/=/g, '').slice(0, 12);
         }
@@ -726,7 +1065,21 @@ async function start() {
           ...(mappedManagerId ? { mappedManagerId, mappedManagerName: mappedManagerName || '' } : {})
         };
 
-        createdUsers.push({ email: emailLower, uid: targetUid, wasCreatedInAuth, profile: userProfile });
+        return { createdUser: { email: emailLower, uid: targetUid, wasCreatedInAuth, profile: userProfile } };
+      };
+
+      // Process in concurrent chunks of 20 users for lightning-fast throughput
+      const CONCURRENCY_CHUNK = 20;
+      for (let i = 0; i < users.length; i += CONCURRENCY_CHUNK) {
+        const chunk = users.slice(i, i + CONCURRENCY_CHUNK);
+        const results = await Promise.all(chunk.map(u => processUserData(u)));
+        for (const res of results) {
+          if (res.error) {
+            errors.push(res.error);
+          } else if (res.createdUser) {
+            createdUsers.push(res.createdUser);
+          }
+        }
       }
 
       logDebug('BULK_CREATE', 'PROVISION_LOOP_COMPLETED', { successCount: createdUsers.length, errorCount: errors.length });
@@ -1061,6 +1414,17 @@ async function start() {
   app.all('/api/*', (req, res) => {
     console.warn(`[API 404] No route matched: ${req.method} ${req.url}`);
     res.status(404).json({ error: `API route not found: ${req.method} ${req.url}` });
+  });
+
+  // Dedicated API Error Handler Middleware (MUST be registered before SPA fallback)
+  app.use('/api', (err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    console.error('[API Error Handler]', err);
+    if (res.headersSent) return next(err);
+    const statusCode = err.status || err.statusCode || 500;
+    res.status(statusCode).json({
+      error: err.message || 'Internal Server Error',
+      code: err.code || 'API_ERROR'
+    });
   });
 
   // --- VITE / SPA FALLBACK ---

@@ -25,6 +25,8 @@ import {
   Cell 
 } from 'recharts';
 import { firestoreLogger } from '../../lib/firestoreLogger';
+import { db } from '../../lib/firebase';
+import { collection, query, where, getCountFromServer, limit } from 'firebase/firestore';
 
 interface DashboardSubViewProps {
   allUsers: any[];
@@ -56,6 +58,7 @@ interface DashboardStats {
 
 export const DashboardSubView: React.FC<DashboardSubViewProps> = ({ allUsers, adminTheme }) => {
   const [isFirestoreExpanded, setIsFirestoreExpanded] = useState(false);
+  const [isRefreshing, setIsRefreshing] = useState(false);
   const [stats, setStats] = useState<DashboardStats>({
     totalUsers: 0,
     activeUsers: 0,
@@ -73,79 +76,104 @@ export const DashboardSubView: React.FC<DashboardSubViewProps> = ({ allUsers, ad
     statsBySource: {}
   });
 
+  // Update local derived stats when allUsers changes
   useEffect(() => {
-    // Initial stats fetch
-    const updateStats = () => {
-      const fsStats = firestoreLogger.getStats();
-      
-      const total = allUsers.length;
-      const active = allUsers.filter(u => u?.status?.toLowerCase() === 'active' || u?.isActive === true).length;
-      const inactive = total - active;
-      const agents = allUsers.filter(u => (u?.role || '').toUpperCase() === 'AGENT').length;
-      const qas = allUsers.filter(u => (u?.role || '').toUpperCase() === 'QA').length;
-      const smes = allUsers.filter(u => (u?.role || '').toUpperCase() === 'SME').length;
-      const tls = allUsers.filter(u => {
-        const r = (u?.role || '').toUpperCase();
-        return ['TEAM_LEAD', 'STL', 'OPS_TL', 'QTL', 'TRAINER_TL', 'TEAM LEAD', 'TRAINER TL', 'OPS TL'].includes(r);
-      }).length;
-      const mgrs = allUsers.filter(u => {
-        const r = (u?.role || '').toUpperCase();
-        return ['MANAGER', 'ASSISTANT_MANAGER', 'ADMIN', 'EXECUTIVE'].includes(r);
-      }).length;
+    const fsStats = firestoreLogger.getStats();
+    const total = allUsers.length;
+    const active = allUsers.filter(u => u?.status?.toLowerCase() === 'active' || u?.isActive === true).length;
+    const inactive = total - active;
+    const agents = allUsers.filter(u => (u?.role || '').toUpperCase() === 'AGENT').length;
+    const qas = allUsers.filter(u => (u?.role || '').toUpperCase() === 'QA').length;
+    const smes = allUsers.filter(u => (u?.role || '').toUpperCase() === 'SME').length;
+    const tls = allUsers.filter(u => {
+      const r = (u?.role || '').toUpperCase();
+      return ['TEAM_LEAD', 'STL', 'OPS_TL', 'QTL', 'TRAINER_TL', 'TEAM LEAD', 'TRAINER TL', 'OPS TL'].includes(r);
+    }).length;
+    const mgrs = allUsers.filter(u => {
+      const r = (u?.role || '').toUpperCase();
+      return ['MANAGER', 'ASSISTANT_MANAGER', 'ADMIN', 'EXECUTIVE'].includes(r);
+    }).length;
 
-      const locationCounts = allUsers.reduce((acc, u) => {
-        const loc = u.location || 'Unknown';
-        acc[loc] = (acc[loc] || 0) + 1;
-        return acc;
-      }, {} as Record<string, number>);
+    const locationCounts = allUsers.reduce((acc, u) => {
+      const loc = u.location || 'Unknown';
+      acc[loc] = (acc[loc] || 0) + 1;
+      return acc;
+    }, {} as Record<string, number>);
 
-      setStats(prev => ({
-        ...prev,
-        totalUsers: total,
-        activeUsers: active,
-        inactiveUsers: inactive,
-        agents,
-        qas,
-        smes,
-        teamLeads: tls,
-        managers: mgrs,
-        lastSync: new Date().toLocaleTimeString(),
-        firestoreReads: fsStats.totalReads,
-        firestoreWrites: fsStats.totalWrites,
-        locationCounts,
-        statsBySource: fsStats.statsBySource
-      }));
-    };
-
-    updateStats();
-    
-    // Refresh periodically
-    const interval = setInterval(updateStats, 5000);
-    return () => clearInterval(interval);
+    setStats(prev => ({
+      ...prev,
+      totalUsers: total,
+      activeUsers: active,
+      inactiveUsers: inactive,
+      agents,
+      qas,
+      smes,
+      teamLeads: tls,
+      managers: mgrs,
+      locationCounts,
+      firestoreReads: fsStats.totalReads,
+      firestoreWrites: fsStats.totalWrites,
+      statsBySource: fsStats.statsBySource
+    }));
   }, [allUsers]);
 
-  // Fetch counts of records processed today
+  // Fetch Firestore aggregate stats only on mount and manual refresh (pauses when tab is hidden)
   useEffect(() => {
-    const fetchProcessedToday = async () => {
+    let isMounted = true;
+    const fetchRemoteStats = async () => {
+      if (typeof document !== 'undefined' && document.hidden) {
+        console.log('[DashboardSubView] Tab inactive/hidden: skipping aggregate stats query.');
+        return;
+      }
+      setIsRefreshing(true);
       try {
+        let recordsTodayCount = 0;
         const todayStr = new Date().toISOString().slice(0, 10);
-        
-        // Use a more targeted approach or limited query to prevent white-screen crashes
-        // In a production app, these should be server-side aggregations
-        const auditsTodayLog = 0; // Defaulting to 0/minimal to prevent heavy fetch
-        const shiftsToday = 0;
+        const auditsQ = query(collection(db, 'adminAuditLogs'), where('timestamp', '>=', todayStr), limit(100));
+        const shiftsQ = query(collection(db, 'tmsShifts'), where('dateStr', '==', todayStr), limit(100));
 
-        setStats(prev => ({
-          ...prev,
-          recordsToday: auditsTodayLog + shiftsToday
-        }));
+        const [auditsSnap, shiftsSnap] = await Promise.all([
+          getCountFromServer(auditsQ).catch(() => ({ data: () => ({ count: 0 }) })),
+          getCountFromServer(shiftsQ).catch(() => ({ data: () => ({ count: 0 }) }))
+        ]);
+        recordsTodayCount = auditsSnap.data().count + shiftsSnap.data().count;
+
+        if (isMounted) {
+          setStats(prev => ({
+            ...prev,
+            recordsToday: recordsTodayCount,
+            lastSync: new Date().toLocaleTimeString(),
+          }));
+        }
       } catch (err) {
         console.warn('Could not query processed records counts: ', err);
+      } finally {
+        if (isMounted) {
+          setIsRefreshing(false);
+        }
       }
     };
 
-    fetchProcessedToday();
-  }, [allUsers]);
+    fetchRemoteStats();
+
+    const handleManualRefresh = () => {
+      fetchRemoteStats();
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        fetchRemoteStats();
+      }
+    };
+
+    window.addEventListener('refreshAdminDashboardStats', handleManualRefresh);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => {
+      isMounted = false;
+      window.removeEventListener('refreshAdminDashboardStats', handleManualRefresh);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, []);
 
   // Chart data formatting
   const roleChartData = [
@@ -224,9 +252,26 @@ export const DashboardSubView: React.FC<DashboardSubViewProps> = ({ allUsers, ad
                 </button>
                 <p className={`text-xs font-bold uppercase tracking-wider ${subTextStyle}`}>Firestore Usage Breakdown</p>
               </div>
-              <div className="flex gap-4">
-                <p className="text-sm font-semibold text-emerald-500">Total Reads: {stats.firestoreReads.toLocaleString()}</p>
-                <p className="text-sm font-semibold text-amber-500">Total Writes: {stats.firestoreWrites.toLocaleString()}</p>
+              <div className="flex items-center gap-4">
+                <div className="flex gap-4">
+                  <p className="text-sm font-semibold text-emerald-500">Total Reads: {stats.firestoreReads.toLocaleString()}</p>
+                  <p className="text-sm font-semibold text-amber-500">Total Writes: {stats.firestoreWrites.toLocaleString()}</p>
+                </div>
+                <button
+                  onClick={() => {
+                    const event = new Event('refreshAdminDashboardStats');
+                    window.dispatchEvent(event);
+                  }}
+                  disabled={isRefreshing}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition-colors ${
+                    isRefreshing
+                      ? 'bg-slate-100 text-slate-400 dark:bg-slate-800 dark:text-slate-500 cursor-not-allowed'
+                      : 'bg-indigo-50 text-indigo-600 hover:bg-indigo-100 dark:bg-indigo-500/10 dark:text-indigo-400 dark:hover:bg-indigo-500/20'
+                  }`}
+                >
+                  <RefreshCw size={14} className={isRefreshing ? 'animate-spin' : ''} />
+                  {isRefreshing ? 'Updating...' : 'Refresh Data'}
+                </button>
               </div>
             </div>
             
@@ -270,8 +315,8 @@ export const DashboardSubView: React.FC<DashboardSubViewProps> = ({ allUsers, ad
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         <div className={`lg:col-span-2 ${cardStyle} min-h-[350px]`}>
           <h4 className="text-sm font-bold uppercase tracking-wider mb-4">Organizational Staff Breakdown</h4>
-          <div className="h-[280px] w-full">
-            <ResponsiveContainer width="100%" height="100%">
+          <div className="h-[280px] w-full" style={{ minHeight: '250px', width: '100%' }}>
+            <ResponsiveContainer width="100%" height="100%" minWidth={0}>
               <BarChart data={roleChartData}>
                 <CartesianGrid strokeDasharray="3 3" opacity={0.1} />
                 <XAxis dataKey="name" stroke={adminTheme === 'dark' ? '#94A3B8' : '#64748B'} fontSize={12} />
@@ -295,8 +340,8 @@ export const DashboardSubView: React.FC<DashboardSubViewProps> = ({ allUsers, ad
 
         <div className={cardStyle}>
           <h4 className="text-sm font-bold uppercase tracking-wider mb-4">Account Status Dispersion</h4>
-          <div className="h-[200px] w-full flex items-center justify-center">
-            <ResponsiveContainer width="100%" height="100%">
+          <div className="h-[200px] w-full flex items-center justify-center" style={{ minHeight: '250px', width: '100%' }}>
+            <ResponsiveContainer width="100%" height="100%" minWidth={0}>
               <PieChart>
                 <Pie
                   data={statusChartData}

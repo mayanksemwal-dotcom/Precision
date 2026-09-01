@@ -276,7 +276,7 @@ export default function KpiUploadModal({
                             penalty: Number(inv.rawData['Penalty'] || 0),
                           } as any))
                         ).map((row, idx) => (
-                          <TableRow key={idx} className="text-xs">
+                          <TableRow key={row.id || `${row.employeeEmail}_${row.reportingPeriod}_${idx}`} className="text-xs">
                             <TableCell className="font-mono font-medium">{formatPeriodForDisplay(row.reportingPeriod)}</TableCell>
                             <TableCell className="font-medium text-slate-800 dark:text-slate-200">{row.employeeEmail}</TableCell>
                             <TableCell>{row.process}</TableCell>
@@ -348,7 +348,7 @@ export default function KpiUploadModal({
                       </TableHeader>
                       <TableBody>
                         {parseResult.invalidRecords.map((inv, idx) => (
-                          <TableRow key={idx} className="text-xs">
+                          <TableRow key={`inv-${inv.rowIndex}-${inv.email}-${idx}`} className="text-xs">
                             <TableCell className="font-mono font-bold text-rose-600 dark:text-rose-400">
                               Row {inv.rowIndex}
                             </TableCell>
@@ -358,7 +358,7 @@ export default function KpiUploadModal({
                             <TableCell className="text-rose-600 dark:text-rose-300">
                               <ul className="list-disc list-inside space-y-0.5">
                                 {inv.reasons.map((r, rIdx) => (
-                                  <li key={rIdx}>{r}</li>
+                                  <li key={`${r}-${rIdx}`}>{r}</li>
                                 ))}
                               </ul>
                             </TableCell>

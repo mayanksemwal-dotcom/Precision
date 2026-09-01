@@ -41,7 +41,7 @@ import { auth, db, logout, getDocsOptimized, getDocOptimized } from './lib/fireb
 import { isFirestoreBlocked, handleFirestoreError } from './lib/safeFirestore';
 import { firestoreLogger } from './lib/firestoreLogger';
 import { OperationType } from './lib/firebase';
-import { onAuthStateChanged } from 'firebase/auth';
+import { onAuthStateChanged, signOut } from 'firebase/auth';
 import { doc, getDoc, getDocs, collection, query, where, orderBy, setDoc, updateDoc, deleteDoc, limit, onSnapshot, writeBatch } from 'firebase/firestore';
 import { Database, RefreshCw, Activity } from 'lucide-react';
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogFooter } from './components/ui/dialog';
@@ -55,6 +55,7 @@ import MyProfileView from './views/MyProfileView';
 import KPIScorecardView from './views/KPIScorecardView';
 import { runRoleStandardizationMigration } from './lib/roleMigration';
 import { useMemoryGuard, manualMemoryCleanAndSync } from './hooks/useMemoryGuard';
+import { syncCurrentUserClaims } from './lib/claimsService';
 
 // UI Components
 import BergLogo from './components/BergLogo';
@@ -89,14 +90,21 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [viewAsRole, setViewAsRole] = useState<string | null>(null);
   
-  const { roster, profiles, refreshRoster, invalidateRosterCache } = useRoster();
+  const { roster, profiles, globalRoster, globalProfiles, refreshRoster, invalidateRosterCache } = useRoster();
   const [allUsers, setAllUsers] = useState<UserProfile[]>([]);
   const [employeeProfiles, setEmployeeProfiles] = useState<Record<string, any>>({});
+  const [globalUsers, setGlobalUsers] = useState<UserProfile[]>([]);
+  const [globalProfilesState, setGlobalProfilesState] = useState<Record<string, any>>({});
 
   useEffect(() => {
     setAllUsers(roster);
     setEmployeeProfiles(profiles);
   }, [roster, profiles]);
+
+  useEffect(() => {
+    setGlobalUsers(globalRoster && globalRoster.length > 0 ? globalRoster : roster);
+    setGlobalProfilesState(globalProfiles && Object.keys(globalProfiles).length > 0 ? globalProfiles : profiles);
+  }, [globalRoster, globalProfiles, roster, profiles]);
 
   // Derive reactive current user from the synced allUsers and employeeProfiles source of truth
   const allUsersWithPhotos = useMemo(() => {
@@ -184,11 +192,19 @@ export default function App() {
 
   // Removed Archive Reports states
 
-  // Firebase Auth Listener with Custom Claims synchronization
+  // Firebase Auth Listener with Custom Claims synchronization and Real-time Role Propagation
   useEffect(() => {
     console.log('Setting up Firebase Auth listener...');
+    let unsubscribeProfile: (() => void) | null = null;
+
     const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
       console.log('onAuthStateChanged fired. User:', firebaseUser ? firebaseUser.email : 'null');
+      
+      if (unsubscribeProfile) {
+        unsubscribeProfile();
+        unsubscribeProfile = null;
+      }
+
       if (firebaseUser) {
         // Direct login allowed without email verification per user request
         try {
@@ -218,13 +234,34 @@ export default function App() {
               console.log('User document found, syncing profile.');
               const currentData = userDoc.data() as any;
               
-              // Promote users to 'Active'
-              let finalStatus = currentData.status === 'Pending Verification' ? 'Active' : (currentData.status || 'Active');
+              // Check if administrator has marked user as login restricted
+              const isRestricted = currentData.loginRestricted === true || currentData.isRestricted === true || currentData.isLoginRestricted === true || currentData.status === 'Restricted';
+              const isSuperAdmin = firebaseUser.email?.toLowerCase().trim() === 'mayank.semwal@bergtechnologies.co.in';
+
+              if (isRestricted && !isSuperAdmin) {
+                console.warn('[AUTH REJECTED] User login is restricted by administrator:', firebaseUser.email);
+                const reasonMsg = currentData.restrictedReason
+                  ? `Access Denied: Your account login has been restricted by an administrator.\nReason: ${currentData.restrictedReason}`
+                  : 'Access Denied: Your account login has been restricted by an administrator. You cannot log into the application even with valid credentials.';
+                safeStorage.set('login_restriction_message', reasonMsg);
+                await signOut(auth);
+                setUser(null);
+                return;
+              }
+
+              // Preserve the existing organizational membership (isActive / status).
+              const finalStatus = currentData.status || (currentData.isActive === false ? 'Inactive' : 'Active');
+              const finalIsActive = currentData.isActive !== undefined ? currentData.isActive : (finalStatus !== 'Inactive' && finalStatus !== 'Archived' && finalStatus !== 'Suspended');
 
               let finalRole = (currentData.role || UserRole.AGENT).toUpperCase();
               if (firebaseUser.email?.toLowerCase().trim() === 'mayank.semwal@bergtechnologies.co.in') {
                 finalRole = 'ADMIN';
               }
+
+              const lastLoginMs = currentData.lastLoginAt ? new Date(currentData.lastLoginAt).getTime() : 0;
+              // Update lastLoginAt on app startup only if missing or > 12 hours old
+              const isLastLoginStale = !lastLoginMs || (now.getTime() - lastLoginMs > 12 * 60 * 60 * 1000);
+              const resolvedLastLoginAt = isLastLoginStale ? now.toISOString() : currentData.lastLoginAt;
 
               userProfile = {
                 ...currentData,
@@ -234,13 +271,23 @@ export default function App() {
                 fullName: currentData.fullName || currentData.name || getCleanName(),
                 role: finalRole,
                 status: finalStatus,
+                isActive: finalIsActive,
                 department: currentData.department || 'Operations',
-                Manager: currentData.Manager || '',
+                Manager: currentData.Manager || currentData.mappedManagerName || currentData.managerName || '',
                 createdAt: currentData.createdAt || now.toISOString(),
-                lastLoginAt: now.toISOString(), // Update last login
+                lastLoginAt: resolvedLastLoginAt,
               };
 
-              await setDoc(userDocRef, userProfile, { merge: true });
+              // Dirty check: Only write to Firestore if profile fields/status changed or lastLoginAt was stale
+              // Fix LEAK #W2: Using deep equality check to prevent redundant writes
+              const hasFieldChanges = JSON.stringify(currentData) !== JSON.stringify({...currentData, ...userProfile});
+
+              if (hasFieldChanges) {
+                console.log('[FIRESTORE WRITE COST] operation=profile_sync collection=employee_master reason=fields_changed_or_stale_login');
+                await setDoc(userDocRef, userProfile, { merge: true });
+              } else {
+                console.log('[PROFILE SYNC SKIPPED] Profile up to date, skipping redundant Firestore write.');
+              }
             } else {
               // Wait if registration is currently active in the client
               const isRegistering = safeStorage.get('is_registering') === 'true';
@@ -254,7 +301,9 @@ export default function App() {
                   if (checkDoc.exists()) {
                     console.log('Registration document detected in auth listener after wait.');
                     const currentData = checkDoc.data() as any;
-                    let finalStatus = currentData.status === 'Pending Verification' ? 'Active' : (currentData.status || 'Active');
+                    // Preserve the existing organizational membership
+                    const finalStatus = currentData.status || (currentData.isActive === false ? 'Inactive' : 'Active');
+                    const finalIsActive = currentData.isActive !== undefined ? currentData.isActive : (finalStatus !== 'Inactive' && finalStatus !== 'Archived' && finalStatus !== 'Suspended');
                     let finalRoleReg = (currentData.role || UserRole.AGENT).toUpperCase();
                     if (firebaseUser.email?.toLowerCase().trim() === 'mayank.semwal@bergtechnologies.co.in') {
                       finalRoleReg = 'ADMIN';
@@ -267,6 +316,7 @@ export default function App() {
                       fullName: currentData.fullName || currentData.name || getCleanName(),
                       role: finalRoleReg,
                       status: finalStatus,
+                      isActive: finalIsActive,
                       department: currentData.department || 'Operations',
                       Manager: currentData.Manager || '',
                       createdAt: currentData.createdAt || now.toISOString(),
@@ -290,7 +340,23 @@ export default function App() {
                   console.log('Pre-provisioned user found. Triggering client-side profile linking and migration...', matchedDoc.id);
                   
                   const matchedData = matchedDoc.data() as any;
-                  let finalStatus = matchedData.status === 'Pending Verification' ? 'Active' : (matchedData.status || 'Active');
+                  const isPreRestricted = matchedData.loginRestricted === true || matchedData.isRestricted === true || matchedData.isLoginRestricted === true || matchedData.status === 'Restricted';
+                  const isSuperAdminPre = firebaseUser.email?.toLowerCase().trim() === 'mayank.semwal@bergtechnologies.co.in';
+
+                  if (isPreRestricted && !isSuperAdminPre) {
+                    console.warn('[AUTH REJECTED] Pre-provisioned user login restricted by administrator:', firebaseUser.email);
+                    const reasonMsg = matchedData.restrictedReason
+                      ? `Access Denied: Your account login has been restricted by an administrator.\nReason: ${matchedData.restrictedReason}`
+                      : 'Access Denied: Your account login has been restricted by an administrator. You cannot log into the application even with valid credentials.';
+                    safeStorage.set('login_restriction_message', reasonMsg);
+                    await signOut(auth);
+                    setUser(null);
+                    return;
+                  }
+
+                  // Preserve the existing organizational membership
+                  const finalStatus = matchedData.status || (matchedData.isActive === false ? 'Inactive' : 'Active');
+                  const finalIsActive = matchedData.isActive !== undefined ? matchedData.isActive : (finalStatus !== 'Inactive' && finalStatus !== 'Archived' && finalStatus !== 'Suspended');
                   
                   let finalRolePre = (matchedData.role || UserRole.AGENT).toUpperCase();
                   if (firebaseUser.email?.toLowerCase().trim() === 'mayank.semwal@bergtechnologies.co.in') {
@@ -305,8 +371,9 @@ export default function App() {
                     fullName: matchedData.fullName || matchedData.name || getCleanName(),
                     role: finalRolePre,
                     status: finalStatus,
+                    isActive: finalIsActive,
                     department: matchedData.department || 'Operations',
-                    Manager: matchedData.Manager || '',
+                    Manager: matchedData.mappedManagerName || matchedData.managerName || '',
                     createdAt: matchedData.createdAt || now.toISOString(),
                     lastLoginAt: now.toISOString(),
                   };
@@ -357,44 +424,80 @@ export default function App() {
           setUser(userProfile);
           console.log('User profile set in state.');
 
-          // Sync Custom claims asynchronously in the background. We check current claims, and only hit the backend/force token refresh if they are out of sync.
-          (async () => {
-            try {
-              // Retrieve cached claims to avoid immediate network requests
-              const tokenResult = await firebaseUser.getIdTokenResult(false);
-              const expectedAdmin = userProfile.role === UserRole.ADMIN;
-              const expectedQA = userProfile.role === UserRole.QA;
+          // Sync Custom claims asynchronously in the background so security rules operate with zero Firestore document lookups
+          syncCurrentUserClaims(userProfile.role).catch(err => {
+            console.error('[AUTH CLAIMS] Error synchronizing claims:', err);
+          });
 
-              const isCurrentAdmin = !!tokenResult.claims.isAdmin;
-              const isCurrentQA = !!tokenResult.claims.isQA;
+          // Set up real-time snapshot listener for direct, immediate claims refreshing upon Admin action
+          const userDocRef = doc(db, 'employee_master', firebaseUser.uid);
+          unsubscribeProfile = onSnapshot(userDocRef, (snapshot) => {
+            if (!snapshot.exists()) return;
+            const liveData = snapshot.data();
 
-              if ((isCurrentAdmin !== expectedAdmin || isCurrentQA !== expectedQA) && !sessionStorage.getItem('claims_sync_attempted')) {
-                console.log('Firebase user custom claims mismatch detected. Synchronizing claims...');
-                sessionStorage.setItem('claims_sync_attempted', 'true');
-                try {
-                  const idToken = await firebaseUser.getIdToken(true);
-                  await fetch('/api/set-claims', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${idToken}` }
-                  });
-                  await firebaseUser.getIdToken(true);
-                } catch (e) {
-                  console.error('Failed to sync claims', e);
-                }
-              }
-            } catch (err) {
-              console.error('Error syncing claims', err);
+            // Check live restriction status
+            const isRestricted = liveData.loginRestricted === true || liveData.isRestricted === true || liveData.isLoginRestricted === true || liveData.status === 'Restricted';
+            const isSuperAdmin = firebaseUser.email?.toLowerCase().trim() === 'mayank.semwal@bergtechnologies.co.in';
+            if (isRestricted && !isSuperAdmin) {
+              console.warn('[AUTH REJECTED LIVE] User restriction updated, signing out...');
+              signOut(auth).then(() => setUser(null));
+              return;
             }
-          })();
+
+            // Check role update
+            const liveRole = (liveData.role || 'AGENT').toUpperCase();
+            setUser(prev => {
+              if (prev && prev.role !== liveRole) {
+                console.info(`[ROLE UPDATE DETECTED REALTIME] ${prev.role} -> ${liveRole}`);
+                
+                // Force custom claims token refresh
+                firebaseUser.getIdToken(true).then(() => {
+                  console.info('[ROLE CLAIMS REFRESHED REALTIME] Custom claims successfully synced.');
+                }).catch(err => {
+                  console.error('[ROLE CLAIMS REFRESHED REALTIME] Error refreshing token:', err);
+                });
+
+                // Clear IndexedDB & localStorage caches so the views refresh with correct data
+                try {
+                  safeStorage.clearAllIndexedDBByPrefix('precision360_hierarchy_nodes_');
+                  safeStorage.clearAllIndexedDBByPrefix('subordinates_');
+                  safeStorage.clearAllIndexedDBByPrefix(`precision360_roster_cache_${firebaseUser.uid}`);
+                  localStorage.removeItem(`precision360_roster_cache_${firebaseUser.uid}`);
+                  localStorage.removeItem(`precision360_roster_cache_${firebaseUser.uid}_profiles`);
+                  localStorage.removeItem(`precision360_roster_cache_${firebaseUser.uid}_roles`);
+                } catch (e) {
+                  console.warn('Cache clear failed on role change:', e);
+                }
+
+                toast.info(`Your security role was updated to ${liveRole}. Workspace permissions refreshed.`);
+
+                return {
+                  ...prev,
+                  role: liveRole,
+                  ...liveData
+                };
+              }
+              return prev;
+            });
+          }, (err) => {
+            console.error('Real-time profile snapshot error:', err);
+          });
+
         } catch (globalErr) {
           console.error("Global auth state error:", globalErr);
         }
-        } else {
-          setUser(null);
-        }
-      });
-      return () => unsubscribe();
-    }, []);
+      } else {
+        setUser(null);
+      }
+    });
+
+    return () => {
+      unsubscribe();
+      if (unsubscribeProfile) {
+        unsubscribeProfile();
+      }
+    };
+  }, []);
 
     if (user === undefined) {
       return (
@@ -460,7 +563,8 @@ function MainAppShell({
   theme,
   setTheme
 }: MainAppShellProps) {
-  const { invalidateRosterCache } = useRoster();
+  const { globalRoster, roster, invalidateRosterCache } = useRoster();
+  const globalUsers = globalRoster && globalRoster.length > 0 ? globalRoster : roster;
   
   const { isDashboardUser, isAdminUser, tmsSubViews } = useMemo(() => {
     const normRole = (effectiveUser?.role || '').toString().toUpperCase().trim();
@@ -480,9 +584,81 @@ function MainAppShell({
     };
   }, [effectiveUser]);
 
-  const [currentView, setCurrentView] = useState(() => {
+  // Console authorization: strictly restricted to Admin & MIS roles
+  const isConsoleUser = useMemo(() => {
+    const normRole = (effectiveUser?.role || '').toString().toUpperCase().trim();
+    const realNormRole = (user?.role || '').toString().toUpperCase().trim();
+    const allowed = ['ADMIN', 'MIS', 'SYSTEM_ADMIN'];
+    return (
+      allowed.includes(normRole) ||
+      normRole.includes('ADMIN') ||
+      normRole.includes('MIS') ||
+      allowed.includes(realNormRole) ||
+      realNormRole.includes('ADMIN') ||
+      realNormRole.includes('MIS')
+    );
+  }, [effectiveUser, user]);
+
+  // Route authorization checker guard
+  const isViewAuthorized = (viewId: string) => {
+    if (viewId === 'tms-agent' || viewId === 'kpi' || viewId === 'resource' || viewId === 'profile') {
+      return true;
+    }
+    if (viewId === 'tms-monitor') {
+      return isDashboardUser;
+    }
+    if (viewId === 'admin') {
+      return isConsoleUser;
+    }
+    return false;
+  };
+
+  const getViewFromHash = () => {
+    const rawHash = window.location.hash.replace('#', '').trim();
+    if (rawHash && isViewAuthorized(rawHash)) {
+      return rawHash;
+    }
     return tmsSubViews[0]?.id || 'tms-agent';
-  });
+  };
+
+  const [currentView, setCurrentView] = useState<string>(() => getViewFromHash());
+
+  const navigateToView = (viewId: string) => {
+    if (isViewAuthorized(viewId)) {
+      setCurrentView(viewId);
+      if (window.location.hash !== `#${viewId}`) {
+        window.history.pushState(null, '', `#${viewId}`);
+      }
+    }
+  };
+
+  // Listen to browser Back/Forward navigation (hashchange / popstate)
+  useEffect(() => {
+    const handleHashChange = () => {
+      const targetView = getViewFromHash();
+      if (targetView !== currentView) {
+        setCurrentView(targetView);
+      }
+    };
+    window.addEventListener('hashchange', handleHashChange);
+    window.addEventListener('popstate', handleHashChange);
+    return () => {
+      window.removeEventListener('hashchange', handleHashChange);
+      window.removeEventListener('popstate', handleHashChange);
+    };
+  }, [effectiveUser, isDashboardUser, currentView]);
+
+  // Ensure valid authorized view when role or authorization changes
+  useEffect(() => {
+    const validView = isViewAuthorized(currentView) ? currentView : (tmsSubViews[0]?.id || 'tms-agent');
+    if (validView !== currentView) {
+      setCurrentView(validView);
+    }
+    if (window.location.hash !== `#${validView}`) {
+      window.history.replaceState(null, '', `#${validView}`);
+    }
+  }, [currentView, effectiveUser, isDashboardUser]);
+
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [desktopSidebarOpen, setDesktopSidebarOpen] = useState(() => {
     const saved = localStorage.getItem('precision360-desktop-sidebar');
@@ -516,6 +692,22 @@ function MainAppShell({
       default: return 'Precision360';
     }
   }, [currentView]);
+
+  // Dynamic document title, canonical link, and noindex protection for protected space
+  useEffect(() => {
+    document.title = `${viewTitle} | Precision360`;
+
+    // Strictly protect internal workforce pages from search indexers
+    const robotsMeta = document.querySelector('meta[name="robots"]');
+    if (robotsMeta) {
+      robotsMeta.setAttribute('content', 'noindex, nofollow, noarchive');
+    }
+
+    const canonicalLink = document.querySelector('link[rel="canonical"]');
+    if (canonicalLink) {
+      canonicalLink.setAttribute('href', `${window.location.origin}${window.location.pathname}#${currentView}`);
+    }
+  }, [currentView, viewTitle]);
 
   return (
     <>
@@ -575,7 +767,7 @@ function MainAppShell({
               <button
                 key={view.id}
                 onClick={() => {
-                  setCurrentView(view.id);
+                  navigateToView(view.id);
                   setMobileSidebarOpen(false);
                 }}
                 className={`w-full flex items-center gap-2.5 px-3 py-2.5 text-xs font-bold rounded-xl transition-colors text-left ${
@@ -591,7 +783,7 @@ function MainAppShell({
               <button
                 key={view.id}
                 onClick={() => {
-                  setCurrentView(view.id);
+                  navigateToView(view.id);
                   setMobileSidebarOpen(false);
                 }}
                 className={`p-3 rounded-xl transition-colors ${
@@ -610,7 +802,7 @@ function MainAppShell({
           {desktopSidebarOpen ? (
             <button
               onClick={() => {
-                setCurrentView('kpi');
+                navigateToView('kpi');
                 setMobileSidebarOpen(false);
               }}
               className={`w-full flex items-center gap-2.5 px-3 py-2.5 text-xs font-bold rounded-xl transition-colors text-left ${
@@ -625,7 +817,7 @@ function MainAppShell({
           ) : (
             <button
               onClick={() => {
-                setCurrentView('kpi');
+                navigateToView('kpi');
                 setMobileSidebarOpen(false);
               }}
               className={`p-3 rounded-xl transition-colors ${
@@ -643,7 +835,7 @@ function MainAppShell({
           {desktopSidebarOpen ? (
             <button
               onClick={() => {
-                setCurrentView('resource');
+                navigateToView('resource');
                 setMobileSidebarOpen(false);
               }}
               className={`w-full flex items-center gap-2.5 px-3 py-2.5 text-xs font-bold rounded-xl transition-colors text-left ${
@@ -658,7 +850,7 @@ function MainAppShell({
           ) : (
             <button
               onClick={() => {
-                setCurrentView('resource');
+                navigateToView('resource');
                 setMobileSidebarOpen(false);
               }}
               className={`p-3 rounded-xl transition-colors ${
@@ -672,12 +864,12 @@ function MainAppShell({
             </button>
           )}
 
-          {/* Console (Visible for Admin, HR, QTL, STL, manager role) */}
-          {(effectiveUser.role === 'ADMIN' || effectiveUser.role === 'HR' || effectiveUser.role === 'MANAGER' || user.role === 'ADMIN') && (
+          {/* Console (Visible ONLY for Admin & MIS roles) */}
+          {isConsoleUser && (
             desktopSidebarOpen ? (
               <button
                 onClick={() => {
-                  setCurrentView('admin');
+                  navigateToView('admin');
                   setMobileSidebarOpen(false);
                 }}
                 className={`w-full flex items-center gap-2.5 px-3 py-2.5 text-xs font-bold rounded-xl transition-colors text-left ${
@@ -692,7 +884,7 @@ function MainAppShell({
             ) : (
               <button
                 onClick={() => {
-                  setCurrentView('admin');
+                  navigateToView('admin');
                   setMobileSidebarOpen(false);
                 }}
                 className={`p-3 rounded-xl transition-colors ${
@@ -713,7 +905,7 @@ function MainAppShell({
           <div className="p-4 border-t border-slate-900/60 bg-slate-950/60 flex items-center justify-between gap-3 shrink-0 min-w-[240px]">
             <div 
               className="flex items-center gap-2.5 cursor-pointer hover:opacity-85 transition-opacity overflow-hidden"
-              onClick={() => setCurrentView('profile')}
+              onClick={() => navigateToView('profile')}
             >
               <div className="w-9 h-9 rounded-full bg-slate-800 border border-slate-700/60 flex items-center justify-center text-xs font-bold text-slate-300 overflow-hidden shrink-0">
                 {effectiveUser.profilePhotoUrl ? (
@@ -739,7 +931,7 @@ function MainAppShell({
           <div className="p-4 border-t border-slate-900/60 bg-slate-950/60 flex flex-col items-center gap-3 shrink-0">
             <div 
               className="cursor-pointer hover:opacity-85 transition-opacity overflow-hidden"
-              onClick={() => setCurrentView('profile')}
+              onClick={() => navigateToView('profile')}
               title={`${effectiveUser.fullName || effectiveUser.name} (${effectiveUser.role}) - My Profile`}
             >
               <div className="w-9 h-9 rounded-full bg-slate-800 border border-slate-700/60 flex items-center justify-center text-xs font-bold text-slate-300 overflow-hidden shrink-0">
@@ -908,7 +1100,7 @@ function MainAppShell({
             {/* Avatar & Name Profile Trigger */}
             <div 
               className="flex items-center gap-2 cursor-pointer hover:opacity-85 transition-opacity shrink-0"
-              onClick={() => setCurrentView('profile')}
+              onClick={() => navigateToView('profile')}
             >
               <div className="w-8 h-8 rounded-full bg-indigo-50 dark:bg-slate-800 border border-indigo-100 dark:border-slate-800 flex items-center justify-center text-xs font-bold text-indigo-500 overflow-hidden shrink-0">
                 {effectiveUser.profilePhotoUrl ? (
@@ -923,14 +1115,14 @@ function MainAppShell({
         </header>
 
         {/* View Router */}
-        <main className={`flex-grow ${currentView.startsWith('tms-') ? 'overflow-hidden flex flex-col' : 'overflow-y-auto'} bg-slate-50 dark:bg-slate-950 p-4 md:p-6 lg:p-8`}>
+        <main className={`flex-grow ${currentView.startsWith('tms-') ? 'overflow-hidden flex flex-col p-2 md:p-3 lg:p-3.5' : 'overflow-y-auto p-3.5 md:p-5 lg:p-6'} bg-slate-50 dark:bg-slate-950`}>
           {currentView.startsWith('tms-') && (
             <TMSView 
               user={effectiveUser} 
               allUsers={allUsers} 
               externalTheme={theme} 
               currentSubView={currentView}
-              onNavigateSubView={(viewId) => setCurrentView(viewId)}
+              onNavigateSubView={(viewId) => navigateToView(viewId)}
             />
           )}
           {currentView === 'kpi' && <KPIScorecardView user={effectiveUser} allUsers={allUsers} externalTheme={theme} />}
@@ -938,11 +1130,11 @@ function MainAppShell({
           {currentView === 'admin' && (
             <AdminView 
               user={effectiveUser} 
-              allUsers={allUsers}
+              allUsers={globalUsers}
               goToTab={(tab) => {
-                if (tab === 'tms') setCurrentView(tmsSubViews[0]?.id || 'tms-agent');
-                else if (tab === 'resource') setCurrentView('resource');
-                else if (tab === 'profile') setCurrentView('profile');
+                if (tab === 'tms') navigateToView(tmsSubViews[0]?.id || 'tms-agent');
+                else if (tab === 'resource') navigateToView('resource');
+                else if (tab === 'profile') navigateToView('profile');
               }}
               externalTheme={theme}
               onRefresh={invalidateRosterCache}

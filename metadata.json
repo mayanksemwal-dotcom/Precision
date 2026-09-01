@@ -1,6 +1,6 @@
 {
   "name": "Precision360",
-  "description": "Precision360: A professional Workforce Management tool for sampling, audits, RCA, and performance monitoring.",
+  "description": "Precision360: A professional Workforce Management tool for Time Tracking and performance monitoring.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

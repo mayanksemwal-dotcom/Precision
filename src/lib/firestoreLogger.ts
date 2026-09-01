@@ -11,16 +11,28 @@ interface CollectionStats {
   calls: number;
 }
 
+export interface FirestoreReadLogEntry {
+  timestamp: string;
+  collection: string;
+  queryFingerprint: string;
+  caller: string;
+  trigger: string;
+  resultCount: number;
+  isCacheHit: boolean;
+}
+
 class FirestoreLogger {
   private totalReads = 0;
   private totalWrites = 0;
   private statsBySource: Record<string, CollectionStats> = {};
+  private readLogs: FirestoreReadLogEntry[] = [];
+  private maxLogs = 500;
 
   constructor() {
     if (typeof window !== 'undefined') {
       // Expose to window for live debugging in browser dev console
       (window as any).firestoreLogger = this;
-      console.log('📈 [Firestore Logger] Initialized! Call window.firestoreLogger.logStats() to inspect live usage.');
+      console.log('📈 [Firestore Logger] Initialized! Call window.firestoreLogger.logStats() or window.firestoreLogger.printDetailedReadLogs() to inspect live usage.');
     }
   }
 
@@ -30,6 +42,52 @@ class FirestoreLogger {
       this.statsBySource[cleanName] = { reads: 0, writes: 0, calls: 0 };
     }
     return this.statsBySource[cleanName];
+  }
+
+  /**
+   * Tracks a Firestore read operation with full forensic metadata.
+   */
+  public trackReadDetailed(entry: {
+    collection: string;
+    queryFingerprint: string;
+    caller: string;
+    trigger: string;
+    resultCount: number;
+    isCacheHit?: boolean;
+  }) {
+    const count = Math.max(0, entry.resultCount);
+    const isHit = !!entry.isCacheHit;
+
+    if (!isHit) {
+      this.totalReads += count;
+    }
+
+    const sourceName = `${entry.collection}::${entry.caller}`;
+    const tracker = this.getTracker(sourceName);
+    if (!isHit) {
+      tracker.reads += count;
+    }
+    tracker.calls += 1;
+
+    const logEntry: FirestoreReadLogEntry = {
+      timestamp: new Date().toISOString(),
+      collection: entry.collection,
+      queryFingerprint: entry.queryFingerprint,
+      caller: entry.caller,
+      trigger: entry.trigger,
+      resultCount: count,
+      isCacheHit: isHit
+    };
+
+    this.readLogs.push(logEntry);
+    if (this.readLogs.length > this.maxLogs) {
+      this.readLogs.shift();
+    }
+
+    const statusTag = isHit ? '🟢 CACHE_HIT' : '🔴 SERVER_READ';
+    console.info(
+      `[FIRESTORE_TRACE] ${statusTag} | time=${logEntry.timestamp} | col=${entry.collection} | caller=${entry.caller} | trigger=${entry.trigger} | count=${count} | query=${entry.queryFingerprint}`
+    );
   }
 
   /**
@@ -109,6 +167,35 @@ class FirestoreLogger {
       );
     }
     console.log('=============================================================\n');
+  }
+
+  /**
+   * Prints the granular trace table of recent Firestore reads.
+   */
+  public printDetailedReadLogs() {
+    console.log('\n=============================================================');
+    console.log(`🔎 [DETAILED FIRESTORE READ TRACE] Total Tracked Events: ${this.readLogs.length}`);
+    console.log('=============================================================');
+    if (this.readLogs.length === 0) {
+      console.log('No read operations tracked yet.');
+    } else {
+      console.table(
+        this.readLogs.map(l => ({
+          Timestamp: l.timestamp,
+          Collection: l.collection,
+          Caller: l.caller,
+          Trigger: l.trigger,
+          Docs: l.resultCount,
+          Status: l.isCacheHit ? 'CACHE_HIT' : 'SERVER_READ',
+          Query: l.queryFingerprint.length > 60 ? l.queryFingerprint.substring(0, 57) + '...' : l.queryFingerprint
+        }))
+      );
+    }
+    console.log('=============================================================\n');
+  }
+
+  public getReadLogs(): FirestoreReadLogEntry[] {
+    return [...this.readLogs];
   }
 
   private printToConsole(message: string) {

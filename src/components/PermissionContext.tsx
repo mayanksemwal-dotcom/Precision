@@ -353,6 +353,63 @@ export const PermissionProvider: React.FC<PermissionProviderProps> = ({ children
         };
       }
     }
+
+    // Strictly enforce Console Module for Admin & MIS only
+    if (module === 'Console') {
+      const rawRole = overriddenRole || user?.role || 'AGENT';
+      const roleName = rawRole.toUpperCase().trim();
+      const norm = normalizeRole(roleName);
+      const isAllowed = norm === 'ADMIN' || norm === 'MIS' || roleName === 'ADMIN' || roleName === 'MIS' || roleName.includes('ADMIN') || roleName.includes('MIS');
+      
+      if (!isAllowed) {
+        return {
+          can_view: false,
+          can_create: false,
+          can_edit: false,
+          can_delete: false,
+          can_export: false,
+          can_approve: false,
+          view_team: false,
+          view_all: false,
+          assign: false,
+          override: false,
+          force_action: false,
+          manage_settings: false,
+          manage_masters: false,
+          audit_access: false,
+          email_trigger: false,
+          bulk_action: false,
+          reopen_records: false,
+          escalate: false,
+          comment: false,
+          view_sensitive_data: false,
+        };
+      }
+
+      const dbPerms = permissions[targetModule] || permissions[fallbackModule];
+      return {
+        can_view: true,
+        can_create: dbPerms ? !!dbPerms.can_create : (norm === 'ADMIN'),
+        can_edit: dbPerms ? !!dbPerms.can_edit : (norm === 'ADMIN'),
+        can_delete: dbPerms ? !!dbPerms.can_delete : (norm === 'ADMIN'),
+        can_export: dbPerms ? !!dbPerms.can_export : true,
+        can_approve: dbPerms ? !!dbPerms.can_approve : (norm === 'ADMIN'),
+        view_team: true,
+        view_all: true,
+        assign: dbPerms ? !!dbPerms.assign : (norm === 'ADMIN'),
+        override: dbPerms ? !!dbPerms.override : (norm === 'ADMIN'),
+        force_action: dbPerms ? !!dbPerms.force_action : (norm === 'ADMIN'),
+        manage_settings: dbPerms ? !!dbPerms.manage_settings : (norm === 'ADMIN'),
+        manage_masters: dbPerms ? !!dbPerms.manage_masters : (norm === 'ADMIN'),
+        audit_access: dbPerms ? !!dbPerms.audit_access : true,
+        email_trigger: dbPerms ? !!dbPerms.email_trigger : false,
+        bulk_action: dbPerms ? !!dbPerms.bulk_action : (norm === 'ADMIN'),
+        reopen_records: dbPerms ? !!dbPerms.reopen_records : false,
+        escalate: dbPerms ? !!dbPerms.escalate : false,
+        comment: true,
+        view_sensitive_data: dbPerms ? !!dbPerms.view_sensitive_data : true,
+      };
+    }
     
     return permissions[targetModule] || permissions[fallbackModule] || {
       can_view: false,

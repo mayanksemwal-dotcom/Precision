@@ -26,19 +26,30 @@ export async function analyzePrecision(audits: AuditRecord[]) {
   Format the output as a JSON array of strings. Each tip should be under 20 words. Focus on patterns in the errors or QA comments.`;
 
   try {
-    const response = await ai.models.generateContent({
-      model: "gemini-3-flash-preview",
-      contents: prompt,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.ARRAY,
-          items: { type: Type.STRING }
+    let text = '';
+    const modelsToTry = ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-flash-latest"];
+    for (const m of modelsToTry) {
+      try {
+        const response = await ai.models.generateContent({
+          model: m,
+          contents: prompt,
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.ARRAY,
+              items: { type: Type.STRING }
+            }
+          }
+        });
+        if (response.text) {
+          text = response.text;
+          break;
         }
+      } catch (err: any) {
+        console.warn(`Gemini service model ${m} attempt failed:`, err?.message);
       }
-    });
+    }
 
-    const text = response.text;
     if (text) {
       return JSON.parse(text) as string[];
     }

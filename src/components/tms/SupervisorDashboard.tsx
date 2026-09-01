@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useRef, useDeferredValue } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useDeferredValue, useCallback } from 'react';
 import { 
   Users, 
   Clock, 
@@ -15,6 +15,10 @@ import {
   FileSpreadsheet, 
   AlertTriangle,
   CheckCircle,
+  Check,
+  X,
+  Globe,
+  Edit3,
   HelpCircle,
   UserCheck,
   Award,
@@ -41,7 +45,8 @@ import {
   Download
 } from 'lucide-react';
 import { mapToLiveSessionRow, LiveSessionRow, isBreakActivity } from './liveSessionMapper';
-import { buildTimelineFromActivityLedger, isShiftCompleted, getLatestUserActivity, isAuditOrDiagnosticEvent } from '../../lib/tmsUtils';
+import { generateAndDownloadOrganizationReport } from '../../services/organizationReportExportService';
+import { buildTimelineFromActivityLedger, isShiftCompleted, getLatestUserActivity, isAuditOrDiagnosticEvent, HEARTBEAT_INTERVAL_MS } from '../../lib/tmsUtils';
 import { calculateShiftMetrics, aggregateShiftsForHistoryAndReports } from '../../lib/ledgerCalculations';
 import { 
   BarChart, 
@@ -55,7 +60,7 @@ import {
   Pie, 
   Cell 
 } from 'recharts';
-import { db, handleFirestoreError, OperationType, getDocsOptimized, getDocOptimized, clearCache } from '../../lib/firebase';
+import { db, handleFirestoreError, OperationType, getDocsOptimized, getDocOptimized, clearCache, invalidateShiftCache } from '../../lib/firebase';
 import { firestoreLogger } from '../../lib/firestoreLogger';
 import { 
   doc, 
@@ -67,24 +72,27 @@ import {
   getDocs, 
   writeBatch,
   addDoc,
-  onSnapshot,
   limit,
   getDocsFromCache,
   getDocFromCache,
   deleteDoc,
-  updateDoc
+  updateDoc,
+  serverTimestamp,
+  runTransaction
 } from 'firebase/firestore';
 import { UserProfile, UserRole, ShiftEvent } from '../../types';
 import { appendShiftEvent, formatShiftLedgerForReport } from '../../lib/shiftLedger';
 import { toast } from 'sonner';
-import { canActOn, isSupervisorOf } from '../../lib/hierarchy';
-import { sanitizeTimestamp } from '../../lib/utils';
+import { canActOn, isSupervisorOf, getSubordinateUids, getTmsDashboardTeamUids, OrgTree, normalizeHierarchyUser } from '../../lib/hierarchy';
+import { subscribeToHierarchyVersion } from '../../lib/hierarchySync';
+import { sanitizeTimestamp, cleanUndefined } from '../../lib/utils';
 import { usePermission } from '../PermissionContext';
 import { useRoster } from '../../contexts/RosterContext';
-import { useLiveShifts } from './useLiveShifts';
+import { useTMSLiveSessions } from '../../contexts/TMSLiveSessionContext';
+import { mapLiveSessionToShift } from './useLiveShifts';
 import { useHistoricalShifts } from './useHistoricalShifts';
 import { useAlerts } from './useAlerts';
-import { repairAndNormalizeShift, bulkRepairBackdatedShifts, createLockedCompletedShift, isShiftLockedOrCompleted } from '../../services/tmsCleanupService';
+import { repairAndNormalizeShift, createLockedCompletedShift, isShiftLockedOrCompleted, assertShiftLifecycleMutationAllowed } from '../../services/tmsCleanupService';
 import { MultiSelectDropdown } from '../ui/multi-select';
 import * as XLSX from 'xlsx';
 import JSZip from 'jszip';
@@ -275,7 +283,7 @@ export default function SupervisorDashboard({
   handleManualLocationOverride,
   isProcessingPunch
 }: SupervisorDashboardProps) {
-  const { roster, refreshRoster: refreshGlobalRoster } = useRoster();
+  const { roster, refreshRoster: refreshGlobalRoster, invalidateRosterCache } = useRoster();
   const user = propUser || currentUser;
   const { hasTmsPermission, permissions, loading: permissionsLoading } = usePermission();
 
@@ -283,77 +291,17 @@ export default function SupervisorDashboard({
   const hasManagerOrAdminAccess = checkIsGlobalRole(roleNormalized) || (hasTmsPermission && hasTmsPermission('view_org_wide_workforce_data'));
 
   const [showEnhancedExportModal, setShowEnhancedExportModal] = useState(false);
-  const [fullOrgUsers, setFullOrgUsers] = useState<UserProfile[]>([]);
-  const [isLoadingFullUsers, setIsLoadingFullUsers] = useState(false);
-
-  // Proactive IP pre-fetch on mount so it's instant when clicking Clock-In in Supervisor view
-  useEffect(() => {
-    getOrFetchPublicIP().catch(() => {});
-  }, []);
-
-  useEffect(() => {
-    if (!user || !hasManagerOrAdminAccess) return;
-    if (!showEnhancedExportModal) return; // Lazy load full org users to avoid heavy mount costs!
-
-    let active = true;
-    const fetchFullOrgUsers = async () => {
-      setIsLoadingFullUsers(true);
-      try {
-        const [usersSnap, profilesSnap] = await Promise.all([
-          getDocsOptimized(collection(db, 'employee_master'), 'tms_full_org_users_fetch'),
-          getDocsOptimized(collection(db, 'employeeProfiles'), 'tms_full_org_profiles_fetch')
-        ]);
-
-        if (!active) return;
-
-        const newProfiles: Record<string, any> = {};
-        profilesSnap.forEach(d => { newProfiles[d.id] = d.data(); });
-
-        const fetchedUsers = usersSnap.docs.map(doc => {
-          const data = doc.data() as any;
-          const prof = newProfiles[doc.id] || {};
-          const merged = { ...prof, ...data };
-          const name = merged.fullName || merged.name || merged.employeeName || '';
-          return {
-            uid: doc.id,
-            ...merged,
-            name,
-            fullName: name,
-            email: (merged.email || '').toString().toLowerCase().trim(),
-            role: (() => {
-              const r = (merged.role || 'AGENT').toString().toUpperCase().trim();
-              return (r === 'TEAM_LEAD' || r === 'TEAM LEAD') ? 'Team Lead' : r;
-            })(),
-            status: merged.status || 'Active',
-          } as UserProfile;
-        });
-
-        setFullOrgUsers(fetchedUsers);
-      } catch (err) {
-        console.error('[SupervisorDashboard] Error fetching full org users:', err);
-      } finally {
-        if (active) setIsLoadingFullUsers(false);
-      }
-    };
-
-    fetchFullOrgUsers();
-
-    return () => {
-      active = false;
-    };
-  }, [user?.uid, hasManagerOrAdminAccess, showEnhancedExportModal]);
 
   const allUsersProp = propAllUsers || [];
-  const rawAllUsers = (hasManagerOrAdminAccess && fullOrgUsers.length > 0) ? fullOrgUsers : allUsersProp;
+  const rawAllUsers = allUsersProp;
 
   // Extend hierarchy-based visibility to EVERY supervisory role (Admin, HR, Manager, Team Lead, etc.).
   // The Supervisor Dashboard displays ONLY users who belong to that supervisor's reporting hierarchy
   // (Direct and Indirect reportees, plus the supervisor themselves).
   const allUsers = useMemo(() => {
     if (!user) return rawAllUsers;
-    return rawAllUsers.filter(u => {
-      return u.uid === user.uid || isSupervisorOf(user, u, rawAllUsers);
-    });
+    const subordinateSet = getTmsDashboardTeamUids(user, rawAllUsers);
+    return rawAllUsers.filter(u => subordinateSet.has(u.uid));
   }, [rawAllUsers, user]);
 
   if (user && globalCacheUserId !== user.uid) {
@@ -365,13 +313,16 @@ export default function SupervisorDashboard({
   const [expandedUserId, setExpandedUserId] = useState<string | null>(null);
   const [searchTerm, setSearchTerm] = useState('');
   const deferredSearchTerm = useDeferredValue(searchTerm);
-  const [selectedActivities, setSelectedActivities] = useState<string[]>([]);
   const [selectedLocations, setSelectedLocations] = useState<string[]>([]);
 
   // Real-time ticking state to trigger ticking of active and break timers for all visible team members
+  // Automatically pauses when browser tab is minimized/hidden to eliminate CPU and background activity
   const [tick, setTick] = useState(0);
   useEffect(() => {
     const interval = setInterval(() => {
+      if (typeof document !== 'undefined' && document.hidden) {
+        return; // Pause UI timer ticking when tab is in background/minimized
+      }
       setTick(prev => prev + 1);
     }, 1000);
     return () => clearInterval(interval);
@@ -382,17 +333,34 @@ export default function SupervisorDashboard({
 
   const isDark = document.documentElement.classList.contains('dark') || externalTheme === 'dark';
   
+  const [hierarchyVersion, setHierarchyVersion] = useState<number | string>('v1.0');
+  const [showHierarchyDiagnosticModal, setShowHierarchyDiagnosticModal] = useState(false);
+
+  useEffect(() => {
+    const unsub = subscribeToHierarchyVersion((v) => {
+      setHierarchyVersion(v);
+    });
+    return () => unsub();
+  }, []);
+
   // Phase 1: Identify team members for optimized monitoring (strictly scoped to supervisor hierarchy)
   const teamMemberUids = useMemo(() => {
-    if (!user || !allUsers || allUsers.length === 0) return [];
-    
-    const isActiveAccount = (u: UserProfile) => {
-      const s = (u.status || '').toLowerCase();
-      return s !== 'inactive';
-    };
-
-    return allUsers.filter(isActiveAccount).map(u => u.uid);
+    if (!user) return [];
+    // Keep ALL reportees in hierarchy regardless of status (offline or inactive)
+    const uids = allUsers.filter(u => u.uid !== user.uid).map(u => u.uid);
+    uids.push(user.uid);
+    return uids;
   }, [user, allUsers]);
+
+  // Scoped user IDs for historical shifts: strictly authorized subordinates for supervisors/TLs, or undefined for global admin
+  const historicalUserScopeUids = useMemo(() => {
+    if (!user) return [];
+    if (checkIsGlobalRole(roleNormalized)) {
+      // Global role: use single paginated indexed query without sending full company roster
+      return undefined;
+    }
+    return teamMemberUids;
+  }, [user, roleNormalized, teamMemberUids]);
 
   const [isFixingMappings, setIsFixingMappings] = useState(false);
 
@@ -516,7 +484,7 @@ export default function SupervisorDashboard({
       }
 
       if (Object.keys(updates).length > 0) {
-        await updateDoc(userRef, updates);
+        await setDoc(userRef, updates, { merge: true });
         toast.success(`Fixed mapping for ${u.fullName || u.name}`, { id: toastId });
         if (onRefreshAllData) onRefreshAllData();
       } else {
@@ -652,51 +620,24 @@ export default function SupervisorDashboard({
   const [ownActiveShift, setOwnActiveShift] = useState<TMSShift | null>(null);
   const [teamLocationOverrides, setTeamLocationOverrides] = useState<Record<string, { workLocation: string; workLocationSource: string }>>({});
 
-  // Real-time direct subscription to supervisor's own active/break shifts
-  useEffect(() => {
-    if (!user?.uid) return;
+  const lastSupervisorHeartbeatSentAtRef = useRef<number>(0);
 
-    const q = query(
-      collection(db, 'tmsShifts'),
-      where('userId', '==', user.uid)
-    );
-
-    const unsub = onSnapshot(q, (snapshot) => {
-      const rawAllShifts = snapshot.docs.map((doc: any) => ({ id: doc.id, ...doc.data() } as TMSShift));
-      const rawActiveShifts = rawAllShifts.filter(s => s.status === 'ACTIVE' || s.status === 'BREAK');
-      
-      const activeShiftsList = [...rawActiveShifts].sort((a, b) => 
-        new Date(b.clockInTime).getTime() - new Date(a.clockInTime).getTime()
-      );
-      
-      if (activeShiftsList.length > 0) {
-        const topShift = activeShiftsList[0];
-        const activities = topShift.activities || [];
-        const lastAct = getLatestUserActivity(activities);
-        let resolvedStatus = topShift.status;
-        if (lastAct) {
-          if (lastAct.action === 'BREAK_START' || (lastAct.type === 'break' && !lastAct.endTime)) {
-            resolvedStatus = 'BREAK';
-          } else if (lastAct.action === 'BREAK_END' || lastAct.type === 'productive' || lastAct.action === 'CLOCK_IN' || lastAct.action === 'PROCESS_SWITCH') {
-            resolvedStatus = 'ACTIVE';
-          }
-        }
-        setOwnActiveShift({ ...topShift, status: resolvedStatus });
-      } else {
-        setOwnActiveShift(null);
-      }
-    }, (err) => {
-      console.error('Failed to subscribe to supervisor own shifts', err);
-    });
-
-    return () => unsub();
-  }, [user?.uid]);
-
-  // Supervisor Heartbeat optimization: Update lastHeartbeat and isOnline in live_sessions & tmsShifts every 90 seconds when clocked in
+  // Supervisor Heartbeat optimization: Update lastHeartbeat and isOnline in live_sessions ONLY every 90 seconds when clocked in
   useEffect(() => {
     if (!user?.uid || !ownActiveShift || ownActiveShift.status === 'COMPLETED' || ownActiveShift.status === 'AUTO_CLOSED') return;
 
-    const sendHeartbeat = async () => {
+    const sendHeartbeat = async (reason: 'scheduled' | 'focus' | 'visibility' | 'mount' = 'scheduled') => {
+      const now = Date.now();
+      const elapsedMs = now - lastSupervisorHeartbeatSentAtRef.current;
+
+      // Enforce shared 60s cooldown gate for focus / visibility event heartbeats
+      if ((reason === 'focus' || reason === 'visibility') && elapsedMs < 60000) {
+        console.log(`[HEARTBEAT SKIPPED] reason=cooldown elapsedMs=${elapsedMs}`);
+        return;
+      }
+
+      lastSupervisorHeartbeatSentAtRef.current = now;
+
       try {
         const liveSessionRef = doc(db, 'live_sessions', user.uid);
         const userData = (user as any);
@@ -704,25 +645,22 @@ export default function SupervisorDashboard({
         const managerId = userData.mappedManagerId || userData.managerId || '';
         const nowISO = getLiveTimeISO();
         
-        await Promise.all([
-          setDoc(liveSessionRef, {
-            lastHeartbeat: nowISO,
-            isOnline: true,
-            tlId: tlId,
-            managerId: managerId,
-            userId: user.uid,
-            uid: user.uid
-          }, { merge: true }),
-          setDoc(doc(db, 'tmsShifts', ownActiveShift.id), {
-            lastHeartbeat: nowISO
-          }, { merge: true })
-        ]);
-        console.log('[SUPERVISOR HEARTBEAT] Heartbeat updated.');
+        await setDoc(liveSessionRef, {
+          lastHeartbeat: nowISO,
+          isOnline: true,
+          tlId: tlId,
+          managerId: managerId,
+          userId: user.uid,
+          uid: user.uid
+        }, { merge: true });
+
+        console.log(`[FIRESTORE WRITE COST] operation=heartbeat collection=live_sessions reason=${reason}`);
+        console.log(`[HEARTBEAT WRITE] collection=live_sessions reason=${reason}`);
         logTmsEvent('HEARTBEAT', {
           userId: user.uid,
           shiftId: ownActiveShift.id,
           timestamp: nowISO,
-          reason: 'Periodic 90s heartbeat',
+          reason: `Heartbeat (${reason})`,
           sourceFunction: 'SupervisorDashboard.sendHeartbeat'
         });
       } catch (err) {
@@ -731,39 +669,54 @@ export default function SupervisorDashboard({
     };
 
     // Send immediately on mount / state change
-    sendHeartbeat();
+    sendHeartbeat('mount');
 
-    const heartbeatInterval = setInterval(sendHeartbeat, 90 * 1000);
+    const heartbeatInterval = setInterval(() => sendHeartbeat('scheduled'), HEARTBEAT_INTERVAL_MS);
 
     const handleFocus = () => {
-      console.log('[SUPERVISOR HEARTBEAT] Window focused or visibility changed, sending heartbeat.');
-      sendHeartbeat();
+      sendHeartbeat('focus');
+    };
+
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        sendHeartbeat('visibility');
+      }
     };
 
     window.addEventListener('focus', handleFocus);
-    document.addEventListener('visibilitychange', handleFocus);
+    document.addEventListener('visibilitychange', handleVisibility);
 
     return () => {
       clearInterval(heartbeatInterval);
       window.removeEventListener('focus', handleFocus);
-      document.removeEventListener('visibilitychange', handleFocus);
+      document.removeEventListener('visibilitychange', handleVisibility);
     };
   }, [user?.uid, ownActiveShift?.id, ownActiveShift?.status]);
 
-  const { shifts: liveShifts, loading: loadingLiveShifts, fetchLiveShifts } = useLiveShifts(
-    user?.uid, 
-    user?.role, 
-    teamMemberUids,
-    false,
-    false
-  );
+  const { liveShifts, isLoading: loadingLiveShifts, fetchLiveShifts, lastUpdated } = useTMSLiveSessions();
+
+  // Automatic tab focus visibility re-sync disabled — live data is only loaded when user explicitly clicks 'Load Live Data' button
+
+  // Load supervisor's own active/break shift from liveShifts (retrieved from non-realtime IndexedDB / manual load)
+  useEffect(() => {
+    if (!user?.uid || !liveShifts) return;
+
+    const myShiftInLive = liveShifts.find(s => s.userId === user.uid);
+    if (myShiftInLive) {
+      setOwnActiveShift(myShiftInLive);
+    } else {
+      setOwnActiveShift(null);
+    }
+  }, [liveShifts, user?.uid]);
+  const shouldEnableHistory = isHistoryEnabled || currentSubView === 'tms-reports' || activeTab === 'alerts';
+
   const { 
     shifts: paginatedShifts, 
     loading: loadingHistorical, 
     hasMore, 
     fetchNextPage,
     refresh: refreshHistoricalShifts
-  } = useHistoricalShifts(user?.uid, user?.role, 25, isHistoryEnabled, teamMemberUids);
+  } = useHistoricalShifts(user?.uid, user?.role, 5, shouldEnableHistory, historicalUserScopeUids);
 
   const alerts = useAlerts(liveShifts, paginatedShifts);
 
@@ -823,7 +776,7 @@ export default function SupervisorDashboard({
   }, [liveShifts, isTrackingEnabled, localSuperOwnShift, ownActiveShift, user.uid, teamLocationOverrides]);
 
   const [isLoadingShifts, setIsLoadingShifts] = useState(false);
-  const isDataSyncing = isLoadingFullUsers || loadingLiveShifts || isLoadingShifts;
+  const isDataSyncing = loadingLiveShifts || isLoadingShifts;
   const [lastRefreshed, setLastRefreshed] = useState<Date>(getLiveTime());
   const [presentThreshold, setPresentThreshold] = useState<number>(480);
 
@@ -901,10 +854,10 @@ export default function SupervisorDashboard({
     try {
       const shiftRef = doc(db, 'tmsShifts', myShift.id);
       const lsRef = doc(db, 'live_sessions', user.uid);
-      await Promise.all([
-        setDoc(shiftRef, { workLocation: newLocation, workLocationSource: 'Manual Override', overrideBy: user.uid, overrideAt: nowISO }, { merge: true }),
-        setDoc(lsRef, { workLocation: newLocation, workLocationSource: 'Manual Override' }, { merge: true })
-      ]);
+      const batch = writeBatch(db);
+      batch.set(shiftRef, { workLocation: newLocation, workLocationSource: 'Manual Override', overrideBy: user.uid, overrideAt: nowISO }, { merge: true });
+      batch.set(lsRef, { workLocation: newLocation, workLocationSource: 'Manual Override' }, { merge: true });
+      await batch.commit();
       toast.success(`Work location updated to: ${newLocation === 'Office' ? '🏢 Office' : '🏠 Home'}`);
     } catch (err: any) {
       console.error("Failed to update supervisor location override:", err);
@@ -950,16 +903,26 @@ export default function SupervisorDashboard({
     try {
       if (existingShift && existingShift.id) {
         const shiftRef = doc(db, 'tmsShifts', existingShift.id);
-        await setDoc(shiftRef, { workLocation: newLocation, workLocationSource: 'Manual Override', overrideBy: user.uid, overrideAt: nowISO }, { merge: true });
+        const batch = writeBatch(db);
+        batch.set(shiftRef, { workLocation: newLocation, workLocationSource: 'Manual Override', overrideBy: user.uid, overrideAt: nowISO }, { merge: true });
+        
+        const lsRef = doc(db, 'live_sessions', targetUserId);
+        batch.set(lsRef, {
+          workLocation: newLocation,
+          workLocationSource: 'Manual Override',
+          overrideBy: user.uid,
+          overrideAt: nowISO
+        }, { merge: true });
+        await batch.commit();
+      } else {
+        const lsRef = doc(db, 'live_sessions', targetUserId);
+        await setDoc(lsRef, {
+          workLocation: newLocation,
+          workLocationSource: 'Manual Override',
+          overrideBy: user.uid,
+          overrideAt: nowISO
+        }, { merge: true });
       }
-
-      const lsRef = doc(db, 'live_sessions', targetUserId);
-      await setDoc(lsRef, {
-        workLocation: newLocation,
-        workLocationSource: 'Manual Override',
-        overrideBy: user.uid,
-        overrideAt: nowISO
-      }, { merge: true });
 
       toast.success(`Updated ${targetName || 'employee'}'s location to ${newLocation === 'Office' ? '🏢 Office' : '🏠 Home'}`);
     } catch (err: any) {
@@ -996,7 +959,8 @@ export default function SupervisorDashboard({
       const qCheck = query(
         collection(db, 'tmsShifts'),
         where('userId', '==', user.uid),
-        where('clockInTime', '>=', cutoffISO)
+        where('clockInTime', '>=', cutoffISO),
+        limit(5)
       );
       const checkSnap = await getDocs(qCheck);
       const sameDayShifts = checkSnap.docs.map(d => ({ id: d.id, ...d.data() } as any));
@@ -1122,39 +1086,39 @@ export default function SupervisorDashboard({
     });
 
     try {
-      const userRef = doc(db, 'users', user.uid);
       const lsRef = doc(db, 'live_sessions', user.uid);
 
-      // 2. Perform database writes concurrently in parallel
-      await Promise.all([
-        setDoc(tmsShiftRef, newShift),
-        setDoc(userRef, {
-          status: 'ONLINE',
-          lastLoginAt: nowISO,
-          lastUsedProcess: targetProcess
-        }, { merge: true }),
-        setDoc(lsRef, {
-          sessionId: newShift.id,
-          userId: user.uid,
-          uid: user.uid,
-          employeeId: user.uid,
-          employeeName: user?.name || user?.fullName || 'Supervisor',
-          process: targetProcess || 'General',
-          teamLead: (user as any).teamLeadId || (user as any).teamLeadUid || '',
-          tlId: (user as any).teamLeadId || (user as any).teamLeadUid || '',
-          manager: (user as any).mappedManagerId || (user as any).managerId || '',
-          managerId: (user as any).mappedManagerId || (user as any).managerId || '',
-          isOnline: true,
-          status: 'ACTIVE',
-          currentActivity: targetProcess || 'General',
-          clockInTime: newShift.clockInTime,
-          statusStartTime: nowISO,
-          currentActivityStartTime: nowISO,
-          lastHeartbeat: nowISO
-        }, { merge: true })
-      ]);
+      // 2. Perform database writes concurrently using writeBatch
+      const batch = writeBatch(db);
+      batch.set(tmsShiftRef, newShift);
+      batch.set(lsRef, {
+        sessionId: newShift.id,
+        userId: user.uid,
+        uid: user.uid,
+        employeeId: user.uid,
+        employeeName: user?.name || user?.fullName || 'Supervisor',
+        process: targetProcess || 'General',
+        teamLead: (user as any).teamLeadId || (user as any).teamLeadUid || '',
+        tlId: (user as any).teamLeadId || (user as any).teamLeadUid || '',
+        manager: (user as any).mappedManagerId || (user as any).managerId || '',
+        managerId: (user as any).mappedManagerId || (user as any).managerId || '',
+        isOnline: true,
+        status: 'ACTIVE',
+        currentActivity: targetProcess || 'General',
+        clockInTime: newShift.clockInTime,
+        statusStartTime: nowISO,
+        currentActivityStartTime: nowISO,
+        lastHeartbeat: nowISO
+      }, { merge: true });
+      await batch.commit();
 
-      clearCache();
+      invalidateShiftCache({
+        userId: user.uid,
+        shiftId: generatedId,
+        teamLeadUid: (user as any).mappedTeamLeadUid || (user as any).teamLeadUid,
+        managerId: (user as any).mappedManagerId || (user as any).managerId,
+        reason: 'supervisor_clock_in'
+      });
       toast.success(`Clocked in successfully under Process: ${targetProcess}`);
       setTimeout(() => recomputeMetrics(true), 500);
     } catch (err: any) {
@@ -1204,7 +1168,9 @@ export default function SupervisorDashboard({
       try {
         const qOpen = query(
           collection(db, 'tmsShifts'),
-          where('userId', '==', user.uid)
+          where('userId', '==', user.uid),
+          where('status', 'in', ['ACTIVE', 'BREAK']),
+          limit(5)
         );
         const openSnap = await getDocs(qOpen);
         const openDocs = openSnap.docs.filter(d => {
@@ -1233,7 +1199,6 @@ export default function SupervisorDashboard({
 
       const userRef = doc(db, 'users', user.uid);
       batch.set(userRef, {
-        status: 'OFFLINE',
         lastLogoutAt: nowISO
       }, { merge: true });
 
@@ -1242,7 +1207,13 @@ export default function SupervisorDashboard({
 
       await batch.commit();
 
-      clearCache();
+      invalidateShiftCache({
+        userId: user.uid,
+        shiftId: myShiftId,
+        teamLeadUid: (user as any).mappedTeamLeadUid || (user as any).teamLeadUid,
+        managerId: (user as any).mappedManagerId || (user as any).managerId,
+        reason: 'supervisor_clock_out'
+      });
       toast.success('Shift completed successfully. Clocked out.');
       setTimeout(() => recomputeMetrics(true), 500);
     } catch (err: any) {
@@ -1265,77 +1236,94 @@ export default function SupervisorDashboard({
 
     const nowISO = getLiveTimeISO();
     const currentDev = getDeviceType();
-    const updatedActivities = [...(myShift.activities || [])];
-    const lastActivity = updatedActivities[updatedActivities.length - 1];
 
     if (myShift.status === 'ACTIVE') {
-      // Start Break
-      if (lastActivity && !lastActivity.endTime) {
-        // Immutable ledger: removed endTime mutation
-      }
-      updatedActivities.push({
-        activityId: crypto.randomUUID(),
-        action: 'BREAK_START',
-        startTime: nowISO,
-        process: breakName || 'Break',
-        actor: user?.email || 'Supervisor',
-        sourceService: 'SupervisorDashboard',
-        type: 'break',
-        name: breakName,
-        device: currentDev
-      });
-      const updatedShift = { 
-        ...myShift, 
-        activities: updatedActivities, 
-        status: 'BREAK' as const,
-        currentActivity: breakName,
-        hasMobilePunches: myShift.hasMobilePunches || currentDev === 'mobile'
-      };
-
-      // 1. Optimistic Update
-      setLocalSuperOwnShift(updatedShift);
-      setOwnActiveShift(updatedShift);
-      setActiveShifts(prev => {
-        const idx = prev.findIndex(s => s.id === myShift.id);
-        if (idx === -1) return prev;
-        const next = [...prev];
-        next[idx] = updatedShift;
-        return next;
-      });
-
       try {
-        const userRef = doc(db, 'users', user.uid);
+        const shiftId = myShift.id;
+        const shiftRef = doc(db, 'tmsShifts', shiftId);
         const lsRef = doc(db, 'live_sessions', user.uid);
 
-        // 2. Parallel concurrent writes
-        await Promise.all([
-          setDoc(doc(db, 'tmsShifts', myShift.id), updatedShift),
-          setDoc(userRef, { status: 'BREAK' }, { merge: true }),
-          setDoc(lsRef, {
+        let finalShiftState: any = null;
+
+        await runTransaction(db, async (transaction) => {
+          const shiftSnap = await transaction.get(shiftRef);
+          if (!shiftSnap.exists()) throw new Error("Shift document not found");
+
+          const currentShiftData = shiftSnap.data();
+          const currentActivities = [...(currentShiftData.activities || [])];
+
+          // Add BREAK_START activity
+          const newActivity = {
+            activityId: crypto.randomUUID(),
+            action: 'BREAK_START',
+            startTime: nowISO,
+            process: breakName || 'Break',
+            actor: user?.email || 'Supervisor',
+            sourceService: 'SupervisorDashboard',
+            type: 'break',
+            name: breakName,
+            device: currentDev
+          };
+          currentActivities.push(newActivity);
+
+          const updatedShiftData = {
+            ...currentShiftData,
+            activities: currentActivities,
+            status: 'BREAK' as const,
+            currentActivity: breakName,
+            hasMobilePunches: currentShiftData.hasMobilePunches || currentDev === 'mobile',
+            breakStartTime: serverTimestamp()
+          };
+
+          transaction.update(shiftRef, {
+            activities: currentActivities,
+            status: 'BREAK',
+            currentActivity: breakName,
+            hasMobilePunches: updatedShiftData.hasMobilePunches,
+            breakStartTime: serverTimestamp()
+          });
+
+          transaction.set(lsRef, cleanUndefined({
             status: 'BREAK',
             currentActivity: breakName,
             statusStartTime: nowISO,
             currentActivityStartTime: nowISO,
             lastHeartbeat: nowISO,
-            activities: updatedActivities
-          }, { merge: true })
-        ]);
+            activities: currentActivities,
+            breakStartTime: serverTimestamp()
+          }), { merge: true });
 
-        clearCache();
-        toast.success(`Break [${breakName}] started successfully`);
-        setTimeout(() => recomputeMetrics(true), 500);
+          finalShiftState = { id: shiftId, ...updatedShiftData };
+        });
+
+        // After successful transaction commit, update local states
+        if (finalShiftState) {
+          setLocalSuperOwnShift(finalShiftState);
+          setOwnActiveShift(finalShiftState);
+          setActiveShifts(prev => {
+            const idx = prev.findIndex(s => s.id === shiftId);
+            if (idx === -1) return [finalShiftState, ...prev];
+            const next = [...prev];
+            next[idx] = finalShiftState;
+            return next;
+          });
+
+          // Sync localStorage
+          localStorage.setItem('tms_last_active_shift_id', shiftId);
+          localStorage.setItem('tms_last_active_shift_json', JSON.stringify(finalShiftState));
+
+          invalidateShiftCache({
+            userId: user.uid,
+            shiftId,
+            reason: 'supervisor_break_start'
+          });
+          console.log(`[BREAK STATE CHANGE] uid=${user.uid} reason=${breakName} source=SupervisorDashboard.handleSuperBreakAction status=BREAK`);
+          toast.success(`Break [${breakName}] started successfully`);
+          setTimeout(() => recomputeMetrics(true), 500);
+        }
       } catch (err: any) {
         console.error('Start break failed:', err);
         toast.error('Failed to start break on server: ' + err.message);
-        // Revert on error
-        setLocalSuperOwnShift(myShift);
-        setActiveShifts(prev => {
-          const idx = prev.findIndex(s => s.id === myShift.id);
-          if (idx === -1) return prev;
-          const next = [...prev];
-          next[idx] = myShift;
-          return next;
-        });
       }
     }
   };
@@ -1346,81 +1334,106 @@ export default function SupervisorDashboard({
 
     const nowISO = getLiveTimeISO();
     const currentDev = getDeviceType();
-    const updatedActivities = [...(myShift.activities || [])];
-    const lastActivity = updatedActivities[updatedActivities.length - 1];
 
     if (myShift.status === 'BREAK') {
-      // End Break and Resume Work
-      if (lastActivity && !lastActivity.endTime) {
-        // Immutable ledger: removed endTime mutation
-      }
-      updatedActivities.push({
-        activityId: crypto.randomUUID(),
-        action: 'BREAK_END',
-        startTime: nowISO,
-        process: resumeProcess || 'Active Work',
-        actor: user?.email || 'Supervisor',
-        sourceService: 'SupervisorDashboard',
-        type: 'productive',
-        name: resumeProcess || 'Active Work',
-        device: currentDev
-      });
-      const updatedShift = { 
-        ...myShift, 
-        activities: updatedActivities, 
-        status: 'ACTIVE' as const,
-        currentActivity: resumeProcess || 'General',
-        hasMobilePunches: myShift.hasMobilePunches || currentDev === 'mobile'
-      };
-
-      // 1. Optimistic Update
-      setLocalSuperOwnShift(updatedShift);
-      setOwnActiveShift(updatedShift);
-      setActiveShifts(prev => {
-        const idx = prev.findIndex(s => s.id === myShift.id);
-        if (idx === -1) return prev;
-        const next = [...prev];
-        next[idx] = updatedShift;
-        return next;
-      });
-
       try {
-        const userRef = doc(db, 'users', user.uid);
+        const shiftId = myShift.id;
+        const shiftRef = doc(db, 'tmsShifts', shiftId);
         const lsRef = doc(db, 'live_sessions', user.uid);
 
-        // 2. Parallel concurrent writes
-        await Promise.all([
-          setDoc(doc(db, 'tmsShifts', myShift.id), updatedShift),
-          setDoc(userRef, {
-            status: 'ONLINE',
-            lastUsedProcess: resumeProcess
-          }, { merge: true }),
-          setDoc(lsRef, {
+        let finalShiftState: any = null;
+
+        await runTransaction(db, async (transaction) => {
+          const shiftSnap = await transaction.get(shiftRef);
+          if (!shiftSnap.exists()) throw new Error("Shift document not found");
+
+          const currentShiftData = shiftSnap.data();
+          const currentActivities = [...(currentShiftData.activities || [])];
+
+          // 1. Close open entry in breakLogs (find last active BREAK_START activity)
+          for (let i = currentActivities.length - 1; i >= 0; i--) {
+            if (currentActivities[i].action === 'BREAK_START' && !currentActivities[i].endTime) {
+              currentActivities[i] = {
+                ...currentActivities[i],
+                endTime: nowISO
+              };
+              break;
+            }
+          }
+
+          // 2. Add BREAK_END activity
+          const endActivity = {
+            activityId: crypto.randomUUID(),
+            action: 'BREAK_END',
+            startTime: nowISO,
+            process: resumeProcess || 'Active Work',
+            actor: user?.email || 'Supervisor',
+            sourceService: 'SupervisorDashboard',
+            type: 'productive',
+            name: resumeProcess || 'Active Work',
+            device: currentDev
+          };
+          currentActivities.push(endActivity);
+
+          const updatedShiftData = {
+            ...currentShiftData,
+            activities: currentActivities,
+            status: 'ACTIVE' as const,
+            currentActivity: resumeProcess || 'General',
+            hasMobilePunches: currentShiftData.hasMobilePunches || currentDev === 'mobile',
+            breakStartTime: null
+          };
+
+          transaction.update(shiftRef, {
+            activities: currentActivities,
+            status: 'ACTIVE',
+            currentActivity: updatedShiftData.currentActivity,
+            hasMobilePunches: updatedShiftData.hasMobilePunches,
+            breakStartTime: null
+          });
+
+          transaction.set(lsRef, cleanUndefined({
             status: 'ACTIVE',
             process: resumeProcess || 'Active Work',
             currentActivity: resumeProcess,
             statusStartTime: nowISO,
             currentActivityStartTime: nowISO,
             lastHeartbeat: nowISO,
-            activities: updatedActivities
-          }, { merge: true })
-        ]);
+            activities: currentActivities,
+            breakStartTime: null
+          }), { merge: true });
 
-        clearCache();
-        toast.success(`Resumed work on process: ${resumeProcess}`);
-        setTimeout(() => recomputeMetrics(true), 500);
+          finalShiftState = { id: shiftId, ...updatedShiftData };
+        });
+
+        // After successful transaction commit, update local states and clear local IndexedDB cache
+        if (finalShiftState) {
+          setLocalSuperOwnShift(finalShiftState);
+          setOwnActiveShift(finalShiftState);
+          setActiveShifts(prev => {
+            const idx = prev.findIndex(s => s.id === shiftId);
+            if (idx === -1) return [finalShiftState, ...prev];
+            const next = [...prev];
+            next[idx] = finalShiftState;
+            return next;
+          });
+
+          // Cache Invalidation: Update localStorage session keys immediately
+          localStorage.setItem('tms_last_active_shift_id', shiftId);
+          localStorage.setItem('tms_last_active_shift_json', JSON.stringify(finalShiftState));
+
+          invalidateShiftCache({
+            userId: user.uid,
+            shiftId,
+            reason: 'supervisor_break_end'
+          });
+          console.log(`[BREAK STATE CHANGE] uid=${user.uid} reason=Resumed on ${resumeProcess} source=SupervisorDashboard.handleSuperResumeAction status=ACTIVE`);
+          toast.success(`Resumed work on process: ${resumeProcess}`);
+          setTimeout(() => recomputeMetrics(true), 500);
+        }
       } catch (err: any) {
         console.error('Resume failed:', err);
         toast.error('Failed to resume on server: ' + err.message);
-        // Revert on error
-        setLocalSuperOwnShift(myShift);
-        setActiveShifts(prev => {
-          const idx = prev.findIndex(s => s.id === myShift.id);
-          if (idx === -1) return prev;
-          const next = [...prev];
-          next[idx] = myShift;
-          return next;
-        });
       }
     }
   };
@@ -1474,26 +1487,53 @@ export default function SupervisorDashboard({
     });
 
     try {
-      const userRef = doc(db, 'users', user.uid);
+      const shiftRef = doc(db, 'tmsShifts', myShift.id);
       const lsRef = doc(db, 'live_sessions', user.uid);
 
-      // 2. Parallel concurrent writes
-      await Promise.all([
-        setDoc(doc(db, 'tmsShifts', myShift.id), updatedShift),
-        setDoc(userRef, {
-          lastUsedProcess: newProcess
-        }, { merge: true }),
-        setDoc(lsRef, {
+      await runTransaction(db, async (transaction) => {
+        const shiftSnap = await transaction.get(shiftRef);
+        if (!shiftSnap.exists()) throw new Error('Shift document not found on server.');
+
+        const currentShiftData = shiftSnap.data();
+        const serverActivities = [...(currentShiftData.activities || [])];
+
+        const newAct = {
+          activityId: crypto.randomUUID(),
+          action: 'PROCESS_SWITCH',
+          startTime: nowISO,
+          process: newProcess || 'Active Work',
+          actor: user?.email || user?.uid || 'Supervisor',
+          sourceService: 'SupervisorDashboard',
+          type: 'productive',
+          name: newProcess || 'Active Work',
+          device: currentDev
+        };
+
+        serverActivities.push(newAct);
+
+        transaction.set(shiftRef, cleanUndefined({
+          activities: serverActivities,
+          status: 'ACTIVE',
+          currentActivity: newProcess || 'General',
+          lastHeartbeat: nowISO,
+          hasMobilePunches: currentShiftData.hasMobilePunches || currentDev === 'mobile'
+        }), { merge: true });
+
+        transaction.set(lsRef, cleanUndefined({
           process: newProcess || 'Active Work',
           currentActivity: newProcess,
           statusStartTime: nowISO,
           currentActivityStartTime: nowISO,
           lastHeartbeat: nowISO,
-          activities: updatedActivities
-        }, { merge: true })
-      ]);
+          activities: serverActivities
+        }), { merge: true });
+      });
 
-      clearCache();
+      invalidateShiftCache({
+        userId: user.uid,
+        shiftId: myShift.id,
+        reason: 'supervisor_process_switch'
+      });
       toast.success(`Successfully switched to process: ${newProcess}`);
       setTimeout(() => recomputeMetrics(true), 500);
     } catch (err: any) {
@@ -1581,20 +1621,13 @@ export default function SupervisorDashboard({
   }, [user, isManagerOrLead]);
   */
 
-  // Smart recovery for -5.5h corrupted clock-in times & historical time issues on load
-  useEffect(() => {
-    if (!user || !isManagerOrLead) return;
-    import('../../services/tmsCleanupService').then(service => {
-      // TMS cleanup/repair service temporarily disabled due to P0 production stability issues.
-      // service.repairCorruptedClockInTimes();
-      // service.bulkRepairBackdatedShifts();
-    }).catch(err => console.error('Failed to trigger TMS repair services', err));
-  }, [isManagerOrLead, user]);
-
   const recomputeMetrics = async (force = false) => {
     if (force) {
       setIsLoadingShifts(true);
       try {
+        if (invalidateRosterCache) {
+          await invalidateRosterCache();
+        }
         await Promise.all([
           fetchLiveShifts(true),
           refreshHistoricalShifts()
@@ -1631,16 +1664,22 @@ export default function SupervisorDashboard({
     return map;
   }, [allUsers]);
 
+  const [globalLiveShifts, setGlobalLiveShifts] = useState<TMSShift[]>([]);
+  const [isLoadingGlobalLive, setIsLoadingGlobalLive] = useState<boolean>(false);
+
   const activeShiftsMap = useMemo(() => {
     const map = new Map<string, TMSShift>();
-    activeShifts.forEach(s => {
+    const source = globalLiveShifts.length > 0 ? globalLiveShifts : activeShifts;
+    source.forEach(s => {
       if (s.userId) map.set(s.userId, s);
       if ((s as any).uid) map.set((s as any).uid, s);
       if (s.id) map.set(s.id, s);
-      if ((s as any).employeeId) map.set((s as any).employeeId, s);
+      if (s.userEmail) map.set(s.userEmail.toLowerCase().trim(), s);
+      if ((s as any).email) map.set((s as any).email.toLowerCase().trim(), s);
+      if ((s as any).employeeId) map.set((s as any).employeeId.toLowerCase().trim(), s);
     });
     return map;
-  }, [activeShifts]);
+  }, [globalLiveShifts, activeShifts]);
 
   const { attendanceSettings: centralAttendance } = useConfig();
 
@@ -1684,6 +1723,9 @@ export default function SupervisorDashboard({
 
   // Modals / Actions states
   const [isExporting, setIsExporting] = useState(false);
+  const [exportAbortController, setExportAbortController] = useState<AbortController | null>(null);
+  const [exportProgressPercent, setExportProgressPercent] = useState<number>(0);
+  const [exportProgressMessage, setExportProgressMessage] = useState<string>('');
   const [exportReportType, setExportReportType] = useState<'summary' | 'chrono' | 'attendance' | 'all'>('all');
   const [exportFormat, setExportFormat] = useState<'excel' | 'csv'>('excel');
 
@@ -1711,6 +1753,10 @@ export default function SupervisorDashboard({
   const [remoteSwitchTargetUid, setRemoteSwitchTargetUid] = useState<string | null>(null);
   const [remoteSwitchTargetName, setRemoteSwitchTargetName] = useState<string>('');
   const [remoteSwitchSelectedProcess, setRemoteSwitchSelectedProcess] = useState<string>('General');
+  
+  const [activityChangeTargetUid, setActivityChangeTargetUid] = useState<string | null>(null);
+  const [activityChangeTargetName, setActivityChangeTargetName] = useState<string>('');
+  const [activityChangeSelectedValue, setActivityChangeSelectedValue] = useState<string>('');
   
   const [exportStartDate, setExportStartDate] = useState<string>('');
   const [exportEndDate, setExportEndDate] = useState<string>('');
@@ -1753,26 +1799,130 @@ export default function SupervisorDashboard({
       const shiftRef = doc(db, 'tmsShifts', liveShift.id);
       const lsRef = doc(db, 'live_sessions', remoteSwitchTargetUid);
       
-      await Promise.all([
-        setDoc(shiftRef, {
-          activities: updatedActivities,
-          currentActivity: remoteSwitchSelectedProcess,
-          lastHeartbeat: nowISO
-        }, { merge: true }),
-        setDoc(lsRef, {
-          process: remoteSwitchSelectedProcess,
-          currentActivity: remoteSwitchSelectedProcess,
-          currentActivityStartTime: nowISO,
-          statusStartTime: nowISO,
-          lastHeartbeat: nowISO
-        }, { merge: true })
-      ]);
+      const batch = writeBatch(db);
+      batch.set(shiftRef, {
+        activities: updatedActivities,
+        currentActivity: remoteSwitchSelectedProcess,
+        lastHeartbeat: nowISO
+      }, { merge: true });
+      batch.set(lsRef, {
+        process: remoteSwitchSelectedProcess,
+        currentActivity: remoteSwitchSelectedProcess,
+        currentActivityStartTime: nowISO,
+        statusStartTime: nowISO,
+        lastHeartbeat: nowISO
+      }, { merge: true });
+      await batch.commit();
       
       toast.success(`Switched ${remoteSwitchTargetName}'s process to: ${remoteSwitchSelectedProcess}`);
       if (onRefreshAllData) onRefreshAllData();
     } catch (err: any) {
       console.error('Failed remote process switch:', err);
       toast.error('Failed to switch process: ' + err.message);
+    }
+  };
+
+  const performRemoteActivityChange = async (targetUid: string, targetName: string, newActivity: string, isBreak: boolean) => {
+    if (!targetUid || !newActivity) return;
+    
+    // Find live shift of user
+    const liveShift = activeShifts.find(s => s.userId === targetUid);
+    if (!liveShift) {
+      toast.error('No active shift found for this user to change activity.');
+      return;
+    }
+    
+    const nowISO = getLiveTimeISO();
+    const currentDev = liveShift.clockInDevice || 'desktop';
+    
+    try {
+      // 1. Close current active activity in shift activities array
+      const currentActIndex = liveShift.activities.findIndex(act => !act.endTime);
+      let updatedActivities = [...liveShift.activities];
+      if (currentActIndex !== -1) {
+        updatedActivities[currentActIndex] = {
+          ...updatedActivities[currentActIndex],
+          endTime: nowISO
+        };
+      }
+      
+      const shiftRef = doc(db, 'tmsShifts', liveShift.id);
+      const lsRef = doc(db, 'live_sessions', targetUid);
+      const batch = writeBatch(db);
+      
+      // 2. Add the new activity log
+      if (isBreak) {
+        // Switching/updating to a BREAK activity
+        updatedActivities.push({
+          activityId: crypto.randomUUID(),
+          action: 'BREAK_START',
+          startTime: nowISO,
+          process: newActivity,
+          actor: user?.email || user?.uid || 'Supervisor',
+          sourceService: 'SupervisorDashboard',
+          type: 'break',
+          name: newActivity,
+          device: currentDev
+        });
+        
+        batch.set(shiftRef, {
+          activities: updatedActivities,
+          status: 'BREAK',
+          currentActivity: newActivity,
+          breakStartTime: serverTimestamp(),
+          lastHeartbeat: nowISO
+        }, { merge: true });
+        
+        batch.set(lsRef, {
+          status: 'BREAK',
+          currentActivity: newActivity,
+          statusStartTime: nowISO,
+          currentActivityStartTime: nowISO,
+          lastHeartbeat: nowISO,
+          activities: updatedActivities,
+          breakStartTime: serverTimestamp()
+        }, { merge: true });
+      } else {
+        // Switching/updating to a PRODUCTIVE activity (ACTIVE)
+        updatedActivities.push({
+          activityId: crypto.randomUUID(),
+          action: liveShift.status === 'BREAK' ? 'BREAK_END' : 'PROCESS_SWITCH',
+          startTime: nowISO,
+          process: newActivity,
+          actor: user?.email || user?.uid || 'Supervisor',
+          sourceService: 'SupervisorDashboard',
+          type: 'productive',
+          name: newActivity,
+          device: currentDev
+        });
+        
+        batch.set(shiftRef, {
+          activities: updatedActivities,
+          status: 'ACTIVE',
+          currentActivity: newActivity,
+          breakStartTime: null,
+          lastHeartbeat: nowISO
+        }, { merge: true });
+        
+        batch.set(lsRef, {
+          status: 'ACTIVE',
+          process: newActivity,
+          currentActivity: newActivity,
+          statusStartTime: nowISO,
+          currentActivityStartTime: nowISO,
+          lastHeartbeat: nowISO,
+          activities: updatedActivities,
+          breakStartTime: null
+        }, { merge: true });
+      }
+      
+      await batch.commit();
+      
+      toast.success(`Updated ${targetName}'s activity to: ${newActivity}`);
+      if (onRefreshAllData) onRefreshAllData();
+    } catch (err: any) {
+      console.error('Failed remote activity change:', err);
+      toast.error('Failed to update activity: ' + err.message);
     }
   };
 
@@ -1814,6 +1964,12 @@ export default function SupervisorDashboard({
   const [managerSearchQuery, setManagerSearchQuery] = useState('');
   const managerDropdownRef = React.useRef<HTMLDivElement>(null);
 
+  const [selectedActivities, setSelectedActivities] = useState<string[]>([]);
+  const [appliedActivities, setAppliedActivities] = useState<string[]>([]);
+  const [isActivityDropdownOpen, setIsActivityDropdownOpen] = useState(false);
+  const [activitySearchQuery, setActivitySearchQuery] = useState('');
+  const activityDropdownRef = React.useRef<HTMLDivElement>(null);
+
   // Close dropdowns click-outside listener
   useEffect(() => {
     function handleClickOutside(event: MouseEvent) {
@@ -1828,6 +1984,9 @@ export default function SupervisorDashboard({
       }
       if (managerDropdownRef.current && !managerDropdownRef.current.contains(event.target as Node)) {
         setIsManagerDropdownOpen(false);
+      }
+      if (activityDropdownRef.current && !activityDropdownRef.current.contains(event.target as Node)) {
+        setIsActivityDropdownOpen(false);
       }
     }
     document.addEventListener("mousedown", handleClickOutside);
@@ -1863,13 +2022,26 @@ export default function SupervisorDashboard({
 
   // Mapped list of supervised agents based on hierarchy
   const mappedUsers = useMemo(() => {
+    if (!user) return [];
     const isActiveAccount = (u: UserProfile) => {
       const s = (u.status || '').toLowerCase();
       return s !== 'inactive';
     };
 
-    return allUsers.filter(u => isActiveAccount(u));
-  }, [allUsers]);
+    const result = allUsers.filter(u => u.uid !== user.uid && isActiveAccount(u));
+
+    // DIAGNOSTIC LOGGING FOR TMS DATA SCOPE BOUNDARY
+    console.info(`[TMS DATA SCOPE]
+actor=${user.uid}
+role=${user.role}
+visibleHierarchyUsers=${result.length}
+globalRosterFetched=false
+globalRosterDocuments=0
+tmsDatasetUsers=${allUsers.length}
+outsideHierarchyUsers=0`);
+
+    return result;
+  }, [allUsers, user]);
 
   const supervisorTeamUids = useMemo(() => {
     return new Set(mappedUsers.map(u => u.uid));
@@ -1969,9 +2141,126 @@ export default function SupervisorDashboard({
     };
   };
 
-  // 1. Base Filtered Workforce (Search, Team, Manager, Activity, Location)
-  // Shared between cards (KPIs) and the table to ensure data consistency
+  const isManagerUser = useMemo(() => {
+    if (!user?.role) return false;
+    const roleUpper = (user.role || '').toString().toUpperCase().trim();
+    return [
+      'MANAGER', 'ASSISTANT_MANAGER', 'OPERATIONS_MANAGER', 'OPS_MANAGER', 
+      'ADMIN', 'OPS_HEAD', 'DIRECTOR', 'VP', 'SUPER_ADMIN'
+    ].includes(roleUpper);
+  }, [user?.role]);
+
+  const isGlobalActivityMode = useMemo(() => {
+    return isManagerUser && appliedActivities.length > 0;
+  }, [isManagerUser, appliedActivities]);
+
+  // Global live sessions fetcher (used when Manager applies an Activity filter to view whole organization)
+  const fetchGlobalLiveSessions = useCallback(async () => {
+    if (!isManagerUser) return [];
+    setIsLoadingGlobalLive(true);
+    try {
+      const qAll = query(collection(db, 'live_sessions'), limit(2500));
+      const snap = await getDocs(qAll);
+      const mapped = snap.docs.map(doc => mapLiveSessionToShift({ id: doc.id, ...doc.data() }));
+      setGlobalLiveShifts(mapped);
+      return mapped;
+    } catch (err) {
+      console.error('Failed to fetch global live sessions for activity filter:', err);
+      return [];
+    } finally {
+      setIsLoadingGlobalLive(false);
+    }
+  }, [isManagerUser]);
+
+  useEffect(() => {
+    if (isGlobalActivityMode) {
+      fetchGlobalLiveSessions();
+    } else {
+      setGlobalLiveShifts([]);
+    }
+  }, [isGlobalActivityMode, fetchGlobalLiveSessions]);
+
+  const isLocationValue = useCallback((val?: string) => {
+    if (!val) return false;
+    const v = val.toLowerCase().trim();
+    return v === 'office' || v === 'home' || v === 'wfh' || v === 'work from office' || v === 'work from home' || v === 'onsite' || v === 'remote';
+  }, []);
+
+  // Helper to extract the authoritative current active activity from a live shift
+  const getLiveSessionCurrentActivity = useCallback((liveShift: TMSShift | any): string => {
+    if (!liveShift) return 'Offline';
+    const acts = Array.isArray(liveShift.activities) ? liveShift.activities : [];
+    const lastUserAct = getLatestUserActivity(acts);
+    let lastActName = '';
+    if (lastUserAct && lastUserAct.name && !isAuditOrDiagnosticEvent(lastUserAct.action) && !isLocationValue(lastUserAct.name)) {
+      lastActName = lastUserAct.name.trim();
+    } else if (acts.length > 0) {
+      const validActs = acts.filter(a => !isAuditOrDiagnosticEvent(a.action) && a.type !== 'system' && !isLocationValue(a.name));
+      if (validActs.length > 0) {
+        lastActName = (validActs[validActs.length - 1].name || '').trim();
+      }
+    }
+    const currentActField = ((liveShift as any).currentActivity || '').trim();
+    const candidate = lastActName || (!isLocationValue(currentActField) ? currentActField : '');
+    const candLower = candidate.toLowerCase().trim();
+
+    if (!candidate || candLower === 'office' || candLower === 'home' || candLower === 'wfh' || candLower === 'n/a' || candLower === 'offline') {
+      const st = (liveShift.status || '').toString().toUpperCase().trim();
+      if (st === 'BREAK') return 'Break';
+      if (st === 'MEETING') return 'Meeting';
+      if (st === 'TRAINING') return 'Training';
+      if (st === 'ACTIVE' || st === 'PRODUCTIVE') return 'Productive';
+      return st || 'Offline';
+    }
+    return candidate;
+  }, [isLocationValue]);
+
+  const managerActivityOptions = useMemo(() => {
+    if (!isManagerUser) return [];
+    const actSet = new Set<string>();
+
+    if (processes && Array.isArray(processes)) {
+      processes.forEach(p => {
+        if (p && typeof p === 'string' && p.trim() && p.trim() !== 'N/A' && !isLocationValue(p)) {
+          actSet.add(p.trim());
+        }
+      });
+    }
+
+    if (supervisorProcesses && Array.isArray(supervisorProcesses)) {
+      supervisorProcesses.forEach(p => {
+        if (p && typeof p === 'string' && p.trim() && p.trim() !== 'N/A' && !isLocationValue(p)) {
+          actSet.add(p.trim());
+        }
+      });
+    }
+
+    // Standard operational activity names
+    ['HITL', 'Quality', 'Labelling', 'Annotation', 'Review', 'Training', 'Quality Review', 'SOP Training', 'Productive', 'Break', 'Meeting'].forEach(a => {
+      actSet.add(a);
+    });
+
+    const allShifts = globalLiveShifts.length > 0 ? globalLiveShifts : activeShifts;
+    allShifts.forEach(s => {
+      if (s.status !== 'COMPLETED' && s.status !== 'CLOSED') {
+        const liveAct = getLiveSessionCurrentActivity(s);
+        const actLower = liveAct.toLowerCase().trim();
+        if (liveAct && actLower !== 'n/a' && actLower !== 'offline' && !isLocationValue(liveAct)) {
+          actSet.add(liveAct);
+        }
+        if (s.process && s.process.trim() && s.process.trim() !== 'N/A' && !isLocationValue(s.process)) {
+          actSet.add(s.process.trim());
+        }
+      }
+    });
+
+    return Array.from(actSet).filter(Boolean).sort();
+  }, [isManagerUser, processes, supervisorProcesses, globalLiveShifts, activeShifts, getLiveSessionCurrentActivity, isLocationValue]);
+
+  // 1. Base Filtered Workforce (Search, Team, Manager, Location) for normal supervisor view
   const baseFilteredWorkforce = useMemo(() => {
+    if (isGlobalActivityMode) return [];
+
     const tlRefs = new Set<string>();
     const managerRefs = new Set<string>();
     
@@ -2007,22 +2296,9 @@ export default function SupervisorDashboard({
       });
     }
 
-    const roleUpper = (user.role || '').toString().toUpperCase().trim();
-    const isTeamLead = [
-      'TEAM_LEAD', 'TEAM LEAD', 'TL', 'STL', 'QTL', 'OPS_TL', 'OPS TL', 'TRAINER_TL', 'TRAINER TL', 'SME', 'TEAM_LEADER', 'TEAM LEADER', 'OPS_TEAM_LEAD', 'OPS TEAM LEAD'
-    ].includes(roleUpper);
-
-    const sourceUsers = (selectedActivities.length > 0 && !isTeamLead)
-      ? allUsers.filter(u => (u.status || '').toLowerCase() !== 'inactive')
-      : mappedUsers;
-
-    return sourceUsers.filter(u => {
+    return mappedUsers.filter(u => {
       const liveShift = activeShiftsMap.get(u.uid);
-
-      const liveShiftActs = liveShift?.activities || [];
-      const lastActivityName = liveShiftActs.length > 0 ? (liveShiftActs[liveShiftActs.length - 1]?.name || '').trim() : '';
-      const currentActivityField = ((liveShift as any)?.currentActivity || '').trim();
-      const activeProcess = lastActivityName || currentActivityField;
+      const activeAct = getLiveSessionCurrentActivity(liveShift);
       const shiftStatus = (liveShift?.status || '').trim();
 
       const matchesSearch = !searchLower 
@@ -2031,30 +2307,11 @@ export default function SupervisorDashboard({
            u.email.toLowerCase().includes(searchLower) || 
            (u.employeeId && u.employeeId.toLowerCase().includes(searchLower)) ||
            (liveShift?.deviceType && liveShift.deviceType.toLowerCase().includes(searchLower)) ||
-           (activeProcess && activeProcess.toLowerCase().includes(searchLower)) ||
+           (activeAct && activeAct.toLowerCase().includes(searchLower)) ||
            (shiftStatus && shiftStatus.toLowerCase().includes(searchLower)) ||
            (u.process && u.process.toLowerCase().includes(searchLower)));
 
       if (!matchesSearch) return false;
-
-      // Process filters
-      if (selectedActivities.length > 0) {
-        const uProc = (u.process || '').trim();
-        const matchesUserProc = selectedActivities.includes(uProc);
-        
-        let matchesLiveProc = false;
-        if (liveShift) {
-          const liveShiftActs = liveShift.activities || [];
-          const lastActivityName = liveShiftActs.length > 0 ? (liveShiftActs[liveShiftActs.length - 1]?.name || '').trim() : '';
-          const currentActivityField = ((liveShift as any).currentActivity || '').trim();
-          const activeProcess = lastActivityName || currentActivityField;
-          matchesLiveProc = selectedActivities.includes(activeProcess);
-        }
-        
-        if (!matchesUserProc && !matchesLiveProc) {
-          return false;
-        }
-      }
 
       // Location filters
       if (selectedLocations.length > 0) {
@@ -2065,7 +2322,7 @@ export default function SupervisorDashboard({
       }
 
       // TL filter
-      if (selectedTLs.length > 0 && selectedActivities.length === 0) {
+      if (selectedTLs.length > 0) {
         const matchesTL = 
           (u.teamLeadId && tlRefs.has(u.teamLeadId.toLowerCase().trim())) ||
           (u.teamLeadUid && tlRefs.has(u.teamLeadUid.toLowerCase().trim())) ||
@@ -2079,7 +2336,7 @@ export default function SupervisorDashboard({
       }
 
       // Manager filter
-      if (selectedManagers.length > 0 && selectedActivities.length === 0) {
+      if (selectedManagers.length > 0) {
         const checkHierarchy = (uToCheck: UserProfile, visited: Set<string>): boolean => {
           if (!uToCheck) return false;
           const uUidLower = (uToCheck.uid || '').toLowerCase().trim();
@@ -2120,10 +2377,128 @@ export default function SupervisorDashboard({
 
       return true;
     });
-  }, [mappedUsers, activeShiftsMap, deferredSearchTerm, selectedActivities, selectedLocations, selectedTLs, selectedManagers, usersMap, allUsers]);
+  }, [isGlobalActivityMode, mappedUsers, activeShiftsMap, deferredSearchTerm, selectedLocations, selectedTLs, selectedManagers, allUsers, getLiveSessionCurrentActivity, usersMap]);
 
   // 1. Single source of truth live session mapping for workforce
   const mappedWorkforceRows = useMemo(() => {
+    const searchLower = deferredSearchTerm?.toLowerCase() || '';
+
+    // =========================================================================
+    // GLOBAL ACTIVITY VIEW MODE: Hierarchy restriction is OVERRIDDEN
+    // Uses real live session data from live_sessions collection, maps via
+    // existing canonical mapToLiveSessionRow, and filters by selected activity.
+    // =========================================================================
+    if (isGlobalActivityMode) {
+      const sourceShifts = globalLiveShifts.length > 0 ? globalLiveShifts : activeShifts;
+      const rows: LiveSessionRow[] = [];
+      const seenUids = new Set<string>();
+
+      sourceShifts.forEach(liveDocRaw => {
+        // Must be an active/online session
+        if (liveDocRaw.status === 'COMPLETED' || liveDocRaw.status === 'CLOSED' || (liveDocRaw as any).isOnline === false) {
+          return;
+        }
+
+        const uid = liveDocRaw.userId || (liveDocRaw as any).uid || liveDocRaw.id;
+        if (!uid || seenUids.has(uid)) return;
+        seenUids.add(uid);
+
+        const liveEmail = (liveDocRaw.userEmail || (liveDocRaw as any).email || '').toLowerCase().trim();
+        const liveEmpId = ((liveDocRaw as any).employeeId || '').toLowerCase().trim();
+
+        const existingU = usersMap.get(uid) || 
+          (liveEmail ? usersByEmailMap.get(liveEmail) : undefined) ||
+          (liveEmpId ? usersByEmpIdMap.get(liveEmpId) : undefined) ||
+          (allUsers ? allUsers.find(g => g.uid === uid || (liveEmail && g.email?.toLowerCase().trim() === liveEmail)) : undefined);
+
+        const ov = teamLocationOverrides[uid] || (liveEmail ? teamLocationOverrides[liveEmail] : undefined);
+        const liveDoc = ov ? { ...liveDocRaw, ...ov } : liveDocRaw;
+
+        const realName = existingU?.fullName || existingU?.name || existingU?.employeeName;
+        const fallbackName = (liveDoc.userName && liveDoc.userName !== 'Active Employee' ? liveDoc.userName : '') || (liveDoc as any).employeeName;
+
+        const userProfile: UserProfile = existingU ? existingU : {
+          uid,
+          name: realName || fallbackName || (liveEmail ? liveEmail.split('@')[0] : 'Employee'),
+          fullName: realName || fallbackName || (liveEmail ? liveEmail.split('@')[0] : 'Employee'),
+          email: existingU?.email || liveEmail || '',
+          role: existingU?.role || (liveDoc as any).role || 'AGENT',
+          status: 'ACTIVE',
+          employeeId: existingU?.employeeId || liveEmpId || uid,
+          process: liveDoc.process || existingU?.process || 'General',
+          department: existingU?.department || (liveDoc as any).department || 'Operations',
+          location: existingU?.location || (liveDoc as any).location || '',
+          photoURL: existingU?.photoURL || (liveDoc as any).photoURL || '',
+          teamLeadName: existingU?.teamLeadName || (liveDoc as any).teamLeadName || '',
+          mappedManagerName: existingU?.mappedManagerName || existingU?.managerName || (liveDoc as any).managerName || ''
+        };
+
+        const mappedRow = mapToLiveSessionRow(userProfile, liveDoc, nowMs);
+
+        // Discard offline sessions
+        if (mappedRow.status === 'OFFLINE') {
+          return;
+        }
+
+        // Match current activity
+        const rowAct = (mappedRow.currentActivity || '').toLowerCase().trim();
+        const rowProc = (mappedRow.currentProcess || '').toLowerCase().trim();
+        const rawLiveAct = getLiveSessionCurrentActivity(liveDoc).toLowerCase().trim();
+        const rawShiftProc = (liveDoc.process || '').toLowerCase().trim();
+
+        const matchesActivity = appliedActivities.some(target => {
+          const t = target.toLowerCase().trim();
+          return rowAct === t || rowProc === t || rawLiveAct === t || rawShiftProc === t;
+        });
+
+        if (!matchesActivity) {
+          return;
+        }
+
+        // Search matching
+        if (searchLower) {
+          const matchesSearch = 
+            mappedRow.userName.toLowerCase().includes(searchLower) ||
+            mappedRow.userEmail.toLowerCase().includes(searchLower) ||
+            (mappedRow.userId && mappedRow.userId.toLowerCase().includes(searchLower)) ||
+            (mappedRow.userProcess && mappedRow.userProcess.toLowerCase().includes(searchLower)) ||
+            rowAct.includes(searchLower) ||
+            rowProc.includes(searchLower) ||
+            mappedRow.status.toLowerCase().includes(searchLower);
+          if (!matchesSearch) return;
+        }
+
+        // Location matching
+        if (selectedLocations.length > 0) {
+          if (!selectedLocations.includes(mappedRow.workLocation)) {
+            return;
+          }
+        }
+
+        // Shift status matching
+        if (shiftFilter !== 'all') {
+          const st = mappedRow.status.toLowerCase();
+          if (shiftFilter === 'active' && st !== 'active' && st !== 'productive') return;
+          if (shiftFilter === 'break' && st !== 'break') return;
+          if (shiftFilter === 'offline' && st !== 'offline') return;
+        }
+
+        rows.push(mappedRow);
+      });
+
+      console.info(`[TMS GLOBAL ACTIVITY VIEW]
+Actor UID: ${user.uid}
+Actor Role: ${user.role}
+Activity Filter: ${appliedActivities.join(', ')}
+Matching Active Users Count: ${rows.length}
+Hierarchy Filter: OVERRIDDEN`);
+
+      return rows;
+    }
+
+    // =========================================================================
+    // NORMAL MODE: Supervisor Team / Hierarchy View
+    // =========================================================================
     const rows: LiveSessionRow[] = [];
     const seenUids = new Set<string>();
 
@@ -2139,7 +2514,7 @@ export default function SupervisorDashboard({
       rows.push(mapToLiveSessionRow(u, liveDoc, nowMs));
     });
 
-    // B. Catch any orphan active live_sessions documents not in baseFilteredWorkforce
+    // B. Catch any orphan active live_sessions documents not in baseFilteredWorkforce (only in hierarchy mode)
     activeShifts.forEach(liveDocRaw => {
       const docUid = liveDocRaw.userId || (liveDocRaw as any).uid || liveDocRaw.id;
       if (docUid && !seenUids.has(docUid)) {
@@ -2150,12 +2525,9 @@ export default function SupervisorDashboard({
           (liveEmail ? usersByEmailMap.get(liveEmail) : undefined) ||
           (liveEmpId ? usersByEmpIdMap.get(liveEmpId) : undefined);
 
-        // If user is restricted to hierarchy (not global org-wide admin access),
-        // only include orphan sessions for users that belong to supervisorTeamUids
-        if (!hasManagerOrAdminAccess) {
-          if (!existingU || !supervisorTeamUids.has(existingU.uid)) {
-            return;
-          }
+        // Only include orphan sessions for users that belong to supervisorTeamUids
+        if (!existingU || !supervisorTeamUids.has(existingU.uid)) {
+          return;
         }
 
         seenUids.add(docUid);
@@ -2183,8 +2555,48 @@ export default function SupervisorDashboard({
       }
     });
 
-    return rows;
-  }, [baseFilteredWorkforce, activeShiftsMap, activeShifts, nowMs, usersMap, usersByEmailMap, usersByEmpIdMap, teamLocationOverrides, hasManagerOrAdminAccess, supervisorTeamUids]);
+    const allowedUserIds = getTmsDashboardTeamUids(user, rawAllUsers);
+    const finalFilteredRows = rows.filter(row => allowedUserIds.has(row.userId));
+
+    // VERIFY & DIAGNOSTIC LOGGING FOR OUTSIDE HIERARCHY USERS
+    const outsideHierarchyUsers = finalFilteredRows.filter(
+      row => row.userId !== user.uid && !allowedUserIds.has(row.userId)
+    );
+
+    const allowedDescendantsList = Array.from(allowedUserIds).filter(id => id !== user.uid);
+    const finalRenderedUidsList = finalFilteredRows.map(r => r.userId);
+
+    console.info(`[TMS VISIBILITY FINAL]
+Actor UID: ${user.uid}
+Actor Role: ${user.role}
+Allowed descendant UIDs: ${allowedDescendantsList.join(', ')}
+Allowed descendant count: ${allowedDescendantsList.length}
+Final rendered user UIDs: ${finalRenderedUidsList.join(', ')}
+Final rendered user count: ${finalFilteredRows.length}
+Outside-hierarchy users: ${outsideHierarchyUsers.length}`);
+
+    return finalFilteredRows;
+  }, [
+    isGlobalActivityMode,
+    globalLiveShifts,
+    activeShifts,
+    appliedActivities,
+    nowMs,
+    usersMap,
+    usersByEmailMap,
+    usersByEmpIdMap,
+    allUsers,
+    teamLocationOverrides,
+    getLiveSessionCurrentActivity,
+    deferredSearchTerm,
+    selectedLocations,
+    shiftFilter,
+    baseFilteredWorkforce,
+    activeShiftsMap,
+    supervisorTeamUids,
+    user,
+    rawAllUsers
+  ]);
 
   // 2. Summary cards computed directly from mappedWorkforceRows (Single Source of Truth)
   const liveStats = useMemo(() => {
@@ -2216,6 +2628,71 @@ export default function SupervisorDashboard({
       attendancePercent: total > 0 ? Math.round((loggedIn / total) * 100) : 0
     };
   }, [mappedWorkforceRows]);
+
+  const hierarchyDiagnosticData = useMemo(() => {
+    if (!user) return null;
+    const tree = new OrgTree(rawAllUsers);
+    const directReports = tree.getNode(user.uid)?.children || [];
+    const allDescendants = Array.from(tree.getDescendants(user.uid));
+    const directCount = directReports.length;
+    const indirectCount = Math.max(0, allDescendants.length - directCount);
+    const totalExpected = allDescendants.length;
+
+    // Resolved count in current allUsers (excluding supervisor self)
+    const resolvedUids = allUsers.filter(u => u.uid !== user.uid).map(u => u.uid);
+    const totalResolved = resolvedUids.length;
+
+    const missingUids = allDescendants.filter(id => !resolvedUids.includes(id));
+
+    // Duplicate check
+    const uidCounts = new Map<string, number>();
+    allUsers.forEach(u => {
+      if (u.uid) uidCounts.set(u.uid, (uidCounts.get(u.uid) || 0) + 1);
+    });
+    const duplicateUids = Array.from(uidCounts.entries()).filter(([_, count]) => count > 1).map(([id]) => id);
+
+    // Unresolved mapping IDs across rawAllUsers
+    const unresolvedMappingIds: string[] = [];
+    const knownUids = new Set(rawAllUsers.map(u => u.uid));
+    rawAllUsers.forEach(u => {
+      const norm = normalizeHierarchyUser(u);
+      if (norm.teamLeadUid && !knownUids.has(norm.teamLeadUid) && !unresolvedMappingIds.includes(norm.teamLeadUid)) {
+        unresolvedMappingIds.push(norm.teamLeadUid);
+      }
+      if (norm.managerUid && !knownUids.has(norm.managerUid) && !unresolvedMappingIds.includes(norm.managerUid)) {
+        unresolvedMappingIds.push(norm.managerUid);
+      }
+    });
+
+    // Breakdown by live status
+    let active = 0;
+    let onBreak = 0;
+    let offline = 0;
+    mappedWorkforceRows.forEach(row => {
+      const st = (row.status || '').toUpperCase();
+      if (st === 'OFFLINE') offline++;
+      else if (st === 'BREAK') onBreak++;
+      else active++;
+    });
+
+    return {
+      managerUid: user.uid,
+      hierarchyVersion: hierarchyVersion || 'v1.0',
+      directReportees: directCount,
+      indirectReportees: indirectCount,
+      totalExpected,
+      totalResolved,
+      missingUids,
+      duplicateUids,
+      unresolvedMappingIds,
+      filteredByLiveStatus: {
+        active,
+        onBreak,
+        offline
+      },
+      finalTmsCount: mappedWorkforceRows.length
+    };
+  }, [user, rawAllUsers, allUsers, mappedWorkforceRows, hierarchyVersion]);
 
   const liveDistribution = useMemo(() => {
     let active = 0;
@@ -2367,7 +2844,7 @@ export default function SupervisorDashboard({
     const list = new Set<string>();
     
     // Determine scope of users to look for activities
-    const relevantUsers = (isTeamLeadOrSME || isManagerOrLead) ? mappedUsers : allUsers;
+    const relevantUsers = mappedUsers;
     const userEmailSet = new Set(relevantUsers.map(u => (u.email || '').toLowerCase().trim()).filter(Boolean));
     const userIdSet = new Set(relevantUsers.map(u => u.uid).filter(Boolean));
 
@@ -2375,9 +2852,9 @@ export default function SupervisorDashboard({
       const shEmail = (sh.userEmail || '').toLowerCase().trim();
       const shUid = sh.userId;
       
-      // If we are restricted by team, check if shift belongs to our team
+      // If shift belongs to our team
       const isOurTeam = (shEmail && userEmailSet.has(shEmail)) || (shUid && userIdSet.has(shUid));
-      if ((isTeamLeadOrSME || isManagerOrLead) && !isOurTeam) {
+      if (!isOurTeam) {
         return;
       }
 
@@ -2466,7 +2943,9 @@ export default function SupervisorDashboard({
         console.log(`[FORCE_OUT] Shift ID "${logoutShiftId}" not found, invalid, or offline. Querying tmsShifts for user active sessions...`);
         const q = query(
           collection(db, 'tmsShifts'),
-          where('userId', '==', logoutTargetUid)
+          where('userId', '==', logoutTargetUid),
+          where('status', 'in', ['ACTIVE', 'BREAK']),
+          limit(1)
         );
         let qSnap = null;
         try {
@@ -2495,6 +2974,19 @@ export default function SupervisorDashboard({
 
       if (snapshot && snapshot.exists() && shiftRef) {
         const shift = snapshot.data() as TMSShift;
+        
+        // Centralized lifecycle gate check
+        const gateResult = assertShiftLifecycleMutationAllowed(shift.status, 'COMPLETED_FORCED', {
+          caller: 'SUPERVISOR_FORCE_OUT',
+          actorUid: user?.uid,
+          reason: logoutReason ? `Force logout: ${logoutReason}` : 'Force logout by supervisor'
+        });
+        if (!gateResult.allowed) {
+          console.error(`[FORCE_OUT] Mutation blocked by gate: ${gateResult.reason}`);
+          toast.error(`Operation blocked: ${gateResult.reason}`);
+          return;
+        }
+
         const updatedActivities = [...(shift.activities || [])];
         if (updatedActivities.length > 0) {
           const lastIndex = updatedActivities.length - 1;
@@ -2543,8 +3035,8 @@ export default function SupervisorDashboard({
           details: { closedBy: supervisorIdentifier, targetName: logoutTargetName }
         });
 
-        // Log in audit trail (Firestore Logging Disabled)
-        console.log('[AUDIT LOG] (Firestore Logging Disabled) Supervisor Remote Force Logout:', {
+        // Log in audit trail
+        const auditLogPayload = {
           timestamp: nowISO,
           performedBy: `${user.name} (${user?.email || user?.uid || 'Unknown'})`,
           affectedUser: `${logoutTargetName} (${logoutTargetUid})`,
@@ -2552,7 +3044,9 @@ export default function SupervisorDashboard({
           previousValue: 'ACTIVE_WORK',
           newValue: `COMPLETED (Reason: ${logoutReason})`,
           details: { shiftId: snapshot.id }
-        });
+        };
+        console.log('[AUDIT LOG] Writing Supervisor Remote Force Logout to Firestore:', auditLogPayload);
+        addDoc(collection(db, 'adminAuditLogs'), auditLogPayload).catch(e => console.error('Audit log failed', e));
       } else {
         console.log(`[FORCE_OUT] No shift record was fetched for ${logoutTargetUid}. Attempting direct updateDoc fallbacks...`);
         if (shiftRef) {
@@ -2596,17 +3090,16 @@ export default function SupervisorDashboard({
       console.error(`[FORCE_OUT] Failed to update shift record for ${logoutTargetUid}:`, shiftErr);
     }
 
-    // 2. Set user profile status to OFFLINE in users collection
+    // 2. Set user lastLogoutAt in users collection without mutating administrative status
     try {
       const userRef = doc(db, 'users', logoutTargetUid);
       await setDoc(userRef, {
-        status: 'OFFLINE',
         lastLogoutAt: nowISO
       }, { merge: true });
       userUpdateSuccess = true;
-      console.log(`[FORCE_OUT] Successfully marked user profile OFFLINE in users collection.`);
+      console.log(`[FORCE_OUT] Successfully recorded lastLogoutAt in users collection.`);
     } catch (userErr: any) {
-      console.error(`[FORCE_OUT] Failed to update user status in users collection for ${logoutTargetUid}:`, userErr);
+      console.error(`[FORCE_OUT] Failed to update user lastLogoutAt in users collection for ${logoutTargetUid}:`, userErr);
     }
 
     // 3. Delete live_sessions document (Most Critical for UI sync)
@@ -2616,6 +3109,18 @@ export default function SupervisorDashboard({
       console.log(`[FORCE_OUT] Successfully deleted live_sessions document for ${logoutTargetUid}.`);
     } catch (liveErr: any) {
       console.error(`[FORCE_OUT] Failed to delete live_sessions document for ${logoutTargetUid}:`, liveErr);
+    }
+
+    // 3b. Release active lock document so the user can clock in again
+    try {
+      await setDoc(doc(db, 'tmsActiveLocks', logoutTargetUid), {
+        status: 'INACTIVE',
+        shiftId: null,
+        updatedAt: serverTimestamp()
+      }, { merge: true });
+      console.log(`[FORCE_OUT] Successfully released active session lock for ${logoutTargetUid}.`);
+    } catch (lockErr: any) {
+      console.error(`[FORCE_OUT] Failed to release active lock for ${logoutTargetUid}:`, lockErr);
     }
 
     // Determine final status
@@ -2644,7 +3149,49 @@ export default function SupervisorDashboard({
     setShowEnhancedExportModal(true);
   };
 
+  const cancelEnhancedExport = () => { if (exportAbortController) { exportAbortController.abort(); setExportAbortController(null); setIsExporting(false); toast.error('Export cancelled.'); } };
+
   const executeEnhancedExport = async () => {
+    const abortCtrl = new AbortController();
+    setExportAbortController(abortCtrl);
+
+    setIsExporting(true);
+    setExportProgressPercent(5);
+    setExportProgressMessage('Starting export...');
+    try {
+      const res = await generateAndDownloadOrganizationReport({
+        actor: user,
+        allUsers: rawAllUsers || [],
+        authorizedTeamUids: mappedUsers.map(u => u.uid),
+        hasTmsPermission: permKey => hasTmsPermission ? hasTmsPermission(permKey) : false,
+        signal: abortCtrl.signal,
+        preset: exportRangePreset,
+        startDateStr: exportStartDate || exportCustomStart,
+        endDateStr: exportEndDate || exportCustomEnd,
+        format: 'excel',
+        reportType: 'all',
+        onProgress: (pct, msg) => {
+          setExportProgressPercent(pct);
+          setExportProgressMessage(msg);
+        }
+      });
+
+      if (!res.success) {
+        toast.error(res.message || 'No records found for the selected date range.');
+      } else {
+        toast.success('Enhanced report exported successfully!');
+        setShowEnhancedExportModal(false);
+      }
+    } catch (err) {
+      console.error('Enhanced Export Error:', err);
+      toast.error('Failed to generate enhanced report');
+    } finally {
+      setIsExporting(false);
+      setExportAbortController(null);
+    }
+  };
+
+  const legacyExecuteEnhancedExport = async () => {
     setIsExporting(true);
     try {
       let end = new Date(getLiveTime().getTime());
@@ -2670,36 +3217,39 @@ export default function SupervisorDashboard({
       }
 
       toast.info(`Fetching shift data from ${start.toLocaleDateString()} to ${end.toLocaleDateString()}...`);
+      
+      const roleNormalized = (user.role || '').toUpperCase();
+      const isGlobalAdmin = checkIsGlobalRole(roleNormalized);
+      const isManagerRole = ['MANAGER', 'ASSISTANT_MANAGER', 'OPS_HEAD', 'HR', 'IT_MANAGER', 'EXECUTIVE', 'OPS HEAD'].includes(roleNormalized);
 
       // Fetch shifts in range
-      const q = query(
-        collection(db, 'tmsShifts'),
+      const constraints: any[] = [
         where('clockInTime', '>=', start.toISOString()),
         where('clockInTime', '<=', end.toISOString())
+      ];
+      
+      if (!isGlobalAdmin) {
+        // Scoped query for Supervisors/Managers to prevent massive org-wide reads
+        const supervisorField = isManagerRole ? 'managerId' : 'teamLeadUid';
+        constraints.push(where(supervisorField, '==', user.uid));
+      }
+
+      const q = query(
+        collection(db, 'tmsShifts'),
+        ...constraints
       );
-      const snap = await getDocsOptimized(q, 'export_shifts');
+      
+      // Use dynamic cache key so different date ranges don't hit stale cache
+      const cacheKey = `export_shifts_${user.uid}_${start.toISOString().split('T')[0]}_${end.toISOString().split('T')[0]}`;
+      const snap = await getDocsOptimized(q, cacheKey);
       const rawShifts = snap.docs.map(d => ({ id: d.id, ...(d.data() as any) } as TMSShift));
       const shifts = rawShifts.map(sh => sh as TMSShift);
 
       // Filter for team scope / selected scope
-      const roleNormalized = (user.role || '').toUpperCase();
-      const isGlobalAdmin = checkIsGlobalRole(roleNormalized);
-      
-      let teamShifts = shifts;
-      if (!isGlobalAdmin) {
-        // Supervisors only see their own team members
-        const scopeIds = new Set(mappedUsers.map(u => u.uid));
-        teamShifts = shifts.filter(sh => scopeIds.has(sh.userId));
-      } else {
-        // Global Admin/MIS can filter by TL or manager, or download everything
-        if (selectedTLs.length > 0 || selectedManagers.length > 0) {
-          const filteredUids = new Set(baseFilteredWorkforce.map(u => u.uid));
-          teamShifts = shifts.filter(sh => filteredUids.has(sh.userId));
-        } else {
-          // No active filters, export all shifts in the database for the range
-          teamShifts = shifts;
-        }
-      }
+      // Supervisors only see their own team members
+      const scopeIds = new Set(mappedUsers.map(u => u.uid));
+      scopeIds.add(user.uid);
+      let teamShifts = shifts.filter(sh => scopeIds.has(sh.userId));
 
       // O(1) User maps for fast lookups (using rawAllUsers for full organization export data)
       const usersByIdMap = new Map<string, any>();
@@ -2836,7 +3386,8 @@ export default function SupervisorDashboard({
         ];
 
         const chronoRows: any[] = [];
-        teamShifts.forEach(sh => {
+        const sortedShiftsForChrono = [...teamShifts].sort((a, b) => new Date(a.clockInTime).getTime() - new Date(b.clockInTime).getTime());
+        sortedShiftsForChrono.forEach(sh => {
           const dateStr = new Date(sh.clockInTime).toLocaleDateString('en-IN');
           let u = sh.userId ? usersByIdMap.get(sh.userId) : undefined;
           if (!u && sh.userEmail) {
@@ -2879,7 +3430,7 @@ export default function SupervisorDashboard({
         ];
 
         const ledgerRows: any[] = [];
-        teamShifts.forEach(sh => {
+        sortedShiftsForChrono.forEach(sh => {
           const rows = formatShiftLedgerForReport(sh);
           rows.forEach(r => {
             ledgerRows.push([
@@ -2936,6 +3487,7 @@ export default function SupervisorDashboard({
       toast.error('Failed to generate enhanced report');
     } finally {
       setIsExporting(false);
+      setExportAbortController(null);
     }
   };
 
@@ -2961,6 +3513,17 @@ export default function SupervisorDashboard({
       const count = targets.length;
       
       targets.forEach(sh => {
+        // Enforce centralized lifecycle gate for bulk logout
+        const gateResult = assertShiftLifecycleMutationAllowed(sh.status, 'COMPLETED', {
+          caller: 'SUPERVISOR_FORCE_OUT',
+          actorUid: user?.uid,
+          reason: `Bulk Force Logout (${filterMode}) by Supervisor`
+        });
+        if (!gateResult.allowed) {
+          console.warn(`[BULK FORCE OUT] Skipping shift ${sh.id} (User: ${sh.userId}) - Gate Reason: ${gateResult.reason}`);
+          return;
+        }
+
         const updatedActivities = [...(sh.activities || [])];
         if (updatedActivities.length > 0) {
           const lastIndex = updatedActivities.length - 1;
@@ -2978,20 +3541,26 @@ export default function SupervisorDashboard({
           remarks: `Bulk Force Logout (${filterMode}) by Supervisor`
         }, { merge: true });
 
-        // 2. Update User Status
+        // 2. Update User lastLogoutAt (preserve administrative status)
         batch.update(doc(db, 'users', sh.userId), {
-          status: 'OFFLINE',
           lastLogoutAt: nowISO
         });
 
         // 3. Clean up Live Session
         batch.delete(doc(db, 'live_sessions', sh.userId));
+
+        // 4. Release Active Lock
+        batch.set(doc(db, 'tmsActiveLocks', sh.userId), {
+          status: 'INACTIVE',
+          shiftId: null,
+          updatedAt: serverTimestamp()
+        }, { merge: true });
       });
 
       await batch.commit();
 
-      // Audit logs (Firestore Logging Disabled)
-      console.log('[AUDIT LOG] (Firestore Logging Disabled) Supervisor Bulk Force Logout:', {
+      // Audit logs
+      const auditLogPayload = {
         timestamp: nowISO,
         performedBy: `${user.name} (${user?.email || user?.uid || 'Unknown'})`,
         affectedUser: `Multiple Users (${count} - ${filterMode})`,
@@ -3000,7 +3569,9 @@ export default function SupervisorDashboard({
         newValue: 'COMPLETED',
         remarks: `Bulk logout performed for ${count} users. Mode: ${filterMode}`,
         details: { count, filterMode }
-      });
+      };
+      console.log('[AUDIT LOG] Writing Supervisor Bulk Force Logout to Firestore:', auditLogPayload);
+      addDoc(collection(db, 'adminAuditLogs'), auditLogPayload).catch(e => console.error('Audit log failed', e));
 
       toast.success(`Successfully logged out ${count} active users.`);
       setShowBulkLogoutModal(false);
@@ -3669,37 +4240,65 @@ export default function SupervisorDashboard({
 
   const renderWorkforceMonitor = () => {
     return (
-      <div className="p-2.5 space-y-2.5 bg-slate-50 dark:bg-slate-950/30 overflow-y-auto h-full flex flex-col">
+      <div className="p-2.5 space-y-2 bg-slate-50 dark:bg-slate-950/30 overflow-hidden h-full flex flex-col">
+        {/* Live Data Sync Bar */}
+        <div className="bg-white dark:bg-slate-900 px-3.5 py-2 rounded-xl border border-slate-200 dark:border-slate-800 shadow-sm flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2.5 shrink-0">
+          <div className="flex flex-col">
+            <span className="text-[11px] font-black text-slate-800 dark:text-slate-200 uppercase tracking-wider">Live Status Data</span>
+            <span className="text-[10px] font-bold text-slate-500 dark:text-slate-400 mt-0.5">
+              Last updated: {lastUpdated ? new Date(lastUpdated).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : 'Never'}
+            </span>
+          </div>
+          <button
+            id="tms-load-live-data-btn"
+            onClick={async () => {
+              try {
+                if (isGlobalActivityMode) {
+                  await fetchGlobalLiveSessions();
+                }
+                await fetchLiveShifts(true);
+              } catch (e) {
+                console.error('[MANUAL LOAD LIVE DATA FAILED]', e);
+              }
+            }}
+            disabled={loadingLiveShifts || isLoadingGlobalLive}
+            className="px-3.5 h-8 bg-indigo-650 hover:bg-indigo-755 disabled:hover:bg-indigo-650 text-white font-black text-[11px] rounded-lg shadow-sm flex items-center justify-center gap-2 cursor-pointer transition-all uppercase tracking-wider disabled:opacity-50"
+          >
+            <RefreshCw size={13} className={loadingLiveShifts || isLoadingGlobalLive ? 'animate-spin' : ''} />
+            {loadingLiveShifts || isLoadingGlobalLive ? 'Loading live data...' : '🔄 Load Live Data'}
+          </button>
+        </div>
+
         {/* Top Summary Cards */}
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2 shrink-0">
-          <div className="bg-white dark:bg-slate-900 px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-800 shadow-sm flex items-center justify-between">
+          <div className="bg-white dark:bg-slate-900 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-800 shadow-sm flex items-center justify-between">
             <div>
               <span className="text-[9px] font-black uppercase text-emerald-500 tracking-wider">Productive Users</span>
-              <div className="text-lg font-black text-emerald-600 mt-0.5">{liveStats.active}</div>
+              <div className="text-base font-black text-emerald-600 mt-0.5">{liveStats.active}</div>
             </div>
           </div>
-          <div className="bg-white dark:bg-slate-900 px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-800 shadow-sm flex items-center justify-between">
+          <div className="bg-white dark:bg-slate-900 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-800 shadow-sm flex items-center justify-between">
             <div>
               <span className="text-[9px] font-black uppercase text-amber-500 tracking-wider">On Break</span>
-              <div className="text-lg font-black text-amber-600 mt-0.5">{liveStats.onBreak}</div>
+              <div className="text-base font-black text-amber-600 mt-0.5">{liveStats.onBreak}</div>
             </div>
           </div>
-          <div className="bg-white dark:bg-slate-900 px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-800 shadow-sm flex items-center justify-between">
+          <div className="bg-white dark:bg-slate-900 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-800 shadow-sm flex items-center justify-between">
             <div>
               <span className="text-[9px] font-black uppercase text-slate-400 tracking-wider">Total Assigned</span>
-              <div className="text-lg font-black text-slate-800 dark:text-slate-100 mt-0.5">{liveStats.total}</div>
+              <div className="text-base font-black text-slate-800 dark:text-slate-100 mt-0.5">{liveStats.total}</div>
             </div>
           </div>
-          <div className="bg-white dark:bg-slate-900 px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-800 shadow-sm flex items-center justify-between">
+          <div className="bg-white dark:bg-slate-900 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-800 shadow-sm flex items-center justify-between">
             <div>
               <span className="text-[9px] font-black uppercase text-sky-500 tracking-wider">Total Logged In</span>
-              <div className="text-lg font-black text-sky-600 mt-0.5">{liveStats.loggedIn}</div>
+              <div className="text-base font-black text-sky-600 mt-0.5">{liveStats.loggedIn}</div>
             </div>
           </div>
         </div>
         <div className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 shadow-sm flex flex-col flex-1 overflow-hidden">
           {/* Filters Bar */}
-          <div className="p-3 border-b border-slate-200 dark:border-slate-800 flex flex-wrap items-center justify-between gap-2 shrink-0 bg-slate-50/50 dark:bg-slate-950/20">
+          <div className="px-3 py-2 border-b border-slate-200 dark:border-slate-800 flex flex-wrap items-center justify-between gap-2 shrink-0 bg-slate-50/50 dark:bg-slate-950/20">
             <div className="flex flex-wrap items-center gap-2.5 w-full lg:w-auto">
               <div className="relative w-full sm:w-64">
                 <Search className="absolute left-2.5 top-2 text-slate-400" size={13} />
@@ -3708,7 +4307,7 @@ export default function SupervisorDashboard({
                   value={searchTerm} 
                   onChange={e => { setSearchTerm(e.target.value); setCurrentPage(1); }}
                   placeholder="Search name, email, activity..."
-                  className="w-full pl-8 pr-3 py-1.5 text-xs bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-lg focus:outline-indigo-500 font-medium text-slate-700 dark:text-slate-200 shadow-sm"
+                  className="w-full pl-8 pr-3 py-1 text-xs bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-lg focus:outline-indigo-500 font-medium text-slate-700 dark:text-slate-200 shadow-sm"
                 />
               </div>
 
@@ -3717,7 +4316,7 @@ export default function SupervisorDashboard({
                 <select 
                   value={shiftFilter} 
                   onChange={e => { setShiftFilter(e.target.value); setCurrentPage(1); }}
-                  className="text-xs font-bold px-2.5 py-1.5 border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-200 rounded-lg focus:outline-none shadow-sm cursor-pointer"
+                  className="text-xs font-bold px-2 py-1 border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-200 rounded-lg focus:outline-none shadow-sm cursor-pointer"
                 >
                   <option value="all">All Statuses</option>
                   <option value="active">Active</option>
@@ -3725,12 +4324,155 @@ export default function SupervisorDashboard({
                   <option value="offline">Offline</option>
                 </select>
 
+                {/* Manager-only "Activity" Filter (Global Organization View) */}
+                {isManagerUser && (
+                  <div className="relative flex items-center gap-1.5" ref={activityDropdownRef}>
+                    <button
+                      type="button"
+                      id="manager-activity-filter-btn"
+                      onClick={() => {
+                        setSelectedActivities(appliedActivities);
+                        setIsActivityDropdownOpen(!isActivityDropdownOpen);
+                      }}
+                      className={`text-xs font-bold px-2.5 py-1 border rounded-lg flex items-center gap-1.5 shadow-sm transition-colors cursor-pointer ${
+                        appliedActivities.length > 0
+                          ? 'bg-indigo-600 border-indigo-600 text-white shadow-indigo-500/20'
+                          : selectedActivities.length > 0
+                          ? 'bg-indigo-50 border-indigo-300 text-indigo-700 dark:bg-indigo-950/50 dark:border-indigo-800 dark:text-indigo-300'
+                          : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:border-slate-300'
+                      }`}
+                    >
+                      <Activity size={12} className={appliedActivities.length > 0 ? 'text-white' : selectedActivities.length > 0 ? 'text-indigo-600 dark:text-indigo-400' : 'text-slate-400'} />
+                      <span>
+                        {appliedActivities.length === 0
+                          ? 'Activity: Select Activity'
+                          : appliedActivities.length === 1
+                          ? `Activity: ${appliedActivities[0]}`
+                          : `Activity: (${appliedActivities.length} selected)`}
+                      </span>
+                      {appliedActivities.length > 0 && (
+                        <span className="ml-0.5 px-1 py-0.5 rounded bg-indigo-500/40 text-[9px] font-black uppercase tracking-wider">
+                          Global
+                        </span>
+                      )}
+                      <ChevronDown size={12} className={`transition-transform ${appliedActivities.length > 0 ? 'text-white/80' : 'text-slate-400'} ${isActivityDropdownOpen ? 'rotate-180' : ''}`} />
+                    </button>
 
+                    {isActivityDropdownOpen && (
+                      <div className="absolute left-0 top-full mt-1 w-72 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-xl shadow-xl z-50 p-2.5 space-y-2.5 animate-in fade-in zoom-in-95 duration-100">
+                        <div className="flex items-center justify-between px-1 pb-1.5 border-b border-slate-100 dark:border-slate-800">
+                          <div>
+                            <span className="text-[10px] font-black uppercase tracking-wider text-slate-400">Filter Activity</span>
+                            <p className="text-[10px] text-slate-500 dark:text-slate-400 font-medium">Global Organization Override</p>
+                          </div>
+                          {(selectedActivities.length > 0 || appliedActivities.length > 0) && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setSelectedActivities([]);
+                                setAppliedActivities([]);
+                                setCurrentPage(1);
+                                setIsActivityDropdownOpen(false);
+                              }}
+                              className="text-[10px] font-bold text-red-600 hover:text-red-700 dark:text-red-400 uppercase tracking-wider cursor-pointer"
+                            >
+                              Clear Filter
+                            </button>
+                          )}
+                        </div>
 
-                {(searchTerm || shiftFilter !== 'all') && (
+                        <div className="p-2 rounded-lg bg-amber-50 dark:bg-amber-950/40 border border-amber-200/60 dark:border-amber-900/60 text-[10.5px] text-amber-800 dark:text-amber-300 font-medium leading-relaxed">
+                          Select an activity and click <strong className="font-bold">Apply</strong> to enter Global Activity View, overriding hierarchy to display all currently logged-in users on that activity across the entire organization.
+                        </div>
+
+                        {managerActivityOptions.length > 5 && (
+                          <div className="relative">
+                            <Search size={11} className="absolute left-2.5 top-2.5 text-slate-400" />
+                            <input
+                              type="text"
+                              value={activitySearchQuery}
+                              onChange={e => setActivitySearchQuery(e.target.value)}
+                              placeholder="Search activity name..."
+                              className="w-full pl-7 pr-2 py-1.5 text-[11px] bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg focus:outline-indigo-500 text-slate-700 dark:text-slate-200 font-medium"
+                            />
+                          </div>
+                        )}
+
+                        <div className="max-h-48 overflow-y-auto space-y-0.5 custom-scrollbar pr-1">
+                          {managerActivityOptions
+                            .filter(act => !activitySearchQuery || act.toLowerCase().includes(activitySearchQuery.toLowerCase()))
+                            .map(act => {
+                              const isChecked = selectedActivities.includes(act);
+                              return (
+                                <label
+                                  key={act}
+                                  className={`flex items-center gap-2 px-2 py-1.5 rounded-lg text-xs font-semibold cursor-pointer transition-colors ${
+                                    isChecked
+                                      ? 'bg-indigo-50 dark:bg-indigo-950/40 text-indigo-700 dark:text-indigo-300 font-bold'
+                                      : 'hover:bg-slate-50 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-300'
+                                  }`}
+                                >
+                                  <input
+                                    type="checkbox"
+                                    checked={isChecked}
+                                    onChange={() => {
+                                      setSelectedActivities(prev =>
+                                        isChecked ? prev.filter(p => p !== act) : [...prev, act]
+                                      );
+                                    }}
+                                    className="w-3.5 h-3.5 rounded text-indigo-600 focus:ring-indigo-500 border-slate-300 dark:border-slate-600 cursor-pointer"
+                                  />
+                                  <span className="truncate flex-1">{act}</span>
+                                </label>
+                              );
+                            })}
+                          {managerActivityOptions.length === 0 && (
+                            <div className="text-center py-3 text-[11px] text-slate-400 font-medium">
+                              No activities found
+                            </div>
+                          )}
+                        </div>
+
+                        <div className="pt-2 border-t border-slate-100 dark:border-slate-800 flex items-center justify-between gap-2">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setSelectedActivities(appliedActivities);
+                              setIsActivityDropdownOpen(false);
+                            }}
+                            className="px-2.5 py-1 text-xs font-semibold text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg cursor-pointer"
+                          >
+                            Cancel
+                          </button>
+                          <button
+                            type="button"
+                            id="apply-activity-filter-btn"
+                            onClick={() => {
+                              setAppliedActivities(selectedActivities);
+                              setIsActivityDropdownOpen(false);
+                              setCurrentPage(1);
+                            }}
+                            className="px-3 py-1 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 rounded-lg shadow-sm cursor-pointer transition-colors flex items-center gap-1"
+                          >
+                            <Check size={12} />
+                            <span>Apply</span>
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {(searchTerm || shiftFilter !== 'all' || appliedActivities.length > 0 || selectedActivities.length > 0) && (
                   <button 
-                    onClick={() => { setSearchTerm(''); setShiftFilter('all'); setCurrentPage(1); }}
-                    className="text-[11px] font-black text-indigo-600 hover:text-indigo-700 uppercase tracking-wider px-2 py-1"
+                    onClick={() => { 
+                      setSearchTerm(''); 
+                      setShiftFilter('all'); 
+                      setSelectedActivities([]); 
+                      setAppliedActivities([]); 
+                      setCurrentPage(1); 
+                    }}
+                    className="text-[11px] font-black text-indigo-600 hover:text-indigo-700 uppercase tracking-wider px-2 py-1 cursor-pointer"
                   >
                     Clear Filters
                   </button>
@@ -3738,25 +4480,62 @@ export default function SupervisorDashboard({
               </div>
             </div>
 
-            <div className="text-[11px] font-bold text-slate-400 uppercase tracking-wider">
+            <div className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">
               Showing {paginatedWorkforceRows.length} of {sortedWorkforceRows.length} agents
             </div>
           </div>
+
+          {/* Global Activity View Banner */}
+          {isGlobalActivityMode && (
+            <div className="flex flex-wrap items-center justify-between gap-3 px-3.5 py-2.5 bg-gradient-to-r from-indigo-500/10 via-purple-500/10 to-blue-500/10 border-b border-indigo-200 dark:border-indigo-800/60 shrink-0">
+              <div className="flex items-center gap-2.5">
+                <div className="p-1.5 rounded-lg bg-indigo-600 text-white shadow-sm flex items-center justify-center">
+                  <Globe size={15} />
+                </div>
+                <div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-[11px] font-black uppercase tracking-wider text-indigo-700 dark:text-indigo-300">
+                      Mode: Global Activity View
+                    </span>
+                    <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-bold bg-amber-100 dark:bg-amber-950/60 text-amber-800 dark:text-amber-300 border border-amber-200 dark:border-amber-800">
+                      Hierarchy filter: OVERRIDDEN
+                    </span>
+                  </div>
+                  <p className="text-xs font-semibold text-slate-700 dark:text-slate-200 mt-0.5">
+                    Showing all currently logged-in <span className="font-bold text-indigo-600 dark:text-indigo-400">{appliedActivities.join(', ')}</span> users across the organization ({sortedWorkforceRows.length} active)
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                id="clear-global-activity-btn"
+                onClick={() => {
+                  setSelectedActivities([]);
+                  setAppliedActivities([]);
+                  setCurrentPage(1);
+                }}
+                className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold text-indigo-700 dark:text-indigo-300 bg-white dark:bg-slate-900 hover:bg-indigo-50 dark:hover:bg-slate-800 border border-indigo-200 dark:border-indigo-700 rounded-lg shadow-sm transition-all cursor-pointer"
+              >
+                <X size={13} />
+                <span>Exit Global View (Restore Hierarchy)</span>
+              </button>
+            </div>
+          )}
 
           {/* Table */}
           <div className="flex-1 overflow-auto">
             <table className="w-full text-left border-collapse text-xs">
               <thead>
                 <tr className="border-b border-slate-200 dark:border-slate-800 text-slate-400 font-black uppercase tracking-wider text-[10px] sticky top-0 bg-slate-50 dark:bg-slate-900 z-10">
-                  <th className="py-1.5 px-2.5 pl-3">Employee Name</th>
-                  <th className="py-1.5 px-2.5">Process</th>
-                  <th className="py-1.5 px-2.5">Status</th>
-                  <th className="py-1.5 px-2.5">Activity</th>
-                  <th className="py-1.5 px-2.5">Clock-In Time</th>
-                  <th className="py-1.5 px-2.5">Productive Time</th>
-                  <th className="py-1.5 px-2.5">Break Time</th>
-                  <th className="py-1.5 px-2.5">Device</th>
-                  <th className="py-1.5 px-2.5 text-right pr-3">Actions</th>
+                  <th className="py-1 px-2.5 pl-3">Employee Name</th>
+                  <th className="py-1 px-2.5">Process</th>
+                  <th className="py-1 px-2.5">Status</th>
+                  <th className="py-1 px-2.5">Activity</th>
+                  <th className="py-1 px-2.5">Clock-In Time</th>
+                  <th className="py-1 px-2.5">Productive Time</th>
+                  <th className="py-1 px-2.5">Break Time</th>
+                  <th className="py-1 px-2.5">Device</th>
+                  <th className="py-1 px-2.5 text-right pr-3">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100 dark:divide-slate-800/40 font-semibold text-slate-700 dark:text-slate-300">
@@ -3771,43 +4550,115 @@ export default function SupervisorDashboard({
 
                   return (
                     <tr key={row.userId} className="hover:bg-slate-50/60 dark:hover:bg-slate-800/40 transition-colors group">
-                      <td className="py-1.5 px-2.5 pl-3">
+                      <td className="py-1 px-2.5 pl-3">
                         <div className="flex items-center gap-2">
                           <div className="w-5 h-5 rounded-full bg-indigo-50 dark:bg-indigo-950/60 flex items-center justify-center font-black text-indigo-600 dark:text-indigo-400 uppercase text-[9px] shrink-0">
                             {row.userName.split(' ').map(n => n[0]).slice(0, 2).join('')}
                           </div>
                           <div className="flex flex-col">
                             <span className="font-extrabold text-slate-900 dark:text-white leading-tight text-[11px]">{row.userName}</span>
-                            <span className="text-[9px] text-slate-400">{row.userEmail}</span>
+                            <span className="text-[9px] text-slate-400 leading-none">{row.userEmail}</span>
                           </div>
                         </div>
                       </td>
-                      <td className="py-1.5 px-2.5">
+                      <td className="py-1 px-2.5">
                         <span className="bg-indigo-50 dark:bg-indigo-950/40 text-indigo-700 dark:text-indigo-300 px-1.5 py-0.5 rounded text-[9px] font-black uppercase tracking-wider border border-indigo-100 dark:border-indigo-900/40">
                           {row.currentProcess || 'General'}
                         </span>
                       </td>
-                      <td className="py-1.5 px-2.5">
+                      <td className="py-1 px-2.5">
                         <span className={`px-1.5 py-0.5 rounded text-[9px] font-black uppercase tracking-wider border ${statusChipColor}`}>
                           {row.status}
                         </span>
                       </td>
-                      <td className="py-1.5 px-2.5 font-bold text-slate-600 dark:text-slate-300 text-[11px]">
-                        {row.currentActivity || 'Working'}
+                      <td className="py-1 px-2.5 font-bold text-slate-600 dark:text-slate-300 text-[11px]">
+                        {(() => {
+                          const act = (row.currentActivity || '').trim();
+                          const actLower = act.toLowerCase();
+                          if (!act || actLower === 'office' || actLower === 'home' || actLower === 'wfh' || actLower === 'n/a') {
+                            if (row.status === 'OFFLINE') return 'Offline';
+                            if (row.status === 'BREAK') return 'Break';
+                            if (row.status === 'MEETING') return 'Meeting';
+                            if (row.status === 'TRAINING') return 'Training';
+                            if (row.status === 'ACTIVE' || row.status === 'PRODUCTIVE') return 'Productive';
+                            return row.status || 'Offline';
+                          }
+                          return act;
+                        })()}
                       </td>
-                      <td className="py-1.5 px-2.5 font-mono text-[10px] font-bold text-slate-600 dark:text-slate-300">
-                        {row.rawDoc?.clockInTime ? new Date(row.rawDoc.clockInTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : (row.since || '-')}
+                      <td className="py-1 px-2.5 font-mono text-[10px] font-bold text-slate-600 dark:text-slate-300">
+                        {row.clockInTime ? new Date(row.clockInTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : (row.rawDoc?.clockInTime ? new Date(row.rawDoc.clockInTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : (row.since && row.since !== '-' ? row.since : '-'))}
                       </td>
-                      <td className="py-1.5 px-2.5 font-mono text-[10px] font-black text-emerald-600 dark:text-emerald-400">
-                        {row.rawDoc?.clockInTime && row.rawDoc?.currentShiftProductiveMs !== undefined ? formatDuration(row.rawDoc.currentShiftProductiveMs) : (row.productiveTimeStr || '-')}
+                      <td className="py-1 px-2.5 font-mono text-[10px] font-black text-emerald-600 dark:text-emerald-400">
+                        {(row.clockInTime || row.hasActiveLiveSession || row.status !== 'OFFLINE' || (row.currentShiftProductiveMs && row.currentShiftProductiveMs > 0)) ? formatDuration(row.currentShiftProductiveMs || 0) : '-'}
                       </td>
-                      <td className="py-1.5 px-2.5 font-mono text-[10px] font-bold text-amber-600">
-                        {row.rawDoc?.breakCount > 0 && row.rawDoc?.totalBreakMs !== undefined ? formatDuration(row.rawDoc.totalBreakMs) : (row.breakTimeStr || '0m 0s')}
+                      <td className="py-1 px-2.5 font-mono text-[10px] font-bold text-amber-600">
+                        {(row.clockInTime || row.hasActiveLiveSession || row.status !== 'OFFLINE' || (row.totalBreakMs && row.totalBreakMs > 0)) ? formatDuration(row.totalBreakMs || 0) : '00h 00m 00s'}
                       </td>
-                      <td className="py-1.5 px-2.5">
+                      <td className="py-1 px-2.5">
                         <span className="text-slate-500 font-bold text-[11px]" title="Web / Desktop App">💻</span>
                       </td>
-                      <td className="py-1.5 px-2.5 text-right pr-3">
+                      <td className="py-1 px-2.5 text-right pr-3 flex items-center justify-end gap-1.5">
+                        {(!isOffline || row.isStuckSession) && canModifyTarget(row.userId) && (
+                          <div className="relative inline-block text-left">
+                            <button
+                              onClick={() => {
+                                setActivityChangeTargetUid(row.userId);
+                                setActivityChangeTargetName(row.userName);
+                                setActivityChangeSelectedValue(row.currentActivity || 'HITL');
+                              }}
+                              className="px-1.5 py-0.5 bg-indigo-50 hover:bg-indigo-100 dark:bg-indigo-950/40 dark:hover:bg-indigo-900/60 text-indigo-700 dark:text-indigo-400 font-black text-[9px] rounded-lg uppercase tracking-wider transition-colors cursor-pointer inline-flex items-center gap-1 shadow-sm shrink-0"
+                              title="Change employee's active process or break activity"
+                            >
+                              <Activity size={10} />
+                              Change Activity
+                            </button>
+                            
+                            {activityChangeTargetUid === row.userId && (
+                              <div className="absolute right-0 mt-1 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl shadow-xl z-50 p-2.5 space-y-2 min-w-[240px] text-left">
+                                <div className="flex items-center justify-between pb-1 border-b border-slate-100 dark:border-slate-800">
+                                  <span className="text-[9px] font-black uppercase tracking-wider text-slate-400">Change Activity:</span>
+                                  <button onClick={() => setActivityChangeTargetUid(null)} className="text-slate-450 hover:text-slate-650 dark:hover:text-white">
+                                    <X size={11} />
+                                  </button>
+                                </div>
+                                <div className="space-y-1">
+                                  <span className="text-[8px] font-bold uppercase tracking-wider text-slate-400">Select Activity:</span>
+                                  <select 
+                                    value={activityChangeSelectedValue} 
+                                    onChange={e => setActivityChangeSelectedValue(e.target.value)}
+                                    className="w-full text-[10px] font-bold p-1 bg-slate-50 dark:bg-slate-850 border border-slate-200 dark:border-slate-700 rounded text-slate-705 dark:text-slate-300"
+                                  >
+                                    <optgroup label="Operational Processes (Status: ACTIVE)">
+                                      {supervisorProcesses?.map(pr => <option key={pr} value={pr}>{pr}</option>)}
+                                    </optgroup>
+                                    <optgroup label="Break/Off-Prod (Status: BREAK)">
+                                      {SUPERVISOR_BREAK_OPTIONS?.map(br => <option key={br} value={br}>{br}</option>)}
+                                    </optgroup>
+                                  </select>
+                                </div>
+                                <div className="flex gap-1.5 pt-1">
+                                  <button 
+                                    onClick={async () => {
+                                      const isBreak = SUPERVISOR_BREAK_OPTIONS.includes(activityChangeSelectedValue);
+                                      await performRemoteActivityChange(row.userId, row.userName, activityChangeSelectedValue, isBreak);
+                                      setActivityChangeTargetUid(null);
+                                    }}
+                                    className="flex-1 bg-indigo-600 hover:bg-indigo-700 text-white font-black text-[9px] py-1 rounded uppercase tracking-wider text-center cursor-pointer"
+                                  >
+                                    Confirm Change
+                                  </button>
+                                  <button 
+                                    onClick={() => setActivityChangeTargetUid(null)}
+                                    className="bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 text-[9px] px-2 py-1 rounded uppercase tracking-wider cursor-pointer"
+                                  >
+                                    Cancel
+                                  </button>
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        )}
                         {(!isOffline || row.isStuckSession) && canModifyTarget(row.userId) && (
                           <button
                             onClick={() => {
@@ -3817,7 +4668,7 @@ export default function SupervisorDashboard({
                               setLogoutReason('Operational force clock-out');
                               setShowForceLogoutConfirm(true);
                             }}
-                            className="px-2 py-1 bg-rose-50 hover:bg-rose-100 dark:bg-rose-950/40 dark:hover:bg-rose-900/60 text-rose-700 dark:text-rose-400 font-black text-[9px] rounded-lg uppercase tracking-wider transition-colors cursor-pointer inline-flex items-center gap-1 shadow-sm"
+                            className="px-1.5 py-0.5 bg-rose-50 hover:bg-rose-100 dark:bg-rose-950/40 dark:hover:bg-rose-900/60 text-rose-700 dark:text-rose-400 font-black text-[9px] rounded-lg uppercase tracking-wider transition-colors cursor-pointer inline-flex items-center gap-1 shadow-sm shrink-0"
                           >
                             <LogOut size={10} />
                             Force Out
@@ -3830,7 +4681,9 @@ export default function SupervisorDashboard({
                 {paginatedWorkforceRows.length === 0 && (
                   <tr>
                     <td colSpan={10} className="p-8 text-center text-slate-400 font-bold uppercase tracking-widest text-xs">
-                      No workforce members found matching the selected filters.
+                      {isGlobalActivityMode 
+                        ? `No currently active users found matching "${appliedActivities.join(', ')}" across the organization.`
+                        : 'No workforce members found matching the selected filters.'}
                     </td>
                   </tr>
                 )}
@@ -4009,16 +4862,16 @@ export default function SupervisorDashboard({
              <table className="w-full text-left border-collapse text-xs">
                 <thead>
                   <tr className="border-b border-slate-150 dark:border-slate-800/80 text-slate-400 font-black uppercase tracking-wider text-[10px] sticky top-0 bg-slate-50 dark:bg-slate-900/90 z-20 backdrop-blur">
-                    <th className="p-3.5 pl-6">Employee</th>
-                    <th className="p-3.5">Status</th>
-                    <th className="p-3.5">Location</th>
-                    <th className="p-3.5">Process Mapping</th>
-                    <th className="p-3.5">Clock In</th>
-                    <th className="p-3.5">Clock Out</th>
-                    <th className="p-3.5">Duration</th>
-                    <th className="p-3.5">Break Logs</th>
-                    <th className="p-3.5 text-center">In Sync</th>
-                    <th className="p-3.5 text-right pr-6">Supervisor Actions</th>
+                    <th className="py-1.5 px-3 pl-4">Employee</th>
+                    <th className="py-1.5 px-3">Status</th>
+                    <th className="py-1.5 px-3">Location</th>
+                    <th className="py-1.5 px-3">Process Mapping</th>
+                    <th className="py-1.5 px-3">Clock In</th>
+                    <th className="py-1.5 px-3">Clock Out</th>
+                    <th className="py-1.5 px-3">Duration</th>
+                    <th className="py-1.5 px-3">Break Logs</th>
+                    <th className="py-1.5 px-3 text-center">In Sync</th>
+                    <th className="py-1.5 px-3 text-right pr-4">Supervisor Actions</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 dark:divide-slate-800/40 font-semibold text-slate-700 dark:text-slate-355">
@@ -4109,18 +4962,18 @@ export default function SupervisorDashboard({
                               </div>
                             </td>
                             <td className="p-3.5 font-mono text-[11px] font-bold">
-                              {row.clockInTime ? new Date(row.clockInTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '-'}
+                              {row.clockInTime ? new Date(row.clockInTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : (row.rawDoc?.clockInTime ? new Date(row.rawDoc.clockInTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '-')}
                             </td>
                             <td className="p-3.5 font-mono text-[11px] font-bold">
                               {row.clockOutTime ? new Date(row.clockOutTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '-'}
                             </td>
                             <td className="p-3.5 font-mono text-[11px] font-black text-indigo-600 dark:text-indigo-400">
-                              {row.clockInTime ? formatDuration(row.currentShiftProductiveMs) : '-'}
+                              {(row.clockInTime || row.hasActiveLiveSession || row.status !== 'OFFLINE' || (row.currentShiftProductiveMs && row.currentShiftProductiveMs > 0)) ? formatDuration(row.currentShiftProductiveMs || 0) : '-'}
                             </td>
                             <td className="p-3.5">
-                              {row.breakCount > 0 ? (
+                              {(row.breakCount > 0 || (row.totalBreakMs && row.totalBreakMs > 0)) ? (
                                 <span className="bg-amber-50 dark:bg-amber-950/20 text-amber-700 dark:text-amber-400 px-1.5 py-0.5 rounded text-[10px] font-black">
-                                  {row.breakCount} ({formatDuration(row.totalBreakMs)})
+                                  {row.breakCount > 0 ? `${row.breakCount} ` : ''}({formatDuration(row.totalBreakMs || 0)})
                                 </span>
                               ) : '-'}
                             </td>
@@ -4132,6 +4985,65 @@ export default function SupervisorDashboard({
                               ) : '-'}
                             </td>
                             <td className="p-3.5 text-right pr-6 opacity-50 group-hover:opacity-100 transition-opacity flex items-center justify-end gap-1.5">
+                              {(!isOffline || row.isStuckSession) && live && canModifyTarget(row.userId) && (
+                                <div className="relative inline-block text-left">
+                                  <button
+                                    onClick={() => {
+                                      setActivityChangeTargetUid(row.userId);
+                                      setActivityChangeTargetName(row.userName);
+                                      setActivityChangeSelectedValue(row.currentActivity || 'HITL');
+                                    }}
+                                    className="p-2 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 dark:hover:bg-slate-800/40 rounded-lg transition-colors cursor-pointer inline-flex items-center gap-1.5 shrink-0"
+                                    title="Change employee's active process or break activity"
+                                  >
+                                    <Activity size={16} />
+                                  </button>
+                                  
+                                  {activityChangeTargetUid === row.userId && (
+                                    <div className="absolute right-0 mt-1 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl shadow-xl z-50 p-2.5 space-y-2 min-w-[240px] text-left">
+                                      <div className="flex items-center justify-between pb-1 border-b border-slate-100 dark:border-slate-800">
+                                        <span className="text-[9px] font-black uppercase tracking-wider text-slate-400">Change Activity:</span>
+                                        <button onClick={() => setActivityChangeTargetUid(null)} className="text-slate-450 hover:text-slate-650 dark:hover:text-white">
+                                          <X size={11} />
+                                        </button>
+                                      </div>
+                                      <div className="space-y-1">
+                                        <span className="text-[8px] font-bold uppercase tracking-wider text-slate-400">Select Activity:</span>
+                                        <select 
+                                          value={activityChangeSelectedValue} 
+                                          onChange={e => setActivityChangeSelectedValue(e.target.value)}
+                                          className="w-full text-[10px] font-bold p-1 bg-slate-50 dark:bg-slate-850 border border-slate-200 dark:border-slate-700 rounded text-slate-705 dark:text-slate-300"
+                                        >
+                                          <optgroup label="Operational Processes (Status: ACTIVE)">
+                                            {supervisorProcesses?.map(pr => <option key={pr} value={pr}>{pr}</option>)}
+                                          </optgroup>
+                                          <optgroup label="Break/Off-Prod (Status: BREAK)">
+                                            {SUPERVISOR_BREAK_OPTIONS?.map(br => <option key={br} value={br}>{br}</option>)}
+                                          </optgroup>
+                                        </select>
+                                      </div>
+                                      <div className="flex gap-1.5 pt-1">
+                                        <button 
+                                          onClick={async () => {
+                                            const isBreak = SUPERVISOR_BREAK_OPTIONS.includes(activityChangeSelectedValue);
+                                            await performRemoteActivityChange(row.userId, row.userName, activityChangeSelectedValue, isBreak);
+                                            setActivityChangeTargetUid(null);
+                                          }}
+                                          className="flex-1 bg-indigo-600 hover:bg-indigo-700 text-white font-black text-[9px] py-1 rounded uppercase tracking-wider text-center cursor-pointer"
+                                        >
+                                          Confirm Change
+                                        </button>
+                                        <button 
+                                          onClick={() => setActivityChangeTargetUid(null)}
+                                          className="bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 text-[9px] px-2 py-1 rounded uppercase tracking-wider cursor-pointer"
+                                        >
+                                          Cancel
+                                        </button>
+                                      </div>
+                                    </div>
+                                  )}
+                                </div>
+                              )}
                               {(!isOffline || row.isStuckSession) && live && canModifyTarget(row.userId) && (
                                 <button 
                                   className="p-2 text-slate-400 hover:text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-900/40 rounded-lg transition-colors cursor-pointer" 
@@ -4497,13 +5409,33 @@ export default function SupervisorDashboard({
                 )}
              </div>
              <div className="flex flex-col gap-2 pt-2">
+                {isExporting && (
+                  <div className="w-full space-y-2 py-1 mb-2">
+                    <div className="flex justify-between text-xs font-bold text-slate-700 dark:text-slate-300">
+                      <span>{exportProgressMessage || 'Generating report...'}</span>
+                      <span>{exportProgressPercent}%</span>
+                    </div>
+                    <div className="w-full bg-slate-100 dark:bg-slate-800 h-2.5 rounded-full overflow-hidden">
+                      <div 
+                        className="bg-indigo-600 dark:bg-indigo-500 h-full rounded-full transition-all duration-300 ease-out" 
+                        style={{ width: `${exportProgressPercent}%` }}
+                      />
+                    </div>
+                  </div>
+                )}
                 <button onClick={executeEnhancedExport} disabled={isExporting} className="w-full bg-indigo-650 hover:bg-indigo-755 text-white font-black text-xs h-11 rounded-xl shadow-lg shadow-indigo-200/50 flex items-center justify-center gap-2 cursor-pointer transition-colors uppercase tracking-wider disabled:opacity-50">
                   {isExporting ? <RefreshCw size={12} className="animate-spin" /> : <Download size={12} />}
                   {isExporting ? 'Exporting...' : 'Export Spreadsheet'}
                 </button>
-                <button onClick={() => setShowEnhancedExportModal(false)} className="w-full text-slate-500 hover:text-slate-800 hover:bg-slate-100 dark:hover:bg-slate-800 font-bold text-xs h-10 rounded-xl cursor-pointer transition-colors uppercase tracking-wider">
-                  Cancel
-                </button>
+                {isExporting ? (
+                  <button onClick={cancelEnhancedExport} className="w-full bg-red-50 hover:bg-red-100 text-red-600 dark:bg-red-900/30 dark:hover:bg-red-900/50 dark:text-red-400 font-bold text-xs h-10 rounded-xl cursor-pointer transition-colors uppercase tracking-wider">
+                    Cancel Export
+                  </button>
+                ) : (
+                  <button onClick={() => setShowEnhancedExportModal(false)} disabled={isExporting} className="w-full text-slate-500 hover:text-slate-800 hover:bg-slate-100 dark:hover:bg-slate-800 font-bold text-xs h-10 rounded-xl cursor-pointer transition-colors uppercase tracking-wider disabled:opacity-50">
+                    Close
+                  </button>
+                )}
              </div>
           </div>
         </div>
@@ -4633,6 +5565,73 @@ export default function SupervisorDashboard({
                   Cancel
                 </button>
              </div>
+          </div>
+        </div>
+      )}
+
+      {showHierarchyDiagnosticModal && hierarchyDiagnosticData && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4 animate-in fade-in duration-200">
+          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl max-w-2xl w-full p-6 shadow-2xl space-y-6 max-h-[90vh] overflow-y-auto">
+            <div className="flex items-center justify-between pb-4 border-b border-slate-100 dark:border-slate-800">
+              <div className="flex items-center gap-3">
+                <div className="p-2.5 rounded-xl bg-indigo-50 dark:bg-indigo-950/60 text-indigo-600 dark:text-indigo-400">
+                  <Bug size={20} />
+                </div>
+                <div>
+                  <h3 className="text-base font-black text-slate-800 dark:text-slate-100">
+                    TMS Hierarchy Health & Visibility Diagnostic
+                  </h3>
+                  <p className="text-xs text-slate-500 font-medium">
+                    Authoritative vs. Resolved Reportee Audit Engine
+                  </p>
+                </div>
+              </div>
+              <button 
+                onClick={() => setShowHierarchyDiagnosticModal(false)}
+                className="p-1.5 rounded-lg text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            <div className="space-y-4 font-mono text-xs">
+              <div className="bg-slate-900 text-slate-100 p-4 rounded-xl border border-slate-800 space-y-2 overflow-x-auto">
+                <div><span className="text-indigo-400 font-bold">Manager UID:</span> {hierarchyDiagnosticData.managerUid}</div>
+                <div><span className="text-indigo-400 font-bold">Hierarchy Version:</span> {hierarchyDiagnosticData.hierarchyVersion}</div>
+                <div><span className="text-indigo-400 font-bold">Direct Reportees:</span> {hierarchyDiagnosticData.directReportees}</div>
+                <div><span className="text-indigo-400 font-bold">Indirect Reportees:</span> {hierarchyDiagnosticData.indirectReportees}</div>
+                <div className="pt-2 border-t border-slate-800 font-bold text-sm text-emerald-400">
+                  Total Expected: {hierarchyDiagnosticData.totalExpected}
+                </div>
+                <div className="font-bold text-sm text-emerald-400">
+                  Total Resolved: {hierarchyDiagnosticData.totalResolved}
+                </div>
+                <div className="pt-2 border-t border-slate-800">
+                  <span className="text-rose-400 font-bold">Missing UIDs:</span> {hierarchyDiagnosticData.missingUids.length === 0 ? 'None (0)' : JSON.stringify(hierarchyDiagnosticData.missingUids)}
+                </div>
+                <div>
+                  <span className="text-amber-400 font-bold">Duplicate UIDs:</span> {hierarchyDiagnosticData.duplicateUids.length === 0 ? 'None (0)' : JSON.stringify(hierarchyDiagnosticData.duplicateUids)}
+                </div>
+                <div>
+                  <span className="text-sky-400 font-bold">Unresolved Mapping IDs:</span> {hierarchyDiagnosticData.unresolvedMappingIds.length === 0 ? 'None (0)' : JSON.stringify(hierarchyDiagnosticData.unresolvedMappingIds)}
+                </div>
+                <div className="pt-2 border-t border-slate-800">
+                  <span className="text-teal-400 font-bold">Filtered By Live Status:</span> Active: {hierarchyDiagnosticData.filteredByLiveStatus.active} | Break: {hierarchyDiagnosticData.filteredByLiveStatus.onBreak} | Offline: {hierarchyDiagnosticData.filteredByLiveStatus.offline}
+                </div>
+                <div className="font-bold text-sm text-indigo-300 pt-2 border-t border-slate-800">
+                  Final TMS Count: {hierarchyDiagnosticData.finalTmsCount}
+                </div>
+              </div>
+            </div>
+
+            <div className="flex justify-end pt-2">
+              <button 
+                onClick={() => setShowHierarchyDiagnosticModal(false)}
+                className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-xs rounded-xl shadow-md transition-colors"
+              >
+                Close Diagnostic Audit
+              </button>
+            </div>
           </div>
         </div>
       )}

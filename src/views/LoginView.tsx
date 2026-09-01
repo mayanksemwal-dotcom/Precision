@@ -16,6 +16,30 @@ export default function LoginView() {
   const [loading, setLoading] = useState(false);
   const [errorDetails, setErrorDetails] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
+
+  useEffect(() => {
+    document.title = "Precision360 | Enterprise Login";
+    
+    // Ensure index, follow meta for public login surface
+    const robotsMeta = document.querySelector('meta[name="robots"]');
+    if (robotsMeta) {
+      robotsMeta.setAttribute('content', 'index, follow');
+    }
+
+    // Dynamic canonical link
+    const canonicalLink = document.querySelector('link[rel="canonical"]');
+    if (canonicalLink) {
+      canonicalLink.setAttribute('href', `${window.location.origin}${window.location.pathname}`);
+    }
+
+    // Check if user was just bounced due to administrator login restriction
+    const restrictionNotice = safeStorage.get<string>('login_restriction_message');
+    if (restrictionNotice) {
+      setErrorDetails(restrictionNotice);
+      toast.error(restrictionNotice);
+      safeStorage.remove('login_restriction_message');
+    }
+  }, []);
   
   // Login form states
   const [email, setEmail] = useState('');
@@ -254,8 +278,12 @@ export default function LoginView() {
     console.error('Auth Error:', error);
     let message = 'Authentication failed.';
     
-    if (error.message && error.message.includes('DEACTIVATED_ACCOUNT')) {
+    if (error.message && (error.message.includes('RESTRICTED_ACCOUNT') || error.message.includes('restricted by an administrator'))) {
+      message = error.message.replace('RESTRICTED_ACCOUNT: ', '');
+      setErrorDetails(message);
+    } else if (error.message && error.message.includes('DEACTIVATED_ACCOUNT')) {
       message = 'Your account has been deactivated. Please contact your administrator.';
+      setErrorDetails(message);
     } else if (error.code === 'auth/popup-blocked') {
       message = 'Login popup was blocked. Please enable popups.';
       setErrorDetails('Enable popups in your browser.');
@@ -352,80 +380,6 @@ export default function LoginView() {
               Continue with Google
             </Button>
 
-            <div className="relative my-4">
-              <div className="absolute inset-0 flex items-center">
-                <span className="w-full border-t border-slate-200"></span>
-              </div>
-              <div className="relative flex justify-center text-[10px] uppercase font-bold tracking-widest text-indigo-600/60">
-                <span className="bg-slate-100/90 px-3 py-0.5 rounded-full backdrop-blur-md">Or Secure Credential Sign In</span>
-              </div>
-            </div>
-
-            {/* Email/Password Credentials Form */}
-            <form onSubmit={handleEmailLogin} className="space-y-4">
-              <div className="space-y-1.5">
-                <Label htmlFor="email" className="text-xs font-bold text-slate-600">Email Address</Label>
-                <div className="relative">
-                  <Mail className="absolute left-3.5 top-3.5 h-4.5 w-4.5 text-slate-400" />
-                  <Input 
-                    id="email" 
-                    type="email" 
-                    placeholder="name@company.com"
-                    className="h-11 pl-10 bg-slate-50 border-slate-200 text-slate-900 rounded-xl placeholder:text-slate-400 font-medium focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all text-sm"
-                    value={email}
-                    onChange={(e) => setEmail(e.target.value)}
-                    required
-                  />
-                </div>
-              </div>
-
-              <div className="space-y-1.5">
-                <Label htmlFor="password" className="text-xs font-bold text-slate-600">Password</Label>
-                <div className="relative">
-                  <Lock className="absolute left-3.5 top-3.5 h-4.5 w-4.5 text-slate-400" />
-                  <Input 
-                    id="password" 
-                    type={showPassword ? "text" : "password"} 
-                    placeholder="••••••••"
-                    className="h-11 pl-10 pr-10 bg-slate-50 border-slate-200 text-slate-900 rounded-xl placeholder:text-slate-400 font-medium focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all text-sm"
-                    value={password}
-                    onChange={(e) => setPassword(e.target.value)}
-                    required
-                  />
-                  <button 
-                    type="button"
-                    onClick={() => setShowPassword(!showPassword)}
-                    className="absolute right-3.5 top-3.5 text-slate-400 hover:text-slate-600 transition-colors"
-                  >
-                    {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
-                  </button>
-                </div>
-              </div>
-
-              <Button 
-                type="submit"
-                disabled={loading}
-                className="w-full h-11 bg-indigo-600 hover:bg-indigo-700 text-white font-extrabold rounded-xl shadow-lg shadow-indigo-600/20 mt-2 transition-all active:scale-[0.98] cursor-pointer"
-              >
-                {loading ? "Verifying..." : "Login"}
-              </Button>
-            </form>
-
-            {/* Registration Prompt Link */}
-            <div className="text-center pt-2">
-              <button 
-                type="button"
-                onClick={() => {
-                  setErrorDetails(null);
-                  setSuccessMessage(null);
-                  setIsRegisterOpen(true);
-                }}
-                className="text-xs font-semibold text-indigo-600 hover:text-indigo-800 transition-all underline decoration-dotted underline-offset-4 cursor-pointer"
-              >
-                Don't have an account? Register
-              </button>
-            </div>
-
           </CardContent>
 
           <CardFooter className="text-center justify-center bg-slate-50/50 py-4 px-8 border-t border-slate-200/50">
@@ -435,165 +389,6 @@ export default function LoginView() {
           </CardFooter>
         </Card>
       </div>
-
-      {/* DEDICATED REGISTRATION MODAL */}
-      {isRegisterOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 backdrop-blur-md p-4 animate-in fade-in duration-200">
-          <div className="relative w-full max-w-md bg-white border border-slate-200 rounded-3xl shadow-2xl p-6 overflow-hidden animate-in zoom-in-95 duration-200 max-h-[90vh] overflow-y-auto text-slate-800">
-            
-            {/* Modal Ambient Lights */}
-            <div className="absolute top-[-20%] right-[-20%] w-[50%] h-[50%] bg-indigo-100 rounded-full blur-[60px]" />
-
-            {/* Header */}
-            <div className="flex justify-between items-center mb-6 relative z-10 border-b border-slate-100 pb-4">
-              <div>
-                <h3 className="text-lg font-black text-slate-900">Create Account</h3>
-                <p className="text-[10px] text-slate-500 font-bold uppercase tracking-wider mt-0.5">Enterprise Registration</p>
-              </div>
-              <button 
-                onClick={() => setIsRegisterOpen(false)} 
-                className="p-1.5 rounded-lg bg-slate-100 text-slate-500 hover:text-slate-800 hover:bg-slate-200 transition-all"
-              >
-                <X size={16} />
-              </button>
-            </div>
-
-            {/* Form */}
-            <form onSubmit={handleEmailRegisterSubmit} className="space-y-4 relative z-10">
-              
-              {/* Full Name */}
-              <div className="space-y-1">
-                <Label htmlFor="reg-name" className="text-xs font-bold text-slate-600">Full Name</Label>
-                <div className="relative">
-                  <UserIcon className="absolute left-3 top-3 h-4 w-4 text-slate-400" />
-                  <Input 
-                    id="reg-name" 
-                    type="text" 
-                    placeholder="First & Last Name"
-                    className="h-10 pl-9 bg-slate-50 border-slate-200 text-slate-900 rounded-xl placeholder:text-slate-400 font-medium text-sm focus:ring-1 focus:ring-indigo-500"
-                    value={registerName}
-                    onChange={(e) => setRegisterName(e.target.value)}
-                    required
-                  />
-                </div>
-              </div>
-
-              {/* Email Address */}
-              <div className="space-y-1">
-                <Label htmlFor="reg-email" className="text-xs font-bold text-slate-600">Email Address</Label>
-                <div className="relative">
-                  <Mail className="absolute left-3 top-3 h-4 w-4 text-slate-400" />
-                  <Input 
-                    id="reg-email" 
-                    type="email" 
-                    placeholder="user@name.com"
-                    className="h-10 pl-9 bg-slate-50 border-slate-200 text-slate-900 rounded-xl placeholder:text-slate-400 font-medium text-sm focus:ring-1 focus:ring-indigo-500"
-                    value={registerEmail}
-                    onChange={(e) => setRegisterEmail(e.target.value)}
-                    required
-                  />
-                </div>
-                {registerEmail && !validateEmailFormat(registerEmail) && (
-                  <p className="text-[10px] text-amber-600 font-semibold">Please enter a valid format (e.g. user@domain.com)</p>
-                )}
-              </div>
-
-              {/* Password */}
-              <div className="space-y-1">
-                <Label htmlFor="reg-password" className="text-xs font-bold text-slate-600">Password</Label>
-                <div className="relative">
-                  <Lock className="absolute left-3 top-3 h-4 w-4 text-slate-400" />
-                  <Input 
-                    id="reg-password" 
-                    type={showRegPassword ? "text" : "password"} 
-                    placeholder="Establish secure shield password"
-                    className="h-10 pl-9 pr-9 bg-slate-50 border-slate-200 text-slate-900 rounded-xl placeholder:text-slate-400 font-medium text-sm focus:ring-1 focus:ring-indigo-500"
-                    value={registerPassword}
-                    onChange={(e) => setRegisterPassword(e.target.value)}
-                    required
-                  />
-                  <button 
-                    type="button"
-                    onClick={() => setShowRegPassword(!showRegPassword)}
-                    className="absolute right-3 top-3 text-slate-400 hover:text-slate-600 transition-colors"
-                  >
-                    {showRegPassword ? <EyeOff size={14} /> : <Eye size={14} />}
-                  </button>
-                </div>
-              </div>
-
-              {/* Dynamic Password Strength Visual Checklist */}
-              {registerPassword.length > 0 && (
-                <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl space-y-1.5 transition-all text-xs">
-                  <div className="flex justify-between items-center">
-                    <span className="font-bold text-slate-500 text-[10px] uppercase tracking-wider">Complexity Shield Guidelines</span>
-                    <span className={`text-[9px] font-black uppercase px-1.5 py-0.5 rounded ${isPasswordStrong ? 'bg-emerald-500/10 text-emerald-700' : 'bg-amber-500/10 text-amber-700'}`}>
-                      {isPasswordStrong ? 'Secure Strength' : 'Weak Strength'}
-                    </span>
-                  </div>
-                  
-                  <div className="grid grid-cols-2 gap-x-3 gap-y-1 mt-1">
-                    {[
-                      { key: 'length', label: '8+ Characters' },
-                      { key: 'uppercase', label: 'Uppercase Letter' },
-                      { key: 'lowercase', label: 'Lowercase Letter' },
-                      { key: 'number', label: 'Contains Number' },
-                      { key: 'special', label: 'Special Character' }
-                    ].map((item) => {
-                      const met = (pwdCriteria as any)[item.key];
-                      return (
-                        <div key={item.key} className="flex items-center gap-1.5">
-                          <Check size={11} className={`shrink-0 ${met ? 'text-emerald-500' : 'text-slate-300'}`} />
-                          <span className={`text-[10px] transition-colors font-medium ${met ? 'text-emerald-700 font-semibold' : 'text-slate-400 line-through'}`}>
-                            {item.label}
-                          </span>
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-              )}
-
-              {/* Confirm Password */}
-              <div className="space-y-1">
-                <Label htmlFor="reg-confirm" className="text-xs font-bold text-slate-600">Confirm Password</Label>
-                <div className="relative">
-                  <Lock className="absolute left-3 top-3 h-4 w-4 text-slate-400" />
-                  <Input 
-                    id="reg-confirm" 
-                    type={showRegConfirmPassword ? "text" : "password"} 
-                    placeholder="Match password exactly"
-                    className="h-10 pl-9 pr-9 bg-slate-50 border-slate-200 text-slate-900 rounded-xl placeholder:text-slate-400 font-medium text-sm focus:ring-1 focus:ring-indigo-500"
-                    value={registerConfirmPassword}
-                    onChange={(e) => setRegisterConfirmPassword(e.target.value)}
-                    required
-                  />
-                  <button 
-                    type="button"
-                    onClick={() => setShowRegConfirmPassword(!showRegConfirmPassword)}
-                    className="absolute right-3 top-3 text-slate-400 hover:text-slate-600 transition-colors"
-                  >
-                    {showRegConfirmPassword ? <EyeOff size={14} /> : <Eye size={14} />}
-                  </button>
-                </div>
-                {registerConfirmPassword && registerPassword !== registerConfirmPassword && (
-                  <p className="text-[10px] text-red-500 font-semibold">Passwords do not match yet.</p>
-                )}
-              </div>
-
-              {/* Register Action Button */}
-              <Button 
-                type="submit"
-                disabled={loading}
-                className="w-full h-11 bg-indigo-600 hover:bg-indigo-700 text-white font-extrabold rounded-xl shadow-lg mt-4 disabled:opacity-50 disabled:pointer-events-none transition-all cursor-pointer"
-              >
-                {loading ? "Registering profile..." : "Submit Registration Request"}
-              </Button>
-            </form>
-          </div>
-        </div>
-      )}
-
     </div>
   );
 }

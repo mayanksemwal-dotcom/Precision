@@ -28,6 +28,28 @@ export default defineConfig(({ mode }) => {
     },
     build: {
       outDir: 'dist',
+      emptyOutDir: true,
+      chunkSizeWarningLimit: 4000,
+      rollupOptions: {
+        output: {
+          manualChunks(id) {
+            if (id.includes('node_modules')) {
+              if (id.includes('firebase')) {
+                return 'vendor-firebase';
+              }
+              if (id.includes('xlsx') || id.includes('jszip')) {
+                return 'vendor-sheets';
+              }
+              if (id.includes('lucide-react')) {
+                return 'vendor-icons';
+              }
+              if (id.includes('recharts') || id.includes('d3-')) {
+                return 'vendor-charts';
+              }
+            }
+          }
+        }
+      }
     },
   };
 });

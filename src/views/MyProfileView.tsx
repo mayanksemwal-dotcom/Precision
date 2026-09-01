@@ -40,6 +40,8 @@ import { doc, getDoc, setDoc, updateDoc, collection, getDocs, query, where } fro
 import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
 import { toast } from 'sonner';
 import { UserProfile } from '../types';
+import { useRoster } from '../contexts/RosterContext';
+import { resolveAuthoritativeHierarchy } from '../lib/hierarchy';
 
 interface MyProfileViewProps {
   user: UserProfile;
@@ -103,6 +105,7 @@ interface EmployeeProfileState {
 }
 
 export default React.memo(function MyProfileView({ user, allUsers, externalTheme, onRefreshAllData }: MyProfileViewProps) {
+  const { updateUserInRoster } = useRoster();
   const isAdminOrHR = user.role === 'ADMIN' || user.role === 'MANAGER' || user.role?.toUpperCase() === 'HR';
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -192,21 +195,9 @@ export default React.memo(function MyProfileView({ user, allUsers, externalTheme
           data = snap.data();
         }
 
-        // Find team lead or manager name from allUsers lookup dynamically
-        let teamLeadName = uProfile.teamLeadName || '';
-        if (uProfile.teamLeadUid || uProfile.teamLeadId) {
-          const tlId = uProfile.teamLeadUid || uProfile.teamLeadId;
-          const tl = allUsersRef.current.find(x => x.uid === tlId);
-          if (tl) teamLeadName = tl.fullName || tl.name || tl.employeeName || '';
-        }
-        let managerName = uProfile.managerName || '';
-        if ((uProfile as any).mappedManagerUid || uProfile.mappedManagerId || uProfile.managerId) {
-          const mId = (uProfile as any).mappedManagerUid || uProfile.mappedManagerId || uProfile.managerId;
-          const m = allUsersRef.current.find(x => x.uid === mId);
-          if (m) managerName = m.fullName || m.name || m.employeeName || '';
-        }
-
-        const reportingMgrName = managerName || teamLeadName || uProfile.Manager || 'Unassigned';
+        // Dynamically resolve canonical manager and team lead from User Directory
+        const authH = resolveAuthoritativeHierarchy(uProfile, allUsersRef.current);
+        const reportingMgrName = authH.manager !== 'Unassigned' ? authH.manager : (authH.teamLead !== 'Unassigned' ? authH.teamLead : 'Unassigned');
         const formattedDateJoined = uProfile.dateJoined || (uProfile.createdAt ? new Date(uProfile.createdAt).toLocaleDateString() : '');
 
         // Prevent OFFLINE showing for active logged-in user
@@ -459,8 +450,11 @@ export default React.memo(function MyProfileView({ user, allUsers, externalTheme
       });
 
       toast.success(`${fileType.toUpperCase()} uploaded and saved successfully!`, { id: uploadToastId });
-      if (onRefreshAllData) {
-        await onRefreshAllData();
+      if (fileType === 'profile-photo') {
+        await updateUserInRoster({
+          uid: inspectUserId,
+          profilePhotoUrl: downloadUrl
+        });
       }
     } catch (err: any) {
       toast.error(`Upload structure failure: ${err.message || 'Check firestore network connection'}`, { id: uploadToastId });
@@ -529,15 +523,13 @@ export default React.memo(function MyProfileView({ user, allUsers, externalTheme
         const userRef = doc(db, 'employee_master', inspectUserId);
         await updateDoc(userRef, {
           fullName: profile.employeeName,
-          status: liveAccountStatus,
           department: profile.department
         }).catch(() => console.log("Core users syncing skipped - non critical resource"));
 
-        // sync employee_master (already handled above now, but keeping consistency with any other triggers)
+        // sync employee_master
         const masterRef = doc(db, 'employee_master', inspectUserId);
         await setDoc(masterRef, {
           employeeName: profile.employeeName,
-          status: liveAccountStatus,
           department: profile.department,
           lastUpdated: getLiveTimeISO()
         }, { merge: true }).catch(() => {});
@@ -549,9 +541,13 @@ export default React.memo(function MyProfileView({ user, allUsers, externalTheme
       toast.success('Pragmatic Employee Profile successfully aligned!');
       setProfile(prev => ({ ...prev, profileCompletionPercentage: completion }));
       
-      if (onRefreshAllData) {
-        await onRefreshAllData();
-      }
+      await updateUserInRoster({
+        uid: inspectUserId,
+        phone: profile.mobileNumber,
+        profilePhotoUrl: profile.profilePhotoUrl,
+        location: profile.location,
+        process: profile.department
+      });
     } catch (err: any) {
       console.error('Save Profile operation error:', err);
       toast.error(`Error saving secure profile: ${err.message}`);

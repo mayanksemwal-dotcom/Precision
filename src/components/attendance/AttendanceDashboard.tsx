@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo, useDeferredValue, useRef } from 'react';
-import { db, auth, getDocsOptimized, getDocOptimized, handleFirestoreError, OperationType } from '../../lib/firebase';
+import { db, auth, getDocsOptimized, getDocOptimized, getDocsCacheFirst, handleFirestoreError, OperationType } from '../../lib/firebase';
 import { firestoreLogger } from '../../lib/firestoreLogger';
 import { getLiveTime, getLiveTimeISO } from '../../lib/timeSync';
 import { collection, query, getDocs, doc, setDoc, writeBatch, where, orderBy, getDoc, addDoc, onSnapshot, limit, startAfter } from 'firebase/firestore';
@@ -81,6 +81,7 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
   const [hasMore, setHasMore] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const initialFilterApplied = useRef(false);
+  const isSyncingRef = useRef(false);
 
   // Default filter for TLs
   useEffect(() => {
@@ -251,16 +252,44 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
 
   const totalPages = Math.ceil(filteredRecords.length / itemsPerPage);
 
-  // Computed summary
-  const summary = useMemo(() => {
-    const present = filteredRecords.filter(r => r.attendanceStatus === 'Present').length;
-    const halfDay = filteredRecords.filter(r => r.attendanceStatus === 'Half Day').length;
-    const absent = filteredRecords.filter(r => r.attendanceStatus === 'Absent').length;
-    const manualOverrides = filteredRecords.filter(r => r.isManuallyOverridden).length;
-    const total = filteredRecords.length;
-    const attendancePct = total > 0 ? (((present + halfDay * 0.5) / total) * 100).toFixed(1) : 0;
-    return { present, halfDay, absent, attendancePct, manualOverrides };
-  }, [filteredRecords]);
+  const [summary, setSummary] = useState({ present: 0, halfDay: 0, absent: 0, attendancePct: '0.0', manualOverrides: 0 });
+
+  useEffect(() => {
+    const fetchGlobalSummary = async () => {
+      try {
+        const { getCountFromServer, query, collection, where } = await import('firebase/firestore');
+        const { db } = await import('../../lib/firebase');
+        const { startStr, endStr } = getDateRangeStr();
+        
+        const baseQ = query(collection(db, 'attendanceSummary'), 
+          where('attendanceDate', '>=', startStr), 
+          where('attendanceDate', '<=', endStr)
+        );
+
+        const [presentSnap, halfDaySnap, absentSnap] = await Promise.all([
+          getCountFromServer(query(baseQ, where('attendanceStatus', '==', 'Present'))).catch(() => ({ data: () => ({ count: 0 }) })),
+          getCountFromServer(query(baseQ, where('attendanceStatus', '==', 'Half Day'))).catch(() => ({ data: () => ({ count: 0 }) })),
+          getCountFromServer(query(baseQ, where('attendanceStatus', '==', 'Absent'))).catch(() => ({ data: () => ({ count: 0 }) }))
+        ]);
+
+        const present = presentSnap.data().count;
+        const halfDay = halfDaySnap.data().count;
+        const absent = absentSnap.data().count;
+        const total = present + halfDay + absent;
+        const attendancePct = total > 0 ? (((present + halfDay * 0.5) / total) * 100).toFixed(1) : '0.0';
+
+        // For manual overrides, it's optional but we leave it out of the heavy query or compute on client loaded data if preferred.
+        // For simplicity, we compute manual overrides from the loaded filtered records.
+        const manualOverrides = filteredRecords.filter(r => r.isManuallyOverridden).length;
+
+        setSummary({ present, halfDay, absent, attendancePct, manualOverrides });
+      } catch (err) {
+        console.warn('Could not fetch global attendance summary counts', err);
+      }
+    };
+    fetchGlobalSummary();
+  }, [dateRange, customStartDate, customEndDate, filteredRecords.length]);
+
   
   // Edit state
   const [editingRecord, setEditingRecord] = useState<AttendanceSummary | null>(null);
@@ -316,7 +345,7 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
     
     // Fetch logs
     const q = query(collection(db, 'attendanceAuditLogs'), where('attendanceId', '==', r.id), orderBy('timestamp', 'desc'));
-    getDocs(q).then(snap => setAuditLogs(snap.docs.map(d => d.data())));
+    getDocsOptimized(q, 'attendance_audit_logs_' + r.id).then(snap => setAuditLogs(snap.docs.map(d => d.data())));
   };
 
   const allUsersRef = React.useRef(allUsers);
@@ -582,15 +611,6 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
     };
 
     fetchData();
-    
-    // Auto refresh every 30 minutes only if the dashboard is visible
-    const interval = setInterval(() => {
-      if (document.visibilityState === 'visible') {
-        fetchData();
-      }
-    }, 30 * 60 * 1000); 
-
-    return () => clearInterval(interval);
   }, [dateRange, customStartDate, customEndDate, user?.uid, isTopAdmin, isStrictAdminOrManager, isTLRole, forceRefresh]);
 
   const loadData = async () => {
@@ -603,145 +623,41 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
      return 'Absent';
   };
 
-  const silentSyncAttendance = async (startStr: string) => {
-    try {
-      let syncSinceDate = getLiveTime();
-      syncSinceDate.setDate(syncSinceDate.getDate() - 14);
-      if (startStr) {
-        const parsed = new Date(startStr);
-        if (!isNaN(parsed.getTime())) {
-          syncSinceDate = parsed;
-          syncSinceDate.setDate(syncSinceDate.getDate() - 1);
-        }
-      }
-      const syncSinceISO = syncSinceDate.toISOString();
-      const syncSinceDateStr = getISTDateStr(syncSinceDate);
-
-      const shiftsRef = collection(db, 'tmsShifts');
-      const qShifts = query(shiftsRef, where('clockInTime', '>=', syncSinceISO));
-      const shiftsSnap = await getDocsOptimized(qShifts, `silent_sync_shifts_fetch_${syncSinceDateStr}`);
-      
-      const completedShifts = shiftsSnap.docs
-        .map((d: any) => ({ ...d.data(), id: d.id }))
-        .filter((s: any) => s.status === 'COMPLETED' || s.status === 'AUTO_CLOSED' || s.status === 'COMPLETED_FORCED');
-
-      if (completedShifts.length === 0) return;
-
-      const attSnap = await getDocsOptimized(query(collection(db, 'attendanceSummary'), where('attendanceDate', '>=', syncSinceDateStr)), `silent_sync_existing_att_fetch_${syncSinceDateStr}`);
-      const existingShiftIds = new Set(attSnap.docs.map((d: any) => d.data().shiftId));
-
-      // Use central config to ensure correct threshold calculations (Phase 5)
-      let activeConfig = config;
-      if (centralAttendance) {
-        activeConfig = {
-          presentThreshold: centralAttendance.presentThreshold ?? 480,
-          halfDayThreshold: centralAttendance.halfDayThreshold ?? 240,
-          countBreakTime: centralAttendance.countBreakTime ?? false
-        };
-      }
-
-      let batch = writeBatch(db);
-      let newCount = 0;
-      let batchCount = 0;
-
-      for (const shift of completedShifts as any[]) {
-        if (existingShiftIds.has(shift.id)) continue; 
-
-        const startMs = new Date(shift.clockInTime).getTime();
-        const endMs = shift.clockOutTime ? new Date(shift.clockOutTime).getTime() : startMs;
-        
-        let prodMs = 0;
-        let breakMs = 0;
-        (shift.activities || []).forEach((act: any) => {
-          const aStart = new Date(act.startTime).getTime();
-          const aEnd = act.endTime ? new Date(act.endTime).getTime() : endMs;
-          const dur = Math.max(0, aEnd - aStart);
-          const actName = (act.name || '').toLowerCase();
-          const isProductive = act.type === 'productive' || 
-                       ['meeting', 'coaching', 'training', 'alignment'].some(k => (act.name || '').toLowerCase().includes(k));
-          if (isProductive) prodMs += dur;
-          else breakMs += dur;
-        });
-
-        let totalMins = Math.floor(prodMs / 60000);
-        if (activeConfig.countBreakTime) {
-          totalMins += Math.floor(breakMs / 60000);
-        }
-
-        const dateStr = shift.clockInTime.split('T')[0];
-        const isOvernight = shift.clockOutTime ? (shift.clockInTime.split('T')[0] !== shift.clockOutTime.split('T')[0]) : false;
-
-        const summary: AttendanceSummary = {
-          id: shift.id,
-          shiftId: shift.id,
-          userId: shift.userId,
-          employeeName: shift.userName || shift.userEmail,
-          employeeEmail: shift.userEmail,
-          employeeId: shift.employeeId || '',
-          process: shift.process || 'N/A',
-          mappedTL: shift.mappedTL || 'N/A',
-          mappedManager: shift.mappedManager || 'N/A',
-          attendanceDate: dateStr,
-          attendanceStatus: calculateStatus(totalMins, activeConfig),
-          productiveMinutes: totalMins,
-          totalBreakMinutes: Math.floor(breakMs / 60000),
-          sessionStart: shift.clockInTime,
-          sessionEnd: shift.clockOutTime || shift.clockInTime,
-          generatedBySystem: true,
-          isOvernight
-        };
-
-        const attDocRef = doc(db, 'attendanceSummary', shift.id);
-        batch.set(attDocRef, summary);
-        newCount++;
-        batchCount++;
-
-        if (batchCount >= 450) {
-            await batch.commit();
-            batch = writeBatch(db);
-            batchCount = 0;
-        }
-      }
-
-      if (batchCount > 0) {
-        await batch.commit();
-      }
-
-      if (newCount > 0) {
-        console.log(`[SILENT AUTO SYNC] Successfully auto-synchronized ${newCount} new attendance records.`);
-        fetchAttendanceRecords(false);
-      }
-    } catch (e) {
-      console.error('[SILENT AUTO SYNC ERROR]', e);
-    }
-  };
-
   const handleSyncAttendance = async () => {
+    if (isSyncingRef.current || syncing) {
+      console.log('[ATTENDANCE_SYNC] Sync already in-flight, skipping manual call.');
+      return;
+    }
+    isSyncingRef.current = true;
     setSyncing(true);
     try {
-      // 1. Fetch completed shifts that might not have attendance
+      // 1. Fetch completed shifts from last 2 days that might not have attendance
       const shiftsRef = collection(db, 'tmsShifts');
-      const lastWeek = new Date();
-      lastWeek.setDate(lastWeek.getDate() - 14); // Sync last 14 days
+      const twoDaysAgo = getLiveTime();
+      twoDaysAgo.setDate(twoDaysAgo.getDate() - 2); // Sync last 2 days
+      // Stabilize boundary to start of the day to ensure cache hits
+      twoDaysAgo.setHours(0, 0, 0, 0);
+      const twoDaysAgoISO = twoDaysAgo.toISOString();
+      const twoDaysAgoDateStr = getISTDateStr(twoDaysAgo);
       
-      // Use single field filter to avoid composite index requirement
-      const qShifts = query(shiftsRef, where('clockInTime', '>=', lastWeek.toISOString()));
-      const shiftsSnap = await getDocs(qShifts);
+      // Use single field filter to avoid composite index requirement, with IndexedDB persistence optimization
+      const qShifts = query(shiftsRef, where('clockInTime', '>=', twoDaysAgoISO));
+      const shiftsSnap = await getDocsCacheFirst(qShifts, 'attendanceDashboardSync_tmsShifts');
       firestoreLogger.trackRead('attendance_sync_shifts_fetch', shiftsSnap.size);
+      console.info(`[ATTENDANCE_SYNC_TRACE] function=handleSyncAttendance syncRange="last 2 days" (${twoDaysAgoDateStr} to ${getISTDateStr(getLiveTime())}) docsRead=${shiftsSnap.size}`);
       
-      // Filter COMPLETED and AUTO_CLOSED in memory
+      // Filter COMPLETED, AUTO_CLOSED, and COMPLETED_FORCED in memory
       const completedShifts = shiftsSnap.docs
         .map(d => ({ ...d.data(), id: d.id }))
-        .filter((s: any) => s.status === 'COMPLETED' || s.status === 'AUTO_CLOSED');
+        .filter((s: any) => s.status === 'COMPLETED' || s.status === 'AUTO_CLOSED' || s.status === 'COMPLETED_FORCED');
 
       if (completedShifts.length === 0) {
-        toast.info('No finalized shifts found to sync in the requested period.');
+        toast.info('No finalized shifts found to sync in the requested 2-day period.');
         return;
       }
 
       // Fetch existing attendances to prevent duplicate logic
-      const lastWeekStr = getISTDateStr(lastWeek);
-      const attSnap = await getDocs(query(collection(db, 'attendanceSummary'), where('attendanceDate', '>=', lastWeekStr)));
+      const attSnap = await getDocsOptimized(query(collection(db, 'attendanceSummary'), where('attendanceDate', '>=', twoDaysAgoDateStr)), 'attendanceSummary_sync_2days');
       firestoreLogger.trackRead('attendance_sync_existing_summary_fetch', attSnap.size);
       const existingShiftIds = new Set(attSnap.docs.map(d => d.data().shiftId));
 
@@ -823,6 +739,7 @@ export default function AttendanceDashboard({ user, allUsers }: { user: UserProf
       console.error(e);
       toast.error('Failed to synchronize attendance');
     } finally {
+      isSyncingRef.current = false;
       setSyncing(false);
     }
   };

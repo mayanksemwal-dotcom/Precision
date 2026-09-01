@@ -1,10 +1,12 @@
 import React, { useState, useMemo, useEffect } from 'react';
-import { Users, Link2, Search, CheckSquare, Square, RefreshCcw, ChevronsRight, Download, Upload, FileSpreadsheet, Sparkles, Check, AlertCircle, ArrowRight } from 'lucide-react';
+import { Users, Link2, Search, CheckSquare, Square, ChevronsRight, Download, Upload, FileSpreadsheet, Sparkles, Check, AlertCircle, ArrowRight } from 'lucide-react';
 import { db } from '../../lib/firebase';
-import { doc, writeBatch, collection, getDocs, getDoc } from 'firebase/firestore';
+import { doc, writeBatch, getDoc } from 'firebase/firestore';
 import { toast } from 'sonner';
 import { UserPicker } from '../UserPicker';
-import { getManagerOfManager } from '../../views/TMSView';
+import { useRoster } from '../../contexts/RosterContext';
+import { OrgTree } from '../../lib/hierarchy';
+import { safeStorage } from '../../lib/safeStorage';
 
 interface TeamProcessMappingSubViewProps {
   allUsers: any[];
@@ -19,6 +21,7 @@ export const TeamProcessMappingSubView: React.FC<TeamProcessMappingSubViewProps>
   onRefresh, 
   logAdminEvent 
 }) => {
+  const { updateMultipleUsersInRoster } = useRoster();
   const [search, setSearch] = useState('');
   const [roleGroup, setRoleGroup] = useState('');
   
@@ -27,8 +30,6 @@ export const TeamProcessMappingSubView: React.FC<TeamProcessMappingSubViewProps>
 
   // Mappings values
   const [targetTL, setTargetTL] = useState('');
-  const [targetManager, setTargetManager] = useState('');
-  const [targetManagerOfManager, setTargetManagerOfManager] = useState('');
   const [targetProcess, setTargetProcess] = useState('');
   const [registeredProcesses, setRegisteredProcesses] = useState<string[]>([]);
 
@@ -45,9 +46,8 @@ export const TeamProcessMappingSubView: React.FC<TeamProcessMappingSubViewProps>
         if (snap.exists() && Array.isArray(snap.data()?.list)) {
           list = snap.data()?.list;
         }
-        // Include default dynamic fallback if empty
         if (list.length === 0) {
-            list = ['HITL', 'OQC', 'SOP Training', 'QA Review', 'Team Alignment'];
+          list = ['HITL', 'OQC', 'SOP Training', 'QA Review', 'Team Alignment'];
         }
         const blocked = ['mpqc', 'mpqc-fk', 'mpqc-sh'];
         list = list.filter(p => !blocked.includes((p || '').toLowerCase().trim()));
@@ -59,16 +59,6 @@ export const TeamProcessMappingSubView: React.FC<TeamProcessMappingSubViewProps>
     fetchRegisteredProcesses();
   }, []);
 
-  // Lists
-  const teamLeads = useMemo(() => allUsers.filter(u => {
-    const r = (u.role || '').toUpperCase().trim();
-    return ['TEAM_LEAD', 'STL', 'QTL', 'OPS_TL', 'TEAM LEAD', 'TRAINER_TL', 'TRAINER TL', 'OPS TL'].includes(r);
-  }), [allUsers]);
-  const managers = useMemo(() => allUsers.filter(u => {
-    const r = (u.role || '').toUpperCase();
-    return r === 'MANAGER' || r === 'ADMIN';
-  }), [allUsers]);
-  
   const filteredUsers = useMemo(() => {
     return allUsers.filter(u => {
       const q = search.toLowerCase();
@@ -112,25 +102,43 @@ export const TeamProcessMappingSubView: React.FC<TeamProcessMappingSubViewProps>
     setSelection(s);
   };
 
-  // Execution Batch Commit mapping
+  // Execution Batch Commit mapping with Cycle Protection & Self-Mapping Validation
   const handleExecuteAlignments = async () => {
     if (selection.size === 0) {
       toast.error('Please select users from the left pane table first.');
       return;
     }
-    if (!targetTL && !targetManager && !targetManagerOfManager && !targetProcess) {
-      toast.error('Please assign at least one Alignment target (Team Lead, Manager, Manager of Manager, or Process) on the right pane.');
+    if (!targetTL && !targetProcess) {
+      toast.error('Please assign at least one Alignment target (Supervisor or Process) on the right pane.');
       return;
+    }
+
+    const selectedList = allUsers.filter(u => selection.has(u.uid));
+    const mappedTLUser = targetTL ? allUsers.find(tl => tl.uid === targetTL) : null;
+
+    // 1. Self-Mapping Protection
+    if (targetTL && selectedList.some(u => u.uid === targetTL)) {
+      toast.error('A user cannot be mapped to themselves as supervisor.');
+      return;
+    }
+
+    // 2. Cycle Protection
+    if (targetTL) {
+      const tree = new OrgTree(allUsers);
+      for (const u of selectedList) {
+        const descendants = tree.getDescendants(u.uid);
+        if (descendants.has(targetTL)) {
+          const uName = u.fullName || u.name || u.employeeName || 'Selected user';
+          const parentName = mappedTLUser ? (mappedTLUser.fullName || mappedTLUser.name || 'target supervisor') : 'target supervisor';
+          toast.error(`Circular hierarchy detected! Cannot set ${parentName} as supervisor of ${uName} because ${uName} is in their upline.`);
+          return;
+        }
+      }
     }
 
     try {
       const batch = writeBatch(db);
-      const selectedList = allUsers.filter(u => selection.has(u.uid));
-
-      // Fetch actual detail objects for mapping
-      const mappedTLUser = targetTL ? allUsers.find(tl => tl.uid === targetTL) : null;
-      const mappedManagerUser = targetManager ? allUsers.find(m => m.uid === targetManager) : null;
-      const mappedManagerOfManagerUser = targetManagerOfManager ? allUsers.find(mom => mom.uid === targetManagerOfManager) : null;
+      const isManagerParent = mappedTLUser && ['MANAGER', 'ADMIN', 'OPS_HEAD', 'DIRECTOR', 'VP', 'OM', 'AM', 'DEPUTY_MANAGER'].some(r => (mappedTLUser.role || '').toString().toUpperCase().includes(r));
 
       selectedList.forEach(u => {
         const uRef = doc(db, 'users', u.uid);
@@ -138,22 +146,30 @@ export const TeamProcessMappingSubView: React.FC<TeamProcessMappingSubViewProps>
           lastModifiedAt: new Date().toISOString()
         };
 
-        if (targetTL) {
+        if (targetTL && mappedTLUser) {
+          const parentName = mappedTLUser.fullName || mappedTLUser.name || mappedTLUser.employeeName || '';
+          const parentEmail = mappedTLUser.email || '';
+
           payload.teamLeadId = targetTL;
-          payload.teamLeadName = mappedTLUser ? (mappedTLUser.fullName || mappedTLUser.name || '') : '';
-        }
+          payload.teamLeadUid = targetTL;
+          payload.teamLeadName = parentName;
+          payload.teamLeadEmail = parentEmail;
 
-        if (targetManager) {
-          payload.mappedManagerId = targetManager;
-          payload.mappedManagerName = mappedManagerUser ? (mappedManagerUser.fullName || mappedManagerUser.name || '') : '';
-          payload.Manager = mappedManagerUser ? (mappedManagerUser.fullName || mappedManagerUser.name || '') : '';
-        }
+          if (isManagerParent) {
+            payload.mappedManagerId = targetTL;
+            payload.mappedManagerUid = targetTL;
+            payload.mappedManagerName = parentName;
+            payload.mappedManagerEmail = parentEmail;
+            payload.managerId = targetTL;
+            payload.managerName = parentName;
+            payload.Manager = parentName;
+          }
 
-        if (targetManagerOfManager) {
-          payload.managerOfManagerId = targetManagerOfManager;
-          payload.managerOfManagerName = mappedManagerOfManagerUser ? (mappedManagerOfManagerUser.fullName || mappedManagerOfManagerUser.name || '') : '';
-          payload.mappedManagerOfManagerId = targetManagerOfManager;
-          payload.mappedManagerOfManagerName = mappedManagerOfManagerUser ? (mappedManagerOfManagerUser.fullName || mappedManagerOfManagerUser.name || '') : '';
+          // Clear legacy manager-of-manager fields
+          payload.managerOfManagerId = '';
+          payload.managerOfManagerName = '';
+          payload.mappedManagerOfManagerId = '';
+          payload.mappedManagerOfManagerName = '';
         }
 
         if (targetProcess) {
@@ -162,7 +178,7 @@ export const TeamProcessMappingSubView: React.FC<TeamProcessMappingSubViewProps>
 
         batch.update(uRef, payload);
 
-        // SYNC Team Mappings (Ongoing Auto-Sync)
+        // SYNC Team Mappings
         const mappingRef = doc(db, 'teamMappings', u.uid);
         batch.set(mappingRef, {
           userId: u.uid,
@@ -171,8 +187,8 @@ export const TeamProcessMappingSubView: React.FC<TeamProcessMappingSubViewProps>
           teamLeadName: payload.teamLeadName || u.teamLeadName || '',
           managerId: payload.mappedManagerId || u.mappedManagerId || '',
           managerName: payload.mappedManagerName || u.mappedManagerName || '',
-          managerOfManagerId: payload.managerOfManagerId || u.managerOfManagerId || '',
-          managerOfManagerName: payload.managerOfManagerName || u.managerOfManagerName || '',
+          managerOfManagerId: '',
+          managerOfManagerName: '',
           process: payload.process || u.process || '',
           lastUpdated: new Date().toISOString()
         }, { merge: true });
@@ -184,8 +200,8 @@ export const TeamProcessMappingSubView: React.FC<TeamProcessMappingSubViewProps>
           teamLeadName: payload.teamLeadName || u.teamLeadName || '',
           managerId: payload.mappedManagerId || u.mappedManagerId || '',
           managerName: payload.mappedManagerName || u.mappedManagerName || '',
-          managerOfManagerId: payload.managerOfManagerId || u.managerOfManagerId || '',
-          managerOfManagerName: payload.managerOfManagerName || u.managerOfManagerName || '',
+          managerOfManagerId: '',
+          managerOfManagerName: '',
           process: payload.process || u.process || '',
           lastUpdated: new Date().toISOString()
         }, { merge: true });
@@ -200,26 +216,43 @@ export const TeamProcessMappingSubView: React.FC<TeamProcessMappingSubViewProps>
       });
 
       await batch.commit();
-      toast.success(`Broadened alignments and synchronized hierarchy for ${selection.size} employee directories!`);
+      toast.success(`Synchronized operational hierarchy for ${selection.size} employees!`);
       logAdminEvent(
         'Staff Network Reconfigured',
         `${selection.size} users`,
         'Varying Mappings',
-        `${targetTL ? 'TL: ' + targetTL : ''}, ${targetManager ? 'Mgr: ' + targetManager : ''}, ${targetManagerOfManager ? 'MoM: ' + targetManagerOfManager : ''}, ${targetProcess ? 'Proc: ' + targetProcess : ''}`
+        `${targetTL ? 'Supervisor: ' + targetTL : ''}, ${targetProcess ? 'Proc: ' + targetProcess : ''}`
       );
       
       setSelection(new Set());
       setTargetTL('');
-      setTargetManager('');
-      setTargetManagerOfManager('');
       setTargetProcess('');
-      onRefresh();
+      
+      const localUpdates = selectedList.map(u => ({
+        uid: u.uid,
+        teamLeadId: targetTL || u.teamLeadId,
+        teamLeadUid: targetTL || u.teamLeadUid,
+        teamLeadName: mappedTLUser ? (mappedTLUser.fullName || mappedTLUser.name || '') : u.teamLeadName,
+        mappedManagerId: isManagerParent ? targetTL : u.mappedManagerId,
+        mappedManagerUid: isManagerParent ? targetTL : u.mappedManagerUid,
+        mappedManagerName: isManagerParent && mappedTLUser ? (mappedTLUser.fullName || mappedTLUser.name || '') : u.mappedManagerName,
+        managerId: isManagerParent ? targetTL : u.managerId,
+        managerName: isManagerParent && mappedTLUser ? (mappedTLUser.fullName || mappedTLUser.name || '') : u.managerName,
+        process: targetProcess || u.process
+      }));
+
+      await updateMultipleUsersInRoster(localUpdates);
+      try {
+        await safeStorage.clearAllIndexedDBByPrefix('subordinates_');
+      } catch (e) {
+        console.warn('Failed clearing subordinate caches:', e);
+      }
     } catch (err) {
       toast.error('Alignment writing failed.');
     }
   };
 
-  // CSV parser for flexible layouts (supporting quotes, etc)
+  // CSV parser for flexible layouts
   const parseCSVRows = (text: string) => {
     const lines = text.split(/\r?\n/).map(line => line.trim()).filter(line => line.length > 0);
     if (lines.length < 2) {
@@ -268,7 +301,7 @@ export const TeamProcessMappingSubView: React.FC<TeamProcessMappingSubViewProps>
   // Bulk CSV Export of Team Mappings
   const handleExportCSV = () => {
     const csvRows = [
-      ['Employee Name', 'Employee Email', 'Designation', 'Mapped TL Name', 'Mapped TL Email/ID', 'Mapped Manager Name', 'Mapped Manager Email/ID', 'Mapped Manager of Manager Name', 'Mapped Manager of Manager Email/ID', 'Current Process']
+      ['Employee Name', 'Employee Email', 'Designation', 'Supervisor Name', 'Supervisor Email/ID', 'Current Process']
     ];
 
     allUsers.forEach(u => {
@@ -276,12 +309,8 @@ export const TeamProcessMappingSubView: React.FC<TeamProcessMappingSubViewProps>
         u.fullName || u.name || u.employeeName || '',
         u.email || '',
         u.role || '',
-        u.teamLeadName || 'Unassigned',
-        u.teamLeadId || '',
-        u.mappedManagerName || u.Manager || 'Unassigned',
-        u.mappedManagerId || '',
-        u.managerOfManagerName || getManagerOfManager(u, allUsers) || 'Unassigned',
-        u.managerOfManagerId || '',
+        u.teamLeadName || u.mappedManagerName || 'Unassigned',
+        u.teamLeadId || u.mappedManagerId || '',
         u.process || 'N/A'
       ]);
     });
@@ -298,7 +327,7 @@ export const TeamProcessMappingSubView: React.FC<TeamProcessMappingSubViewProps>
     toast.success('Successfully exported current team mappings to CSV!');
   };
 
-  // Bulk CSV Import alignment implementation
+  // Bulk CSV Import alignment implementation with Cycle Validation
   const handleCSVImportAlignments = async () => {
     if (!bulkInputText.trim()) {
       toast.error('Please paste or load CSV data first.');
@@ -315,6 +344,7 @@ export const TeamProcessMappingSubView: React.FC<TeamProcessMappingSubViewProps>
 
       const resolvedUpdates: any[] = [];
       const skippedRows: any[] = [];
+      const tree = new OrgTree(allUsers);
 
       rows.forEach((row, rowIndex) => {
         let targetUser: any = null;
@@ -345,79 +375,35 @@ export const TeamProcessMappingSubView: React.FC<TeamProcessMappingSubViewProps>
           return;
         }
 
-        // Resolve TL
-        let tlUser: any = null;
-        const tlKey = Object.keys(row).find(k => k.includes('lead') || k.includes('supervisor') || k === 'tl');
-        if (tlKey && row[tlKey]) {
-          const tlVal = row[tlKey].toLowerCase().trim();
-          tlUser = allUsers.find(u => {
-            const role = (u.role || '').toUpperCase().trim();
-            const isTLRole = ['TEAM_LEAD', 'STL', 'OPS_TL', 'QTL', 'TRAINER_TL', 'TEAM LEAD'].includes(role);
-            if (!isTLRole) return false;
-            return (u.email || '').toLowerCase().trim() === tlVal ||
-                   (u.fullName || '').toLowerCase().trim() === tlVal ||
-                   (u.name || '').toLowerCase().trim() === tlVal ||
-                   (u.employeeId || '').toLowerCase().trim() === tlVal;
+        // Resolve Supervisor (TL or Manager)
+        let supervisorUser: any = null;
+        const supKey = Object.keys(row).find(k => k.includes('lead') || k.includes('supervisor') || k.includes('manager') || k === 'tl' || k === 'mgr');
+        if (supKey && row[supKey]) {
+          const supVal = row[supKey].toLowerCase().trim();
+          supervisorUser = allUsers.find(u => {
+            return (u.email || '').toLowerCase().trim() === supVal ||
+                   (u.fullName || '').toLowerCase().trim() === supVal ||
+                   (u.name || '').toLowerCase().trim() === supVal ||
+                   (u.employeeId || '').toLowerCase().trim() === supVal;
           });
-          if (!tlUser) {
-            tlUser = allUsers.find(u => {
-              const role = (u.role || '').toUpperCase().trim();
-              const isTLRole = ['TEAM_LEAD', 'STL', 'OPS_TL', 'QTL', 'TRAINER_TL', 'TEAM LEAD'].includes(role);
+          if (!supervisorUser) {
+            supervisorUser = allUsers.find(u => {
               const uName = (u.fullName || u.name || '').toLowerCase().trim();
-              return isTLRole && (uName.includes(tlVal) || tlVal.includes(uName));
+              return uName && (uName.includes(supVal) || supVal.includes(uName));
             });
           }
         }
 
-        // Resolve Manager
-        let mgrUser: any = null;
-        const mgrKey = Object.keys(row).find(k => 
-          (k.includes('manager') || k.includes('executive') || k.includes('mgr')) && 
-          !k.includes('of') && !k.includes('skip') && !k.includes('mom')
-        );
-        if (mgrKey && row[mgrKey]) {
-          const mgrVal = row[mgrKey].toLowerCase().trim();
-          mgrUser = allUsers.find(u => {
-            const role = (u.role || '').toUpperCase().trim();
-            const isMgrRole = ['MANAGER', 'ADMIN'].includes(role);
-            if (!isMgrRole) return false;
-            return (u.email || '').toLowerCase().trim() === mgrVal ||
-                   (u.fullName || '').toLowerCase().trim() === mgrVal ||
-                   (u.name || '').toLowerCase().trim() === mgrVal ||
-                   (u.employeeId || '').toLowerCase().trim() === mgrVal;
-          });
-          if (!mgrUser) {
-            mgrUser = allUsers.find(u => {
-              const role = (u.role || '').toUpperCase().trim();
-              const isMgrRole = ['MANAGER', 'ADMIN'].includes(role);
-              const uName = (u.fullName || u.name || '').toLowerCase().trim();
-              return isMgrRole && (uName.includes(mgrVal) || mgrVal.includes(uName));
-            });
-          }
+        // Validate Self-Mapping
+        if (supervisorUser && supervisorUser.uid === targetUser.uid) {
+          skippedRows.push({ rowIndex: rowIndex + 2, row, reason: 'Self-mapping rejected (user cannot report to themselves).' });
+          return;
         }
 
-        // Resolve Manager of Manager
-        let momUser: any = null;
-        const momKey = Object.keys(row).find(k => k.includes('ofmanager') || k.includes('skip') || k.includes('mom'));
-        if (momKey && row[momKey]) {
-          const momVal = row[momKey].toLowerCase().trim();
-          momUser = allUsers.find(u => {
-            const role = (u.role || '').toUpperCase().trim();
-            const isMoMRole = ['MANAGER', 'ADMIN'].includes(role);
-            if (!isMoMRole) return false;
-            return (u.email || '').toLowerCase().trim() === momVal ||
-                   (u.fullName || '').toLowerCase().trim() === momVal ||
-                   (u.name || '').toLowerCase().trim() === momVal ||
-                   (u.employeeId || '').toLowerCase().trim() === momVal;
-          });
-          if (!momUser) {
-            momUser = allUsers.find(u => {
-              const role = (u.role || '').toUpperCase().trim();
-              const isMoMRole = ['MANAGER', 'ADMIN'].includes(role);
-              const uName = (u.fullName || u.name || '').toLowerCase().trim();
-              return isMoMRole && (uName.includes(momVal) || momVal.includes(uName));
-            });
-          }
+        // Validate Cycle
+        if (supervisorUser && tree.getDescendants(targetUser.uid).has(supervisorUser.uid)) {
+          skippedRows.push({ rowIndex: rowIndex + 2, row, reason: `Circular hierarchy rejected (${supervisorUser.name} is in ${targetUser.name}'s downline).` });
+          return;
         }
 
         // Resolve Campaign (Process)
@@ -429,47 +415,61 @@ export const TeamProcessMappingSubView: React.FC<TeamProcessMappingSubViewProps>
 
         resolvedUpdates.push({
           user: targetUser,
-          tl: tlUser,
-          mgr: mgrUser,
-          mom: momUser,
+          supervisor: supervisorUser,
           process: processVal
         });
       });
 
       if (resolvedUpdates.length === 0) {
-        toast.error('Zero rows matched existing employee profiles. Check emails/names.');
+        toast.error('Zero rows matched existing employee profiles or passed hierarchy validations.');
+        setImportStats({
+          total: rows.length,
+          resolved: 0,
+          failed: skippedRows.length,
+          updates: skippedRows
+        });
         return;
       }
 
       const batch = writeBatch(db);
       resolvedUpdates.forEach(item => {
         const u = item.user;
+        const sup = item.supervisor;
         const payload: Record<string, any> = { ...u };
 
-        if (item.tl) {
-          payload.teamLeadId = item.tl.uid;
-          payload.teamLeadName = item.tl.fullName || item.tl.name || '';
+        if (sup) {
+          const supName = sup.fullName || sup.name || '';
+          const supEmail = sup.email || '';
+          const isMgr = ['MANAGER', 'ADMIN', 'OPS_HEAD', 'DIRECTOR', 'VP'].some(r => (sup.role || '').toUpperCase().includes(r));
+
+          payload.teamLeadId = sup.uid;
+          payload.teamLeadUid = sup.uid;
+          payload.teamLeadName = supName;
+          payload.teamLeadEmail = supEmail;
+
+          if (isMgr) {
+            payload.mappedManagerId = sup.uid;
+            payload.mappedManagerUid = sup.uid;
+            payload.mappedManagerName = supName;
+            payload.mappedManagerEmail = supEmail;
+            payload.managerId = sup.uid;
+            payload.managerName = supName;
+            payload.Manager = supName;
+          }
+
+          payload.managerOfManagerId = '';
+          payload.managerOfManagerName = '';
         }
-        if (item.mgr) {
-          payload.mappedManagerId = item.mgr.uid;
-          payload.mappedManagerName = item.mgr.fullName || item.mgr.name || '';
-          payload.Manager = item.mgr.fullName || item.mgr.name || '';
-        }
-        if (item.mom) {
-          payload.managerOfManagerId = item.mom.uid;
-          payload.managerOfManagerName = item.mom.fullName || item.mom.name || '';
-          payload.mappedManagerOfManagerId = item.mom.uid;
-          payload.mappedManagerOfManagerName = item.mom.fullName || item.mom.name || '';
-        }
+
         if (item.process) {
           payload.process = item.process;
         }
 
         payload.lastUpdated = new Date().toISOString();
 
-        batch.set(doc(db, 'users', u.uid), payload);
+        batch.set(doc(db, 'users', u.uid), payload, { merge: true });
 
-        // SYNC Team Mappings (Ongoing Auto-Sync)
+        // SYNC Team Mappings
         const mappingRef = doc(db, 'teamMappings', u.uid);
         batch.set(mappingRef, {
           userId: u.uid,
@@ -478,8 +478,8 @@ export const TeamProcessMappingSubView: React.FC<TeamProcessMappingSubViewProps>
           teamLeadName: payload.teamLeadName || u.teamLeadName || '',
           managerId: payload.mappedManagerId || u.mappedManagerId || '',
           managerName: payload.mappedManagerName || u.mappedManagerName || '',
-          managerOfManagerId: payload.managerOfManagerId || u.managerOfManagerId || '',
-          managerOfManagerName: payload.managerOfManagerName || u.managerOfManagerName || '',
+          managerOfManagerId: '',
+          managerOfManagerName: '',
           process: payload.process || u.process || '',
           lastUpdated: new Date().toISOString()
         }, { merge: true });
@@ -491,8 +491,8 @@ export const TeamProcessMappingSubView: React.FC<TeamProcessMappingSubViewProps>
           teamLeadName: payload.teamLeadName || u.teamLeadName || '',
           managerId: payload.mappedManagerId || u.mappedManagerId || '',
           managerName: payload.mappedManagerName || u.mappedManagerName || '',
-          managerOfManagerId: payload.managerOfManagerId || u.managerOfManagerId || '',
-          managerOfManagerName: payload.managerOfManagerName || u.managerOfManagerName || '',
+          managerOfManagerId: '',
+          managerOfManagerName: '',
           process: payload.process || u.process || '',
           lastUpdated: new Date().toISOString()
         }, { merge: true });
@@ -523,7 +523,21 @@ export const TeamProcessMappingSubView: React.FC<TeamProcessMappingSubViewProps>
         failed: skippedRows.length,
         updates: skippedRows
       });
-      onRefresh();
+
+      const localBulkUpdates = resolvedUpdates.map(item => ({
+        uid: item.user.uid,
+        teamLeadId: item.supervisor ? item.supervisor.uid : item.user.teamLeadId,
+        teamLeadUid: item.supervisor ? item.supervisor.uid : item.user.teamLeadUid,
+        teamLeadName: item.supervisor ? (item.supervisor.fullName || item.supervisor.name) : item.user.teamLeadName,
+        process: item.process || item.user.process
+      }));
+
+      await updateMultipleUsersInRoster(localBulkUpdates);
+      try {
+        await safeStorage.clearAllIndexedDBByPrefix('subordinates_');
+      } catch (e) {
+        console.warn('Failed clearing subordinate caches:', e);
+      }
     } catch (err: any) {
       toast.error(`Import parsing/writing error: ${err.message || 'System error'}`);
     }
@@ -536,7 +550,7 @@ export const TeamProcessMappingSubView: React.FC<TeamProcessMappingSubViewProps>
   return (
     <div className="space-y-6">
       <div className={cardClass}>
-        {/* Header section with Mapping mode choices */}
+        {/* Header section */}
         <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 mb-6 border-b border-slate-100 dark:border-slate-800 pb-5">
           <div className="flex items-center gap-2.5">
             <div className="p-2 bg-indigo-500/10 rounded-xl text-indigo-500">
@@ -544,7 +558,7 @@ export const TeamProcessMappingSubView: React.FC<TeamProcessMappingSubViewProps>
             </div>
             <div>
               <h3 className="text-base font-extrabold text-slate-800 dark:text-white leading-tight">Team Alignments & Process Mapping</h3>
-              <p className="text-xs text-slate-400 mt-0.5">Configure operational hierarchies: map supervisors, managers, managers of managers, and campaign workflows.</p>
+              <p className="text-xs text-slate-400 mt-0.5">Configure operational hierarchies: map direct supervisors, team leads, managers, and campaign workflows.</p>
             </div>
           </div>
 
@@ -603,11 +617,12 @@ export const TeamProcessMappingSubView: React.FC<TeamProcessMappingSubViewProps>
                     <option value="QA">QAs only</option>
                     <option value="TEAM LEAD">Team Leads only</option>
                     <option value="SME">SMEs only</option>
+                    <option value="MANAGER">Managers only</option>
                   </select>
                 </div>
               </div>
 
-              {/* Micro Selection table */}
+              {/* Selection table */}
               <div className="max-h-[380px] overflow-y-auto border border-slate-205 dark:border-slate-800 rounded-xl shadow-inner">
                 <table className="w-full text-left text-xs border-collapse">
                   <thead className={adminTheme === 'dark' ? 'bg-slate-900 text-slate-300 sticky top-0 border-b border-slate-800' : 'bg-slate-50 text-slate-600 sticky top-0 border-b border-slate-150'}>
@@ -623,9 +638,7 @@ export const TeamProcessMappingSubView: React.FC<TeamProcessMappingSubViewProps>
                       </th>
                       <th className="p-3">Employee Name</th>
                       <th className="p-3">Designation</th>
-                      <th className="p-3">Mapped TL</th>
-                      <th className="p-3">Mapped Manager</th>
-                      <th className="p-3">Manager of Manager</th>
+                      <th className="p-3">Direct Supervisor</th>
                       <th className="p-3">Process</th>
                     </tr>
                   </thead>
@@ -653,16 +666,14 @@ export const TeamProcessMappingSubView: React.FC<TeamProcessMappingSubViewProps>
                               </div>
                             </td>
                             <td className="p-3"><span className="text-[10px] font-semibold bg-indigo-500/15 text-indigo-400 px-1.5 py-0.5 rounded uppercase tracking-wider">{u.role}</span></td>
-                            <td className="p-3 font-medium opacity-85 text-slate-600 dark:text-slate-300">{u.teamLeadName || 'Unassigned'}</td>
-                            <td className="p-3 font-medium opacity-85 text-slate-600 dark:text-slate-300">{u.mappedManagerName || u.Manager || 'Unassigned'}</td>
-                            <td className="p-3 font-medium opacity-85 text-slate-600 dark:text-slate-300">{u.managerOfManagerName || getManagerOfManager(u, allUsers) || 'Unassigned'}</td>
+                            <td className="p-3 font-medium opacity-85 text-slate-600 dark:text-slate-300">{u.teamLeadName || u.mappedManagerName || 'Unassigned'}</td>
                             <td className="p-3 font-mono font-bold opacity-85 text-emerald-500 dark:text-emerald-400">{u.process || 'N/A'}</td>
                           </tr>
                         );
                       })
                     ) : (
                       <tr>
-                        <td colSpan={7} className="p-8 text-center text-slate-450 font-medium">No directory entries matched the search filters.</td>
+                        <td colSpan={5} className="p-8 text-center text-slate-450 font-medium">No directory entries matched the search filters.</td>
                       </tr>
                     )}
                   </tbody>
@@ -676,33 +687,13 @@ export const TeamProcessMappingSubView: React.FC<TeamProcessMappingSubViewProps>
                 <span className="text-xs font-black uppercase tracking-wider text-slate-500">2. Apply Mappings</span>
               </div>
 
-              {/* Assign TL */}
+              {/* Assign Supervisor (Team Lead or Manager) */}
               <UserPicker 
-                label="Map to Supervisor (Team Lead)"
+                label="Map to Supervisor (Team Lead / Manager)"
                 onSelect={(u) => setTargetTL(u.uid)}
                 selectedUserId={targetTL}
-                placeholder="Select supervisor..."
-                roleFilter={['Team Lead', 'TEAM LEAD', 'STL', 'OPS_TL', 'QTL', 'TRAINER_TL', 'TEAM_LEAD', 'OPS_TEAM_LEAD', 'TEAM_LEADER']}
-                allUsers={allUsers}
-              />
-
-              {/* Assign Manager */}
-              <UserPicker 
-                label="Map to Executive (Manager)"
-                onSelect={(u) => setTargetManager(u.uid)}
-                selectedUserId={targetManager}
-                placeholder="Select executive..."
-                roleFilter={['MANAGER', 'ADMIN']}
-                allUsers={allUsers}
-              />
-
-              {/* Assign Manager of Manager */}
-              <UserPicker 
-                label="Map to Executive Leader (Manager of Manager)"
-                onSelect={(u) => setTargetManagerOfManager(u.uid)}
-                selectedUserId={targetManagerOfManager}
-                placeholder="Select manager of manager..."
-                roleFilter={['MANAGER', 'ADMIN']}
+                placeholder="Search supervisor or manager..."
+                roleFilter={['Team Lead', 'TEAM LEAD', 'STL', 'OPS_TL', 'QTL', 'TRAINER_TL', 'TEAM_LEAD', 'OPS_TEAM_LEAD', 'TEAM_LEADER', 'MANAGER', 'ADMIN', 'OPS_HEAD', 'ASSISTANT_MANAGER', 'AM', 'DEPUTY_MANAGER', 'SME']}
                 allUsers={allUsers}
               />
 
@@ -744,20 +735,14 @@ export const TeamProcessMappingSubView: React.FC<TeamProcessMappingSubViewProps>
               <div className="text-xs space-y-1">
                 <h4 className="font-extrabold uppercase tracking-tight text-[11px]">Dynamic Column-Flexible CSV Import Engine</h4>
                 <p className="opacity-90">
-                  Bulk align employee reporting lines easily. The CSV engine automatically resolves records using <strong>Email, Full Name, or Employee ID</strong>. Match columns using simple descriptors like:
+                  Bulk align employee reporting lines easily. The CSV engine automatically resolves records using <strong>Email, Full Name, or Employee ID</strong>. Match columns using simple descriptors:
                 </p>
                 <div className="grid grid-cols-2 gap-4 mt-2 font-mono text-[10px] bg-slate-905/10 p-2 rounded-lg text-slate-500 dark:text-slate-400">
                   <div>
                     <strong>• Target Employee:</strong> email, employeeemail, employee id, name
                   </div>
                   <div>
-                    <strong>• Supervisor/TL:</strong> team lead, supervisor, tl
-                  </div>
-                  <div>
-                    <strong>• Manager:</strong> manager, executive, mgr
-                  </div>
-                  <div>
-                    <strong>• Manager of Manager:</strong> manager of manager, skip-level, mom
+                    <strong>• Supervisor/Manager:</strong> supervisor, team lead, manager, tl, mgr
                   </div>
                 </div>
               </div>
@@ -806,7 +791,7 @@ export const TeamProcessMappingSubView: React.FC<TeamProcessMappingSubViewProps>
                     setBulkInputText(e.target.value);
                     if (importStats) setImportStats(null);
                   }}
-                  placeholder={`Employee Email,Mapped TL,Mapped Manager,Manager of Manager,Process&#10;akshit@bergtechnologies.co.in,Mayank Semwal,John Doe,Sarah Smith,HITL&#10;assessor.one@bergtechnologies.co.in,Mayank Semwal,John Doe,Sarah Smith,MPQC`}
+                  placeholder={`Employee Email,Supervisor,Process&#10;akshit@bergtechnologies.co.in,Mayank Semwal,HITL&#10;assessor.one@bergtechnologies.co.in,Harak Singh,OQC`}
                   className={`w-full text-xs p-4 font-mono border rounded-2xl focus:outline-none focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-500 shadow-inner ${
                     adminTheme === 'dark' ? 'bg-slate-905 border-slate-800 text-slate-100' : 'bg-slate-50 text-slate-800 border-slate-200'
                   }`}
@@ -837,7 +822,7 @@ export const TeamProcessMappingSubView: React.FC<TeamProcessMappingSubViewProps>
                       <div className="space-y-1.5 max-h-36 overflow-y-auto pr-1">
                         <div className="text-[10px] font-bold text-slate-450 uppercase flex items-center gap-1"><AlertCircle size={11} className="text-rose-455" /> Skipped Rows Breakdown:</div>
                         {importStats.updates.map((err, idx) => (
-                          <div key={idx} className="flex justify-between items-center text-[10px] bg-red-500/5 border border-red-500/10 p-1.5 rounded text-rose-400">
+                          <div key={`${err.rowIndex}_${err.row.email || err.row.name || ''}_${idx}`} className="flex justify-between items-center text-[10px] bg-red-500/5 border border-red-500/10 p-1.5 rounded text-rose-400">
                             <span>Row {err.rowIndex}: <strong className="font-mono">{err.row.email || err.row.name || 'unidentified'}</strong></span>
                             <span>{err.reason}</span>
                           </div>

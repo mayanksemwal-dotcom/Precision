@@ -61,6 +61,12 @@ export interface UserProfile {
   photoURL?: string;
   profilePhotoUrl?: string;
   location?: string;
+  notes?: string;
+  loginRestricted?: boolean;
+  isRestricted?: boolean;
+  restrictedReason?: string;
+  restrictedAt?: string;
+  restrictedBy?: string;
 }
 
 export enum DisputeStatus {
@@ -382,6 +388,10 @@ export interface KPIScorecard {
   organizationRank?: number | string;
   uploadedBy: string;
   uploadedAt: string;
+  kpiNameProductivity?: string;
+  kpiNameQuality?: string;
+  kpiNameAttendance?: string;
+  kpiNameAPT?: string;
 }
 
 export interface ITAsset {
@@ -429,6 +439,53 @@ export interface ShiftEvent {
   metadata?: Record<string, any>;
   confidence?: number;
   remarks?: string;
+}
+
+export interface ShiftActivity {
+  activityId?: string;
+  action?: string;
+  startTime: string; // ISO
+  endTime?: string; // ISO (undefined if active)
+  process?: string;
+  actor?: string;
+  reason?: string;
+  sourceService?: string;
+  previousValue?: string;
+  newValue?: string;
+  type?: 'productive' | 'break';
+  name?: string;
+  device?: 'mobile' | 'desktop' | string;
+}
+
+export interface TMSShift {
+  id: string;
+  userId: string;
+  userName: string;
+  userEmail: string;
+  teamLeadUid?: string;
+  mappedTL?: string;
+  mappedManager?: string;
+  clockInTime: string; // ISO
+  clockOutTime?: string; // ISO
+  endShiftTime?: string; // ISO
+  sessionClosedBy?: string;
+  activities: ShiftActivity[];
+  shiftEventLedger?: ShiftEvent[];
+  status: 'ACTIVE' | 'BREAK' | 'COMPLETED' | 'AUTO_CLOSED' | 'COMPLETED_FORCED' | 'CLOCKED_OUT' | 'CLOSED';
+  statusStartTime?: string;
+  clockInDevice?: 'mobile' | 'desktop';
+  clockOutDevice?: 'mobile' | 'desktop';
+  hasMobilePunches?: boolean;
+  sessionExtended?: boolean;
+  extended?: boolean;
+  remarks?: string;
+  lastHeartbeat?: string;
+  workLocation?: 'Home' | 'Office' | string;
+  workLocationSource?: string;
+  officeName?: string;
+  publicIP?: string;
+  locationCapturedAt?: string;
+  process?: string;
 }
 
 

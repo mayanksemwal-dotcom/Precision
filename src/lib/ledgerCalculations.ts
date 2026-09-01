@@ -1,4 +1,5 @@
 import { buildTimelineFromActivityLedger, isAuditOrDiagnosticEvent } from './tmsUtils';
+import { calculateShiftMetrics as calcShiftMetricsEngine, calculateAttendanceDate as calcAttDateEngine } from './tmsCalculationEngine';
 
 // Universal Firestore & JS timestamp parser returning Unix milliseconds
 export function parseTimestampMs(val: any): number {
@@ -62,10 +63,14 @@ export function isBreakActivity(activityName?: string, activityType?: string): b
   if (!activityName) return false;
   const nameLower = activityName.toLowerCase().trim();
   if (nameLower.includes('system_repair') || nameLower.includes('system repair') || nameLower.includes('clock out repair') || nameLower.includes('audit')) return false;
-  return BREAK_KEYWORDS.some(k => {
-    const regex = new RegExp(`\\b${k}\\b`, 'i');
-    return regex.test(nameLower);
-  });
+  
+  // Match only explicit standalone break names / phrases, never substring in processes like 'Biotechnology' or 'Breakfast Logistics'
+  const explicitBreakPhrases = [
+    'lunch', 'lunch break', 'tea', 'tea break', 'bio', 'bio break', 'bathroom', 'restroom',
+    'break', 'coffee', 'coffee break', 'meal', 'meal break', 'snack', 'snack break',
+    'recess', 'refreshment', 'short break', 'official break', 'unpaid break', 'paid break'
+  ];
+  return explicitBreakPhrases.includes(nameLower);
 }
 
 export function formatMs(ms: number): string {
@@ -99,62 +104,8 @@ export interface ShiftMetrics {
 
 // Internal function to calculate a single shift's ledger times (Productive & Break)
 export function calculateLedgerTimes(s: any, nowMs: number) {
-  let productiveMs = 0;
-  let breakMs = 0;
-
-  let acts = s.activities || [];
-  if (!acts || !Array.isArray(acts) || acts.length === 0) {
-    if (s.clockInTime) {
-      acts = [{
-        startTime: s.clockInTime,
-        type: s.status === 'BREAK' ? 'break' : 'productive',
-        name: s.status === 'BREAK' ? 'Break' : 'Work',
-        action: s.status === 'BREAK' ? 'BREAK_START' : 'CLOCK_IN'
-      }];
-    } else {
-      return { productiveMs, breakMs };
-    }
-  }
-
-  // Sort activities chronologically
-  const sortedActs = [...acts].sort((a, b) => new Date(a.startTime).getTime() - new Date(b.startTime).getTime());
-  
-  // Filter out audit/system events
-  const validActs = sortedActs.filter(act => !isAuditOrDiagnosticEvent(act.action) && act.type !== 'system');
-
-  for (let i = 0; i < validActs.length; i++) {
-    const act = validActs[i];
-    const startMs = new Date(act.startTime).getTime();
-    
-    let endMs;
-    if (i < validActs.length - 1) {
-      endMs = new Date(validActs[i+1].startTime).getTime();
-    } else {
-      endMs = s.clockOutTime ? new Date(s.clockOutTime).getTime() : nowMs;
-    }
-    
-    const durationMs = Math.max(0, endMs - startMs);
-    const actName = (act.name || act.currentActivity || '').toLowerCase();
-    const isMeetingOrTraining = ['meeting', 'coaching', 'training', 'alignment', '1:1', 'one-on-one', 'upskilling', 'onboarding'].some(k => actName.includes(k));
-    
-    let isProductive = false;
-    if (act.type === 'productive' || isMeetingOrTraining) {
-      isProductive = true;
-    } else if (act.type === 'break' || (act.action && act.action.includes('BREAK'))) {
-      isProductive = false;
-    } else {
-      const isBreakName = isBreakActivity(act.name || act.currentActivity || act.activityName || '', act.type);
-      isProductive = !isBreakName;
-    }
-
-    if (isProductive) {
-      productiveMs += durationMs;
-    } else {
-      breakMs += durationMs;
-    }
-  }
-
-  return { productiveMs, breakMs };
+  const res = calcShiftMetricsEngine(s, nowMs);
+  return { productiveMs: res.productiveMs, breakMs: res.breakMs };
 }
 
 // Compat wrapper for calculateMetricsFromLedger
@@ -171,33 +122,8 @@ export function calculateMetricsFromLedger(
 // Internal function to calculate active work for a single shift
 export function getActiveWork(s: any, nowMs: number): number {
   if (!s || s.clockOutTime) return 0;
-  const acts = s.activities || [];
-  if (!Array.isArray(acts) || acts.length === 0) return 0;
-
-  const sortedActs = [...acts]
-    .map(act => ({ ...act, startMs: parseTimestampMs(act.startTime) }))
-    .sort((a, b) => a.startMs - b.startMs);
-  
-  const validActs = sortedActs.filter(
-    act => !isAuditOrDiagnosticEvent(act.action) && act.type !== 'system'
-  );
-  
-  if (validActs.length === 0) return 0;
-  
-  const latestAct = validActs[validActs.length - 1];
-  
-  const isProd = !isBreakActivity(
-    latestAct.name || latestAct.currentActivity || latestAct.activityName || '',
-    latestAct.type
-  );
-  
-  const hasNoEndTime = !latestAct.endTime;
-  
-  if (isProd && hasNoEndTime) {
-    return Math.max(0, nowMs - latestAct.startMs);
-  }
-  
-  return 0;
+  const res = calcShiftMetricsEngine(s, nowMs);
+  return res.activeWorkMs;
 }
 
 export function calculateShiftMetrics(
@@ -240,34 +166,13 @@ export function calculateShiftMetrics(
 
   const processSingleShift = (s: any) => {
     if (!s || !s.clockInTime) return;
-    
-    // 1. Shift Elapsed
-    console.log('[TMS TIMER DEBUG] calculateShiftMetrics', {
-      nowMs,
-      status: s.status,
-      clockInTime: s.clockInTime,
-  });
-  const startMs = parseTimestampMs(s.clockInTime);
-    if (startMs === 0) return;
-    // Always use nowMs (passed from useSharedTimer) for active shifts
-    const endMs = (s.clockOutTime && s.status !== 'ACTIVE' && s.status !== 'BREAK') ? parseTimestampMs(s.clockOutTime) : nowMs;
-    const elapsedMs = Math.max(0, endMs - startMs);
+    const res = calcShiftMetricsEngine(s, nowMs);
 
-    // 3. Productive Work and 5. Break Duration
-    const { productiveMs, breakMs } = calculateLedgerTimes(s, endMs);
-    
-    // 2. Active Work (same as productiveMs as per specs)
-    const activeWorkMs = productiveMs;
-
-    // 4. Total Breaks (Count every BREAK_START activity)
-    const acts = s.activities || [];
-    const breaksCount = acts.filter((act: any) => act && act.action && act.action.toUpperCase().trim() === 'BREAK_START').length;
-
-    totalElapsedMs += elapsedMs;
-    totalProductiveMs += productiveMs;
-    totalBreakMs += breakMs;
-    totalBreaksCount += breaksCount;
-    totalActiveWorkMs += activeWorkMs;
+    totalElapsedMs += res.elapsedMs;
+    totalProductiveMs += res.productiveMs;
+    totalBreakMs += res.breakMs;
+    totalBreaksCount += res.totalBreaks;
+    totalActiveWorkMs += res.activeWorkMs;
   };
 
   if (aggregationMode === 'TODAY') {
@@ -283,10 +188,10 @@ export function calculateShiftMetrics(
     }
   }
 
-  // 6. Total Connected
+  // Total Connected
   const connectedMs = totalProductiveMs + totalBreakMs;
 
-  // 7. Utilization
+  // Utilization
   const productiveMins = totalProductiveMs / 60000;
   const utilization = Math.min((productiveMins / 480) * 100, 100);
   const formattedUtilization = Number(utilization.toFixed(1));
@@ -342,66 +247,6 @@ export interface MergedShiftRecord {
 }
 
 // Helper function to extract raw productive intervals for a single shift
-function extractProductiveIntervalsFromShift(s: any, nowMs: number): { start: number; end: number }[] {
-  const intervals: { start: number; end: number }[] = [];
-  const shiftInMs = parseTimestampMs(s.clockInTime);
-  if (!shiftInMs) return intervals;
-
-  const isOngoing = !s.clockOutTime && (s.status === 'ACTIVE' || s.status === 'BREAK' || !s.status);
-  const shiftOutMs = isOngoing ? nowMs : (s.clockOutTime ? parseTimestampMs(s.clockOutTime) : shiftInMs);
-  if (shiftOutMs <= shiftInMs) return intervals;
-
-  let acts = s.activities;
-  if (!acts || !Array.isArray(acts) || acts.length === 0) {
-    if (s.status !== 'BREAK') {
-      intervals.push({ start: shiftInMs, end: shiftOutMs });
-    }
-    return intervals;
-  }
-
-  const sortedActs = [...acts]
-    .map(a => ({ ...a, startMs: parseTimestampMs(a.startTime) }))
-    .filter(a => a.startMs > 0 && !isAuditOrDiagnosticEvent(a.action) && a.type !== 'system')
-    .sort((a, b) => a.startMs - b.startMs);
-
-  if (sortedActs.length === 0) {
-    if (s.status !== 'BREAK') {
-      intervals.push({ start: shiftInMs, end: shiftOutMs });
-    }
-    return intervals;
-  }
-
-  for (let i = 0; i < sortedActs.length; i++) {
-    const act = sortedActs[i];
-    const segStart = Math.max(shiftInMs, act.startMs);
-    let segEnd = shiftOutMs;
-    if (i < sortedActs.length - 1) {
-      segEnd = Math.min(shiftOutMs, sortedActs[i + 1].startMs);
-    }
-
-    if (segEnd <= segStart) continue;
-
-    const actName = (act.name || act.currentActivity || act.activityName || '').toLowerCase();
-    const isMeetingOrTraining = ['meeting', 'coaching', 'training', 'alignment', '1:1', 'one-on-one', 'upskilling', 'onboarding'].some(k => actName.includes(k));
-
-    let isProductive = false;
-    if (act.type === 'productive' || isMeetingOrTraining) {
-      isProductive = true;
-    } else if (act.type === 'break' || (act.action && act.action.includes('BREAK'))) {
-      isProductive = false;
-    } else {
-      const isBreakName = isBreakActivity(act.name || act.currentActivity || act.activityName || '', act.type);
-      isProductive = !isBreakName;
-    }
-
-    if (isProductive) {
-      intervals.push({ start: segStart, end: segEnd });
-    }
-  }
-
-  return intervals;
-}
-
 export function aggregateShiftsForHistoryAndReports(
   shifts: any[],
   nowMs: number = Date.now()
@@ -411,18 +256,7 @@ export function aggregateShiftsForHistoryAndReports(
   }
 
   const getWorkDate = (clockInTime: any): string => {
-    const inMs = parseTimestampMs(clockInTime);
-    if (!inMs) return '1970-01-01';
-    const d = new Date(inMs);
-    // 4-hour offset for overnight shifts (00:00 - 04:00 AM belongs to previous day's shift)
-    const logicalDate = new Date(d.getTime() - 4 * 60 * 60 * 1000);
-    const formatter = new Intl.DateTimeFormat('en-CA', {
-      timeZone: 'Asia/Kolkata',
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit'
-    });
-    return formatter.format(logicalDate);
+    return calcAttDateEngine(clockInTime);
   };
 
   const getExactDateStr = (clockInTime: any): string => {
@@ -454,18 +288,17 @@ export function aggregateShiftsForHistoryAndReports(
   const results: MergedShiftRecord[] = [];
 
   groups.forEach((groupShifts, key) => {
-    // 1. Sort shifts chronologically by clockInTime
     const sorted = [...groupShifts].sort((a, b) => {
       return parseTimestampMs(a.clockInTime) - parseTimestampMs(b.clockInTime);
     });
 
     const firstShift = sorted[0];
-    const earliestClockInMs = parseTimestampMs(firstShift.clockInTime);
-
-    // 2. Determine LATEST clock-out and check for ongoing session
-    let latestClockOutMs = 0;
-    let latestClockOutShift: any = null;
     let hasOngoing = false;
+    let latestClockOutShift: any = null;
+    let latestClockOutMs = 0;
+
+    let totalProductiveMs = 0;
+    let totalBreakMs = 0;
 
     sorted.forEach(s => {
       const isOngoing = !s.clockOutTime && (s.status === 'ACTIVE' || s.status === 'BREAK' || !s.status);
@@ -478,44 +311,14 @@ export function aggregateShiftsForHistoryAndReports(
           latestClockOutShift = s;
         }
       }
+
+      const metrics = calcShiftMetricsEngine(s, nowMs);
+      totalProductiveMs += metrics.productiveMs;
+      totalBreakMs += metrics.breakMs;
     });
 
-    const effectiveEndMs = hasOngoing ? nowMs : (latestClockOutMs || earliestClockInMs);
-
-    // 3. Extract & Merge overlapping productive intervals chronologically
-    const rawIntervals: { start: number; end: number }[] = [];
-    sorted.forEach(s => {
-      rawIntervals.push(...extractProductiveIntervalsFromShift(s, nowMs));
-    });
-
-    rawIntervals.sort((a, b) => a.start - b.start || a.end - b.end);
-
-    const mergedIntervals: { start: number; end: number }[] = [];
-    for (const intv of rawIntervals) {
-      if (intv.end <= intv.start) continue;
-      if (mergedIntervals.length === 0) {
-        mergedIntervals.push({ ...intv });
-      } else {
-        const last = mergedIntervals[mergedIntervals.length - 1];
-        if (intv.start <= last.end) {
-          last.end = Math.max(last.end, intv.end);
-        } else {
-          mergedIntervals.push({ ...intv });
-        }
-      }
-    }
-
-    let uniqueProductiveMs = 0;
-    mergedIntervals.forEach(intv => {
-      uniqueProductiveMs += (intv.end - intv.start);
-    });
-
-    // 4. Calculate total connected duration and non-productive / break time
-    const totalConnectedMs = Math.max(0, effectiveEndMs - earliestClockInMs);
-    const finalProductiveMs = Math.min(uniqueProductiveMs, totalConnectedMs);
-    const totalBreakMs = Math.max(0, totalConnectedMs - finalProductiveMs);
-
-    const totalProductiveMins = finalProductiveMs / 60000;
+    const totalConnectedMs = totalProductiveMs + totalBreakMs;
+    const totalProductiveMins = totalProductiveMs / 60000;
     const utilization = Math.min(100, Number(((totalProductiveMins / 480) * 100).toFixed(1)));
 
     const proc = sorted.find(s => Boolean(s.process))?.process || firstShift.process || '';
@@ -536,7 +339,7 @@ export function aggregateShiftsForHistoryAndReports(
       officeName: firstShift.officeName,
       publicIP: firstShift.publicIP,
       locationCapturedAt: firstShift.locationCapturedAt,
-      productiveMs: finalProductiveMs,
+      productiveMs: totalProductiveMs,
       breakMs: totalBreakMs,
       connectedMs: totalConnectedMs,
       utilization,

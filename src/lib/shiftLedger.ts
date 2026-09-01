@@ -218,44 +218,30 @@ export function formatShiftLedgerForReport(shift: MinimalShiftData): Chronologic
   const email = shift.userEmail || shift.email || '-';
   const shiftDate = shift.clockInTime ? shift.clockInTime.split('T')[0] : 'N/A';
 
-  // Use the shared timeline reconstruction logic to derive windows
-  const segments = buildTimelineFromActivityLedger(
-    shift.activities || [], 
-    shift.status || 'ACTIVE', 
-    shift.clockOutTime
-  );
+  const ledger = generateLegacyLedgerIfEmpty(shift);
 
-  return segments.map((act, index) => {
-    let formattedTime = act.startTime;
+  return ledger.map((event, index) => {
+    let formattedTime = event.timestamp;
     try {
-      formattedTime = new Date(act.startTime).toLocaleString('en-US', { timeZone: 'Asia/Kolkata' });
+      formattedTime = new Date(event.timestamp).toLocaleString('en-US', { timeZone: 'Asia/Kolkata' });
     } catch {
       // fallback
-    }
-
-    let endFormatted = 'Active Now';
-    if (act.endTime) {
-      try {
-        endFormatted = new Date(act.endTime).toLocaleString('en-US', { timeZone: 'Asia/Kolkata' });
-      } catch {
-        // fallback
-      }
     }
 
     return {
       'Employee': employee,
       'User Email': email,
       'Shift Date': shiftDate,
-      'Event Sequence': index + 1,
+      'Event Sequence': event.sequence || (index + 1),
       'Event Time': formattedTime,
-      'Event Type': act.action || (act.type === 'break' ? 'BREAK' : 'WORK'),
-      'Old Value': act.previousValue || '-',
-      'New Value': act.newValue || act.process || act.name || '-',
-      'Reason': `${act.reason || '-'}${act.isLive ? ' (CURRENT)' : ` (Ended: ${endFormatted})`}`,
-      'Source': act.sourceService || 'TMS',
-      'Performed By': act.actor || employee,
-      'Confidence': act.confidence !== undefined ? `${act.confidence}%` : '-',
-      'Remarks': act.remarks || '-'
+      'Event Type': event.eventType,
+      'Old Value': event.oldValue || '-',
+      'New Value': event.newValue || '-',
+      'Reason': event.reason || '-',
+      'Source': event.source || 'TMS',
+      'Performed By': event.performedBy || employee,
+      'Confidence': event.confidence !== undefined ? `${event.confidence}%` : '-',
+      'Remarks': event.remarks || '-'
     };
   });
 }
